@@ -57,14 +57,14 @@ func startSFTP(t *testing.T) *sftpServer {
 // known_hosts file holding its host key -- the backend refuses to talk
 // to a server it cannot verify, so the test has to do what a person
 // would do with ssh-keyscan.
-func launchSFTP() (*sftpServer, error) {
+func launchSFTP(dockerArgs ...string) (*sftpServer, error) {
 	port, err := freePort()
 	if err != nil {
 		return nil, err
 	}
-	out, err := exec.Command("docker", "run", "-d", "--rm",
-		"-p", fmt.Sprintf("127.0.0.1:%d:22", port),
-		sftpImage, fmt.Sprintf("%s:%s:1001::repo", sftpUser, sftpPass)).CombinedOutput()
+	args := append([]string{"run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:22", port)}, dockerArgs...)
+	args = append(args, sftpImage, fmt.Sprintf("%s:%s:1001::repo", sftpUser, sftpPass))
+	out, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("docker run: %w: %s", err, out)
 	}
@@ -366,4 +366,72 @@ func TestSFTPPutAndGetIgnoreACancelledContext(t *testing.T) {
 		t.Fatalf("get with a cancelled context: %d bytes, %v", n, err)
 	}
 	t.Logf("cancelled context ignored: put of %d MiB completed in %v, get returned all %d bytes", size>>20, put.Round(time.Millisecond), n)
+}
+
+// format.md §10 says the backup account cannot have `remove` on the
+// `internal-sftp -P` blacklist, because every PutIfAbsent ends by
+// removing its spool file. This runs a second server with exactly that
+// blacklist (atmoz/sftp executes /etc/sftp.d/* before sshd starts) and
+// pins the consequence: the put still succeeds, the spool file stays
+// behind, and Delete fails.
+func TestSFTPRemoveBlacklistLeavesSpoolFilesBehind(t *testing.T) {
+	if os.Getenv(sftpTestEnv) != "1" {
+		t.Skipf("set %s=1 to run the SFTP tests against OpenSSH in Docker", sftpTestEnv)
+	}
+	script := filepath.Join(t.TempDir(), "blacklist.sh")
+	patch := "#!/bin/sh\nset -e\nsed -i 's/^ForceCommand internal-sftp$/ForceCommand internal-sftp -P remove/' /etc/ssh/sshd_config\ngrep -q 'internal-sftp -P remove' /etc/ssh/sshd_config\n"
+	if err := os.WriteFile(script, []byte(patch), 0o755); err != nil { //nolint:gosec // it has to be executable for the container's entrypoint to run it
+		t.Fatal(err)
+	}
+	started := time.Now()
+	srv, err := launchSFTP("-v", script+":/etc/sftp.d/blacklist.sh:ro")
+	if err != nil {
+		t.Fatalf("start sftp with a blacklist: %v", err)
+	}
+	t.Cleanup(srv.stop)
+	t.Logf("second server ready in %v", time.Since(started).Round(time.Millisecond))
+
+	ctx := context.Background()
+	b, err := CreateSFTP(ctx, srv.config("blacklist"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := b.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	// First prove the blacklist is in force, or the rest passes for the
+	// wrong reason.
+	if err := b.Put(ctx, "probe", strings.NewReader("x"), 1); err != nil {
+		t.Fatalf("put under the blacklist: %v", err)
+	}
+	if err := b.Delete(ctx, "probe"); err == nil {
+		t.Fatal("delete succeeded: the remove blacklist did not take effect")
+	} else {
+		t.Logf("delete under -P remove: %v", err)
+	}
+
+	if err := b.PutIfAbsent(ctx, "packs/one", strings.NewReader("pack"), 4); err != nil {
+		t.Fatalf("put-if-absent under the blacklist: %v", err)
+	}
+	dir, err := b.path("packs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := b.client.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stray []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			stray = append(stray, e.Name())
+		}
+	}
+	if len(stray) == 0 {
+		t.Fatalf("no spool file left behind; entries: %v", entries)
+	}
+	t.Logf("put-if-absent succeeded and left %d spool file(s) behind: %v", len(stray), stray)
 }

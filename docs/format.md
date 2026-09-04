@@ -239,7 +239,7 @@ chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟
 
 backup **不需要**讀 tree：tree 一律用 `PutIfAbsent` 寫，去重靠的是「已存在」的回應，不是先讀再比。
 
-**SFTP（M4）**：OpenSSH 沒有 per-prefix 的權限模型，能做的是 `Match User backup` + `ChrootDirectory` + `ForceCommand internal-sftp -P <黑名單>`。但 kist 的備份帳號**不能**把 `remove` 列進黑名單：每次 `PutIfAbsent` 都以 `Remove(.tmp-*)` 結尾——不只競態時——禁了 `remove` 之後每個物件都會留下第二個硬連結的名字（List 看不到、共用同一個 inode），prune 刪掉 `packs/<id>` 之後位元組仍然被 `.tmp-*` 佔著，什麼都回收不到。所以老實的說法是：**在 SFTP 上，抗勒索性質沒有任何一半能由伺服器端強制**——備份憑證能刪也能覆寫，性質只對誠實的 client 成立。要一個不需要 `remove` 的備份帳號，路徑是改用 OpenSSH 的 `SSH_FXP_RENAME`（探測證明它在 OpenSSH 上不覆寫），但它的原子性與在其他伺服器上的行為都沒驗過；記下來，不做。`prune` 用的維護帳號不加 `-P`。
+**SFTP（M4）**：OpenSSH 沒有 per-prefix 的權限模型，能做的是 `Match User backup` + `ChrootDirectory` + `ForceCommand internal-sftp -P <黑名單>`。但 kist 的備份帳號**不能**把 `remove` 列進黑名單：每次 `PutIfAbsent` 都以 `Remove(.tmp-*)` 結尾——不只競態時——禁了 `remove` 之後每個物件都會留下第二個硬連結的名字（List 看不到、共用同一個 inode），prune 刪掉 `packs/<id>` 之後位元組仍然被 `.tmp-*` 佔著，什麼都回收不到。實測（`TestSFTPRemoveBlacklistLeavesSpoolFilesBehind`，OpenSSH 開 `-P remove`）：`PutIfAbsent` 照樣成功、目錄裡多出一個 `.tmp-*`，`Delete` 回 access denied。所以老實的說法是：**在 SFTP 上，抗勒索性質沒有任何一半能由伺服器端強制**——備份憑證能刪也能覆寫，性質只對誠實的 client 成立。要一個不需要 `remove` 的備份帳號，路徑是改用 OpenSSH 的 `SSH_FXP_RENAME`（探測證明它在 OpenSSH 上不覆寫），但它的原子性與在其他伺服器上的行為都沒驗過；記下來，不做。`prune` 用的維護帳號不加 `-P`。
 
 ### 抗勒索性質，以及它在哪裡成立
 
@@ -310,6 +310,7 @@ MinIO 上這條全部跑過。AWS S3 的行為文件上相同，**UNVERIFIED**�
 | 小檔備份的每檔成本（chunker buffer 重用） | `BenchmarkBackupSmallFiles`、`TestResetChunksLikeAFreshChunker` |
 | SFTP 吞吐量是量過的數字 | `TestSFTPThroughput` |
 | SFTP 的 Put / Get 忽略已取消的 ctx（限制，釘住以便察覺函式庫改變） | `TestSFTPPutAndGetIgnoreACancelledContext` |
+| OpenSSH `-P remove` 黑名單下 `PutIfAbsent` 仍成功但留下 `.tmp-*`、`Delete` 失敗（§10：黑名單不可行） | `TestSFTPRemoveBlacklistLeavesSpoolFilesBehind` |
 | parity 物件不變、edge size 都對 | `internal/parity/testdata/parity.txt`、`TestEncodeAndParseAtAwkwardSizes` |
 | ≤ M 個 shard 損壞（含 trailer、同 shard 兩處）修得回逐位元組相同；> M 不動 pack | `TestRepairsUpToMShards`、`TestRefusesMoreThanMErasures`、`TestCheckRepairsADamagedPackFromParity`、`TestCheckReportsWhatParityCannotRepair` |
 | 偽造的 parity 修不出錯的東西 | `TestForgedParityCannotRepairWrongly`、`TestCheckReportsWhatParityCannotRepair/forged_parity` |
