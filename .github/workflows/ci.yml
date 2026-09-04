@@ -40,6 +40,12 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # A release build refuses a dirty tree, so go.mod and go.sum have
+      # to be tidy before a tag, not discovered untidy by the tag.
+      - name: go.mod is tidy
+        if: runner.os == 'Linux'
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+
       - name: test
         run: go test ./...
         env:

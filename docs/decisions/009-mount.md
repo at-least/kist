@@ -49,4 +49,4 @@ mount 時載入的 index 不認識之後寫進來的 pack。最上面兩層每�
 ## UNVERIFIED
 
 - macOS：只有交叉編譯與 vet；需要 macFUSE 才能跑。
-- CI 的 ubuntu runner 有沒有 `/dev/fuse`：沒推過，不知道；沒有就是 skip。
+- ~~CI 的 ubuntu runner 有沒有 `/dev/fuse`~~：推上去後確認了：ubuntu runner 有，FUSE 測試在 CI 真的跑並通過（run 33903651553）；macOS runner 沒有 macFUSE，那邊 skip。macOS 上的 mount 仍然沒有驗證過。

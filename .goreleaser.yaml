@@ -5,9 +5,8 @@ version: 2
 
 project_name: kist
 
-before:
-  hooks:
-    - go mod tidy
+# No `go mod tidy` hook: a release must not rewrite anything, and CI
+# already fails if go.mod or go.sum are not tidy.
 
 builds:
   - id: kist
