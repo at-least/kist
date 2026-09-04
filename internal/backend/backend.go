@@ -19,6 +19,12 @@ var (
 	// content-addressed object this is success -- the bytes are already
 	// there. For a snapshot it is a collision to retry.
 	ErrExists = errors.New("object already exists")
+
+	// ErrLocked means Delete was accepted but the object's bytes are
+	// retained by the storage -- an Object Lock retention, say -- and
+	// remain readable. The caller must go on treating the object as
+	// present.
+	ErrLocked = errors.New("object is retained by the storage")
 )
 
 // ReadToEnd is the length argument to Get that means "from off to the end

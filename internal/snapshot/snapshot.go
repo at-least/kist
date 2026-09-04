@@ -36,14 +36,15 @@ const maxTimestampRetries = 1000
 // Stats summarise what a backup did. They are reporting, not structure:
 // nothing reads them back to make a decision.
 type Stats struct {
-	Files       uint64 `cbor:"files,omitempty"`
-	Dirs        uint64 `cbor:"dirs,omitempty"`
-	Symlinks    uint64 `cbor:"symlinks,omitempty"`
-	Bytes       uint64 `cbor:"bytes,omitempty"`
-	ChunksNew   uint64 `cbor:"chunks_new,omitempty"`
-	ChunksRead  uint64 `cbor:"chunks_read,omitempty"`
-	PacksAdded  uint64 `cbor:"packs_added,omitempty"`
-	BytesStored uint64 `cbor:"bytes_stored,omitempty"`
+	Files        uint64 `cbor:"files,omitempty"`
+	Dirs         uint64 `cbor:"dirs,omitempty"`
+	Symlinks     uint64 `cbor:"symlinks,omitempty"`
+	Bytes        uint64 `cbor:"bytes,omitempty"`
+	ChunksNew    uint64 `cbor:"chunks_new,omitempty"`
+	ChunksRead   uint64 `cbor:"chunks_read,omitempty"`
+	PacksAdded   uint64 `cbor:"packs_added,omitempty"`
+	PacksRevived uint64 `cbor:"packs_revived,omitempty"`
+	BytesStored  uint64 `cbor:"bytes_stored,omitempty"`
 }
 
 // A Snapshot is one completed backup.

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/at-least/kist/internal/backend"
+	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/pack"
 )
 
@@ -279,20 +280,28 @@ func backupPolicy(bucket, prefix string, enforceConditional bool) string {
       "Resource": [%s, %s]
     },
     {
-      "Sid": "ListOnlyTheIndex",
+      "Sid": "ListTheIndexAndTheMarks",
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
       "Resource": ["arn:aws:s3:::%s"],
-      "Condition": {"StringLike": {"s3:prefix": ["%s/indexes/*"]}}
+      "Condition": {"StringLike": {"s3:prefix": ["%s/indexes/*", "%s/gc/*"]}}
     },
     {
       "Sid": "ConditionalWriteOnly",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": [%s, %s, %s, %s]%s
+      "Resource": [%s, %s, %s, %s, %s]%s
+    },
+    {
+      "Sid": "ReviveMarkedPacks",
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject"],
+      "Resource": [%s]
     }
   ]
-}`, res("config"), res("indexes/*"), bucket, prefix, res("packs/*"), res("indexes/*"), res("trees/*"), res("snapshots/*"), condition)
+}`, res("config"), res("indexes/*"), bucket, prefix, prefix,
+		res("packs/*"), res("indexes/*"), res("trees/*"), res("snapshots/*"), res("clients/*"), condition,
+		res("gc/*"))
 }
 
 // createScopedUser makes a MinIO user holding the backup policy, with
@@ -402,10 +411,35 @@ func TestS3BackupPolicy(t *testing.T) {
 	})
 
 	t.Run("cannot list data prefixes", func(t *testing.T) {
-		for _, prefix := range []string{pack.Prefix, "trees/", "snapshots/", ""} {
+		for _, prefix := range []string{pack.Prefix, "trees/", "snapshots/", ClientsPrefix, ""} {
 			err := limited.List(ctx, prefix, func(backend.FileInfo) error { return nil })
 			if !errors.Is(err, backend.ErrDenied) {
 				t.Errorf("list %q: err = %v, want ErrDenied", prefix, err)
+			}
+		}
+	})
+
+	// Prune's marks are the one thing a backup client may delete: a
+	// mark is a statement that nobody needs a pack, and a backup that
+	// needs it is entitled to say otherwise. Nothing else under the
+	// backup's credentials may go.
+	t.Run("can revive a marked pack and nothing more", func(t *testing.T) {
+		packID, err := crypto.ParseID(strings.TrimPrefix(packKey, pack.Prefix))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := backend.PutBytesIfAbsent(ctx, admin, gcKey(packID), []byte("mark")); err != nil {
+			t.Fatalf("mark as admin: %v", err)
+		}
+		if err := limited.Delete(ctx, gcKey(packID)); err != nil {
+			t.Errorf("delete a mark: %v, want success", err)
+		}
+		if ok, err := backend.Exists(ctx, admin, gcKey(packID)); err != nil || ok {
+			t.Errorf("mark still there after the backup client removed it: %v, %v", ok, err)
+		}
+		for _, key := range []string{packKey, "config", clientKey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")} {
+			if err := limited.Delete(ctx, key); !errors.Is(err, backend.ErrDenied) {
+				t.Errorf("delete %s: err = %v, want ErrDenied", key, err)
 			}
 		}
 	})
@@ -460,4 +494,140 @@ func TestS3BackupPolicy(t *testing.T) {
 			t.Error("the pack was overwritten despite the policy")
 		}
 	})
+}
+
+// Scenario D against the storage where duplicate packs actually arise:
+// two clients back up the same source at once, the non-canonical copy
+// is marked, and once both clients have been active since the mark and
+// the grace has passed it is reclaimed. Nothing a snapshot needs goes.
+func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
+	srv := startMinio(t)
+	ctx := context.Background()
+	prefix := freshPrefix()
+	clk := newClock()
+	options := func(clientID string) Options {
+		o := s3Options(t, clientID)
+		o.Now = clk.now
+		return o
+	}
+
+	root := s3Backend(t, srv, prefix, srv.accessKey, srv.secretKey)
+	init, err := Init(ctx, root, options("ffffffffffffffffffffffffffffffff"))
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	source := t.TempDir()
+	writeTree(t, source, sampleFiles(t))
+	clients := []string{"11111111111111111111111111111111", "22222222222222222222222222222222"}
+	backupAll := func(source string) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make([]error, len(clients))
+		for i, id := range clients {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r, err := Open(ctx, s3Backend(t, srv, prefix, srv.accessKey, srv.secretKey), options(id))
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				if _, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+					errs[i] = err
+				}
+				if err := r.Close(); err != nil && errs[i] == nil {
+					errs[i] = err
+				}
+			}()
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("client %s: %v", clients[i], err)
+			}
+		}
+	}
+	backupAll(source)
+
+	pruner, err := Open(ctx, s3Backend(t, srv, prefix, srv.accessKey, srv.secretKey), options("ffffffffffffffffffffffffffffffff"))
+	if err != nil {
+		t.Fatalf("open pruner: %v", err)
+	}
+	defer func() {
+		if err := pruner.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	before := countKeys(t, pruner.Backend(), pack.Prefix)
+	duplicates := before - 1 // one canonical pack holds everything
+	t.Logf("%d packs stored for two concurrent backups; %d duplicate(s) to reclaim", before, duplicates)
+
+	first, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(first.Marked) != duplicates || len(first.Deleted) != 0 {
+		t.Fatalf("first run: %+v", first)
+	}
+
+	clk.advance(2 * time.Hour)
+	backupAll(t.TempDir()) // both clients active since the mark
+	sweep, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(sweep.Deleted) != duplicates || len(sweep.Held) != 0 {
+		t.Fatalf("sweep: %+v", sweep)
+	}
+	if n := countKeys(t, pruner.Backend(), pack.Prefix); n != before-duplicates {
+		t.Errorf("%d packs left, want %d", n, before-duplicates)
+	}
+
+	third, err := Open(ctx, s3Backend(t, srv, prefix, srv.accessKey, srv.secretKey), options("33333333333333333333333333333333"))
+	if err != nil {
+		t.Fatalf("open third: %v", err)
+	}
+	defer func() {
+		if err := third.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	report, err := third.Check(ctx, CheckOptions{ReadData: true})
+	if err != nil || !report.OK() {
+		t.Fatalf("check after prune: %v %v", err, report.Problems)
+	}
+	handles, err := third.Snapshots(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := 0
+	for _, h := range handles {
+		snap, err := third.LoadSnapshot(ctx, h.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.Paths[0] != source {
+			continue
+		}
+		target := filepath.Join(t.TempDir(), "out")
+		if _, err := third.Restore(ctx, h.Key, target, RestoreOptions{}); err != nil {
+			t.Fatalf("restore %s: %v", h.Key, err)
+		}
+		compareTrees(t, source, filepath.Join(target, filepath.Base(source)))
+		restored++
+	}
+	if restored != 2 {
+		t.Errorf("restored %d snapshots of the source, want 2", restored)
+	}
+	again, _, err := third.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Stats.ChunksNew != 0 {
+		t.Errorf("backup after prune stored %d new chunks, want 0", again.Stats.ChunksNew)
+	}
 }

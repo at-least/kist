@@ -26,6 +26,7 @@ func NewRootCommand() *cobra.Command {
 		newRestoreCommand(),
 		newCheckCommand(),
 		newForgetCommand(),
+		newPruneCommand(),
 		newRebuildIndexCommand(),
 		newVersionCommand(),
 	)

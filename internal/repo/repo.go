@@ -27,6 +27,10 @@ type Repository struct {
 	index    *index.Index
 	clientID string
 
+	// indexSource is where index blobs are read from: the local cache
+	// when there is one, the backend otherwise.
+	indexSource backend.Backend
+
 	// nonceSource is nil in production, meaning crypto/rand. Tests set it
 	// so that a whole repository can be reproduced byte for byte.
 	nonceSource io.Reader
@@ -219,9 +223,27 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 		keys:        keys,
 		index:       ix,
 		clientID:    clientID,
+		indexSource: source,
 		nonceSource: nonces,
 		now:         opts.clock(),
 	}, nil
+}
+
+// refreshIndex reloads the index from the stored blobs.
+//
+// A process that stays open across backups would otherwise deduplicate
+// against a view from when it opened, and prune's safety argument
+// assumes a backup's view of the index is no older than the backup.
+func (r *Repository) refreshIndex(ctx context.Context, warn func(string, ...any)) error {
+	ix, skipped, err := index.LoadAll(ctx, r.indexSource, r.keys)
+	if err != nil {
+		return err
+	}
+	for _, s := range skipped {
+		warn("%v; run `kist rebuild-index` to repair the index", s)
+	}
+	r.index = ix
+	return nil
 }
 
 // Backend returns the storage this repository sits on.
@@ -247,45 +269,19 @@ func (r *Repository) Close() error {
 // RebuildIndex discards the cached index, reconstructs it by reading
 // every pack trailer, and replaces the stored index blobs with one blob
 // describing everything.
-//
-// The new blob is written before the old ones are deleted. A crash in
-// between therefore leaves a repository with two blobs describing
-// overlapping sets -- harmless, because loading merges them -- rather
-// than a window with no index at all.
 func (r *Repository) RebuildIndex(ctx context.Context) (int, error) {
 	stale, unusable, err := index.List(ctx, r.backend)
 	if err != nil {
 		return 0, err
 	}
-
-	ix, packs, err := index.Rebuild(ctx, r.backend, r.keys)
+	_, packs, err := index.Rebuild(ctx, r.backend, r.keys)
 	if err != nil {
 		return 0, err
 	}
-
-	fresh := crypto.ID{}
-	if len(packs) > 0 {
-		if fresh, err = index.Save(ctx, r.backend, r.keys, packs, r.nonceSource); err != nil {
-			return 0, err
-		}
+	if err := r.replaceIndex(ctx, stale, unusable, packs); err != nil {
+		return 0, fmt.Errorf("rebuild index: %w", err)
 	}
-
-	for _, id := range stale {
-		if id == fresh {
-			continue
-		}
-		if err := r.backend.Delete(ctx, index.Key(id)); err != nil {
-			return 0, fmt.Errorf("rebuild index: remove the old blob %s: %w", id, err)
-		}
-	}
-	for _, key := range unusable {
-		if err := r.backend.Delete(ctx, key); err != nil {
-			return 0, fmt.Errorf("rebuild index: remove %s: %w", key, err)
-		}
-	}
-
-	r.index = ix
-	return ix.Len(), nil
+	return r.index.Len(), nil
 }
 
 func hexRepoID(id crypto.RepoID) string {

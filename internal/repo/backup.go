@@ -65,16 +65,41 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 		host = name
 	}
 
+	// Three things happen before any file is read, in this order, and a
+	// backup that cannot do all three does not run. Prune's sweep argues
+	// from them: a client is registered before it deduplicates against
+	// anything, so a sweep that lists clients after this point waits for
+	// this backup; and a backup that started after a pack was marked
+	// refreshed its index and read the marks after the mark, so it sees
+	// the mark and uploads the pack's chunks again. A client whose
+	// credentials cannot register or list gc/ is on a data-loss path,
+	// not in a degraded mode.
+	started := r.now().UTC()
+	if err := r.register(ctx, started); err != nil {
+		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
+	}
+	if err := r.refreshIndex(ctx, opts.warn); err != nil {
+		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
+	}
+	marked, err := r.listMarkedPacks(ctx)
+	if err != nil {
+		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
+	}
+	if backupHooks.afterMarks != nil {
+		backupHooks.afterMarks()
+	}
+
 	b := &backupRun{
-		repo:    r,
-		opts:    opts,
-		pending: make(map[crypto.ID]struct{}),
-		written: make(map[crypto.ID][]pack.Entry),
-		hard:    make(map[hardLinkKey][]crypto.ID),
+		repo:       r,
+		opts:       opts,
+		marked:     marked,
+		uploaded:   make(map[crypto.ID]struct{}),
+		referenced: make(map[crypto.ID]struct{}),
+		revived:    make(map[crypto.ID]struct{}),
+		written:    make(map[crypto.ID][]pack.Entry),
+		hard:       make(map[hardLinkKey][]crypto.ID),
 	}
 	defer b.abort()
-
-	started := r.now().UTC()
 
 	roots, err := normalisePaths(paths)
 	if err != nil {
@@ -105,6 +130,14 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 		}
 	}
 
+	// A pack this backup deduplicated against may have been marked by a
+	// prune that ran meanwhile. It cannot have been deleted -- the mark is
+	// younger than this backup, and this client, registered before the
+	// mark, holds the sweep -- so removing the mark is enough to keep it.
+	if err := b.reviveReferenced(ctx); err != nil {
+		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
+	}
+
 	snap := &snapshot.Snapshot{
 		Version:  snapshot.Version,
 		Root:     rootID,
@@ -121,6 +154,12 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	return snap, handle, nil
 }
 
+// backupHooks are set by tests to interleave a backup with a prune at
+// the point where the interleaving matters. Nil in production.
+var backupHooks struct {
+	afterMarks func()
+}
+
 // hardLinkKey identifies one inode, so that a file reachable by several
 // names is stored once.
 type hardLinkKey struct {
@@ -134,7 +173,18 @@ type backupRun struct {
 
 	writer *pack.Writer
 
-	// pending holds the chunks in the pack currently being built.
+	// marked is the set of packs prune has marked for deletion, as of
+	// the start of this backup. See has.
+	marked map[crypto.ID]struct{}
+
+	// referenced is the set of packs this run deduplicated against: it
+	// refers to their chunks without holding a copy. revived is the set
+	// of marked packs whose mark this run has removed.
+	referenced map[crypto.ID]struct{}
+	revived    map[crypto.ID]struct{}
+
+	// uploaded holds every chunk this run has put into a pack, finished
+	// or not.
 	//
 	// The index only learns about a chunk when its pack is finished, so
 	// without this a payload repeated inside one pack's worth of work --
@@ -142,8 +192,10 @@ type backupRun struct {
 	// twice. That produces a trailer listing one chunk twice, which fails
 	// the trailer's own consistency check and makes the pack unreadable.
 	// It does not show up in a small test: it needs the repeat to fall
-	// inside a single pack.
-	pending map[crypto.ID]struct{}
+	// inside a single pack. It is never cleared, because a chunk this run
+	// re-uploaded out of a marked pack still resolves to the marked pack
+	// in the index and would otherwise be re-uploaded on every repeat.
+	uploaded map[crypto.ID]struct{}
 
 	written map[crypto.ID][]pack.Entry
 	hard    map[hardLinkKey][]crypto.ID
@@ -384,13 +436,70 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 	}
 }
 
-// has reports whether a chunk is already stored or already staged in the
-// pack being built.
+// has reports whether a chunk is already stored, by this run or by the
+// repository, in a pack that is going to stay.
+//
+// A chunk whose pack prune has marked counts as absent: it is uploaded
+// again, into a pack of this run's, and the mark is removed. Removing
+// the mark alone would leave a race -- prune reads the mark, this client
+// removes it, prune deletes the pack -- that no ordering of two
+// unconditional operations can close. Uploading the chunk again closes
+// it: whichever way the race goes, a pack holding the chunk survives.
+// The upload costs nothing worth counting, since the data it repeats
+// was about to be deleted.
 func (b *backupRun) has(id crypto.ID) bool {
-	if _, staged := b.pending[id]; staged {
+	if _, ok := b.uploaded[id]; ok {
 		return true
 	}
-	return b.repo.index.Has(id)
+	loc, ok := b.repo.index.Lookup(id)
+	if !ok {
+		return false
+	}
+	if _, doomed := b.marked[loc.Pack]; doomed {
+		b.revive(loc.Pack)
+		return false
+	}
+	b.referenced[loc.Pack] = struct{}{}
+	return true
+}
+
+// reviveReferenced removes any mark placed during this backup on a pack
+// it refers to.
+func (b *backupRun) reviveReferenced(ctx context.Context) error {
+	if len(b.referenced) == 0 {
+		return nil
+	}
+	marked, err := b.repo.listMarkedPacks(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range sortedIDs(marked) {
+		if _, ok := b.referenced[id]; ok {
+			b.revive(id)
+		}
+	}
+	return nil
+}
+
+// revive removes the mark from a pack this backup is about to reference,
+// once per pack. The mark is what tells prune the pack is unreferenced;
+// leaving it would have prune delete a pack that, after this backup
+// commits, a snapshot resolves chunks to.
+//
+// The pack stays in marked: every chunk of a marked pack is uploaded
+// again, not only the first one met. A failure to remove the mark is
+// reported, not fatal: the re-upload in has is what keeps the data
+// safe, and a backup role without Delete on gc/ must still be able to
+// back up.
+func (b *backupRun) revive(id crypto.ID) {
+	if _, done := b.revived[id]; done {
+		return
+	}
+	b.revived[id] = struct{}{}
+	if err := b.repo.backend.Delete(context.Background(), gcKey(id)); err != nil {
+		b.opts.warn("could not remove the gc mark on pack %s: %v; the data is re-uploaded, prune will re-evaluate the mark", id, err)
+	}
+	b.stats.PacksRevived++
 }
 
 // add puts one new chunk into the current pack, flushing when full.
@@ -406,7 +515,7 @@ func (b *backupRun) add(ctx context.Context, id crypto.ID, data []byte) error {
 	if err := b.writer.Add(id, data); err != nil {
 		return err
 	}
-	b.pending[id] = struct{}{}
+	b.uploaded[id] = struct{}{}
 	b.stats.ChunksNew++
 
 	if b.writer.Full() {
@@ -427,10 +536,6 @@ func (b *backupRun) flush(ctx context.Context) error {
 		return fmt.Errorf("backup: %w", err)
 	}
 
-	// Cleared before the index learns about the pack, not after: with a
-	// parallel backup the window between the two would be one where a
-	// chunk is in neither set and could be packed a second time.
-	clear(b.pending)
 	b.repo.index.AddPack(packID, entries)
 	b.written[packID] = entries
 	b.stats.PacksAdded++
