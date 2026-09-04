@@ -239,6 +239,16 @@ func TestMountServesTheSnapshot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "nobody")); !errors.Is(err, iofs.ErrNotExist) {
 		t.Errorf("stat of an unknown client: %v", err)
 	}
+	// Names that cannot be keys -- what file managers and shells probe
+	// for -- do not exist; they are not I/O errors.
+	for _, name := range []string{".Trash-1000", "Upper", ".hidden"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, iofs.ErrNotExist) {
+			t.Errorf("stat of %q at the root: err = %v, want ErrNotExist", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, r.ClientID(), name)); !errors.Is(err, iofs.ErrNotExist) {
+			t.Errorf("stat of %q under the client: err = %v, want ErrNotExist", name, err)
+		}
+	}
 }
 
 // A backup committed while mounted shows up, and its data reads, even
