@@ -55,6 +55,13 @@ jobs:
         env:
           CGO_ENABLED: "1"
 
+      # A short fuzz pass on every target: not a campaign, a guard that the
+      # targets still build and their seed corpora still pass. The 24-hour
+      # campaign is make fuzz-long, run by hand.
+      - name: fuzz smoke
+        if: runner.os == 'Linux'
+        run: make fuzz FUZZTIME=10s
+
       # The FUSE cases skip where /dev/fuse cannot be opened (macOS without
       # macFUSE). Verbose, so the log says which it was.
       - name: mount test, verbosely
