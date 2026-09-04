@@ -152,7 +152,8 @@ salt 與 KDF 參數本來就是公開的。
 ```
 Tree { version: u32, nodes: [Node], prev: ObjectId | null }
 Node { name: bytes, meta: NodeMeta, kind: NodeKind }
-NodeMeta { mode: u32, uid: u32, gid: u32, mtime_secs: i64, mtime_nanos: u32 }
+NodeMeta { mode: u32, uid: u32, gid: u32, mtime_secs: i64, mtime_nanos: u32,
+           ctime_secs: i64, ctime_nanos: u32, inode: u64 }
 NodeKind =
   | { "File":    { size: u64, content: Content } }
   | { "Dir":     { subtree: ObjectId } }
@@ -166,6 +167,9 @@ ChunkList { version: u32, chunks: [ChunkId] }
 - `nodes` 依 `name` 的 bytes 升冪排序；同一目錄內名稱不重複。
 - `name` 在 Unix 是原始 OS bytes；Windows 上是檔名的 UTF-8。
 - `mode` 含檔案類型位元（例如一般檔 `0o100644`）。Windows 上 mode/uid/gid 為 0。
+- `ctime_*` 與 `inode` 只用於 backup 的快速路徑（size + mtime + ctime + inode 都沒變才沿用
+  上次的 chunk 清單），不會被還原。Windows 上為 0；讀到 0 就不拿來比對。
+  這三個欄位是 `#[serde(default)]`，缺少時視為 0。
 - **大目錄**：每 10 000 個節點切一段。前面的段先寫出，後一段的 `prev` 指向它；
   父目錄記錄**最後一段**的名稱。讀取時沿 `prev` 收集所有段，再從最舊的一段開始讀。
   目錄前段沒變，那些段的名稱就沒變，照樣重用。

@@ -58,6 +58,15 @@ pub struct NodeMeta {
     /// 修改時間：Unix 秒 + 奈秒。
     pub mtime_secs: i64,
     pub mtime_nanos: u32,
+    /// inode 變更時間（Unix 的 ctime）：kernel 在任何寫入時更新、使用者無法設定，
+    /// 所以 `cp -p` 這類保留 mtime 的複製也會被抓到。0 = 這個平台沒有，不拿來比對。
+    #[serde(default)]
+    pub ctime_secs: i64,
+    #[serde(default)]
+    pub ctime_nanos: u32,
+    /// inode 編號。0 = 這個平台沒有，不拿來比對。
+    #[serde(default)]
+    pub inode: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

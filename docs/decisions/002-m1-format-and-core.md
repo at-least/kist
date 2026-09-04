@@ -70,8 +70,10 @@ nonce，密文每次都不同，名稱也就不同。解法：tree 的 nonce 不
 寫入順序固定 packs → trees → index → snapshot。snapshot 是唯一的 commit point：
 它出現之前 repo 裡多出來的東西都是垃圾，GC 可以收；它出現之後，它引用的一切都在。
 
-同一台機器、同一組路徑的上一個 snapshot 當 parent：檔案的 size 與 mtime 都沒變，
-就直接沿用它的 chunk 清單，不重讀檔案。這是第二次 backup 快的主因；即使快速路徑
+同一台機器、同一組路徑的上一個 snapshot 當 parent：檔案的 size、mtime、ctime、inode
+都沒變，就直接沿用它的 chunk 清單，不重讀檔案。只比 size + mtime 不夠：`cp -p` 或
+`rsync -a` 會保留 mtime，內容不同但大小相同的檔會被漏掉；ctime 是 kernel 在寫入時更新、
+使用者改不了的，所以加進來（restic 也是這樣做）。這是第二次 backup 快的主因；即使快速路徑
 失效（例如只碰了 mtime），chunk 層級的去重仍保證不寫新 pack。
 
 ### 8. CPU 工作全部在 blocking thread

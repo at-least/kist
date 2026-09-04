@@ -61,24 +61,62 @@ pub fn bytes_to_relative_path(bytes: &[u8]) -> Result<PathBuf> {
 
 pub fn capture(meta: &std::fs::Metadata) -> NodeMeta {
     let (secs, nanos) = mtime_of(meta);
+    let (ctime_secs, ctime_nanos) = ctime_of(meta);
     NodeMeta {
         mode: mode_of(meta),
         uid: uid_of(meta),
         gid: gid_of(meta),
         mtime_secs: secs,
         mtime_nanos: nanos,
+        ctime_secs,
+        ctime_nanos,
+        inode: inode_of(meta),
     }
 }
 
-/// 兩份 metadata 的 mtime 是否相同（backup 快速路徑用）。
-pub fn same_mtime(a: &NodeMeta, meta: &std::fs::Metadata) -> bool {
-    let (secs, nanos) = mtime_of(meta);
-    a.mtime_secs == secs && a.mtime_nanos == nanos
+/// backup 快速路徑：上一次記錄的 metadata 與現在的是否「看起來沒變」。
+/// mtime 一定比；ctime 與 inode 在上一次有記錄（非 0）時也要相同。
+pub fn unchanged(previous: &NodeMeta, now: &NodeMeta) -> bool {
+    if previous.mtime_secs != now.mtime_secs || previous.mtime_nanos != now.mtime_nanos {
+        return false;
+    }
+    let has_ctime = previous.ctime_secs != 0 || previous.ctime_nanos != 0;
+    if has_ctime
+        && (previous.ctime_secs != now.ctime_secs || previous.ctime_nanos != now.ctime_nanos)
+    {
+        return false;
+    }
+    if previous.inode != 0 && previous.inode != now.inode {
+        return false;
+    }
+    true
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> (i64, u32) {
     let ft = filetime::FileTime::from_last_modification_time(meta);
     (ft.unix_seconds(), ft.nanoseconds())
+}
+
+#[cfg(unix)]
+fn ctime_of(meta: &std::fs::Metadata) -> (i64, u32) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ctime(), u32::try_from(meta.ctime_nsec()).unwrap_or(0))
+}
+
+#[cfg(unix)]
+fn inode_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+fn ctime_of(_: &std::fs::Metadata) -> (i64, u32) {
+    (0, 0)
+}
+
+#[cfg(not(unix))]
+fn inode_of(_: &std::fs::Metadata) -> u64 {
+    0
 }
 
 #[cfg(unix)]

@@ -259,3 +259,42 @@ async fn list_and_resolve_snapshots() {
         Err(CoreError::SnapshotNotFound(_))
     ));
 }
+
+/// `cp -p` / `rsync -a` 會保留 mtime；內容不同但大小相同時，只比 size + mtime 會漏掉。
+/// ctime 是 kernel 在寫入時更新、使用者改不了的，所以能抓到。
+#[cfg(unix)]
+#[tokio::test]
+async fn same_size_and_mtime_but_different_content_is_detected() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let file = src.join("data.bin");
+    std::fs::write(&file, random_bytes(11, 100 * 1024)).unwrap();
+    let mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(&file, mtime).unwrap();
+
+    let repo = t.open().await;
+    repo.backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    // 換掉內容（同大小），再把 mtime 設回去
+    std::fs::write(&file, random_bytes(12, 100 * 1024)).unwrap();
+    filetime::set_file_mtime(&file, mtime).unwrap();
+
+    let second = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert!(
+        second.stats.chunks_new > 0,
+        "內容變了卻沒有新 chunk：快速路徑誤判 {:?}",
+        second.stats
+    );
+    let target = t.dir.path().join("out");
+    repo.restore(&second.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_same_tree(&src, &restored);
+}

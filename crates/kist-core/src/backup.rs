@@ -357,7 +357,7 @@ impl Backup {
         Ok(id)
     }
 
-    /// 處理一個檔案：能沿用 parent 的 chunk 清單就沿用，否則讀檔切塊。
+    /// 處理一個檔案：size、mtime、ctime、inode 都與 parent 相同就沿用它的 chunk 清單，否則讀檔切塊。
     async fn process_file(
         &mut self,
         path: &Path,
@@ -376,10 +376,7 @@ impl Backup {
             ..
         }) = parent
         {
-            if *psize == size
-                && pmeta.mtime_secs == node_meta.mtime_secs
-                && pmeta.mtime_nanos == node_meta.mtime_nanos
-            {
+            if *psize == size && fsmeta::unchanged(pmeta, node_meta) {
                 let ids = match content {
                     Content::Direct { chunks } | Content::Indirect { chunks } => chunks,
                 };

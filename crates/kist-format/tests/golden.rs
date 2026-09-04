@@ -81,6 +81,9 @@ fn sample_tree() -> Tree {
                     gid: 1000,
                     mtime_secs: 1_700_000_000,
                     mtime_nanos: 123_456_789,
+                    ctime_secs: 1_700_000_001,
+                    ctime_nanos: 5,
+                    inode: 424_242,
                 },
                 kind: NodeKind::File {
                     size: 3_000_000,
@@ -243,4 +246,15 @@ fn pack_layout_golden() {
     let bytes = pack::finish(buf, &trailer_env);
     check("pack_layout.bin", &bytes);
     assert_eq!(pack::trailer_bytes(&bytes).unwrap(), &trailer_env);
+}
+
+/// 加 ctime / inode 之前寫出的 tree 必須還能讀：缺少的欄位視為 0（`#[serde(default)]`）。
+#[test]
+fn tree_without_ctime_fields_still_decodes() {
+    let bytes = std::fs::read(golden_dir().join("tree-before-ctime.cbor")).unwrap();
+    let tree: Tree = cbor::decode(&bytes).unwrap();
+    assert_eq!(tree.nodes.len(), 4);
+    let meta = tree.nodes[0].meta;
+    assert_eq!(meta.mtime_secs, 1_700_000_000);
+    assert_eq!((meta.ctime_secs, meta.ctime_nanos, meta.inode), (0, 0, 0));
 }
