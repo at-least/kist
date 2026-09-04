@@ -17,5 +17,25 @@ kist-crypto = { path = "crates/kist-crypto" }
 kist-format = { path = "crates/kist-format" }
 
 anyhow = "1"
+argon2 = "0.6"
+blake3 = "1.8"
+chacha20poly1305 = "0.11"
+ciborium = "0.2"
 clap = { version = "4", features = ["derive"] }
+fastcdc = "5"
+futures = "0.3"
+hex = "0.4"
+object_store = "0.14"
+proptest = "1"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+tempfile = "3"
 thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+zeroize = { version = "1", features = ["derive"] }
+zstd = "0.13"

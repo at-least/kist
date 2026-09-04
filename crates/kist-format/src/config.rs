@@ -1,0 +1,98 @@
+//! `config` 物件：repo 參數與 master key 的封裝。
+//!
+//! 這是 repo 裡**唯一以明文 CBOR 存放**的物件（打開 repo 前需要它裡面的 KDF 參數），
+//! 也是唯一允許覆寫的物件（換密碼時）。裡面沒有任何祕密：master key 已被 KEK 包住。
+//!
+//! 金鑰階層：
+//! ```text
+//! password ──Argon2id(salt, params)──▶ KEK ──AEAD 解開──▶ master key
+//! master key ──blake3::derive_key(context)──▶ chunk key / hash key / object key / nonce key
+//! ```
+
+use serde::{Deserialize, Serialize};
+
+use crate::FORMAT_VERSION;
+
+/// KDF 演算法名稱，寫進 config 讓未來可以換。
+pub const KDF_ARGON2ID: &str = "argon2id";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoConfig {
+    pub version: u32,
+    /// 隨機 16 bytes，用來區分不同 repo（例如本地快取的命名）。
+    #[serde(with = "serde_bytes")]
+    pub repo_id: Vec<u8>,
+    /// RFC 3339 UTC。
+    pub created: String,
+    pub chunker: ChunkerParams,
+    /// pack 寫滿多少 bytes 就 flush。
+    pub pack_target_size: u64,
+    /// 第 0 個 key slot：由密碼推導的 KEK 包住的 master key。
+    pub key: KeySlot,
+}
+
+impl RepoConfig {
+    pub fn new(repo_id: Vec<u8>, created: String, key: KeySlot) -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            repo_id,
+            created,
+            chunker: ChunkerParams::default(),
+            pack_target_size: 64 * 1024 * 1024,
+            key,
+        }
+    }
+}
+
+/// FastCDC 參數（bytes）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkerParams {
+    pub min: u32,
+    pub avg: u32,
+    pub max: u32,
+}
+
+impl Default for ChunkerParams {
+    fn default() -> Self {
+        Self {
+            min: 512 * 1024,
+            avg: 2 * 1024 * 1024,
+            max: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// 一個 key slot：某組密碼可以解開 master key。
+/// slot 0 放在 `config`，其餘放 `keys/<id>`（用 envelope 包、以 master key 加密的話就失去意義，
+/// 所以 `keys/<id>` 也是明文 CBOR）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeySlot {
+    pub version: u32,
+    /// 人看的名稱，例如 "default"、"recovery"。
+    pub name: String,
+    /// RFC 3339 UTC。
+    pub created: String,
+    pub kdf: KdfParams,
+    pub wrapped_master_key: WrappedKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KdfParams {
+    /// 目前只有 [`KDF_ARGON2ID`]。
+    pub algorithm: String,
+    pub m_cost_kib: u32,
+    pub t_cost: u32,
+    pub p_cost: u32,
+    #[serde(with = "serde_bytes")]
+    pub salt: Vec<u8>,
+}
+
+/// 用 KEK 做 XChaCha20-Poly1305 包住的 32-byte master key。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrappedKey {
+    #[serde(with = "serde_bytes")]
+    pub nonce: Vec<u8>,
+    /// 32-byte key + 16-byte tag。
+    #[serde(with = "serde_bytes")]
+    pub ciphertext: Vec<u8>,
+}
