@@ -35,6 +35,8 @@ key     = segment *( "/" segment )
 
 實作：`internal/backend.ValidateKey`。
 
+三個後端各自怎麼做到「條件寫入」：local 用 `os.Link`（EEXIST）；S3 用 `If-None-Match: *`（412）；SFTP 用 `hardlink@openssh.com`——SFTP v3 沒有「已存在」的狀態碼，OpenSSH 回的是通用的 `SSH_FX_FAILURE`，所以 link 失敗後再 `Stat` 一次：名字存在（而 link 是原子的，存在就是完整的）就是 `ErrExists`，否則回真正的錯誤。三者都由同一份 `runConformance` 驗。
+
 ### 不變條件
 
 1. **讀得到的物件就是完整的。** 部分寫入絕不能出現在最終名稱底下，crash 之後也不行。這是「不用鎖也能檢查 repo」的根據。
@@ -233,6 +235,8 @@ chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟
 | `forget` / `prune` / `rebuild-index` | 全部 | 全部 | `gc/*`、`indexes/*` | 全部 |
 
 backup **不需要**讀 tree：tree 一律用 `PutIfAbsent` 寫，去重靠的是「已存在」的回應，不是先讀再比。
+
+**SFTP（M4）**：OpenSSH 沒有 per-prefix 的權限模型，能做的是 `Match User backup` + `ChrootDirectory` + `ForceCommand internal-sftp -P remove,rmdir,rename,posix-rename,setstat,fsetstat,symlink`。這擋得住刪 pack、改名、改 mtime；擋不住覆寫（`open` 帶 `O_TRUNC` 是同一個 request），而且 `remove` 被禁之後 client 在競態中留下的 `.tmp-*` 暫存檔會沒人清。也就是說 SFTP 上 backup 憑證的性質是「**不能刪、能覆寫**」——比 MinIO 弱一點（MinIO 上誠實的 client 不會覆寫），跟 AWS 差兩級。`prune` 用的維護帳號不加 `-P`。**UNVERIFIED**：`-P` 黑名單的實際效果沒有在測試裡跑；conformance 測試用的是不受限的帳號。
 
 M3 加了三項，每一項都是 §12 的安全論證需要的：`clients/*` 的 Put（登記自己，讓 prune 知道要等誰）、`gc/` 的 List（看見待刪標記，把被標記的 pack 當成不存在）、`gc/*` 的 Delete（復活）。其中 Delete 是唯一一項 backup 拿得到的刪除權限，而它能刪的東西——一個「沒人需要這個 pack」的宣告——被刪掉的後果只是 prune 下次重算。
 

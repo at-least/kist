@@ -144,6 +144,9 @@ func TestMain(m *testing.M) {
 	if minioEnv != nil {
 		minioEnv.stop()
 	}
+	if sftpEnv != nil {
+		sftpEnv.stop()
+	}
 	os.Exit(code)
 }
 

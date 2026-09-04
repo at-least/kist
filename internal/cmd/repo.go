@@ -32,6 +32,15 @@ func (f *repoFlags) register(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&f.clientID, "client-id", "", "override this machine's client identifier")
 }
 
+// SFTP settings that have no place in a URL. The agent at $SSH_AUTH_SOCK
+// is always tried first.
+const (
+	SFTPKnownHostsEnv    = "KIST_SFTP_KNOWN_HOSTS"    // default ~/.ssh/known_hosts
+	SFTPKeyEnv           = "KIST_SFTP_KEY"            // private key file
+	SFTPKeyPassphraseEnv = "KIST_SFTP_KEY_PASSPHRASE" //nolint:gosec // an env var name, not a credential
+	SFTPPasswordEnv      = "KIST_SFTP_PASSWORD"       //nolint:gosec // an env var name, not a credential
+)
+
 // RepositoryEnv names the repository when --repo is not given.
 const RepositoryEnv = "KIST_REPOSITORY"
 
@@ -119,8 +128,21 @@ func openBackend(ctx context.Context, location string, create bool) (backend.Bac
 		// Create is a no-op for S3: the bucket must already exist, and
 		// Init's own check refuses a prefix that already holds a config.
 		return backend.OpenS3(ctx, cfg)
+	case scheme == "sftp":
+		cfg, err := backend.ParseSFTPLocation(location)
+		if err != nil {
+			return nil, err
+		}
+		cfg.KnownHostsFile = os.Getenv(SFTPKnownHostsEnv)
+		cfg.KeyFile = os.Getenv(SFTPKeyEnv)
+		cfg.Passphrase = []byte(os.Getenv(SFTPKeyPassphraseEnv))
+		cfg.Password = []byte(os.Getenv(SFTPPasswordEnv))
+		if create {
+			return backend.CreateSFTP(ctx, cfg)
+		}
+		return backend.OpenSFTP(ctx, cfg)
 	default:
-		return nil, fmt.Errorf("repository scheme %q is not supported; this build knows local paths and s3://", scheme)
+		return nil, fmt.Errorf("repository scheme %q is not supported; this build knows local paths, s3:// and sftp://", scheme)
 	}
 }
 

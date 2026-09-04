@@ -42,7 +42,7 @@ $ kist check --read-data
 
 `forget` 與 `prune` 要用持有 Delete 權限的憑證跑；備份用的憑證做不到（[權限表](docs/format.md#10-權限模型)）。`prune` 定期跑：第一次只標記，grace 過後的下一次才刪，中間有 client 引用到被標記的 pack 會自動復活它。
 
-repo 位置：`--repo` 或 `$KIST_REPOSITORY`。
+repo 位置：`--repo` 或 `$KIST_REPOSITORY`——本機路徑、`s3://bucket/prefix`、或 `sftp://user@host:port/path`（`/~/path` 表示相對於登入目錄）。SFTP 一定驗 host key（`~/.ssh/known_hosts` 或 `$KIST_SFTP_KNOWN_HOSTS`，先 `ssh-keyscan`）；認證依序試 SSH agent、`$KIST_SFTP_KEY`（`$KIST_SFTP_KEY_PASSPHRASE`）、`$KIST_SFTP_PASSWORD`。
 密碼：`--password-file`、`$KIST_PASSWORD`，或終端機提示，依此順序。
 
 ## `check` 的兩個層級

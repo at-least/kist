@@ -39,6 +39,14 @@ linters:
         - (io.ReadCloser).Close
         - (*os.File).Close
         - os.Remove
+        - os.RemoveAll
+        # The same cleanup calls over SSH and SFTP: closing a connection
+        # or a scratch file, or removing a scratch file, on an error path
+        # that already has an error to report.
+        - (net.Conn).Close
+        - (golang.org/x/crypto/ssh.Conn).Close
+        - (*github.com/pkg/sftp.Client).Remove
+        - (*github.com/pkg/sftp.File).Close
     exhaustive:
       # A default clause is not an answer here: the point is to be told
       # that a new NodeType or algorithm byte was added and some switch

@@ -77,6 +77,15 @@ jobs:
 
   # The S3 backend against a real MinIO, on Linux only: the tests start
   # the container themselves and need a Docker daemon.
+  sftp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - run: make test-sftp
+
   s3:
     name: s3 (minio)
     runs-on: ubuntu-latest
