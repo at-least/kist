@@ -75,7 +75,8 @@ func TestAcceptance(t *testing.T) {
 		first.Stats.Files, human(int64(first.Stats.Bytes)), human(int64(first.Stats.BytesStored)),
 		first.Stats.PacksAdded, first.Stats.ChunksNew, elapsed.Round(time.Second),
 		human(int64(float64(first.Stats.Bytes)/elapsed.Seconds())))
-	t.Logf("peak heap during backup: %s", human(int64(peakHeap())))
+	// Not a peak: a peak needs sampling, which is M5 profiling work.
+	t.Logf("heap in use after the backup: %s", human(int64(heapInUse())))
 
 	if first.Stats.Files != uint64(files) {
 		t.Errorf("backed up %d files, want %d", first.Stats.Files, files)
@@ -386,7 +387,11 @@ func human(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", value, "KMGTP"[exp-1])
 }
 
-func peakHeap() uint64 {
+// heapInUse is a single sample taken after the backup returns, not a
+// peak. Measuring the peak needs continuous sampling, which is the memory
+// profile M5 calls for; this is here only to catch an order-of-magnitude
+// regression.
+func heapInUse() uint64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	return m.HeapAlloc

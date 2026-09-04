@@ -65,6 +65,8 @@ func sampleFiles(t *testing.T) []fileSpec {
 		{path: "readme.txt", data: []byte("hello kist\n")},
 		{path: "empty.bin", data: nil},
 		{path: "exec.sh", data: []byte("#!/bin/sh\necho hi\n"), mode: 0o755},
+		{path: "setuid.bin", data: []byte("pretend this is a binary"), mode: 0o755 | fs.ModeSetuid},
+		{path: "setgid.bin", data: []byte("and this one too"), mode: 0o2755&^0o2000 | fs.ModeSetgid},
 		{path: "docs/notes.md", data: bytes.Repeat([]byte("compressible text. "), 20000)},
 		{path: "docs/deep/nested/blob.bin", data: randomBytes(t, "blob", 6<<20)},
 		{path: "docs/deep/small.bin", data: randomBytes(t, "small", 1024)},
@@ -147,8 +149,11 @@ func compareTrees(t *testing.T, want, got string) {
 			}
 			continue
 		}
-		if runtime.GOOS != "windows" && wantInfo.Mode().Perm() != gotInfo.Mode().Perm() {
-			t.Errorf("%s: mode = %v, want %v", name, gotInfo.Mode().Perm(), wantInfo.Mode().Perm())
+		// Compare the special bits too, not just Perm: a restore that
+		// drops setuid is a restore that produced something different.
+		const modeBits = fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+		if runtime.GOOS != "windows" && wantInfo.Mode()&modeBits != gotInfo.Mode()&modeBits {
+			t.Errorf("%s: mode = %v, want %v", name, gotInfo.Mode()&modeBits, wantInfo.Mode()&modeBits)
 		}
 		if wantInfo.IsDir() {
 			continue

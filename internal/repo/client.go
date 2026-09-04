@@ -26,7 +26,7 @@ const ClientIDSize = 16
 // filesystem every run mints a new client each time, and a repository
 // accumulates single-snapshot clients. That is M3's problem -- a client
 // with no snapshot for several grace periods is forgotten -- and it is
-// noted in ADR 005 so that it is a known cost, not a surprise.
+// noted in ADR 004 so that it is a known cost, not a surprise.
 func ClientID(stateDir string, repoID string) (string, error) {
 	path := filepath.Join(stateDir, "clients", repoID)
 

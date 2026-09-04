@@ -251,13 +251,30 @@ func (run *restoreRun) applyMetadata(path string, entry tree.Entry, isSymlink bo
 		return nil
 	}
 
-	mode := entry.FileMode().Perm()
+	// Ownership first, mode second. POSIX chown clears the setuid and
+	// setgid bits, so doing it the other way round silently strips them:
+	//
+	//	after chmod:  ugrwxr-xr-x
+	//	after lchown: -rwxr-xr-x
+	//
+	// A restored binary that quietly lost its setuid bit is a system that
+	// does not work and does not say why.
+	if entry.UID != 0 || entry.GID != 0 {
+		if err := chown(path, entry.UID, entry.GID); err != nil {
+			run.opts.warn("could not restore ownership of %s (uid %d gid %d): %v", path, entry.UID, entry.GID, err)
+		}
+	}
+
+	// Perm() alone would drop the same three bits for a different reason.
+	mode := entry.FileMode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky)
 	// path came from safeJoin, which rejects anything that is not a
 	// single component inside the parent directory.
 	if err := os.Chmod(path, mode); err != nil { //nolint:gosec // path is bounded by safeJoin
 		return fmt.Errorf("restore: set mode on %s: %w", path, err)
 	}
 
+	// Times last: chmod does not touch them, but chown updates ctime and
+	// a future writer here would.
 	if entry.MTimeNs != 0 {
 		at := time.Unix(0, entry.MTimeNs)
 		if err := os.Chtimes(path, at, at); err != nil {
@@ -265,10 +282,5 @@ func (run *restoreRun) applyMetadata(path string, entry tree.Entry, isSymlink bo
 		}
 	}
 
-	if entry.UID != 0 || entry.GID != 0 {
-		if err := chown(path, entry.UID, entry.GID); err != nil {
-			run.opts.warn("could not restore ownership of %s (uid %d gid %d): %v", path, entry.UID, entry.GID, err)
-		}
-	}
 	return nil
 }

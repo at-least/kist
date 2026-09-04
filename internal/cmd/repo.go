@@ -52,7 +52,7 @@ func (f *repoFlags) options(cmd *cobra.Command, confirm bool) (repo.Options, err
 	if err != nil {
 		return repo.Options{}, err
 	}
-	return repo.Options{Password: password, ClientID: f.clientID}, nil
+	return repo.Options{Password: password, ClientID: f.clientID, Warnf: warnTo(cmd)}, nil
 }
 
 func (f *repoFlags) password(cmd *cobra.Command, confirm bool) ([]byte, error) {

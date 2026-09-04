@@ -203,36 +203,66 @@ func Load(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.I
 	return nil
 }
 
-// LoadAll merges every index blob in the repository.
-func LoadAll(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index, error) {
-	ix := New()
-
-	var ids []crypto.ID
+// List returns the ID of every index blob in the repository, and the keys
+// of any object under the prefix that is not named like one.
+func List(ctx context.Context, b backend.Backend) ([]crypto.ID, []string, error) {
+	var (
+		ids      []crypto.ID
+		unusable []string
+	)
 	err := b.List(ctx, Prefix, func(fi backend.FileInfo) error {
-		id, err := crypto.ParseID(fi.Key[len(Prefix):])
-		if err != nil {
-			return fmt.Errorf("index blob %q: %w", fi.Key, err)
+		// An object under this prefix that is not named like a blob is
+		// reported, not returned as an error: List's job is to say what
+		// is there, and the caller decides what an unusable entry means.
+		id, parseErr := crypto.ParseID(fi.Key[len(Prefix):])
+		if parseErr != nil {
+			unusable = append(unusable, fi.Key)
+			return nil //nolint:nilerr // a misnamed object is a finding for the caller, not a listing failure
 		}
 		ids = append(ids, id)
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list index blobs: %w", err)
+		return nil, nil, fmt.Errorf("list index blobs: %w", err)
+	}
+	return ids, unusable, nil
+}
+
+// LoadAll merges every index blob in the repository.
+//
+// A blob that cannot be read is skipped and returned in the second
+// result, not treated as a failure. The index is a cache: a damaged blob
+// means "this repository needs rebuild-index", and making it fatal would
+// be a catch-22, because opening the repository is how you get to run
+// that command. Only a failure to list is fatal, because then nothing is
+// known about what is there.
+func LoadAll(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index, []error, error) {
+	ids, unusable, err := List(ctx, b)
+	if err != nil {
+		return nil, nil, err
 	}
 
+	ix := New()
+	var skipped []error
+	for _, key := range unusable {
+		skipped = append(skipped, fmt.Errorf("%w: %q is not named like an index blob", ErrCorrupt, key))
+	}
 	for _, id := range ids {
 		if err := Load(ctx, b, keys, id, ix); err != nil {
-			return nil, err
+			skipped = append(skipped, err)
 		}
 	}
-	return ix, nil
+	return ix, skipped, nil
 }
 
 // Rebuild reconstructs an index by reading every pack trailer, ignoring
 // the index blobs entirely. It is what proves an index is only a cache.
-func Rebuild(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index, error) {
-	ix := New()
-
+//
+// It returns the per-pack entries as well as the index, because the index
+// itself cannot give them back: a chunk stored in two packs is recorded
+// once, so reconstructing the map from it would silently drop the second
+// pack's copy.
+func Rebuild(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index, map[crypto.ID][]pack.Entry, error) {
 	var ids []crypto.ID
 	err := b.List(ctx, pack.Prefix, func(fi backend.FileInfo) error {
 		id, err := crypto.ParseID(fi.Key[len(pack.Prefix):])
@@ -243,15 +273,18 @@ func Rebuild(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index,
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list packs: %w", err)
+		return nil, nil, fmt.Errorf("list packs: %w", err)
 	}
 
+	ix := New()
+	packs := make(map[crypto.ID][]pack.Entry, len(ids))
 	for _, id := range ids {
 		entries, err := pack.ReadTrailer(ctx, b, keys, id)
 		if err != nil {
-			return nil, fmt.Errorf("rebuild index: %w", err)
+			return nil, nil, fmt.Errorf("rebuild index: %w", err)
 		}
 		ix.AddPack(id, entries)
+		packs[id] = entries
 	}
-	return ix, nil
+	return ix, packs, nil
 }

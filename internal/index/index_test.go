@@ -151,9 +151,12 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	loaded, err := LoadAll(ctx, b, keys)
+	loaded, skipped, err := LoadAll(ctx, b, keys)
 	if err != nil {
 		t.Fatalf("load all: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Errorf("load all skipped %v", skipped)
 	}
 	if loaded.Len() != 3 {
 		t.Errorf("loaded %d chunks, want 3", loaded.Len())
@@ -214,9 +217,12 @@ func TestSaveRefusesAnEmptyIndex(t *testing.T) {
 }
 
 func TestLoadAllOnAnEmptyRepository(t *testing.T) {
-	ix, err := LoadAll(context.Background(), testBackend(t), testKeys(t))
+	ix, skipped, err := LoadAll(context.Background(), testBackend(t), testKeys(t))
 	if err != nil {
 		t.Fatalf("load all: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Errorf("load all skipped %v", skipped)
 	}
 	if ix.Len() != 0 {
 		t.Errorf("Len = %d, want 0", ix.Len())
@@ -294,9 +300,49 @@ func TestLoadAllRejectsAMisnamedBlob(t *testing.T) {
 	if err := backend.PutBytesIfAbsent(ctx, b, Prefix+"not-a-hash", []byte("junk")); err != nil {
 		t.Fatalf("store: %v", err)
 	}
-	if _, err := LoadAll(ctx, b, testKeys(t)); err == nil || !strings.Contains(err.Error(), "not-a-hash") {
-		t.Fatalf("load all: err = %v, want it to name the bad blob", err)
+
+	// Skipped and reported, not fatal: an index is a cache, and opening
+	// the repository is how a caller reaches rebuild-index.
+	ix, skipped, err := LoadAll(ctx, b, testKeys(t))
+	if err != nil {
+		t.Fatalf("load all: %v", err)
 	}
+	if ix.Len() != 0 {
+		t.Errorf("index holds %d chunks, want 0", ix.Len())
+	}
+	if len(skipped) != 1 || !strings.Contains(skipped[0].Error(), "not-a-hash") {
+		t.Fatalf("skipped = %v, want one naming the bad blob", skipped)
+	}
+}
+
+// A blob that will not decrypt is skipped the same way, so one damaged
+// cache entry cannot make a repository unopenable.
+func TestLoadAllSkipsUnreadableBlobs(t *testing.T) {
+	ctx := context.Background()
+	keys, b := testKeys(t), testBackend(t)
+
+	good, err := Save(ctx, b, keys, map[crypto.ID][]pack.Entry{id(0xaa): {entry(1, 0, 100)}}, crypto.DeterministicReader("good"))
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// A blob whose name matches its bytes but which is not ours.
+	junk := bytes.Repeat([]byte{0x5a}, 128)
+	if err := backend.PutBytesIfAbsent(ctx, b, Key(crypto.CiphertextID(junk)), junk); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	ix, skipped, err := LoadAll(ctx, b, keys)
+	if err != nil {
+		t.Fatalf("load all: %v", err)
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("skipped = %v, want exactly one", skipped)
+	}
+	if !ix.Has(id(1)) {
+		t.Error("the readable blob was not loaded")
+	}
+	_ = good
 }
 
 // An index is a cache. Rebuild proves it by reconstructing the same
@@ -327,7 +373,7 @@ func TestRebuildReconstructsTheIndexFromPacksAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	fromBlob, err := LoadAll(ctx, b, keys)
+	fromBlob, _, err := LoadAll(ctx, b, keys)
 	if err != nil {
 		t.Fatalf("load all: %v", err)
 	}
@@ -336,9 +382,12 @@ func TestRebuildReconstructsTheIndexFromPacksAlone(t *testing.T) {
 	if err := b.Delete(ctx, Key(saved)); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	rebuilt, err := Rebuild(ctx, b, keys)
+	rebuilt, rebuiltPacks, err := Rebuild(ctx, b, keys)
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
+	}
+	if len(rebuiltPacks) != len(payloads) {
+		t.Errorf("rebuild reported %d packs, want %d", len(rebuiltPacks), len(payloads))
 	}
 
 	if rebuilt.Len() != fromBlob.Len() {

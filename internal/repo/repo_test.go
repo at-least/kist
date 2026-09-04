@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,3 +225,28 @@ func TestClientIDRejectsGarbageOnDisk(t *testing.T) {
 // the backend package under a name that shadows its own helpers.
 func createLocalAt(dir string) (backend.Backend, error) { return backend.CreateLocal(dir) }
 func openLocalAt(dir string) (backend.Backend, error)   { return backend.OpenLocal(dir) }
+
+// reopenWarning opens a repository, collecting the warnings it emits.
+func reopenWarning(t *testing.T, dir, seed string, warnings *[]string) *Repository {
+	t.Helper()
+
+	b, err := backend.OpenLocal(dir)
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	opts := testOptions(t, seed)
+	opts.Warnf = func(format string, args ...any) {
+		*warnings = append(*warnings, fmt.Sprintf(format, args...))
+	}
+
+	r, err := Open(context.Background(), b, opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return r
+}

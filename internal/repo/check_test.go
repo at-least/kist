@@ -327,3 +327,96 @@ func TestSafeJoinRefusesEscapes(t *testing.T) {
 		t.Errorf("safeJoin = %q, want %q", got, want)
 	}
 }
+
+// rebuild-index has to leave the repair on disk. A rebuild that only
+// updates the running process repairs nothing: the next Open reloads the
+// same missing or damaged blobs.
+func TestRebuildIndexPersists(t *testing.T) {
+	ctx := context.Background()
+	r, dir, handle := backedUpRepo(t, "rebuild-persist")
+	before := r.Index().Len()
+
+	if err := r.Backend().List(ctx, index.Prefix, func(fi backend.FileInfo) error {
+		return r.Backend().Delete(ctx, fi.Key)
+	}); err != nil {
+		t.Fatalf("delete index blobs: %v", err)
+	}
+
+	repairing := reopen(t, dir, "rebuild-persist-2")
+	if _, err := repairing.RebuildIndex(ctx); err != nil {
+		t.Fatalf("rebuild index: %v", err)
+	}
+
+	// A fresh process, with no rebuild call of its own.
+	after := reopen(t, dir, "rebuild-persist-3")
+	if after.Index().Len() != before {
+		t.Errorf("after reopening, the index holds %d chunks, want %d", after.Index().Len(), before)
+	}
+	if n := countKeys(t, after.Backend(), index.Prefix); n != 1 {
+		t.Errorf("repository holds %d index blobs, want exactly 1", n)
+	}
+
+	target := filepath.Join(t.TempDir(), "out")
+	if _, err := after.Restore(ctx, handle.Key, target, RestoreOptions{}); err != nil {
+		t.Fatalf("restore after a persisted rebuild: %v", err)
+	}
+}
+
+// A damaged index blob must not make a repository unopenable. It is a
+// cache, and opening the repository is how you reach the command that
+// repairs it -- making it fatal would be a catch-22.
+func TestADamagedIndexBlobIsRepairable(t *testing.T) {
+	ctx := context.Background()
+	r, dir, handle := backedUpRepo(t, "bad-blob")
+	before := r.Index().Len()
+
+	blobKey := anyKey(t, r, index.Prefix)
+	damaged := bytes.Clone(mustGet(t, r, blobKey))
+	damaged[len(damaged)/2] ^= 0x01
+	replace(t, r, blobKey, damaged)
+
+	// Also drop in an object that is not named like a blob at all.
+	if err := backend.PutBytesIfAbsent(ctx, r.Backend(), index.Prefix+"not-a-hash", []byte("junk")); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	var warnings []string
+	opened := reopenWarning(t, dir, "bad-blob-2", &warnings)
+	if len(warnings) != 2 {
+		t.Errorf("opening warned %d times, want 2 (the damaged blob and the misnamed object): %v", len(warnings), warnings)
+	}
+
+	report, err := opened.Check(ctx, CheckOptions{})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if report.OK() {
+		t.Error("check did not report the damaged index blob")
+	}
+
+	if _, err := opened.RebuildIndex(ctx); err != nil {
+		t.Fatalf("rebuild index: %v", err)
+	}
+
+	var afterWarnings []string
+	repaired := reopenWarning(t, dir, "bad-blob-3", &afterWarnings)
+	if len(afterWarnings) != 0 {
+		t.Errorf("after a rebuild, opening still warned: %v", afterWarnings)
+	}
+	if repaired.Index().Len() != before {
+		t.Errorf("repaired index holds %d chunks, want %d", repaired.Index().Len(), before)
+	}
+
+	clean, err := repaired.Check(ctx, CheckOptions{ReadData: true})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !clean.OK() {
+		t.Errorf("check after the repair found problems: %v", clean.Problems)
+	}
+
+	target := filepath.Join(t.TempDir(), "out")
+	if _, err := repaired.Restore(ctx, handle.Key, target, RestoreOptions{}); err != nil {
+		t.Fatalf("restore after the repair: %v", err)
+	}
+}

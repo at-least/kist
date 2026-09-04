@@ -427,6 +427,9 @@ func (b *backupRun) flush(ctx context.Context) error {
 		return fmt.Errorf("backup: %w", err)
 	}
 
+	// Cleared before the index learns about the pack, not after: with a
+	// parallel backup the window between the two would be one where a
+	// chunk is in neither set and could be packed a second time.
 	clear(b.pending)
 	b.repo.index.AddPack(packID, entries)
 	b.written[packID] = entries

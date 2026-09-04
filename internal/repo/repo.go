@@ -58,6 +58,18 @@ type Options struct {
 
 	// Now overrides the clock. Production leaves it nil.
 	Now func() time.Time
+
+	// Warnf receives non-fatal problems found while opening: an index
+	// blob that will not read, for instance. Those are repairable with
+	// rebuild-index and must not stop the repository opening, but they
+	// must be said out loud.
+	Warnf func(format string, args ...any)
+}
+
+func (o Options) warn(format string, args ...any) {
+	if o.Warnf != nil {
+		o.Warnf(format, args...)
+	}
 }
 
 func (o Options) clock() func() time.Time {
@@ -154,7 +166,19 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 		return nil, err
 	}
 
-	ix, err := index.LoadAll(ctx, b, keys)
+	ix, skipped, err := index.LoadAll(ctx, b, keys)
+	if err != nil {
+		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
+	}
+	for _, s := range skipped {
+		opts.warn("%v; run `kist rebuild-index` to repair the index", s)
+	}
+
+	// Every nonce this repository writes comes out of one stream, so a
+	// caller that hands over a source which does not advance still cannot
+	// reuse a nonce. pack.Writer already did this for chunks; trees,
+	// snapshots and index blobs need it just as much.
+	nonces, err := crypto.NonceStream(opts.NonceSource)
 	if err != nil {
 		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
 	}
@@ -165,7 +189,7 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 		keys:        keys,
 		index:       ix,
 		clientID:    clientID,
-		nonceSource: opts.NonceSource,
+		nonceSource: nonces,
 		now:         opts.clock(),
 	}, nil
 }
@@ -190,13 +214,46 @@ func (r *Repository) Close() error {
 	return nil
 }
 
-// RebuildIndex discards the cached index and reconstructs it from pack
-// trailers, then writes it back as a single blob.
+// RebuildIndex discards the cached index, reconstructs it by reading
+// every pack trailer, and replaces the stored index blobs with one blob
+// describing everything.
+//
+// The new blob is written before the old ones are deleted. A crash in
+// between therefore leaves a repository with two blobs describing
+// overlapping sets -- harmless, because loading merges them -- rather
+// than a window with no index at all.
 func (r *Repository) RebuildIndex(ctx context.Context) (int, error) {
-	ix, err := index.Rebuild(ctx, r.backend, r.keys)
+	stale, unusable, err := index.List(ctx, r.backend)
 	if err != nil {
 		return 0, err
 	}
+
+	ix, packs, err := index.Rebuild(ctx, r.backend, r.keys)
+	if err != nil {
+		return 0, err
+	}
+
+	fresh := crypto.ID{}
+	if len(packs) > 0 {
+		if fresh, err = index.Save(ctx, r.backend, r.keys, packs, r.nonceSource); err != nil {
+			return 0, err
+		}
+	}
+
+	for _, id := range stale {
+		if id == fresh {
+			continue
+		}
+		if err := r.backend.Delete(ctx, index.Key(id)); err != nil {
+			return 0, fmt.Errorf("rebuild index: remove the old blob %s: %w", id, err)
+		}
+	}
+	for _, key := range unusable {
+		if err := r.backend.Delete(ctx, key); err != nil {
+			return 0, fmt.Errorf("rebuild index: remove %s: %w", key, err)
+		}
+	}
+
 	r.index = ix
 	return ix.Len(), nil
 }

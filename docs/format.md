@@ -137,6 +137,7 @@ FastCDC，min 512 KiB / avg 2 MiB / max 8 MiB，normalization 2，seed 0。
 - 依 pack 分組，所以 packID 不會在每個 entry 重複。
 - 編碼前依 packID 排序：Go 的 map 迭代順序是隨機的，不排序的話兩個 client 記錄同一批工作會寫出兩個 blob 而不是去重成一個。
 - 一次 backup 一個 blob，在最後一個 pack 上傳之後、snapshot 提交之前寫。
+- **壞掉的 blob 不是致命錯誤。** 打不開的 blob 會被跳過並警告，因為「打開 repo」正是執行 `rebuild-index` 的前提——把它當致命錯誤會變成一個修不了的死結。`rebuild-index` 先寫新 blob 再刪舊的，所以中途 crash 會留下重複（載入時會合併），不會留下空窗。
 - **index 永遠只是快取。** `rebuild-index` 只讀 pack trailer 就能重建出完全相同的答案，測試會把 blob 全刪掉來證明這件事。
 
 ## 6. Tree 物件
@@ -151,7 +152,7 @@ Entry 欄位（除 `n`、`t`、`mode` 外皆 `omitempty`）：
 | --- | --- |
 | `n` | 名稱，不得為空、`.`、`..`，不得含 `/` 或 NUL |
 | `t` | 0 = file、1 = dir、2 = symlink |
-| `mode`, `uid`, `gid`, `mtime`, `ctime` | 中繼資料 |
+| `mode`, `uid`, `gid`, `mtime`, `ctime` | 中繼資料，`mode` 含 setuid/setgid/sticky |
 | `size` | 檔案長度 |
 | `target` | symlink 目標 |
 | `chunks` | 檔案的 chunk ID 陣列，**inline** |
@@ -162,6 +163,13 @@ Entry 欄位（除 `n`、`t`、`mode` 外皆 `omitempty`）：
 **tree 以明文命名，不是密文。** 這一條是承重牆：密文 hash 每次密封都會變（nonce 是隨機的），沒改過的目錄每晚都會換名字，「未變動的子樹整棵重用」就永遠不會發生。
 
 Entry 編碼前依名稱 bytewise 排序，所以一個目錄只有一種編碼、一個名字，跟 client 用什麼順序走它無關。
+
+還原時的順序是**先 chown 再 chmod**。POSIX 的 chown 會清掉 setuid 與 setgid 位元，反過來做會無聲地把它們吃掉：
+
+```
+after chmod:  ugrwxr-xr-x
+after lchown: -rwxr-xr-x
+```
 
 Socket、FIFO、device node 會被跳過並警告：忠實還原它們需要還原程序不該假設有的權限，而且它們的「內容」從來不是使用者想存的東西。
 
@@ -230,7 +238,11 @@ chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟
 | 邊界與 reader 的讀取大小無關 | `TestBoundariesDoNotDependOnReadSizes`（`iotest.OneByteReader`） |
 | 插入位元組不會重排後面的邊界 | `TestBoundariesSurviveAnInsertionAtTheFront` |
 | pack 位元組不變 | `internal/pack/testdata/pack.txt`（完整的小 pack，逐位元組） |
-| pack 損壞會被拒絕 | `TestReaderRejectsDamagedPacks`（8 種）+ `TestReaderRejectsInconsistentTrailer`（7 種） |
+| pack 損壞會被拒絕 | `TestReaderRejectsDamagedPacks`（9 種）+ `TestReaderRejectsInconsistentTrailer`（7 種） |
+| 同一個 chunk 不會在一個 pack 裡出現兩次 | `TestDuplicateContentWithinOnePackIsStoredOnce`、`TestWriterRefusesADuplicateChunk` |
+| index blob 壞掉不會讓 repo 打不開，而且修得回來 | `TestADamagedIndexBlobIsRepairable`、`TestRebuildIndexPersists` |
+| restore 不會寫到目標目錄外面 | `TestSafeJoinRefusesEscapes` |
+| setuid/setgid/sticky 位元會被還原 | `TestBackupRestoreIsByteForByte`（模式比對含這三個位元） |
 | 解壓炸彈被擋 | `TestDecompressionBombIsRefused`（1796 B → 宣稱 16 MiB） |
 | index blob 不變、可從 pack 重建 | `internal/index/testdata/index.txt`、`TestRebuildReconstructsTheIndexFromPacksAlone` |
 | tree 不變、順序無關、內容變則名變 | `internal/tree/testdata/tree.txt`、`TestNewSortsEntries`、`TestAChangedEntryChangesTheName`（10 種變動） |

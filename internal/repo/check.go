@@ -56,7 +56,10 @@ func (r CheckReport) OK() bool { return len(r.Problems) == 0 }
 
 // Check verifies a repository.
 func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport, error) {
-	var report CheckReport
+	var (
+		report CheckReport
+		err    error
+	)
 	problem := func(format string, args ...any) {
 		report.Problems = append(report.Problems, fmt.Sprintf(format, args...))
 	}
@@ -72,7 +75,7 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 	stored := make(map[crypto.ID]struct{})
 	rebuilt := index.New()
 
-	err := r.backend.List(ctx, pack.Prefix, func(fi backend.FileInfo) error {
+	err = r.backend.List(ctx, pack.Prefix, func(fi backend.FileInfo) error {
 		id, err := crypto.ParseID(fi.Key[len(pack.Prefix):])
 		if err != nil {
 			problem("%s is not named like a pack: %v", fi.Key, err)
@@ -94,9 +97,23 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 	}
 	report.Chunks = rebuilt.Len()
 
-	// 2. The cached index must not refer to packs that are not there. A
-	// disagreement is a finding, not a failure -- the index is a cache,
-	// and rebuild-index is the answer -- but it must be reported.
+	// 2. Every stored index blob must be readable, and the cached index
+	// must not refer to packs that are not there.
+	//
+	// Neither is fatal -- the index is a cache and rebuild-index is the
+	// answer -- but both must be reported. The blobs are re-read here
+	// rather than trusting what open() managed to load, so that a check
+	// says what is in the repository and not what this process
+	// remembers.
+	opts.progress("checking index blobs")
+	_, skipped, err := index.LoadAll(ctx, r.backend, r.keys)
+	if err != nil {
+		return report, fmt.Errorf("check: %w", err)
+	}
+	for _, s := range skipped {
+		problem("%v; run rebuild-index to repair it", s)
+	}
+
 	for _, id := range r.index.Packs() {
 		if _, ok := stored[id]; !ok {
 			problem("the index refers to pack %s, which is not stored", id)

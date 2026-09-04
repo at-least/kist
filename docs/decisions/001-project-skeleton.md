@@ -55,13 +55,15 @@ CLI 的進入點是 `cmd/kist/main.go`，內容只有一行 `cmd.Execute()`；�
 - `make build` / `make test`：`CGO_ENABLED=0`，跟出貨的建置一致。
 - `make test-race`：`CGO_ENABLED=1`，只跑測試，不產出任何要發布的檔案。
 
-CI 在 Linux/macOS 跑 race，Windows 跳過——那台 runner 的 C 工具鏈不該是測試套件的相依。
+CI 三個 OS 都跑 race。一開始 Windows 是跳過的（不想讓測試套件相依於那台 runner 的 C 工具鏈），後來依使用者要求改成全跑：Go 的 data race 是靜默的記憶體損毀，對備份工具而言那等於靜默的資料損毀，值得為它多裝一個編譯器。**注意：Windows 上的 `-race` 從來沒有在這台機器上實際跑過**，只有交叉編譯與 `go vet` 驗過。
 
 ### 6. golangci-lint 釘在 v2.13.2，設定用 v2 schema
 
 v2 的設定檔跟 v1 不相容（需要 `version: "2"`、`linters.default`、獨立的 `formatters` 區塊）。版本同時釘在 `Makefile` 與 CI，兩邊要一起改。
 
-在 standard 集合之外多開的 linter 都對應到這個專案的具體風險，不是湊數：`errorlint`（錯誤比較要吃 `%w` 包裝）、`nilerr`（err 非 nil 卻回 nil 是資料遺失的起點）、`bodyclose`（S3 後端漏 body 就是漏連線）、`gosec`（這支工具經手金鑰和別人的資料）、`revive` 的 `package-comments` 與 `exported`（工程規範要求）。`errcheck` 開了 `check-blank`：`_ = err` 也算吞錯。
+在 standard 集合之外多開的 linter 都對應到這個專案的具體風險，不是湊數：`errorlint`（錯誤比較要吃 `%w` 包裝）、`nilerr`（err 非 nil 卻回 nil 是資料遺失的起點）、`bodyclose`（S3 後端漏 body 就是漏連線）、`gosec`（這支工具經手金鑰和別人的資料）、`revive` 的 `package-comments` 與 `exported`（工程規範要求）。`errcheck` 開了 `check-blank`：`_ = err` 也算吞錯，例外只有兩類，都寫在設定檔裡並附理由——(1) 清理路徑上的 `Close`/`Remove`，那裡已經在回傳或已經在失敗，錯誤無處可去；(2) 寫到命令自己的 stdout/stderr 的 `fmt.Fprint*`，管線斷了就沒有第二條通道可以回報。列表是按具體型別列的，透過其他介面呼叫的 `Close` 仍然要真的檢查或附 nolint 理由。
+
+`exhaustive` 檢查 switch 與 map 的列舉窮盡性，且 `default-signifies-exhaustive: false`——重點正是「加了一個新的 `NodeType` 或壓縮演算法而某個 switch 沒跟上」時要被告知，而格式演進靠的就是加列舉值。
 
 ### 7. `make fuzz` 逐一列舉 fuzz target
 
