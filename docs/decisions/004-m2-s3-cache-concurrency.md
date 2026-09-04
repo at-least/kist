@@ -80,6 +80,9 @@ GC 可以收），不會互相覆蓋。測試：同時 backup 有重疊的資料
 ## 沒做（留給之後）
 
 - 用快取記住「這台機器寫過的 tree」以省掉每次 backup 的 tree put（ADR 003 §1 的承諾）。
+  對 MinIO 的量測：內容未變的第二次 backup 35 s（本機後端 0.8 s）。
+- restore 對每個 chunk 各發一次 range GET（10 GiB 71 040 次 → 213 s，本機 41 s）；
+  同一 pack 內連續的 chunk 應合併成一次讀取。
 
 - 10 GiB 對 S3/MinIO 的效能量測（功能與正確性有測，吞吐量還沒量）。
 - 免 List 的純 Put 模式；本機記住最後 snapshot key 以偵測回滾（M3/M4）。

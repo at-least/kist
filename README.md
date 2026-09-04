@@ -54,7 +54,7 @@ Object Lock，並把 `config` 另存一份。backup 需要的權限是 `PutObjec
 
 ## 開發
 
-本地跑一遍和 CI 一樣的四道關卡：
+所有驗證都在本機跑（GitHub Actions 的 workflow 只留手動觸發，避免吃配額）；四道關卡：
 
 ```sh
 cargo fmt --all --check
@@ -95,6 +95,27 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 | 峰值 RSS（backup 期間，`ru_maxrss`） | **186 MiB**（審查修正前 253 MiB） |
 | 512 MiB 單一大檔的 RSS 成長（reviewer 的 probe） | 22 MiB（修正前 736 MiB） |
 
+## M2 驗收數據（S3 / MinIO）
+
+2026-09-05，commit `09f6f82`，同一台機器、同一份資料集，repo 放在本機 Docker 裡的 MinIO
+（`minio/minio:RELEASE.2025-09-07`，HTTP、無 TLS），腳本 `tests/acceptance/run_s3.py`，
+完整 log `tests/acceptance/m2-acceptance-s3-2026-09-05.log`。
+
+| 項目 | 結果 | 對照本機後端 |
+| --- | --- | --- |
+| 第一次 backup | 157 s；77 個 pack（4.90 GiB） | 54 s |
+| 第二次 backup（內容未變） | 35 s；**0 個新 pack、0 個新 chunk** | 0.8 s |
+| restore | 213 s；`diff -r` **完全相同** | 41 s |
+| `check` | 2 s | 0.3 s |
+| `check --read-data` | 28 s | 17 s |
+| `rebuild-index`（77 個 pack，只讀 trailer） | 0.4 s；再 `check` 通過 | — |
+| 人為翻轉 pack 中一個 bit（透過 `mc` 上傳） | `check --read-data` 以非 0 結束並指名該 pack | 同 |
+| 峰值 RSS（backup 期間） | **242 MiB** | 186 MiB |
+
+第二次 backup 與 restore 對 S3 明顯慢：前者每次仍 put 全部 1 102 個 tree 並逐個讀 parent 的 tree，
+後者對每個 chunk 各發一次 range GET（71 040 次）。
+UNVERIFIED（未做 profile，只是從請求數推測）。兩者都列在 M3/M4 待辦（ADR 004「沒做」）。
+
 ## Clean build 時間
 
 機器：AMD Ryzen 7 7700（8C/16T）、Linux 7.2.0、rustc 1.98.1、cargo 1.98.1。
@@ -105,7 +126,7 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 | M0 骨架（只有 clap） | 3.9 s | 3.5 s |
 | M1（完整相依） | 8.7 s | 15.8 s |
 
-CI 上的時間會比較長（要下載相依套件），`Swatinem/rust-cache` 負責跨次數快取。
+（CI 從未實際執行；負責人決定所有驗證只在本機跑。）
 
 ## 授權
 

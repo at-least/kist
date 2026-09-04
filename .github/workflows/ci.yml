@@ -1,6 +1,9 @@
 name: CI
 
-on: [push, pull_request]
+# 只手動觸發：所有驗證都在本機跑（cargo fmt/clippy/test/deny + tests/minio-setup.sh），
+# 這支只留著給偶爾想看三平台結果時用，避免吃 GitHub Actions 配額。
+on:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
