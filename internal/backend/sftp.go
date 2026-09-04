@@ -105,6 +105,7 @@ func ParseSFTPLocation(location string) (SFTPConfig, error) {
 	if cfg.Path == "" {
 		return SFTPConfig{}, fmt.Errorf("parse %q: no path", location)
 	}
+	cfg.Path = path.Clean(cfg.Path)
 	return cfg, nil
 }
 
@@ -201,7 +202,10 @@ func dialSFTP(ctx context.Context, cfg SFTPConfig) (*SFTP, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("open sftp backend at %s: start sftp: %w", location, err)
 	}
-	s := &SFTP{conn: conn, client: client, root: cfg.Path, location: location}
+	// Cleaned here as well as in ParseSFTPLocation, for a config built
+	// by hand: List derives keys by trimming the root off each path, and
+	// a root with a trailing slash would trim nothing and list nothing.
+	s := &SFTP{conn: conn, client: client, root: path.Clean(cfg.Path), location: location}
 
 	if v, ok := client.HasExtension("hardlink@openssh.com"); !ok || v != "1" {
 		s.discard()

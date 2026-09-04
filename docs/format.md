@@ -236,11 +236,7 @@ chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟
 
 backup **不需要**讀 tree：tree 一律用 `PutIfAbsent` 寫，去重靠的是「已存在」的回應，不是先讀再比。
 
-**SFTP（M4）**：OpenSSH 沒有 per-prefix 的權限模型，能做的是 `Match User backup` + `ChrootDirectory` + `ForceCommand internal-sftp -P remove,rmdir,rename,posix-rename,setstat,fsetstat,symlink`。這擋得住刪 pack、改名、改 mtime；擋不住覆寫（`open` 帶 `O_TRUNC` 是同一個 request），而且 `remove` 被禁之後 client 在競態中留下的 `.tmp-*` 暫存檔會沒人清。也就是說 SFTP 上 backup 憑證的性質是「**不能刪、能覆寫**」——比 MinIO 弱一點（MinIO 上誠實的 client 不會覆寫），跟 AWS 差兩級。`prune` 用的維護帳號不加 `-P`。**UNVERIFIED**：`-P` 黑名單的實際效果沒有在測試裡跑；conformance 測試用的是不受限的帳號。
-
-M3 加了三項，每一項都是 §12 的安全論證需要的：`clients/*` 的 Put（登記自己，讓 prune 知道要等誰）、`gc/` 的 List（看見待刪標記，把被標記的 pack 當成不存在）、`gc/*` 的 Delete（復活）。其中 Delete 是唯一一項 backup 拿得到的刪除權限，而它能刪的東西——一個「沒人需要這個 pack」的宣告——被刪掉的後果只是 prune 下次重算。
-
-同一個測試也驗了反面：持有 backup 權限的 client 對 pack、`config`、`clients/<id>` 做 Delete → `ErrDenied`；對 `packs/`、`trees/`、`snapshots/`、`clients/`、`` 做 List → `ErrDenied`；讀 pack → `ErrDenied`；對既有 pack 做 `PutIfAbsent` → `ErrExists`（條件寫入在政策限制下仍然正常運作）；對 `gc/<packID>` 做 Delete → 成功。
+**SFTP（M4）**：OpenSSH 沒有 per-prefix 的權限模型，能做的是 `Match User backup` + `ChrootDirectory` + `ForceCommand internal-sftp -P <黑名單>`。但 kist 的備份帳號**不能**把 `remove` 列進黑名單：每次 `PutIfAbsent` 都以 `Remove(.tmp-*)` 結尾——不只競態時——禁了 `remove` 之後每個物件都會留下第二個硬連結的名字（List 看不到、共用同一個 inode），prune 刪掉 `packs/<id>` 之後位元組仍然被 `.tmp-*` 佔著，什麼都回收不到。所以老實的說法是：**在 SFTP 上，抗勒索性質沒有任何一半能由伺服器端強制**——備份憑證能刪也能覆寫，性質只對誠實的 client 成立。要一個不需要 `remove` 的備份帳號，路徑是改用 OpenSSH 的 `SSH_FXP_RENAME`（探測證明它在 OpenSSH 上不覆寫），但它的原子性與在其他伺服器上的行為都沒驗過；記下來，不做。`prune` 用的維護帳號不加 `-P`。
 
 ### 抗勒索性質，以及它在哪裡成立
 
@@ -362,3 +358,4 @@ backup 開頭 =
 - [005 — Backend 原子性與權限模型](decisions/005-backend-atomicity.md)
 - [006 — S3 後端與無鎖並發](decisions/006-s3-backend.md)
 - [007 — 垃圾回收：標記、grace、登記與復活](decisions/007-garbage-collection.md)
+- [008 — SFTP 後端](decisions/008-sftp-backend.md)

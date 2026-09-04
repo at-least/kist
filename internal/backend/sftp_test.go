@@ -98,9 +98,23 @@ func launchSFTP() (*sftpServer, error) {
 		srv.stop()
 		return nil, err
 	}
-	// sshd accepts TCP before it is ready to complete a handshake.
-	time.Sleep(time.Second)
-	return srv, nil
+	// sshd accepts TCP before it can complete a handshake, and the
+	// container's entrypoint may still be generating keys. Ready means
+	// a real session opens.
+	for {
+		cfg := srv.config("readiness")
+		cfg.Timeout = 2 * time.Second
+		b, err := CreateSFTP(context.Background(), cfg)
+		if err == nil {
+			b.discard()
+			return srv, nil
+		}
+		if time.Now().After(deadline) {
+			srv.stop()
+			return nil, fmt.Errorf("sftp server never completed a handshake: %w", err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 func (s *sftpServer) stop() {
@@ -219,6 +233,36 @@ func TestSFTPFailedPutLeavesNothing(t *testing.T) {
 	}
 }
 
+// A trailing slash in the path is a natural thing to type. It must not
+// make the repository look empty: List builds keys by trimming the root,
+// and an uncleaned root trims nothing.
+func TestSFTPListSurvivesAnUncleanRootPath(t *testing.T) {
+	ctx := context.Background()
+	srv := startSFTP(t)
+	sftpDirCounter++
+	cfg := srv.config(fmt.Sprintf("t%d-%d/", os.Getpid(), sftpDirCounter))
+	cfg.Path = "/" + cfg.Path // absolute with a trailing slash: /repo/tN/
+	b, err := CreateSFTP(ctx, cfg)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer func() {
+		if err := b.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	if err := PutBytesIfAbsent(ctx, b, "packs/one", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	if err := b.List(ctx, "packs/", func(fi FileInfo) error { keys = append(keys, fi.Key); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || keys[0] != "packs/one" {
+		t.Fatalf("List under a root with a trailing slash returned %v, want [packs/one]", keys)
+	}
+}
+
 func TestSFTPRefusesAnUnknownHost(t *testing.T) {
 	srv := startSFTP(t)
 	empty := filepath.Join(t.TempDir(), "known_hosts")
@@ -264,6 +308,9 @@ func TestParseSFTPLocation(t *testing.T) {
 		err  bool
 	}{
 		{in: "sftp://alice@backup.example:2222/srv/kist", want: SFTPConfig{User: "alice", Host: "backup.example", Port: 2222, Path: "/srv/kist"}},
+		{in: "sftp://h/srv/kist/", want: SFTPConfig{Host: "h", Port: 22, Path: "/srv/kist"}},
+		{in: "sftp://h//srv//kist", want: SFTPConfig{Host: "h", Port: 22, Path: "/srv/kist"}},
+		{in: "sftp://h/~/x/", want: SFTPConfig{Host: "h", Port: 22, Path: "x"}},
 		{in: "sftp://backup.example/~/kist", want: SFTPConfig{Host: "backup.example", Port: 22, Path: "kist"}},
 		{in: "sftp://backup.example/~", want: SFTPConfig{Host: "backup.example", Port: 22, Path: "."}},
 		{in: "sftp://[::1]:22/x", want: SFTPConfig{Host: "::1", Port: 22, Path: "/x"}},
