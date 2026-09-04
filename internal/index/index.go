@@ -94,17 +94,22 @@ func (ix *Index) Packs() []crypto.ID {
 
 // AddPack records every chunk in one pack.
 //
-// A chunk already known keeps its existing location. Two packs holding
-// the same chunk is normal -- two clients can pack the same content at
-// the same moment -- and either copy is as good as the other, so the
-// first one wins and the duplicate simply becomes unreferenced.
+// Two packs holding the same chunk is normal -- two clients can pack the
+// same content at the same moment -- and either copy serves. Which one
+// the index points at is decided by pack ID, smallest wins, and not by
+// which pack happened to be added first. That makes the mapping a pure
+// function of the set of packs: an index loaded from blobs in blob order
+// and one rebuilt from packs in pack order agree on every chunk. Prune
+// depends on it, because "which packs are live" is derived from exactly
+// this mapping, and a rebuild between two prune runs must not move the
+// live copy.
 func (ix *Index) AddPack(packID crypto.ID, entries []pack.Entry) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
 	ix.sealed[packID] = struct{}{}
 	for _, e := range entries {
-		if _, ok := ix.byID[e.ID]; ok {
+		if existing, ok := ix.byID[e.ID]; ok && bytes.Compare(existing.Pack[:], packID[:]) <= 0 {
 			continue
 		}
 		ix.byID[e.ID] = Location{Pack: packID, Offset: e.Offset, Length: e.Length}

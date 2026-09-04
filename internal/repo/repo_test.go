@@ -267,3 +267,25 @@ func freePort() (int, error) {
 	}
 	return addr.Port, nil
 }
+
+// reopenAs opens a repository as a specific client.
+func reopenAs(t *testing.T, dir, seed, clientID string) *Repository {
+	t.Helper()
+
+	b, err := backend.OpenLocal(dir)
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	opts := testOptions(t, seed)
+	opts.ClientID = clientID
+	r, err := Open(context.Background(), b, opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return r
+}

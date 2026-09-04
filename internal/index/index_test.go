@@ -95,22 +95,41 @@ func TestLookupAndHas(t *testing.T) {
 }
 
 // Two clients can pack the same content at the same moment. Either copy
-// serves, so the first one recorded wins and the second is left
-// unreferenced for prune to collect.
-func TestDuplicateChunkKeepsTheFirstLocation(t *testing.T) {
-	ix := New()
-	ix.AddPack(id(0xaa), []pack.Entry{entry(1, 0, 100)})
-	ix.AddPack(id(0xbb), []pack.Entry{entry(1, 500, 100)})
+// serves; the index points at the one with the smaller pack ID, whatever
+// order the packs were added in, so that a rebuild cannot move the live
+// copy out from under prune.
+func TestDuplicateChunkResolvesToTheSmallestPackID(t *testing.T) {
+	packs := []struct {
+		pack    crypto.ID
+		entries []pack.Entry
+	}{
+		{id(0xcc), []pack.Entry{entry(1, 0, 100), entry(2, 100, 50)}},
+		{id(0xaa), []pack.Entry{entry(1, 500, 100), entry(3, 0, 10)}},
+		{id(0xbb), []pack.Entry{entry(2, 0, 50), entry(3, 50, 10)}},
+	}
 
-	loc, ok := ix.Lookup(id(1))
-	if !ok {
-		t.Fatal("chunk 1 is missing")
+	forward, reverse := New(), New()
+	for _, p := range packs {
+		forward.AddPack(p.pack, p.entries)
 	}
-	if loc.Pack != id(0xaa) {
-		t.Errorf("chunk 1 points at pack %s, want the first one, %s", loc.Pack, id(0xaa))
+	for i := len(packs) - 1; i >= 0; i-- {
+		reverse.AddPack(packs[i].pack, packs[i].entries)
 	}
-	if len(ix.Packs()) != 2 {
-		t.Errorf("Packs = %d, want both packs recorded", len(ix.Packs()))
+
+	want := map[byte]crypto.ID{1: id(0xaa), 2: id(0xbb), 3: id(0xaa)}
+	for chunk, wantPack := range want {
+		for name, ix := range map[string]*Index{"forward": forward, "reverse": reverse} {
+			loc, ok := ix.Lookup(id(chunk))
+			if !ok {
+				t.Fatalf("%s: chunk %d is missing", name, chunk)
+			}
+			if loc.Pack != wantPack {
+				t.Errorf("%s: chunk %d points at pack %s, want %s", name, chunk, loc.Pack, wantPack)
+			}
+		}
+	}
+	if len(forward.Packs()) != 3 {
+		t.Errorf("Packs = %d, want all three recorded", len(forward.Packs()))
 	}
 }
 

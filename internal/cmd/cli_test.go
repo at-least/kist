@@ -108,6 +108,36 @@ func TestEndToEnd(t *testing.T) {
 	if !strings.Contains(stdout, "rebuilt the index") {
 		t.Errorf("rebuild-index printed %q", stdout)
 	}
+
+	// A second backup, then forget the older one by policy. No rule and
+	// no name is an error, not "forget everything".
+	if _, _, err = run(t, "backup", "--repo", repoDir, source); err != nil {
+		t.Fatalf("second backup: %v", err)
+	}
+	if _, _, err = run(t, "forget", "--repo", repoDir); err == nil {
+		t.Fatal("forget with no rule succeeded")
+	}
+	stdout, _, err = run(t, "forget", "--repo", repoDir, "--keep-last", "1", "--dry-run")
+	if err != nil {
+		t.Fatalf("forget --dry-run: %v", err)
+	}
+	if !strings.Contains(stdout, "would remove "+key) {
+		t.Errorf("forget --dry-run printed %q", stdout)
+	}
+	stdout, _, err = run(t, "forget", "--repo", repoDir, "--keep-last", "1")
+	if err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if !strings.Contains(stdout, "removed "+key) || !strings.Contains(stdout, "removed 1 snapshot(s), kept 1") {
+		t.Errorf("forget printed %q", stdout)
+	}
+	stdout, _, err = run(t, "snapshots", "--repo", repoDir)
+	if err != nil {
+		t.Fatalf("snapshots after forget: %v", err)
+	}
+	if strings.Contains(stdout, key) {
+		t.Errorf("forgotten snapshot still listed: %q", stdout)
+	}
 }
 
 // check must exit non-zero when it finds something, or a cron job that
