@@ -53,6 +53,14 @@ struct RepoArgs {
     /// Otherwise the KIST_PASSWORD environment variable is used, or you are prompted.
     #[arg(long, env = "KIST_PASSWORD_FILE", global = true)]
     password_file: Option<PathBuf>,
+
+    /// Directory for the local index cache (default: the user cache directory, e.g. ~/.cache/kist).
+    #[arg(long, env = "KIST_CACHE_DIR", global = true)]
+    cache_dir: Option<PathBuf>,
+
+    /// Do not use a local index cache; read every index object from the repository.
+    #[arg(long, global = true)]
+    no_cache: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -290,7 +298,18 @@ fn open_backend(args: &RepoArgs) -> Result<Backend> {
 async fn open_repo(args: &RepoArgs) -> Result<Repository> {
     let backend = open_backend(args)?;
     let password = password::obtain(&args.password_file, false)?;
-    Ok(Repository::open(backend, password.as_bytes()).await?)
+    let cache_root = if args.no_cache {
+        None
+    } else {
+        match &args.cache_dir {
+            Some(d) => Some(d.clone()),
+            None => dirs::cache_dir().map(|d| d.join("kist")),
+        }
+    };
+    if cache_root.is_none() && !args.no_cache {
+        tracing::warn!("cannot determine a cache directory; running without the local index cache");
+    }
+    Ok(Repository::open_with_cache(backend, password.as_bytes(), cache_root).await?)
 }
 
 /// `snapshots/<client>/<ts>` → `<client 前 8 碼>/<ts>`，給人看的簡短 id。

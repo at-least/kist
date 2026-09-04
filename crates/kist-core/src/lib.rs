@@ -8,13 +8,14 @@
 //! - 所有 I/O 是 async（tokio）；chunk / hash / 壓縮 / 加密等 CPU 密集工作一律丟進
 //!   `spawn_blocking`，不在 async task 裡做重計算。
 //! - backup 的寫入順序固定：packs → trees → index → snapshot。snapshot 是唯一的 commit point。
-//! - 記憶體：檔案以串流切塊，pack 只保留一個 buffer（目標 64 MiB）；
-//!   index 目前整份在記憶體（M2 改成本地 mmap 快取）。
+//! - 記憶體：檔案以串流切塊，在飛的 pack 最多 2 個（各 ≤ 64 MiB）；
+//!   index 有本地快取（排序表、按需讀取）時不整份載入記憶體。
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod backup;
+pub mod cache;
 pub mod check;
 pub mod fsmeta;
 pub mod index;

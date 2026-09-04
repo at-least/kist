@@ -12,6 +12,7 @@ kist-chunker.workspace = true
 kist-crypto.workspace = true
 kist-format.workspace = true
 
+blake3.workspace = true
 filetime.workspace = true
 hex.workspace = true
 serde.workspace = true

@@ -109,8 +109,8 @@ impl Repository {
             let mut by_pack: HashMap<ObjectId, HashMap<ChunkId, ChunkLocation>> = HashMap::new();
             let mut all_ids = HashSet::new();
             for (id, loc) in index.chunks() {
-                by_pack.entry(loc.pack).or_default().insert(*id, *loc);
-                all_ids.insert(*id);
+                by_pack.entry(loc.pack).or_default().insert(id, loc);
+                all_ids.insert(id);
             }
             let all_ids = Arc::new(all_ids);
             for (id, _) in index.packs() {

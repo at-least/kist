@@ -1,6 +1,7 @@
 //! 打開 / 建立 repo，以及各種物件的讀寫幫手。
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kist_backend::{Backend, BackendError};
@@ -39,6 +40,8 @@ pub struct Repository {
     backend: Backend,
     config: RepoConfig,
     keys: Arc<RepoKeys>,
+    /// 本地 index 快取；`None` 表示每次都從 repo 讀全部 index blob。
+    cache: Option<crate::cache::IndexCache>,
 }
 
 impl std::fmt::Debug for Repository {
@@ -82,11 +85,21 @@ impl Repository {
             backend,
             config,
             keys: Arc::new(RepoKeys::from_master(&master)),
+            cache: None,
         })
     }
 
-    /// 打開既有 repo：讀 `config`、用密碼解開 master key、派生子金鑰。
+    /// 打開既有 repo：讀 `config`、用密碼解開 master key、派生子金鑰。不用本地快取。
     pub async fn open(backend: Backend, password: &[u8]) -> Result<Self> {
+        Self::open_with_cache(backend, password, None).await
+    }
+
+    /// 同 [`Self::open`]，並在 `cache_root` 底下維護這個 repo 的本地 index 快取。
+    pub async fn open_with_cache(
+        backend: Backend,
+        password: &[u8],
+        cache_root: Option<PathBuf>,
+    ) -> Result<Self> {
         let bytes = match backend.get(keys::CONFIG).await {
             Ok(b) => b,
             Err(BackendError::NotFound(_)) => return Err(CoreError::NotARepository),
@@ -111,11 +124,20 @@ impl Repository {
         let password = Zeroizing::new(password.to_vec());
         let slot = config.key.clone();
         let master = blocking(move || Ok(unlock_key_slot(&password, &slot, &binding)?)).await?;
+        let keys = Arc::new(RepoKeys::from_master(&master));
+        let cache = cache_root.map(|root| {
+            crate::cache::IndexCache::new(&root, &keys.cache_id(), &backend.location().to_string())
+        });
         Ok(Self {
             backend,
             config,
-            keys: Arc::new(RepoKeys::from_master(&master)),
+            keys,
+            cache,
         })
+    }
+
+    pub fn cache(&self) -> Option<&crate::cache::IndexCache> {
+        self.cache.as_ref()
     }
 
     pub fn config(&self) -> &RepoConfig {
@@ -220,12 +242,29 @@ impl Repository {
         Ok(id)
     }
 
-    /// 讀進所有 index blob。任何一個壞掉就整個失敗（`check` 有寬鬆版本）。
+    /// backup / restore 用的 index：有本地快取就用快取（只讀新 blob），否則讀全部 blob。
+    /// 任何一個 blob 壞掉就整個失敗（`check` 有寬鬆版本）。
     pub async fn load_index(&self) -> Result<ChunkIndex> {
+        if let Some(cache) = &self.cache {
+            let mut live = Vec::new();
+            for (key, _) in self.backend.list(keys::INDEXES_PREFIX).await? {
+                live.push(keys::object_id_from_key(&key)?);
+            }
+            live.sort();
+            return cache
+                .load(&live, |id| async move {
+                    self.read_object::<IndexBlob>(ObjectKind::Index, &keys::index(&id))
+                        .await
+                })
+                .await;
+        }
         let mut errors = Vec::new();
         let index = self.load_index_lenient(&mut errors).await?;
         if let Some(first) = errors.into_iter().next() {
-            return Err(first);
+            return Err(CoreError::Corrupt {
+                key: "index".to_owned(),
+                reason: format!("{first}; run `kist rebuild-index`"),
+            });
         }
         Ok(index)
     }

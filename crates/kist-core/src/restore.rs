@@ -171,7 +171,7 @@ impl Repository {
 
     /// 從 pack 讀一個 chunk 的明文（range read + 解密 + 驗證）。
     pub(crate) async fn read_chunk(&self, id: &ChunkId, index: &ChunkIndex) -> Result<Vec<u8>> {
-        let loc = *index.get(id).ok_or(CoreError::ChunkMissing(*id))?;
+        let loc = index.get(id).ok_or(CoreError::ChunkMissing(*id))?;
         let key = keys::pack(&loc.pack);
         let end = loc
             .offset
