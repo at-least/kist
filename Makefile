@@ -10,6 +10,10 @@ GOLANGCI_VERSION := v2.13.2
 GOLANGCI := $(shell command -v golangci-lint 2>/dev/null)
 
 FUZZTIME ?= 30s
+## FUZZPARALLEL: fuzz workers per target. Empty means one per core, which
+## saturates the machine; set it to a fraction of the cores to keep the
+## machine usable while a long campaign runs.
+FUZZPARALLEL ?=
 
 .PHONY: build test test-s3 test-sftp test-race vet lint fuzz fuzz-long release-snapshot verify clean
 
@@ -80,7 +84,7 @@ fuzz:
 		for f in $$(grep -ho -E '^func (Fuzz[A-Za-z0-9_]*)' $$p/*_test.go \
 			| sed 's/^func //' | sort -u); do \
 			echo "==> $$p $$f ($(FUZZTIME))"; \
-			go test "$$p" -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) || exit 1; \
+			go test "$$p" -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) $(if $(FUZZPARALLEL),-parallel $(FUZZPARALLEL)) || exit 1; \
 		done; \
 	done
 
