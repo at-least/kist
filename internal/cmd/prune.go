@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
 )
 
 func newPruneCommand() *cobra.Command {
@@ -30,17 +31,26 @@ func newPruneCommand() *cobra.Command {
 			"the first run marks, a run after the grace period deletes.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
-				report, err := r.Prune(ctx, repo.PruneOptions{
+			ev := event("prune")
+			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
+				result, err := r.Prune(ctx, repo.PruneOptions{
 					Grace:              grace,
 					ForgetClientsAfter: forgetClientsAfter,
 					ClockSkew:          clockSkew,
 					DryRun:             dryRun,
-					Progressf:          warnTo(cmd),
+					Progressf:          func(format string, args ...any) { fmt.Fprintf(cmd.ErrOrStderr(), format+"\n", args...) },
 				})
 				if err != nil {
 					return err
 				}
+				ev.Prune = report.FromPrune(result, dryRun)
+				for _, key := range result.UnreadableClients {
+					warnInto(cmd, ev)("%s is not a readable client record; left in place", key)
+				}
+				if jsonMode(cmd) {
+					return nil
+				}
+				report := result
 				out := cmd.OutOrStdout()
 				would := ""
 				if dryRun {
@@ -59,16 +69,13 @@ func newPruneCommand() *cobra.Command {
 				for _, id := range report.Locked {
 					fmt.Fprintf(out, "%sdeleted %s: retained by the storage, nothing reclaimed\n", would, id)
 				}
-				for _, key := range report.UnreadableClients {
-					warnTo(cmd)("%s is not a readable client record; left in place", key)
-				}
 				for _, id := range report.Deleted {
 					fmt.Fprintf(out, "%sdeleted %s\n", would, id)
 				}
 				fmt.Fprintf(out, "%smarked %d, unmarked %d, held %d, deleted %d (%s reclaimed)\n",
 					would, len(report.Marked), len(report.Unmarked), len(report.Held), len(report.Deleted), humanBytes(report.BytesReclaimed))
 				return nil
-			})
+			}))
 		},
 	}
 

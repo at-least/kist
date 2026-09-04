@@ -24,6 +24,7 @@ type Event struct {
 	Error    string    `json:"error,omitempty"`
 	Warnings []string  `json:"warnings,omitempty"`
 
+	Init    *InitResult    `json:"init,omitempty"`
 	Backup  *BackupResult  `json:"backup,omitempty"`
 	Forget  *ForgetResult  `json:"forget,omitempty"`
 	Prune   *PruneResult   `json:"prune,omitempty"`
@@ -34,6 +35,24 @@ type Event struct {
 
 // Duration is how long the event took.
 func (e Event) Duration() time.Duration { return e.Finished.Sub(e.Started) }
+
+// InitResult is a created repository.
+type InitResult struct {
+	Location string `json:"location"`
+	ClientID string `json:"client_id"`
+}
+
+// SnapshotSummary is one row of `kist snapshots --json`.
+type SnapshotSummary struct {
+	Snapshot string    `json:"snapshot"`
+	ClientID string    `json:"client_id"`
+	Time     time.Time `json:"time"`
+	Host     string    `json:"host,omitempty"`
+	Paths    []string  `json:"paths,omitempty"`
+	Files    uint64    `json:"files"`
+	Bytes    uint64    `json:"bytes"`
+	Error    string    `json:"error,omitempty"`
+}
 
 // BackupResult is a committed snapshot.
 type BackupResult struct {

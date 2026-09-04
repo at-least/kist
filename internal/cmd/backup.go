@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
 )
 
 func newBackupCommand() *cobra.Command {
@@ -26,14 +27,19 @@ func newBackupCommand() *cobra.Command {
 			"reclaims them.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
+			ev := event("backup")
+			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
 				snap, handle, err := r.Backup(ctx, args, repo.BackupOptions{
 					Host:     host,
 					SpoolDir: spoolDir,
-					Warnf:    warnTo(cmd),
+					Warnf:    warnInto(cmd, ev),
 				})
 				if err != nil {
 					return err
+				}
+				ev.Backup = report.FromBackup(snap, handle)
+				if jsonMode(cmd) {
+					return nil
 				}
 
 				out := cmd.OutOrStdout()
@@ -42,7 +48,7 @@ func newBackupCommand() *cobra.Command {
 				fmt.Fprintf(out, "  %s read, %s stored in %d new packs\n",
 					humanBytes(snap.Stats.Bytes), humanBytes(snap.Stats.BytesStored), snap.Stats.PacksAdded)
 				return nil
-			})
+			}))
 		},
 	}
 

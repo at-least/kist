@@ -19,6 +19,8 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 	}
 
+	root.PersistentFlags().Bool(JSONFlag, false, "print one JSON object (or array) on stdout instead of text")
+
 	root.AddCommand(
 		newInitCommand(),
 		newBackupCommand(),

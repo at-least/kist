@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
 )
 
 func newInitCommand() *cobra.Command {
@@ -47,6 +48,11 @@ func newInitCommand() *cobra.Command {
 				}
 			}()
 
+			if jsonMode(cmd) {
+				ev := event("init")
+				ev.Init = &report.InitResult{Location: b.Location(), ClientID: r.ClientID()}
+				return finish(cmd, ev, nil)
+			}
 			fmt.Fprintf(cmd.OutOrStdout(), "created repository at %s\n", b.Location())
 			fmt.Fprintf(cmd.OutOrStdout(), "client %s\n", r.ClientID())
 			return nil

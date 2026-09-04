@@ -3,10 +3,13 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/at-least/kist/internal/report"
 )
 
 // run executes the command tree with buffers attached, the way the binary
@@ -137,6 +140,103 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if strings.Contains(stdout, key) {
 		t.Errorf("forgotten snapshot still listed: %q", stdout)
+	}
+}
+
+// Every command speaks JSON on request: one object, or one array for
+// snapshots, and the exit code still says whether it went well.
+func TestJSONOutput(t *testing.T) {
+	t.Setenv(PasswordEnv, "a test password")
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "f.txt"), []byte("json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	decode := func(t *testing.T, stdout string) report.Event {
+		t.Helper()
+		var ev report.Event
+		if err := json.Unmarshal([]byte(stdout), &ev); err != nil {
+			t.Fatalf("not one JSON object: %v\n%s", err, stdout)
+		}
+		return ev
+	}
+
+	stdout, _, err := run(t, "init", "--json", "--repo", repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := decode(t, stdout); ev.Kind != "init" || !ev.OK || ev.Init == nil || ev.Init.ClientID == "" {
+		t.Errorf("init: %s", stdout)
+	}
+
+	stdout, _, err = run(t, "backup", "--json", "--repo", repoDir, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup := decode(t, stdout)
+	if backup.Kind != "backup" || !backup.OK || backup.Backup == nil || backup.Backup.Files != 1 || backup.Backup.Snapshot == "" {
+		t.Errorf("backup: %s", stdout)
+	}
+	key := backup.Backup.Snapshot
+
+	stdout, _, err = run(t, "snapshots", "--json", "--repo", repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []report.SnapshotSummary
+	if err := json.Unmarshal([]byte(stdout), &rows); err != nil || len(rows) != 1 || rows[0].Snapshot != key || rows[0].Files != 1 {
+		t.Errorf("snapshots: %v %s", err, stdout)
+	}
+
+	stdout, _, err = run(t, "check", "--json", "--repo", repoDir, "--read-data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := decode(t, stdout); ev.Kind != "check" || !ev.OK || ev.Check == nil || !ev.Check.ReadData || ev.Check.Packs != 1 || ev.Check.Problems == nil {
+		t.Errorf("check: %s", stdout)
+	}
+
+	target := filepath.Join(t.TempDir(), "out")
+	stdout, _, err = run(t, "restore", "--json", "--repo", repoDir, key, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := decode(t, stdout); ev.Kind != "restore" || ev.Restore == nil || ev.Restore.Files != 1 || ev.Restore.Target != target {
+		t.Errorf("restore: %s", stdout)
+	}
+
+	stdout, _, err = run(t, "prune", "--json", "--repo", repoDir, "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := decode(t, stdout); ev.Kind != "prune" || ev.Prune == nil || !ev.Prune.DryRun || ev.Prune.PacksStored != 1 || ev.Prune.PacksLive != 1 {
+		t.Errorf("prune: %s", stdout)
+	}
+
+	stdout, _, err = run(t, "forget", "--json", "--repo", repoDir, "--keep-last", "5", "--dry-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := decode(t, stdout); ev.Kind != "forget" || ev.Forget == nil || len(ev.Forget.Kept) != 1 || len(ev.Forget.Removed) != 0 {
+		t.Errorf("forget: %s", stdout)
+	}
+
+	stdout, _, err = run(t, "rebuild-index", "--json", "--repo", repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := decode(t, stdout); ev.Kind != "rebuild_index" || ev.Index == nil || ev.Index.Chunks != 1 {
+		t.Errorf("rebuild-index: %s", stdout)
+	}
+
+	// A failure is still one object, with ok=false, and a non-zero exit.
+	stdout, stderr, err := run(t, "restore", "--json", "--repo", repoDir, "snapshots/nobody/20260101t000000.000000000z", filepath.Join(t.TempDir(), "x"))
+	if err == nil {
+		t.Fatal("restore of a missing snapshot succeeded")
+	}
+	if ev := decode(t, stdout); ev.OK || ev.Error == "" || ev.Kind != "restore" {
+		t.Errorf("failed restore: stdout %s stderr %s", stdout, stderr)
 	}
 }
 

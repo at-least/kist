@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
 )
 
 func newSnapshotsCommand() *cobra.Command {
@@ -27,6 +28,19 @@ func newSnapshotsCommand() *cobra.Command {
 				handles, err := r.Snapshots(ctx, client)
 				if err != nil {
 					return err
+				}
+				if jsonMode(cmd) {
+					rows := make([]report.SnapshotSummary, 0, len(handles))
+					for _, handle := range handles {
+						row := report.SnapshotSummary{Snapshot: handle.Key, ClientID: handle.ClientID, Time: handle.Time}
+						if snap, err := r.LoadSnapshot(ctx, handle.Key); err != nil {
+							row.Error = err.Error()
+						} else {
+							row.Host, row.Paths, row.Files, row.Bytes = snap.Host, snap.Paths, snap.Stats.Files, snap.Stats.Bytes
+						}
+						rows = append(rows, row)
+					}
+					return emitList(cmd, rows)
 				}
 				if len(handles) == 0 {
 					fmt.Fprintln(cmd.OutOrStdout(), "no snapshots")

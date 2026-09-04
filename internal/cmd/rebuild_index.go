@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
 )
 
 func newRebuildIndexCommand() *cobra.Command {
@@ -23,14 +24,19 @@ func newRebuildIndexCommand() *cobra.Command {
 			"packs that are not there.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
+			ev := event("rebuild_index")
+			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
 				n, err := r.RebuildIndex(ctx)
 				if err != nil {
 					return err
 				}
+				ev.Index = &report.IndexResult{Chunks: n}
+				if jsonMode(cmd) {
+					return nil
+				}
 				fmt.Fprintf(cmd.OutOrStdout(), "rebuilt the index: %d chunks\n", n)
 				return nil
-			})
+			}))
 		},
 	}
 	flags.register(cmd)

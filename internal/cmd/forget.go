@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
 )
 
 func newForgetCommand() *cobra.Command {
@@ -27,7 +28,8 @@ func newForgetCommand() *cobra.Command {
 			"stays until prune finds it unreferenced. With no rule and no\n" +
 			"snapshot named, forget refuses to run rather than forget everything.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
+			ev := event("forget")
+			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
 				result, err := r.Forget(ctx, repo.ForgetOptions{
 					Policy:   policy,
 					ClientID: client,
@@ -36,6 +38,10 @@ func newForgetCommand() *cobra.Command {
 				})
 				if err != nil {
 					return err
+				}
+				ev.Forget = report.FromForget(result, dryRun)
+				if jsonMode(cmd) {
+					return nil
 				}
 				verb := "removed"
 				if dryRun {
@@ -50,7 +56,7 @@ func newForgetCommand() *cobra.Command {
 				}
 				fmt.Fprintf(out, "%s %d snapshot(s), kept %d\n", verb, len(result.Removed), len(result.Kept))
 				return nil
-			})
+			}))
 		},
 	}
 

@@ -39,11 +39,61 @@ $ kist check --read-data
 | `kist forget --keep-daily 7 ...` | 依 retention 規則（或指名）移除 snapshot |
 | `kist prune` | 標記沒人引用的 pack，grace（預設 72h）之後的下一次刪掉 |
 | `kist rebuild-index` | 從 pack trailer 重建 index |
+| `kist run --config kist.toml [--once]` | 依設定檔的排程跑備份與維護工作 |
+
+每個指令都接受 `--json`：stdout 只印一個 JSON 物件（`snapshots` 印一個陣列），警告與進度仍在 stderr，失敗仍以非零結束。
 
 `forget` 與 `prune` 要用持有 Delete 權限的憑證跑；備份用的憑證做不到（[權限表](docs/format.md#10-權限模型)）。`prune` 定期跑：第一次只標記，grace 過後的下一次才刪，中間有 client 引用到被標記的 pack 會自動復活它。
 
 repo 位置：`--repo` 或 `$KIST_REPOSITORY`——本機路徑、`s3://bucket/prefix`、或 `sftp://user@host:port/path`（`/~/path` 表示相對於登入目錄）。SFTP 一定驗 host key（`~/.ssh/known_hosts` 或 `$KIST_SFTP_KNOWN_HOSTS`，先 `ssh-keyscan`）；認證依序試 SSH agent、`$KIST_SFTP_KEY`（`$KIST_SFTP_KEY_PASSPHRASE`）、`$KIST_SFTP_PASSWORD`。
 密碼：`--password-file`、`$KIST_PASSWORD`，或終端機提示，依此順序。
+
+## 設定檔與 `run`
+
+```toml
+[repository]
+location = "s3://bucket/kist"          # 或本機路徑、sftp://user@host/path
+password_file = "/etc/kist/password"   # 或 $KIST_PASSWORD
+
+[[backup]]
+name = "home"
+paths = ["/home", "/etc"]
+schedule = "0 2 * * *"                 # 標準 cron 五欄，或 @daily / @hourly
+pre_backup  = ["/usr/local/sbin/lvm-snap", "create"]   # 可選，argv；失敗就不備份
+post_backup = ["/usr/local/sbin/lvm-snap", "release"]  # 可選；一定會跑
+
+[retention]                            # 由 [prune] 的維護工作套用，因為 forget 是刪除
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 6
+
+[prune]
+schedule = "0 4 * * 0"
+grace = "72h"
+
+[webhook]                              # 每個工作結束 POST 一個 JSON（跟 --json 同一個格式）
+url = "https://hooks.example/kist"
+
+[metrics]                              # Prometheus 文字格式，/metrics
+listen = "127.0.0.1:9345"
+```
+
+未知的 key 是錯誤，不是被忽略的拼字錯。`[[backup]]` 放在被備份的機器上、用只能寫的憑證；`[prune]`（含 `[retention]`）放在維護主機上、用能刪的憑證。一份設定同時有兩者可以跑，但 `run` 會警告：那台機器持有能刪掉自己備份的憑證。工作一次跑一個，不重疊；備份跑過了下一個 tick，tick 延後、不並發。VSS / LVM 快照沒有內建：`pre_backup` / `post_backup` 就是整個機制，知道那台機器怎麼拍快照的腳本是你的。
+
+### `--json` 與 webhook 的欄位
+
+一個事件：`kind`（`init backup forget prune check restore rebuild_index`）、`job`（run 模式的工作名）、`started`、`finished`、`ok`、`error`、`warnings`，加上一個對應 kind 的子物件：
+
+- `backup`：`snapshot host paths files dirs symlinks bytes bytes_stored chunks_new packs_added packs_revived`
+- `forget`：`dry_run removed kept locked`
+- `prune`：`dry_run packs_stored packs_live marked unmarked deleted locked held[{pack,reason}] bytes_reclaimed`
+- `check`：`read_data snapshots trees chunks packs problems`
+- `restore`：`snapshot target files dirs symlinks hard_links bytes`
+- `init`：`location client_id`；`rebuild_index`：`chunks`
+
+`snapshots --json` 是陣列：`snapshot client_id time host paths files bytes`（讀不出來的列有 `error`）。
+
+Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,result}`、`kist_last_run_duration_seconds{job}`、`kist_last_backup_{files,bytes,bytes_stored,packs_added}{job}`、`kist_last_prune_packs_{stored,live,deleted,held}`、`kist_prune_bytes_reclaimed_total`。
 
 ## `check` 的兩個層級
 

@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
 )
 
 func newCheckCommand() *cobra.Command {
@@ -26,27 +27,33 @@ func newCheckCommand() *cobra.Command {
 			"whole repository.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
-				report, err := r.Check(ctx, repo.CheckOptions{
+			ev := event("check")
+			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
+				result, err := r.Check(ctx, repo.CheckOptions{
 					ReadData:  readData,
 					Progressf: func(format string, args ...any) { fmt.Fprintf(cmd.ErrOrStderr(), format+"\n", args...) },
 				})
 				if err != nil {
 					return err
 				}
+				ev.Check = report.FromCheck(result, readData)
 
 				out := cmd.OutOrStdout()
-				fmt.Fprintf(out, "%d snapshots, %d trees, %d chunks in %d packs\n",
-					report.Snapshots, report.Trees, report.Chunks, report.Packs)
-				if report.OK() {
-					fmt.Fprintln(out, "no problems found")
-					return nil
+				if !jsonMode(cmd) {
+					fmt.Fprintf(out, "%d snapshots, %d trees, %d chunks in %d packs\n",
+						result.Snapshots, result.Trees, result.Chunks, result.Packs)
+					if result.OK() {
+						fmt.Fprintln(out, "no problems found")
+					}
+					for _, p := range result.Problems {
+						fmt.Fprintf(out, "problem: %s\n", p)
+					}
 				}
-				for _, p := range report.Problems {
-					fmt.Fprintf(out, "problem: %s\n", p)
+				if !result.OK() {
+					return fmt.Errorf("%w: %d problems", repo.ErrCheckFailed, len(result.Problems))
 				}
-				return fmt.Errorf("%w: %d problems", repo.ErrCheckFailed, len(report.Problems))
-			})
+				return nil
+			}))
 		},
 	}
 
