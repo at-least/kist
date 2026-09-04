@@ -86,6 +86,16 @@ pack buffer 與 index 在檔案之間「移進 closure 再移出來」，不用�
 `kist` 是開源工具，錯誤訊息與 `--help` 用英文；程式碼註解、ADR、格式文件用中文，
 因為讀的人是專案負責人。
 
+### 10. 明文 config 的防護（審查後補）
+
+`config` 沒有加密也沒有 MAC——開 repo 前需要它裡面的 KDF 參數，先有雞還是先有蛋。
+審查指出兩個後果：改 chunker 參數會讓去重悄悄失效；改 `repo_id` 會讓 M2 的本地快取
+認錯 repo、以為 chunk 已存在而不上傳（無聲資料遺失）。對策：
+`repo_id` 與 chunker 參數綁進 master key 的 AAD（改了就解不開），快取 ID 改從 master key
+派生，所有明文數字讀進來先做範圍檢查（否則 fastcdc 在 release 會越界 panic、
+Argon2 會嘗試配置 4 TiB）。`pack_target_size` 刻意不綁：它是可調的效能參數，
+綁了每次調整都得用所有 key slot 的密碼重包 master key。
+
 ## 沒做（留給之後的里程碑）
 
 - uid/gid 的還原（需要 root）、xattr、hardlink：格式已留欄位空間（解碼忽略未知欄位）。

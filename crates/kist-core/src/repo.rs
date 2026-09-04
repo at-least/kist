@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use kist_backend::{Backend, BackendError};
-use kist_crypto::{create_key_slot, unlock_key_slot, KdfCost, RepoKeys};
+use kist_crypto::{create_key_slot, unlock_key_slot, KdfCost, KeyBinding, RepoKeys};
 use kist_format::config::{ChunkerParams, RepoConfig};
 use kist_format::envelope::{Compression, ObjectKind};
 use kist_format::index::IndexBlob;
@@ -12,6 +12,7 @@ use kist_format::snapshot::{format_key_timestamp, format_rfc3339, Snapshot};
 use kist_format::tree::{Node, Tree};
 use kist_format::{cbor, keys, ObjectId};
 use serde::de::DeserializeOwned;
+use zeroize::Zeroizing;
 
 use crate::index::ChunkIndex;
 use crate::{blocking, CoreError, Result};
@@ -50,14 +51,26 @@ impl Repository {
     /// 建立新 repo：產生 master key、用密碼包起來、寫 `config`。已存在則拒絕。
     pub async fn init(backend: Backend, password: &[u8], opts: InitOptions) -> Result<Self> {
         let now = format_rfc3339(time::OffsetDateTime::now_utc())?;
-        let password = password.to_vec();
+        let repo_id = kist_crypto::random_bytes::<16>()?.to_vec();
+        let binding = KeyBinding {
+            repo_id: repo_id.clone(),
+            chunker: opts.chunker,
+        };
+        let password = Zeroizing::new(password.to_vec());
         let created = now.clone();
         let cost = opts.kdf_cost;
-        let (slot, master) =
-            blocking(move || Ok(create_key_slot(&password, "default", &created, cost)?)).await?;
-        let mut config = RepoConfig::new(kist_crypto::random_bytes::<16>().to_vec(), now, slot);
+        let (slot, master) = blocking(move || {
+            Ok(create_key_slot(
+                &password, "default", &created, cost, &binding,
+            )?)
+        })
+        .await?;
+        let mut config = RepoConfig::new(repo_id, now, slot);
         config.chunker = opts.chunker;
         config.pack_target_size = opts.pack_target_size;
+        config
+            .validate()
+            .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
 
         let bytes = cbor::encode(&config)?;
         match backend.put_if_absent(keys::CONFIG, bytes).await {
@@ -87,9 +100,17 @@ impl Repository {
             }
             .into());
         }
-        let password = password.to_vec();
+        // config 是明文：先確認參數合理，再用它們（綁在 AAD 裡）解 master key
+        config
+            .validate()
+            .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
+        let binding = KeyBinding {
+            repo_id: config.repo_id.clone(),
+            chunker: config.chunker,
+        };
+        let password = Zeroizing::new(password.to_vec());
         let slot = config.key.clone();
-        let master = blocking(move || Ok(unlock_key_slot(&password, &slot)?)).await?;
+        let master = blocking(move || Ok(unlock_key_slot(&password, &slot, &binding)?)).await?;
         Ok(Self {
             backend,
             config,

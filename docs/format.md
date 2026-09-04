@@ -42,7 +42,7 @@ CBOR 內兩者都是 32-byte 的 byte string（major type 2），不是整數陣
 
 ```
 password ─Argon2id(salt, m/t/p 來自 config)─▶ KEK (32B)
-KEK ─XChaCha20-Poly1305 解開 wrapped_master_key（AAD = "kist v1 master key"）─▶ master key (32B)
+KEK ─XChaCha20-Poly1305 解開 wrapped_master_key（AAD 見下）─▶ master key (32B)
 master key ─blake3::derive_key(context)─▶
     "kist v1 hash key"    → chunk ID 用的 keyed hash key
     "kist v1 chunk key"   → chunk 加密
@@ -50,8 +50,18 @@ master key ─blake3::derive_key(context)─▶
     "kist v1 nonce key"   → content-addressed 物件的決定性 nonce（§5.2）
 ```
 
+wrapped_master_key 的 AAD = `"kist v1 master key\0"` ‖ `repo_id`（16 bytes）‖
+`chunker.min` ‖ `chunker.avg` ‖ `chunker.max`（各 u32 little-endian）。
+`config` 是明文、沒有 MAC；把這些欄位綁進 AAD 之後，有人改了它們就會解不開 master key，
+而不是悄悄讓去重失效。只綁本來就不可變的欄位；`pack_target_size` 可調，不綁。
+
 Argon2id 參數存在 config 裡，開 repo 時**一律讀 config**，不寫死在程式裡；
-日後要調高只需改 `init` 的預設值，舊 repo 不受影響。
+日後要調高只需改 `init` 的預設值（目前 64 MiB / t=3 / p=1），舊 repo 不受影響。
+但明文參數不可信：讀取端對 m_cost（≤ 1 GiB）、t_cost、p_cost（≤ 64）、salt 長度（16）
+與 chunker / pack 參數（§7）都有範圍檢查，超出就拒絕，不會真的去配置記憶體。
+
+本機快取（M2）識別 repo 用的 ID 從 master key 派生（`derive_key("kist v1 cache id")`），
+不用明文的 `repo_id`。
 
 ## 4. CBOR 慣例
 
@@ -150,6 +160,13 @@ KeySlot {
 `config` 是唯一允許覆寫的物件（換密碼、調參數）。額外的 key slot 寫在 `keys/<id>`，
 只新增不修改。兩者都是明文 CBOR，裡面沒有祕密：master key 已被 KEK 包住，
 salt 與 KDF 參數本來就是公開的。
+
+參數範圍（讀取端強制）：`chunker.min` 64..=1 MiB、`avg` 256..=16 MiB、`max` 1 KiB..=64 MiB、
+min ≤ avg ≤ max；`pack_target_size` 64 KiB..=4 GiB 且 ≥ `chunker.max`；`repo_id` 16 bytes。
+
+因為 `config` 可覆寫，有 Put 權限的人可以把它蓋成垃圾讓所有人打不開 repo
+（資料本身仍在，只是需要備份的 config）。M2 的抗勒索設計要對 `config` 開 S3 versioning
+或 Object Lock，並建議使用者把 `config` 另存一份。
 
 ## 8. Tree
 

@@ -67,6 +67,7 @@ enum Command {
         /// Snapshot to restore: `latest`, a full id, or a unique timestamp prefix.
         snapshot: String,
         /// Directory to restore into (the original absolute paths are recreated beneath it).
+        /// Should be empty: existing files are overwritten and existing symlinks are followed.
         target: PathBuf,
     },
     /// Verify the repository's integrity.

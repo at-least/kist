@@ -22,6 +22,7 @@ fn key_slot_round_trip() {
         "default",
         "2026-01-01T00:00:00Z",
         fast_kdf(),
+        &binding(),
     )
     .unwrap();
     assert_eq!(slot.kdf.algorithm, "argon2id");
@@ -29,7 +30,7 @@ fn key_slot_round_trip() {
     assert_eq!(slot.wrapped_master_key.nonce.len(), 24);
     assert_eq!(slot.wrapped_master_key.ciphertext.len(), 32 + 16);
 
-    let unlocked = unlock_key_slot(PASSWORD.as_bytes(), &slot).unwrap();
+    let unlocked = unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).unwrap();
     assert_eq!(unlocked.as_bytes(), master.as_bytes());
 }
 
@@ -40,10 +41,11 @@ fn wrong_password_is_rejected() {
         "default",
         "2026-01-01T00:00:00Z",
         fast_kdf(),
+        &binding(),
     )
     .unwrap();
     assert!(matches!(
-        unlock_key_slot(b"wrong", &slot),
+        unlock_key_slot(b"wrong", &slot, &binding()),
         Err(CryptoError::WrongPassword)
     ));
 }
@@ -55,10 +57,11 @@ fn tampered_wrapped_key_is_rejected() {
         "default",
         "2026-01-01T00:00:00Z",
         fast_kdf(),
+        &binding(),
     )
     .unwrap();
     slot.wrapped_master_key.ciphertext[0] ^= 1;
-    assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot).is_err());
+    assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).is_err());
 }
 
 #[test]
@@ -68,11 +71,12 @@ fn unknown_kdf_is_rejected() {
         "default",
         "2026-01-01T00:00:00Z",
         fast_kdf(),
+        &binding(),
     )
     .unwrap();
     slot.kdf.algorithm = "scrypt".to_owned();
     assert!(matches!(
-        unlock_key_slot(PASSWORD.as_bytes(), &slot),
+        unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()),
         Err(CryptoError::UnsupportedKdf(_))
     ));
 }
@@ -80,15 +84,18 @@ fn unknown_kdf_is_rejected() {
 #[test]
 fn two_slots_wrap_the_same_master_key_differently() {
     // 同一個 master key 用兩組密碼各包一次：salt / nonce 不同，密文不同，但解出來一樣。
-    let (slot_a, master) = create_key_slot(b"a", "a", "t", fast_kdf()).unwrap();
-    let slot_b = kist_crypto::wrap_master_key(&master, b"b", "b", "t", fast_kdf()).unwrap();
+    let (slot_a, master) = create_key_slot(b"a", "a", "t", fast_kdf(), &binding()).unwrap();
+    let slot_b =
+        kist_crypto::wrap_master_key(&master, b"b", "b", "t", fast_kdf(), &binding()).unwrap();
     assert_ne!(slot_a.kdf.salt, slot_b.kdf.salt);
     assert_ne!(
         slot_a.wrapped_master_key.ciphertext,
         slot_b.wrapped_master_key.ciphertext
     );
     assert_eq!(
-        unlock_key_slot(b"b", &slot_b).unwrap().as_bytes(),
+        unlock_key_slot(b"b", &slot_b, &binding())
+            .unwrap()
+            .as_bytes(),
         master.as_bytes()
     );
 }
@@ -235,4 +242,71 @@ fn tree_nonce_is_derived_from_the_encrypted_body_not_the_plaintext() {
         plaintext
     );
     assert_eq!(keys.open_object(ObjectKind::Tree, &raw).unwrap(), plaintext);
+}
+
+fn binding() -> kist_crypto::KeyBinding {
+    kist_crypto::KeyBinding {
+        repo_id: vec![9; 16],
+        chunker: kist_format::config::ChunkerParams::default(),
+    }
+}
+
+#[test]
+fn key_slot_is_bound_to_repo_id_and_chunker_params() {
+    let (slot, _) = create_key_slot(PASSWORD.as_bytes(), "d", "t", fast_kdf(), &binding()).unwrap();
+    assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).is_ok());
+
+    let mut other_repo = binding();
+    other_repo.repo_id[0] ^= 1;
+    assert!(
+        matches!(
+            unlock_key_slot(PASSWORD.as_bytes(), &slot, &other_repo),
+            Err(CryptoError::WrongPassword)
+        ),
+        "repo_id 被改 → 解不開"
+    );
+
+    let mut other_chunker = binding();
+    other_chunker.chunker.avg += 1;
+    assert!(
+        unlock_key_slot(PASSWORD.as_bytes(), &slot, &other_chunker).is_err(),
+        "chunker 被改 → 解不開"
+    );
+}
+
+#[test]
+fn absurd_kdf_parameters_are_rejected_before_running_argon2() {
+    let (mut slot, _) =
+        create_key_slot(PASSWORD.as_bytes(), "d", "t", fast_kdf(), &binding()).unwrap();
+    slot.kdf.m_cost_kib = u32::MAX; // 4 TiB
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()),
+        Err(CryptoError::BadKdfParams(_))
+    ));
+    assert!(started.elapsed().as_secs() < 1, "不該真的去配置記憶體");
+    slot.kdf.m_cost_kib = 8;
+    slot.kdf.t_cost = u32::MAX;
+    assert!(matches!(
+        unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()),
+        Err(CryptoError::BadKdfParams(_))
+    ));
+}
+
+#[test]
+fn default_kdf_cost_is_above_owasp_floor() {
+    let c = kist_crypto::KdfCost::default();
+    assert!(c.m_cost_kib >= 64 * 1024 && c.t_cost >= 3, "{c:?}");
+}
+
+#[test]
+fn cache_id_is_derived_from_master_key() {
+    let a = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
+    let b = RepoKeys::from_master(&MasterKey::from_bytes([2; 32]));
+    assert_eq!(
+        a.cache_id(),
+        RepoKeys::from_master(&MasterKey::from_bytes([1; 32])).cache_id()
+    );
+    assert_ne!(a.cache_id(), b.cache_id());
+    assert_ne!(a.cache_id(), [0; 16]);
 }

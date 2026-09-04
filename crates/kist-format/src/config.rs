@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::FORMAT_VERSION;
+use crate::{FormatError, Result, FORMAT_VERSION};
 
 /// KDF 演算法名稱，寫進 config 讓未來可以換。
 pub const KDF_ARGON2ID: &str = "argon2id";
@@ -31,6 +31,10 @@ pub struct RepoConfig {
     pub key: KeySlot,
 }
 
+/// pack 目標大小的允許範圍。
+pub const MIN_PACK_TARGET_SIZE: u64 = 64 * 1024;
+pub const MAX_PACK_TARGET_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
 impl RepoConfig {
     pub fn new(repo_id: Vec<u8>, created: String, key: KeySlot) -> Self {
         Self {
@@ -42,6 +46,32 @@ impl RepoConfig {
             key,
         }
     }
+
+    /// config 是明文，讀進來的任何數字都不可信：使用前先確認在合理範圍內，
+    /// 否則荒謬的值會讓 chunker 越界或配置巨量記憶體。
+    pub fn validate(&self) -> Result<()> {
+        if self.repo_id.len() != 16 {
+            return Err(FormatError::InvalidParams(format!(
+                "repo_id must be 16 bytes, got {}",
+                self.repo_id.len()
+            )));
+        }
+        self.chunker.validate()?;
+        if self.pack_target_size < MIN_PACK_TARGET_SIZE
+            || self.pack_target_size > MAX_PACK_TARGET_SIZE
+        {
+            return Err(FormatError::InvalidParams(format!(
+                "pack_target_size {} is outside {MIN_PACK_TARGET_SIZE}..={MAX_PACK_TARGET_SIZE}",
+                self.pack_target_size
+            )));
+        }
+        if u64::from(self.chunker.max) > self.pack_target_size {
+            return Err(FormatError::InvalidParams(
+                "chunker.max must not exceed pack_target_size".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// FastCDC 參數（bytes）。
@@ -50,6 +80,32 @@ pub struct ChunkerParams {
     pub min: u32,
     pub avg: u32,
     pub max: u32,
+}
+
+impl ChunkerParams {
+    /// FastCDC 的硬性限制（它在 release build 不檢查，越界會 panic）再加上合理上限。
+    pub fn validate(&self) -> Result<()> {
+        let bad = |msg: String| Err(FormatError::InvalidParams(msg));
+        if self.min < 64 || self.min > 1024 * 1024 {
+            return bad(format!("chunker.min {} is outside 64..=1 MiB", self.min));
+        }
+        if self.avg < 256 || self.avg > 16 * 1024 * 1024 {
+            return bad(format!("chunker.avg {} is outside 256..=16 MiB", self.avg));
+        }
+        if self.max < 1024 || self.max > 64 * 1024 * 1024 {
+            return bad(format!(
+                "chunker.max {} is outside 1 KiB..=64 MiB",
+                self.max
+            ));
+        }
+        if !(self.min <= self.avg && self.avg <= self.max) {
+            return bad(format!(
+                "chunker sizes must satisfy min <= avg <= max, got {}/{}/{}",
+                self.min, self.avg, self.max
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ChunkerParams {

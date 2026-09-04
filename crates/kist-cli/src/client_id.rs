@@ -22,7 +22,7 @@ pub fn load_or_create(explicit: Option<&Path>) -> Result<[u8; 16]> {
             .map_err(|_| anyhow::anyhow!("client id file {} must hold 16 bytes", path.display()))?;
         return Ok(id);
     }
-    let id = kist_crypto::random_bytes::<16>();
+    let id = kist_crypto::random_bytes::<16>()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;

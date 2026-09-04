@@ -56,6 +56,8 @@ pub enum FormatError {
     BadName(String),
     #[error("invalid timestamp: {0}")]
     BadTimestamp(String),
+    #[error("invalid repository parameters: {0}")]
+    InvalidParams(String),
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;

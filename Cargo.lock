@@ -884,6 +884,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -904,6 +905,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "zeroize",
  "zstd",
 ]
 
@@ -914,8 +916,8 @@ dependencies = [
  "argon2",
  "blake3",
  "chacha20poly1305",
+ "getrandom 0.4.3",
  "kist-format",
- "rand 0.10.2",
  "thiserror",
  "zeroize",
  "zstd",

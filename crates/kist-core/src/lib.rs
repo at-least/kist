@@ -58,6 +58,8 @@ pub enum CoreError {
     BadFileName(PathBuf),
     #[error("background task failed: {0}")]
     Join(String),
+    #[error("invalid repository configuration: {0}")]
+    InvalidConfig(String),
     #[error(transparent)]
     Backend(#[from] kist_backend::BackendError),
     #[error(transparent)]
