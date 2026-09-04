@@ -306,6 +306,8 @@ MinIO 上這條全部跑過。AWS S3 的行為文件上相同，**UNVERIFIED**�
 | 時鐘偏差在容許值內會 hold | `TestPruneHoldsWithinTheClockSkew` |
 | backup 權限只能刪 `gc/*` | `TestS3BackupPolicy/can_revive_a_marked_pack_and_nothing_more` |
 | Object Lock 底下：回報、不計回收、index 不再指向、repo 仍健康 | `TestS3ObjectLockIsReportedNotFought` |
+| 小檔備份的每檔成本（chunker buffer 重用） | `BenchmarkBackupSmallFiles`、`TestResetChunksLikeAFreshChunker` |
+| SFTP 吞吐量是量過的數字 | `TestSFTPThroughput` |
 | parity 物件不變、edge size 都對 | `internal/parity/testdata/parity.txt`、`TestEncodeAndParseAtAwkwardSizes` |
 | ≤ M 個 shard 損壞（含 trailer、同 shard 兩處）修得回逐位元組相同；> M 不動 pack | `TestRepairsUpToMShards`、`TestRefusesMoreThanMErasures`、`TestCheckRepairsADamagedPackFromParity`、`TestCheckReportsWhatParityCannotRepair` |
 | 偽造的 parity 修不出錯的東西 | `TestForgedParityCannotRepairWrongly`、`TestCheckReportsWhatParityCannotRepair/forged_parity` |
