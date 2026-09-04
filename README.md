@@ -40,6 +40,7 @@ $ kist check --read-data
 | `kist prune` | 標記沒人引用的 pack，grace（預設 72h）之後的下一次刪掉 |
 | `kist rebuild-index` | 從 pack trailer 重建 index |
 | `kist run --config kist.toml [--once]` | 依設定檔的排程跑備份與維護工作 |
+| `kist mount <dir>` | 把所有 snapshot 掛成唯讀檔案系統（`<client>/<時間戳>/…`，Linux/macOS） |
 
 每個指令都接受 `--json`：stdout 只印一個 JSON 物件（`snapshots` 印一個陣列），警告與進度仍在 stderr，失敗仍以非零結束。
 

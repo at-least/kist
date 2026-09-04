@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"github.com/at-least/kist/internal/crypto"
-	"github.com/at-least/kist/internal/index"
-	"github.com/at-least/kist/internal/pack"
 	"github.com/at-least/kist/internal/snapshot"
 	"github.com/at-least/kist/internal/tree"
 )
@@ -66,10 +64,10 @@ func (r *Repository) Restore(ctx context.Context, key, target string, opts Resto
 	}
 
 	run := &restoreRun{
-		repo:    r,
-		opts:    opts,
-		readers: make(map[crypto.ID]*pack.Reader),
-		links:   make(map[hardLinkKey]string),
+		repo:   r,
+		opts:   opts,
+		chunks: r.NewChunkSource(),
+		links:  make(map[hardLinkKey]string),
 	}
 	if err := run.restoreTree(ctx, snap.Root, abs); err != nil {
 		return run.stats, err
@@ -81,10 +79,7 @@ type restoreRun struct {
 	repo *Repository
 	opts RestoreOptions
 
-	// readers caches one open pack reader per pack, so restoring a
-	// directory whose files interleave across packs does not re-fetch a
-	// trailer for every chunk.
-	readers map[crypto.ID]*pack.Reader
+	chunks *ChunkSource
 
 	// links maps an inode seen in the snapshot to the first path it was
 	// restored to, so the second name becomes a hard link rather than a
@@ -218,25 +213,7 @@ func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path s
 
 // chunk fetches one chunk, reusing an open pack reader when it can.
 func (run *restoreRun) chunk(ctx context.Context, id crypto.ID) ([]byte, error) {
-	loc, ok := run.repo.index.Lookup(id)
-	if !ok {
-		return nil, fmt.Errorf("chunk %s: %w", id, index.ErrNotFound)
-	}
-
-	reader, ok := run.readers[loc.Pack]
-	if !ok {
-		var err error
-		if reader, err = pack.OpenReader(ctx, run.repo.backend, run.repo.keys, loc.Pack); err != nil {
-			return nil, err
-		}
-		run.readers[loc.Pack] = reader
-	}
-
-	entry, ok := reader.Lookup(id)
-	if !ok {
-		return nil, fmt.Errorf("chunk %s: the index says pack %s, whose trailer does not list it", id, loc.Pack)
-	}
-	return reader.Chunk(ctx, entry)
+	return run.chunks.Chunk(ctx, id)
 }
 
 // applyMetadata restores mode, times and ownership, warning about what it

@@ -359,3 +359,4 @@ backup 開頭 =
 - [006 — S3 後端與無鎖並發](decisions/006-s3-backend.md)
 - [007 — 垃圾回收：標記、grace、登記與復活](decisions/007-garbage-collection.md)
 - [008 — SFTP 後端](decisions/008-sftp-backend.md)
+- [009 — mount：唯讀 FUSE](decisions/009-mount.md)

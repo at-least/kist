@@ -7,6 +7,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// platformCommands are registered by files with build constraints:
+// mount needs FUSE, which Windows does not have.
+var platformCommands []func() *cobra.Command
+
 // NewRootCommand builds the kist command tree. Tests use it to execute a
 // command with buffers attached instead of the process streams.
 func NewRootCommand() *cobra.Command {
@@ -33,6 +37,9 @@ func NewRootCommand() *cobra.Command {
 		newRebuildIndexCommand(),
 		newVersionCommand(),
 	)
+	for _, newCommand := range platformCommands {
+		root.AddCommand(newCommand())
+	}
 
 	return root
 }
