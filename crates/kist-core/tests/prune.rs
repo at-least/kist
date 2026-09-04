@@ -503,3 +503,99 @@ async fn duplicate_copies_are_reclaimed() {
     let out = t.dir.path().join("out");
     restore_matches(&fresh, &s2.snapshot_key, &src, &out).await;
 }
+
+/// reviewer 的第二個發現：兩個 prune 重疊（或 prune 途中 rebuild-index）會讓被刪掉的 pack 留在 index 裡
+/// （幽靈）。幽靈不能參加正本的選擇（否則真正的持有者會被當垃圾），下次重寫 index 時要丟掉。
+#[tokio::test]
+async fn phantom_packs_do_not_steal_canonical_from_real_holders() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_src(&src);
+    let repo = t.open().await;
+    let r = OffsetDateTime::now_utc();
+    repo.backup(std::slice::from_ref(&src), client(1, r))
+        .await
+        .unwrap();
+    let first = ids_under(&t, "packs");
+    // client 2 把同樣的資料再寫一份（假裝第一批被標記）
+    for id in &first {
+        let path = t.repo_path().join(keys::gc(id));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, keys::GC_MARK_MAGIC).unwrap();
+    }
+    let s2 = t
+        .open()
+        .await
+        .backup(
+            std::slice::from_ref(&src),
+            client(2, r + Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+    for id in &first {
+        std::fs::remove_file(t.repo_path().join(keys::gc(id))).unwrap();
+    }
+    // 製造幽靈：第一批 pack 從儲存消失，但 index 裡還在（= 另一個 prune 刪了它們、我們的 blob 沒被取代）
+    for id in &first {
+        std::fs::remove_file(t.repo_path().join(keys::pack(id))).unwrap();
+    }
+    let second: HashSet<ObjectId> = ids_under(&t, "packs");
+    assert!(second.is_disjoint(&first));
+
+    let p1 = repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
+    // 真正的持有者一個都不能被標記
+    let marked = ids_under(&t, "gc");
+    assert!(marked.is_disjoint(&second), "{p1:?} marked={marked:?}");
+    assert_eq!(p1.live_packs as usize, second.len(), "{p1:?}");
+    // index 已重寫，幽靈不在裡面
+    let fresh = t.open().await;
+    let index = fresh.load_index().await.unwrap();
+    for id in &first {
+        assert!(
+            !index.packs().any(|(p, _)| p == id),
+            "幽靈 {id} 還在 index 裡"
+        );
+    }
+    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let out = t.dir.path().join("out");
+    restore_matches(&fresh, &s2.snapshot_key, &src, &out).await;
+    // 之後收斂
+    repo.backup(std::slice::from_ref(&src), client(2, r + Duration::days(5)))
+        .await
+        .unwrap();
+    repo.backup(std::slice::from_ref(&src), client(1, r + Duration::days(5)))
+        .await
+        .unwrap();
+    let p2 = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
+    assert!(p2.skipped.is_empty(), "{p2:?}");
+    let report = t
+        .open()
+        .await
+        .check(CheckOptions { read_data: true })
+        .await
+        .unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+}
+
+/// 被引用的 chunk 只有幽靈持有（index 指到的 pack 不存在）：引用不完整，prune 必須拒絕。
+#[tokio::test]
+async fn refuses_when_a_referenced_chunk_is_only_in_a_missing_pack() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_src(&src);
+    let repo = t.open().await;
+    let r = OffsetDateTime::now_utc();
+    repo.backup(std::slice::from_ref(&src), client(1, r))
+        .await
+        .unwrap();
+    let victim = ids_under(&t, "packs").into_iter().next().unwrap();
+    std::fs::remove_file(t.repo_path().join(keys::pack(&victim))).unwrap();
+    let err = repo
+        .prune(prune_opts(r + Duration::days(4)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Unsafe(_)), "{err}");
+    assert!(ids_under(&t, "gc").is_empty());
+    assert_eq!(t.count("indexes"), 1);
+}

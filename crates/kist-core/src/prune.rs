@@ -25,6 +25,11 @@
 //! 拆成兩段：`prune_plan`（讀、走訪、決定）與 `PrunePlan::execute`（寫、刪）。競態測試用這個縫把
 //! backup 的 commit 插進去。
 //!
+//! 幽靈 pack：兩個 prune 重疊、或 prune 途中跑 rebuild-index 時，兩個新 index blob 的 `supersedes`
+//! 都只列自己開始時的 blob，結果兩個都有效、取聯集，被其中一個刪掉的 pack 還留在另一個 blob 裡。
+//! 這種「index 有、儲存沒有」的 pack **不參加正本的選擇**（否則它可能贏過真正的持有者，害後者被當垃圾），
+//! 下次重寫 index 時丟掉；被引用的 chunk 若只有幽靈持有 → 引用不完整，拒絕。
+//!
 //! 安全性依賴兩個假設（寫在 docs/format.md §11）：grace 長於最長的一次 backup；
 //! 同一個 client id 一次只跑一個 backup（CLI 用檔案鎖保證）。
 //! 引用不完整（有 snapshot / tree / index 讀不出來，或被引用的 chunk 不在 index 裡）時整個拒絕，不標也不刪。
@@ -127,6 +132,10 @@ pub struct PrunePlan {
     report: PruneReport,
     /// 有效 index 裡的每個 pack 與它的 entries。
     indexed: HashMap<ObjectId, IndexPack>,
+    /// index 裡有、儲存上沒有的 pack（見模組說明）：重寫 index 時丟掉。
+    phantoms: HashSet<ObjectId>,
+    /// plan 時已被標記的 pack：重寫 index 時排在後面。
+    marked_packs: HashSet<ObjectId>,
     /// 目前存在的所有 index blob（有效的與被取代的），新 blob 要 supersede 它們。
     all_blob_ids: Vec<ObjectId>,
     referenced: HashSet<ChunkId>,
@@ -194,10 +203,24 @@ impl Repository {
         let indexes_listed = self.list_ids(keys::INDEXES_PREFIX).await?;
         let marks = self.list_ids(keys::GC_PREFIX).await?;
 
-        // 4. 每個被引用 chunk 的正本 pack：沒被標記者優先，其次名稱小者
+        // 4. 每個被引用 chunk 的正本 pack：只在儲存上存在的 pack 裡選，沒被標記者優先，其次名稱小者
+        let phantoms: HashSet<ObjectId> = indexed
+            .keys()
+            .filter(|id| !packs_listed.contains_key(id))
+            .copied()
+            .collect();
+        if !phantoms.is_empty() {
+            tracing::warn!(
+                "{} pack(s) are in the index but not in storage; the index will be rewritten without them",
+                phantoms.len()
+            );
+        }
         let rank = |id: &ObjectId| (marks.contains_key(id), *id);
         let mut canonical: HashMap<ChunkId, ObjectId> = HashMap::new();
         for (pid, p) in &indexed {
+            if phantoms.contains(pid) {
+                continue;
+            }
             for e in &p.entries {
                 if !reach.referenced_chunks.contains(&e.id) {
                     continue;
@@ -209,6 +232,15 @@ impl Repository {
                     }
                 }
             }
+        }
+        if let Some(c) = reach
+            .referenced_chunks
+            .iter()
+            .find(|c| !canonical.contains_key(c))
+        {
+            return Err(CoreError::Unsafe(format!(
+                "chunk {c} is referenced but no existing pack holds it (the index lists a pack that is gone); run `kist check` and `kist rebuild-index` first"
+            )));
         }
         let needed_packs: HashSet<ObjectId> = canonical.values().copied().collect();
         // 每個 pack 的 (正本 bytes, 全部 bytes)
@@ -359,6 +391,12 @@ impl Repository {
             repo: self.clone(),
             dry_run: opts.dry_run,
             report,
+            marked_packs: marks
+                .keys()
+                .filter(|id| indexed.contains_key(id))
+                .copied()
+                .collect(),
+            phantoms,
             indexed,
             all_blob_ids,
             referenced: reach.referenced_chunks,
@@ -435,20 +473,24 @@ impl PrunePlan {
             .filter(|(t, _)| t.kind == Kind::Pack && self.indexed.contains_key(&t.id))
             .map(|(t, _)| t.id)
             .collect();
-        if !deleted_packs.is_empty() || !new_packs.is_empty() {
-            // 順序有意義：讀取端同一個 chunk 取第一個位置，所以新 pack 在前、被 repack 的舊 pack 在最後，
-            // 之後的 backup 才不會把 chunk 解析到被標記的 pack 而白白重傳
+        if !deleted_packs.is_empty() || !new_packs.is_empty() || !self.phantoms.is_empty() {
+            // 順序有意義：讀取端同一個 chunk 取第一個位置，所以新 pack 在前、被標記的（含被 repack 的舊 pack）
+            // 在最後，之後的 backup 才不會把 chunk 解析到被標記的 pack 而白白重傳。幽靈 pack 丟掉。
+            let dropped =
+                |p: &IndexPack| deleted_packs.contains(&p.pack) || self.phantoms.contains(&p.pack);
+            let marked_now =
+                |p: &IndexPack| repack_set.contains(&p.pack) || self.marked_packs.contains(&p.pack);
             let mut kept: Vec<IndexPack> = self
                 .indexed
                 .values()
-                .filter(|p| !deleted_packs.contains(&p.pack) && !repack_set.contains(&p.pack))
+                .filter(|p| !dropped(p) && !marked_now(p))
                 .cloned()
                 .collect();
             kept.sort_by_key(|p| p.pack);
             let mut old: Vec<IndexPack> = self
                 .indexed
                 .values()
-                .filter(|p| repack_set.contains(&p.pack))
+                .filter(|p| !dropped(p) && marked_now(p))
                 .cloned()
                 .collect();
             old.sort_by_key(|p| p.pack);

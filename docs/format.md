@@ -301,8 +301,11 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
   「活躍 client 在標記後有新 snapshot」這條保護假設每台 client 的 backup 一個接一個。
 - 一台 client 的 snapshot 全被 forget 之後，它就是 inactive；新機器第一次備份也是。它們的
   backup 靠 11.4 的 commit 檢查保護。
-- `rebuild-index` 與 `prune` 不要同時跑：重建出來的 blob 可能把正被刪的 pack 加回 index，
-  之後的 backup 會在 commit 時失敗（安全），需要再 rebuild 一次。
+- 兩個 prune 重疊、或 prune 途中跑 `rebuild-index`：兩個新 index blob 的 `supersedes` 都只列自己
+  開始時的 blob，結果兩個都有效、取聯集，被其中一個刪掉的 pack 還留在另一個 blob 裡（「幽靈」）。
+  prune 對幽靈的處理：不參加正本的選擇（否則可能贏過真正的持有者，害後者被當垃圾）、下次重寫 index 時丟掉；
+  被引用的 chunk 若只有幽靈持有 → 引用不完整、拒絕。所以重疊是安全的，代價是多一輪 index 重寫。
+  仍然建議一個 repo 只排程一個 prune。
 - bucket 開 versioning 時，prune 刪掉的只是目前版本；要真的釋放空間需要 lifecycle 規則清掉
   noncurrent 版本。Object Lock 保護中的物件刪不掉，prune 會回報並保留標記。
 - 後端必須支援條件寫入（S3 的 `If-None-Match: *`；本機用 `O_EXCL`）：snapshot 與 gc 標記都靠它。
