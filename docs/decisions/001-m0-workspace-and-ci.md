@@ -75,5 +75,5 @@ GitHub Actions 在 ubuntu / macOS / Windows 各跑一次 `cargo fmt --check`、
 ## 影響
 
 - 之後每加一個命令，就先加一個像 `version.rs` 這樣的行為測試。
-- 授權（LICENSE）還沒決定，`deny.toml` 暫時以 `private = { ignore = true }`
-  跳過自家 crate；選定授權後要拿掉這行並補上 LICENSE 檔。
+- 授權採 `MIT OR Apache-2.0`（Rust 生態的慣例雙授權，使用者可任選一邊），
+  已補上 `LICENSE-MIT` / `LICENSE-APACHE`，`deny.toml` 也不再跳過自家 crate。

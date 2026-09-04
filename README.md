@@ -47,3 +47,8 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 | `cargo build --release` | 3.5 s |
 
 CI 上的時間會比較長（要下載相依套件），`Swatinem/rust-cache` 負責跨次數快取。
+
+## 授權
+
+MIT OR Apache-2.0（你可以任選其一）。見 [LICENSE-MIT](LICENSE-MIT) 與
+[LICENSE-APACHE](LICENSE-APACHE)。
