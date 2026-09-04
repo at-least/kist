@@ -167,6 +167,9 @@ salt 與 KDF 參數本來就是公開的。
 參數範圍（讀取端強制）：`chunker.min` 64..=1 MiB、`avg` 256..=16 MiB、`max` 1 KiB..=64 MiB、
 min ≤ avg ≤ max；`pack_target_size` 64 KiB..=4 GiB 且 ≥ `chunker.max`；`repo_id` 16 bytes。
 
+backup 帳號需要的最小權限是 `PutObject` + `GetObject` + `ListBucket`，**不需要 `DeleteObject`**
+（開 repo 要讀 `config` 與 index，所以字面上的「只有 Put」做不到；抗勒索的重點是拿不到刪除權）。
+
 因為 `config` 可覆寫，有 Put 權限的人可以把它蓋成垃圾讓所有人打不開 repo
 （資料本身仍在，只是需要備份的 config）。M2 的抗勒索設計要對 `config` 開 S3 versioning
 或 Object Lock，並建議使用者把 `config` 另存一份。

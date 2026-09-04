@@ -2,9 +2,10 @@
 
 去重、加密、可多台機器共用 repo 的備份工具（Rust）。
 
-> 目前狀態：**M1 完成** —— 本機 repo 的 `init` / `backup` / `snapshots` / `restore` / `check`
-> 可用，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
-> S3 後端、GC、排程等在後續里程碑。**尚未達到可日常使用的階段。**
+> 目前狀態：**M2 完成** —— 本機與 S3（含 MinIO）repo 的 `init` / `backup` / `snapshots` /
+> `restore` / `check` / `rebuild-index` 可用，多台機器可同時備份到同一個 repo，
+> on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
+> GC（`forget` / `prune`）在 M3；**在那之前不會自動釋放空間，也還不建議日常使用。**
 
 ## 建置
 
@@ -25,7 +26,14 @@ kist snapshots                          # 列出 snapshot
 kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路徑>
 kist check                              # 檢查一致性（不下載資料）
 kist check --read-data                  # 下載並驗證每個 chunk
+kist rebuild-index                      # index 物件遺失或損壞時，從 pack 重建
 ```
+
+結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）或還原失敗（restore）——snapshot 已寫出，
+請看警告。
+
+本地 index 快取放在使用者快取目錄（Linux：`~/.cache/kist/`），可用 `--cache-dir` /
+`KIST_CACHE_DIR` 指定、`--no-cache` 關閉。`check` 永遠不用快取。
 
 ### S3 / MinIO
 
