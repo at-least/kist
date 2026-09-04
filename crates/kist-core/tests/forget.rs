@@ -102,6 +102,8 @@ fn client(id: u8) -> BackupOptions {
         client_id: [id; 16],
         hostname: format!("host{id}"),
         username: "tester".to_owned(),
+        now: None,
+        gc_grace: kist_core::DEFAULT_GC_GRACE,
     }
 }
 

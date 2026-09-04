@@ -51,12 +51,24 @@ async fn prefix_is_applied_and_basic_ops_work() {
     assert_eq!(b.get("config").await.unwrap(), vec![1, 2, 3]);
     assert_eq!(b.get_range("packs/aa", 10..20).await.unwrap(), vec![9; 10]);
     assert_eq!(b.size("packs/aa").await.unwrap(), 100);
-    let mut listed = b.list("packs").await.unwrap();
-    listed.sort();
+    let listed: Vec<(String, u64)> = b
+        .list("packs")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| (o.key, o.size))
+        .collect();
     assert_eq!(
         listed,
         vec![("packs/aa".to_owned(), 100)],
         "list 回傳的 key 不含 prefix"
+    );
+    let head = b.head("packs/aa").await.unwrap();
+    let age = time::OffsetDateTime::now_utc() - head.modified;
+    assert!(
+        age.abs() < time::Duration::minutes(5),
+        "S3 modified {} 太離譜",
+        head.modified
     );
     assert!(matches!(
         b.get("nope").await,

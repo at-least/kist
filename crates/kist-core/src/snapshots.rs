@@ -41,7 +41,7 @@ impl Repository {
             .list(keys::SNAPSHOTS_PREFIX)
             .await?
             .into_iter()
-            .map(|(k, _)| k)
+            .map(|o| o.key)
             .collect();
         keys.sort_by(|a, b| timestamp_of(a).cmp(timestamp_of(b)).then_with(|| a.cmp(b)));
         Ok(keys)

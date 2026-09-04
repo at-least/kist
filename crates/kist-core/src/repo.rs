@@ -18,6 +18,16 @@ use zeroize::Zeroizing;
 use crate::index::ChunkIndex;
 use crate::{blocking, CoreError, Result};
 
+/// repo 裡目前所有 index blob 的原貌：prune 需要看每個 pack 完整的 entries（而不是
+/// `ChunkIndex` 每個 chunk 只記一個位置），才能判斷重複 chunk 所在的每個 pack 都活著。
+#[derive(Debug, Clone, Default)]
+pub struct IndexBlobs {
+    /// 未被取代的 blob。
+    pub effective: Vec<(ObjectId, IndexBlob)>,
+    /// 存在但被取代的 blob（GC 的候選）。
+    pub superseded: Vec<ObjectId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InitOptions {
     pub chunker: ChunkerParams,
@@ -247,8 +257,8 @@ impl Repository {
     pub async fn load_index(&self) -> Result<ChunkIndex> {
         if let Some(cache) = &self.cache {
             let mut live = Vec::new();
-            for (key, _) in self.backend.list(keys::INDEXES_PREFIX).await? {
-                live.push(keys::object_id_from_key(&key)?);
+            for o in self.backend.list(keys::INDEXES_PREFIX).await? {
+                live.push(keys::object_id_from_key(&o.key)?);
             }
             live.sort();
             return cache
@@ -273,35 +283,47 @@ impl Repository {
         Ok(index)
     }
 
-    /// 讀進所有 index blob，壞掉的記在 `errors` 裡繼續。
-    /// 被其他 blob 的 `supersedes` 列到的 blob 整個忽略（repack 之後新舊並存時以新的為準）。
-    pub(crate) async fn load_index_lenient(
-        &self,
-        errors: &mut Vec<CoreError>,
-    ) -> Result<ChunkIndex> {
-        let mut blobs = Vec::new();
-        for (key, _) in self.backend.list(keys::INDEXES_PREFIX).await? {
-            let id = match keys::object_id_from_key(&key) {
+    /// 讀進所有 index blob（不用快取），壞掉的記在 `errors` 裡繼續。
+    /// 回傳的 `effective` 已排除被 `supersedes` 列到的 blob。
+    pub async fn load_index_blobs(&self, errors: &mut Vec<CoreError>) -> Result<IndexBlobs> {
+        let mut all = Vec::new();
+        for o in self.backend.list(keys::INDEXES_PREFIX).await? {
+            let id = match keys::object_id_from_key(&o.key) {
                 Ok(id) => id,
                 Err(e) => {
                     errors.push(e.into());
                     continue;
                 }
             };
-            match self.read_object::<IndexBlob>(ObjectKind::Index, &key).await {
-                Ok(blob) => blobs.push((id, blob)),
+            match self
+                .read_object::<IndexBlob>(ObjectKind::Index, &o.key)
+                .await
+            {
+                Ok(blob) => all.push((id, blob)),
                 Err(e) => errors.push(e),
             }
         }
-        let superseded: HashSet<ObjectId> = blobs
+        let superseded: HashSet<ObjectId> = all
             .iter()
             .flat_map(|(_, b)| b.supersedes.iter().copied())
             .collect();
+        let (dropped, effective): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|(id, _)| superseded.contains(id));
+        Ok(IndexBlobs {
+            effective,
+            superseded: dropped.into_iter().map(|(id, _)| id).collect(),
+        })
+    }
+
+    /// 讀進所有 index blob 合成一個 `ChunkIndex`，壞掉的記在 `errors` 裡繼續。
+    /// 被其他 blob 的 `supersedes` 列到的 blob 整個忽略（repack 之後新舊並存時以新的為準）。
+    pub(crate) async fn load_index_lenient(
+        &self,
+        errors: &mut Vec<CoreError>,
+    ) -> Result<ChunkIndex> {
+        let blobs = self.load_index_blobs(errors).await?;
         let mut index = ChunkIndex::new();
-        for (id, blob) in &blobs {
-            if superseded.contains(id) {
-                continue;
-            }
+        for (_, blob) in &blobs.effective {
             for pack in &blob.packs {
                 index.add_pack(pack);
             }

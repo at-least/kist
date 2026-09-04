@@ -21,12 +21,13 @@ pub mod forget;
 pub mod fsmeta;
 pub mod index;
 pub mod pack;
+pub mod reach;
 pub mod rebuild;
 pub mod repo;
 pub mod restore;
 pub mod snapshots;
 
-pub use backup::{BackupOptions, BackupSummary};
+pub use backup::{BackupOptions, BackupSummary, PreparedBackup, DEFAULT_GC_GRACE};
 pub use check::{CheckOptions, CheckReport};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
@@ -51,6 +52,12 @@ pub enum CoreError {
     AmbiguousSnapshot(String, usize),
     #[error("chunk {0} is referenced but missing from the index")]
     ChunkMissing(ChunkId),
+    /// backup 引用到的 pack 在 commit 前消失（或它的 GC 標記已超過 grace）：不寫 snapshot。
+    #[error("pack {pack} referenced by this backup is gone or about to be deleted{}; rerun the backup", chunk.map(|c| format!(" (chunk {c})")).unwrap_or_default())]
+    PackMissing {
+        pack: kist_format::ObjectId,
+        chunk: Option<ChunkId>,
+    },
     #[error("object {key} is corrupt: {reason}")]
     Corrupt { key: String, reason: String },
     #[error("{path}: {source}")]

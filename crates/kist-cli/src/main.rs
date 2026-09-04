@@ -83,6 +83,10 @@ enum Command {
         /// File holding this machine's client id (created on first use).
         #[arg(long, env = "KIST_CLIENT_ID_FILE")]
         client_id_file: Option<PathBuf>,
+        /// Packs marked for deletion longer ago than this are treated as already gone.
+        /// Must match the `--grace` used by `prune`.
+        #[arg(long, value_name = "DURATION", default_value = "72h", value_parser = parse_duration)]
+        gc_grace: std::time::Duration,
     },
     /// List snapshots.
     Snapshots {
@@ -200,6 +204,7 @@ async fn run(cli: Cli) -> Result<()> {
             repo,
             paths,
             client_id_file,
+            gc_grace,
         } => {
             let r = open_repo(&repo).await?;
             let client_id = client_id::load_or_create(client_id_file.as_deref())?;
@@ -207,6 +212,8 @@ async fn run(cli: Cli) -> Result<()> {
                 client_id,
                 hostname: hostname(),
                 username: username(),
+                now: None,
+                gc_grace,
             };
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;

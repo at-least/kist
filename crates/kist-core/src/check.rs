@@ -12,10 +12,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use kist_format::tree::{Content, NodeKind};
 use kist_format::{keys, ChunkId, ObjectId};
 
-use crate::index::{ChunkIndex, ChunkLocation};
+use crate::index::ChunkLocation;
 use crate::pack::{decode_chunk, read_trailer};
 use crate::repo::Repository;
 use crate::{blocking, Result};
@@ -59,6 +58,7 @@ impl Repository {
             .list(keys::PACKS_PREFIX)
             .await?
             .into_iter()
+            .map(|o| (o.key, o.size))
             .collect();
         let mut indexed_packs = HashSet::new();
         for (id, size) in index.packs() {
@@ -81,27 +81,39 @@ impl Repository {
             }
         }
 
-        // 3. snapshots → trees → chunks
-        let mut visited_trees = HashSet::new();
-        for key in self.list_snapshot_keys().await? {
-            report.snapshots += 1;
-            let snapshot = match self.read_snapshot(&key).await {
-                Ok(s) => s,
-                Err(e) => {
-                    report.errors.push(format!("{key}: {e}"));
-                    continue;
+        // 3. snapshots → trees → chunks（走訪與 prune 共用；這裡另外驗每個檔案）
+        let mut file_errors = Vec::new();
+        let reach = self
+            .walk_references(&index, &mut |f| {
+                let mut sum = 0u64;
+                let mut complete = true;
+                for c in f.data_chunks {
+                    match index.get(c) {
+                        Some(loc) => sum = sum.saturating_add(loc.raw_len),
+                        None => {
+                            complete = false;
+                            file_errors.push(format!(
+                                "{}: chunk {c} is missing from the index",
+                                f.tree_key
+                            ));
+                        }
+                    }
                 }
-            };
-            self.check_tree(
-                &snapshot.root,
-                &key,
-                &index,
-                &mut visited_trees,
-                &mut report,
-            )
-            .await;
-        }
-        report.trees = visited_trees.len() as u64;
+                // 不讀資料也能抓到 size 與 chunk 總長不符（例如備份中變動的檔）
+                if complete && sum != f.size {
+                    file_errors.push(format!(
+                        "{}: file {:?} says {} bytes but its chunks total {sum}",
+                        f.tree_key,
+                        String::from_utf8_lossy(&f.node.name),
+                        f.size
+                    ));
+                }
+            })
+            .await?;
+        report.snapshots = self.list_snapshot_keys().await?.len() as u64;
+        report.errors.extend(reach.errors);
+        report.errors.extend(file_errors);
+        report.trees = reach.live_trees.len() as u64;
 
         // 4. 讀資料
         if opts.read_data {
@@ -120,82 +132,6 @@ impl Repository {
             }
         }
         Ok(report)
-    }
-
-    fn check_tree<'a>(
-        &'a self,
-        id: &'a ObjectId,
-        context: &'a str,
-        index: &'a ChunkIndex,
-        visited: &'a mut HashSet<ObjectId>,
-        report: &'a mut CheckReport,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
-        Box::pin(async move {
-            if !visited.insert(*id) {
-                return;
-            }
-            let key = keys::tree(id);
-            let tree = match self.read_tree(id).await {
-                Ok(t) => t,
-                Err(e) => {
-                    report.errors.push(format!("{key} (from {context}): {e}"));
-                    return;
-                }
-            };
-            if let Some(prev) = tree.prev {
-                self.check_tree(&prev, context, index, visited, report)
-                    .await;
-            }
-            for node in &tree.nodes {
-                match &node.kind {
-                    NodeKind::Dir { subtree } => {
-                        self.check_tree(subtree, context, index, visited, report)
-                            .await;
-                    }
-                    NodeKind::File { size, content } => {
-                        let ids = match content {
-                            Content::Direct { chunks } => chunks.clone(),
-                            Content::Indirect { chunks } => {
-                                if let Some(missing) = chunks.iter().find(|c| !index.contains(c)) {
-                                    report.errors.push(format!(
-                                        "{key}: chunk list chunk {missing} is missing from the index"
-                                    ));
-                                    continue;
-                                }
-                                match self.resolve_content(content, index).await {
-                                    Ok(ids) => ids,
-                                    Err(e) => {
-                                        report.errors.push(format!("{key}: chunk list: {e}"));
-                                        continue;
-                                    }
-                                }
-                            }
-                        };
-                        let mut sum = 0u64;
-                        let mut complete = true;
-                        for c in ids {
-                            match index.get(&c) {
-                                Some(loc) => sum = sum.saturating_add(loc.raw_len),
-                                None => {
-                                    complete = false;
-                                    report.errors.push(format!(
-                                        "{key}: chunk {c} is missing from the index"
-                                    ));
-                                }
-                            }
-                        }
-                        // 不讀資料也能抓到 size 與 chunk 總長不符（例如備份中變動的檔）
-                        if complete && sum != *size {
-                            report.errors.push(format!(
-                                "{key}: file {:?} says {size} bytes but its chunks total {sum}",
-                                String::from_utf8_lossy(&node.name)
-                            ));
-                        }
-                    }
-                    NodeKind::Symlink { .. } => {}
-                }
-            }
-        })
     }
 
     /// 下載整個 pack：名稱 = hash(bytes)、trailer 解得開、trailer 與 index 一致、每個 chunk 解得開且 ID 相符。

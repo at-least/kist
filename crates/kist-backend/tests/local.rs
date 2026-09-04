@@ -21,11 +21,33 @@ async fn put_get_head_list_round_trip() {
     assert!(b.exists("packs/aa").await.unwrap());
     assert!(!b.exists("packs/zz").await.unwrap());
 
-    let mut listed = b.list("packs").await.unwrap();
+    let mut listed: Vec<(String, u64)> = b
+        .list("packs")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| (o.key, o.size))
+        .collect();
     listed.sort();
     assert_eq!(
         listed,
         vec![("packs/aa".to_owned(), 5), ("packs/bb".to_owned(), 1)]
+    );
+    // list 與 head 的 modified 一致，而且是最近的時間
+    let head = b.head("packs/aa").await.unwrap();
+    let from_list = b
+        .list("packs")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|o| o.key == "packs/aa")
+        .unwrap();
+    assert_eq!(head.modified, from_list.modified);
+    let age = time::OffsetDateTime::now_utc() - head.modified;
+    assert!(
+        age.abs() < time::Duration::minutes(5),
+        "modified {} 太離譜",
+        head.modified
     );
     assert!(b.list("nothing").await.unwrap().is_empty());
 }

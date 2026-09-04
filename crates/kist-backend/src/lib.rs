@@ -44,6 +44,32 @@ pub enum BackendError {
     },
     #[error("storage error: {0}")]
     Store(#[from] object_store::Error),
+    #[error("object {0} has an unrepresentable timestamp")]
+    BadTimestamp(String),
+}
+
+/// list / head 回傳的物件資訊。`modified` 是後端記的最後修改時間
+/// （本機 = 檔案 mtime；S3 = LastModified），GC 用它判斷物件夠不夠「老」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub key: String,
+    pub size: u64,
+    pub modified: time::OffsetDateTime,
+}
+
+impl ObjectInfo {
+    fn from_meta(m: object_store::ObjectMeta) -> Result<Self> {
+        let key = m.location.to_string();
+        let nanos = i128::from(m.last_modified.timestamp()) * 1_000_000_000
+            + i128::from(m.last_modified.timestamp_subsec_nanos());
+        let modified = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+            .map_err(|_| BackendError::BadTimestamp(key.clone()))?;
+        Ok(Self {
+            key,
+            size: m.size,
+            modified,
+        })
+    }
 }
 
 pub type Result<T> = std::result::Result<T, BackendError>;
@@ -227,14 +253,19 @@ impl Backend {
         Ok(bytes.to_vec())
     }
 
-    /// 物件大小（bytes）。
-    pub async fn size(&self, key: &str) -> Result<u64> {
+    /// 物件的大小與最後修改時間（HEAD）。
+    pub async fn head(&self, key: &str) -> Result<ObjectInfo> {
         let meta = self
             .store
             .head(&Self::path(key)?)
             .await
             .map_err(|e| Self::map_err(key, e))?;
-        Ok(meta.size)
+        ObjectInfo::from_meta(meta)
+    }
+
+    /// 物件大小（bytes）。
+    pub async fn size(&self, key: &str) -> Result<u64> {
+        Ok(self.head(key).await?.size)
     }
 
     pub async fn exists(&self, key: &str) -> Result<bool> {
@@ -245,14 +276,11 @@ impl Backend {
         }
     }
 
-    /// 列出某個 prefix 底下的所有 (key, size)。順序不保證。
-    pub async fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+    /// 列出某個 prefix 底下的所有物件。順序不保證。
+    pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
         let prefix = Self::path(prefix)?;
         let items: Vec<_> = self.store.list(Some(&prefix)).try_collect().await?;
-        Ok(items
-            .into_iter()
-            .map(|m| (m.location.to_string(), m.size))
-            .collect())
+        items.into_iter().map(ObjectInfo::from_meta).collect()
     }
 
     /// 刪除。只有 maintenance 操作會用。

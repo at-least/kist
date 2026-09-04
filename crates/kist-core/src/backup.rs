@@ -7,7 +7,15 @@
 //! 3. 依名稱排序遞迴走訪。檔案在 blocking thread 裡串流切塊、算 ID、對 index 去重、
 //!    新 chunk 壓縮加密進 pack；pack 滿了就交回 async 端上傳（最多 2 個同時在飛）。
 //! 4. 每個目錄結束時封成 tree（決定性加密）並上傳（冪等，見 `write_tree`）。
-//! 5. 全部結束：flush 最後一個 pack、等上傳完成、寫 index blob、最後寫 snapshot。
+//! 5. 全部結束：flush 最後一個 pack、等上傳完成、寫 index blob（到這裡是 `backup_prepare`）。
+//! 6. `commit`：確認引用到的每個 pack 都還在，然後寫 snapshot。
+//!
+//! 面對 GC（M3，見 `docs/format.md` §11）：
+//! - 開始時列 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。backup 因此不需要
+//!   刪標記（維持 Put-only），prune 第二階段看到新 snapshot 引用會自己撤銷標記。
+//! - commit 前對引用到的每個 pack 做 HEAD；不見了（或標記已超過 grace、隨時會被刪）就重新載入
+//!   index 找同一個 chunk 的其他副本；找不到就失敗、不寫 snapshot。這把「backup 跑得比 grace 還久」
+//!   從悄悄留下壞 snapshot 變成安全失敗。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -35,11 +43,18 @@ use crate::{blocking, CoreError, Result};
 /// 同時在上傳中的 pack 上限（每個最多 pack_target_size bytes 的記憶體）。
 const MAX_INFLIGHT_UPLOADS: usize = 2;
 
+/// GC 標記到真正刪除之間的最短時間（與 `prune` 的預設一致）。
+pub const DEFAULT_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
+
 #[derive(Debug, Clone)]
 pub struct BackupOptions {
     pub client_id: [u8; 16],
     pub hostname: String,
     pub username: String,
+    /// snapshot 的時間（= backup 開始時間）；`None` = 現在。測試用。
+    pub now: Option<time::OffsetDateTime>,
+    /// 標記超過這麼久的 pack 視同已刪（commit 前的驗證）。必須與 prune 用的一致。
+    pub gc_grace: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +81,8 @@ struct ChunkState<R: std::io::Read> {
     bytes_total: u64,
     bytes_new: u64,
     chunks_new: u64,
+    /// 這輪沿用的既有 chunk 與它們所在的 pack。
+    reused: Vec<(ChunkId, ObjectId)>,
 }
 
 struct Backup {
@@ -82,12 +99,144 @@ struct Backup {
     stats: SnapshotStats,
     /// parent snapshot 的開始時間（Unix 秒、奈秒）；沒有 parent 時快速路徑不會用到。
     parent_start: (i64, u32),
+    /// backup 開始時已被 GC 標記的 pack：不拿來去重。
+    marked: Arc<HashSet<ObjectId>>,
+    /// 這次沿用的既有 chunk 各自在哪個 pack（commit 前要驗這些 pack 還在）。
+    referenced: HashMap<ObjectId, Vec<ChunkId>>,
+}
+
+/// 除了 snapshot 之外全部寫完的 backup：`commit` 驗證引用的 pack 後寫 snapshot。
+/// 拆成兩步是為了讓競態測試能在中間插入 prune。
+pub struct PreparedBackup {
+    repo: Repository,
+    opts: BackupOptions,
+    started: time::OffsetDateTime,
+    paths: Vec<Vec<u8>>,
+    root: ObjectId,
+    parent_key: Option<String>,
+    stats: SnapshotStats,
+    /// 引用到的 pack → 其中被引用的 chunk（這次新寫的 pack 也在內）。
+    referenced: HashMap<ObjectId, Vec<ChunkId>>,
+}
+
+impl PreparedBackup {
+    pub fn stats(&self) -> &SnapshotStats {
+        &self.stats
+    }
+
+    /// 驗證引用到的每個 pack 都還在，然後寫 snapshot。
+    pub async fn commit(self) -> Result<BackupSummary> {
+        self.repo
+            .verify_referenced_packs(&self.referenced, self.opts.gc_grace)
+            .await?;
+        let snapshot_key = self
+            .repo
+            .commit_snapshot(
+                &self.opts,
+                self.started,
+                self.paths,
+                self.root,
+                self.parent_key.clone(),
+                self.stats,
+            )
+            .await?;
+        Ok(BackupSummary {
+            snapshot_key,
+            parent: self.parent_key,
+            root: self.root,
+            stats: self.stats,
+        })
+    }
 }
 
 impl Repository {
+    /// 完整的 backup：`backup_prepare` + `commit`。
     pub async fn backup(&self, paths: &[PathBuf], opts: BackupOptions) -> Result<BackupSummary> {
+        self.backup_prepare(paths, opts).await?.commit().await
+    }
+
+    /// 目前 `gc/` 底下的標記：被標記的物件 → 標記的修改時間。
+    pub(crate) async fn list_gc_marks(&self) -> Result<HashMap<ObjectId, time::OffsetDateTime>> {
+        let mut out = HashMap::new();
+        for o in self.backend().list(keys::GC_PREFIX).await? {
+            match keys::object_id_from_key(&o.key) {
+                Ok(id) => {
+                    out.insert(id, o.modified);
+                }
+                Err(e) => tracing::warn!("{}: ignoring odd gc marker: {e}", o.key),
+            }
+        }
+        Ok(out)
+    }
+
+    /// commit 前：引用到的每個 pack 都要存在，且沒有超過 grace 的 GC 標記。
+    /// 不符合的 pack 重新載入 index，看它的每個 chunk 在別的 pack 有沒有副本。
+    async fn verify_referenced_packs(
+        &self,
+        referenced: &HashMap<ObjectId, Vec<ChunkId>>,
+        grace: std::time::Duration,
+    ) -> Result<()> {
+        let marks = self.list_gc_marks().await?;
+        let now = time::OffsetDateTime::now_utc();
+        let expired = |pack: &ObjectId| marks.get(pack).is_some_and(|m| *m + grace <= now);
+        let mut suspects = Vec::new();
+        for pack in referenced.keys() {
+            let exists = self.backend().exists(&keys::pack(pack)).await?;
+            if !exists || expired(pack) {
+                suspects.push(*pack);
+            }
+        }
+        if suspects.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            "{} referenced pack(s) vanished or are about to be deleted; reloading the index",
+            suspects.len()
+        );
+        let fresh = self.load_index().await?;
+        let mut checked: HashMap<ObjectId, bool> = HashMap::new();
+        for pack in suspects {
+            for chunk in referenced.get(&pack).into_iter().flatten() {
+                let Some(loc) = fresh.get(chunk) else {
+                    return Err(CoreError::PackMissing {
+                        pack,
+                        chunk: Some(*chunk),
+                    });
+                };
+                if loc.pack == pack {
+                    return Err(CoreError::PackMissing {
+                        pack,
+                        chunk: Some(*chunk),
+                    });
+                }
+                let ok = match checked.get(&loc.pack) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = !expired(&loc.pack)
+                            && self.backend().exists(&keys::pack(&loc.pack)).await?;
+                        checked.insert(loc.pack, ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    return Err(CoreError::PackMissing {
+                        pack: loc.pack,
+                        chunk: Some(*chunk),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 除了 snapshot 以外全部寫完。
+    pub async fn backup_prepare(
+        &self,
+        paths: &[PathBuf],
+        opts: BackupOptions,
+    ) -> Result<PreparedBackup> {
         // snapshot 的時間 = 開始時間：任何在這之後改動的檔案，下一次都必須重讀
-        let started = time::OffsetDateTime::now_utc();
+        let started = opts.now.unwrap_or_else(time::OffsetDateTime::now_utc);
         let mut abs_paths = Vec::new();
         for p in paths {
             let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
@@ -115,6 +264,13 @@ impl Repository {
         let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = kept.into_iter().unzip();
 
         let index = self.load_index().await?;
+        let marked: HashSet<ObjectId> = self.list_gc_marks().await?.into_keys().collect();
+        if !marked.is_empty() {
+            tracing::info!(
+                "{} pack(s) are marked for deletion and will not be used for deduplication",
+                marked.len()
+            );
+        }
 
         let parent = self.find_parent(&opts.client_id, &path_bytes).await?;
         let parent_nodes = match &parent {
@@ -141,6 +297,8 @@ impl Repository {
             uploads: JoinSet::new(),
             stats: SnapshotStats::default(),
             parent_start,
+            marked: Arc::new(marked),
+            referenced: HashMap::new(),
         };
 
         // 根 tree：每個來源路徑一個節點，名稱是絕對路徑。
@@ -160,23 +318,27 @@ impl Repository {
         b.flush_pack().await?;
         b.wait_uploads(0).await?;
 
-        // index blob（只包含這次新寫的 pack）
+        // index blob（只包含這次新寫的 pack）；這些 pack 也列入 commit 前要驗的清單
         if !b.new_packs.is_empty() {
             let packs = std::mem::take(&mut b.new_packs);
+            for p in &packs {
+                b.referenced
+                    .entry(p.pack)
+                    .or_default()
+                    .extend(p.entries.iter().map(|e| e.id));
+            }
             self.write_index(IndexBlob::new(packs)).await?;
         }
 
-        // snapshot（commit point）
-        let parent_key = parent.as_ref().map(|(k, _)| k.clone());
-        let stats = b.stats;
-        let snapshot_key = self
-            .commit_snapshot(&opts, started, path_bytes, root, parent_key.clone(), stats)
-            .await?;
-        Ok(BackupSummary {
-            snapshot_key,
-            parent: parent_key,
+        Ok(PreparedBackup {
+            repo: self.clone(),
+            paths: path_bytes,
             root,
-            stats,
+            parent_key: parent.as_ref().map(|(k, _)| k.clone()),
+            stats: b.stats,
+            referenced: std::mem::take(&mut b.referenced),
+            opts,
+            started,
         })
     }
 
@@ -192,7 +354,7 @@ impl Repository {
             .list(&prefix)
             .await?
             .into_iter()
-            .map(|(k, _)| k)
+            .map(|o| o.key)
             .collect();
         keys.sort();
         let Some(latest) = keys.pop() else {
@@ -523,12 +685,35 @@ impl Backup {
                 }
             }
         };
-        if !data_ids.iter().all(|id| index.contains(id)) {
-            return Ok(None);
+        let mut packs: Vec<(ChunkId, ObjectId)> = Vec::with_capacity(data_ids.len());
+        for id in &data_ids {
+            match index.get(id) {
+                Some(loc) if !self.marked.contains(&loc.pack) => packs.push((*id, loc.pack)),
+                _ => return Ok(None),
+            }
         }
+        if let Content::Indirect { chunks } = content {
+            for id in chunks {
+                match index.get(id) {
+                    Some(loc) if !self.marked.contains(&loc.pack) => packs.push((*id, loc.pack)),
+                    _ => return Ok(None),
+                }
+            }
+        }
+        self.record_referenced(packs);
         self.stats.bytes_total += *size;
         self.stats.chunks_total += data_ids.len() as u64;
         Ok(Some((*size, content.clone())))
+    }
+
+    /// 記下沿用的 chunk 在哪個 pack。這次新寫的 pack（佔位或已 flush）另外在最後加。
+    fn record_referenced(&mut self, chunks: Vec<(ChunkId, ObjectId)>) {
+        for (id, pack) in chunks {
+            if pack == crate::index::PENDING_PACK {
+                continue;
+            }
+            self.referenced.entry(pack).or_default().push(id);
+        }
     }
 
     /// 切塊、去重、打包。每輪 blocking 最多封一個 pack 就回到 async 端上傳，
@@ -544,6 +729,7 @@ impl Backup {
             bytes_total: 0,
             bytes_new: 0,
             chunks_new: 0,
+            reused: Vec::new(),
         };
         loop {
             let mut packer = self
@@ -555,6 +741,7 @@ impl Backup {
                 .take()
                 .ok_or_else(|| CoreError::Join("index missing".into()))?;
             let keys = Arc::clone(&self.keys);
+            let marked = Arc::clone(&self.marked);
 
             let (packer, index, state_back, finished, done, read_error) = blocking(move || {
                 let mut finished = None;
@@ -576,11 +763,21 @@ impl Backup {
                     let id = keys.chunk_id(&chunk);
                     state.bytes_total += chunk.len() as u64;
                     state.ids.push(id);
-                    if index.contains(&id) {
-                        continue;
+                    let mut in_marked_pack = false;
+                    if let Some(loc) = index.get(&id) {
+                        if marked.contains(&loc.pack) {
+                            in_marked_pack = true;
+                        } else {
+                            state.reused.push((id, loc.pack));
+                            continue;
+                        }
                     }
                     let entry = packer.add(id, &chunk)?;
-                    index.add_pending(&entry);
+                    if in_marked_pack {
+                        index.replace_pending(&entry);
+                    } else {
+                        index.add_pending(&entry);
+                    }
                     state.bytes_new += chunk.len() as u64;
                     state.chunks_new += 1;
                     if packer.is_full() {
@@ -597,6 +794,7 @@ impl Backup {
             self.packer = Some(packer);
             self.index = Some(index);
             state = state_back;
+            self.record_referenced(std::mem::take(&mut state.reused));
             if let Some(p) = finished {
                 self.handle_finished(vec![p]).await?;
             }

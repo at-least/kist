@@ -314,6 +314,12 @@ impl ChunkIndex {
             .or_insert(location(PENDING_PACK, entry));
     }
 
+    /// 同上，但覆寫既有位置：chunk 原本在被 GC 標記的 pack 裡、這次重寫了一份，
+    /// 之後同一次 backup 再遇到它要指到新的位置。
+    pub fn replace_pending(&mut self, entry: &PackEntry) {
+        self.overlay.insert(entry.id, location(PENDING_PACK, entry));
+    }
+
     /// pack flush 完成：把佔位的名稱換成真正的 pack 名稱。
     pub fn resolve_pending(&mut self, pack: ObjectId, size: u64, entries: &[PackEntry]) {
         self.packs.insert(pack, size);

@@ -29,14 +29,14 @@ pub struct RebuildSummary {
 impl Repository {
     pub async fn rebuild_index(&self) -> Result<RebuildSummary> {
         let mut existing = Vec::new();
-        for (key, _) in self.backend().list(keys::INDEXES_PREFIX).await? {
-            existing.push(keys::object_id_from_key(&key)?);
+        for o in self.backend().list(keys::INDEXES_PREFIX).await? {
+            existing.push(keys::object_id_from_key(&o.key)?);
         }
         existing.sort();
 
         let mut packs: Vec<(ObjectId, u64)> = Vec::new();
-        for (key, size) in self.backend().list(keys::PACKS_PREFIX).await? {
-            packs.push((keys::object_id_from_key(&key)?, size));
+        for o in self.backend().list(keys::PACKS_PREFIX).await? {
+            packs.push((keys::object_id_from_key(&o.key)?, o.size));
         }
         packs.sort();
 

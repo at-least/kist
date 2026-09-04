@@ -62,8 +62,8 @@ async fn backup_restore_check_on_s3() {
 
     // 收尾：刪掉這次的物件（測試 prefix 是隨機的，留著也不影響別的測試）
     for prefix in ["packs", "trees", "indexes", "snapshots"] {
-        for (key, _) in backend.list(prefix).await.unwrap() {
-            backend.delete(&key).await.unwrap();
+        for o in backend.list(prefix).await.unwrap() {
+            backend.delete(&o.key).await.unwrap();
         }
     }
     backend.delete("config").await.unwrap();
