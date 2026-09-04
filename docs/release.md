@@ -13,6 +13,18 @@ $ make fuzz         # 每個目標 FUZZTIME（預設 30s）；發版前跑 make 
 
 `fuzz` 找到的 crash 會落在各 package 的 `testdata/fuzz/` 裡，**留著**，那是回歸測試。
 
+24 小時的 campaign 別讓它吃滿機器，也別掛在一個會被回收的 shell 底下：
+
+```console
+$ systemd-run --user --unit kist-fuzz-long -p MemoryMax=6G -p Nice=19 \
+    -p StandardOutput=append:$HOME/.cache/kist-fuzz-long.log -p StandardError=append:$HOME/.cache/kist-fuzz-long.log \
+    --working-directory=$PWD --setenv=PATH=$PATH --setenv=HOME=$HOME --setenv=GOMEMLIMIT=768MiB \
+    /usr/bin/env make fuzz-long FUZZPARALLEL=3      # 16 核的 20%
+$ systemctl --user show kist-fuzz-long.service -p ActiveState -p MemoryCurrent
+```
+
+`FUZZPARALLEL` 是每個目標的 worker 數（空 = 每核一個）。chunker 的 seed 故意只比 `MinSize` 大一點：MiB 級的 seed 會讓整個 corpus 都是 MiB 級，三個 worker 一起長就把記憶體吃掉了。
+
 ## 版本號
 
 git tag `vX.Y.Z`。binary 裡的版本來自 link 時的 `-X github.com/at-least/kist/internal/cmd.version=…`；`kist version` 印出來。沒 tag 的 build 是 `dev`。
