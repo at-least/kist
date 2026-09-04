@@ -68,6 +68,7 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	b := &backupRun{
 		repo:    r,
 		opts:    opts,
+		pending: make(map[crypto.ID]struct{}),
 		written: make(map[crypto.ID][]pack.Entry),
 		hard:    make(map[hardLinkKey][]crypto.ID),
 	}
@@ -131,7 +132,19 @@ type backupRun struct {
 	repo *Repository
 	opts BackupOptions
 
-	writer  *pack.Writer
+	writer *pack.Writer
+
+	// pending holds the chunks in the pack currently being built.
+	//
+	// The index only learns about a chunk when its pack is finished, so
+	// without this a payload repeated inside one pack's worth of work --
+	// two identical files, a duplicated directory -- would be added
+	// twice. That produces a trailer listing one chunk twice, which fails
+	// the trailer's own consistency check and makes the pack unreadable.
+	// It does not show up in a small test: it needs the repeat to fall
+	// inside a single pack.
+	pending map[crypto.ID]struct{}
+
 	written map[crypto.ID][]pack.Entry
 	hard    map[hardLinkKey][]crypto.ID
 	stats   snapshot.Stats
@@ -362,13 +375,22 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 		ids = append(ids, id)
 		total += uint64(len(chunk.Data))
 
-		if b.repo.index.Has(id) {
+		if b.has(id) {
 			continue
 		}
 		if err := b.add(ctx, id, chunk.Data); err != nil {
 			return nil, 0, err
 		}
 	}
+}
+
+// has reports whether a chunk is already stored or already staged in the
+// pack being built.
+func (b *backupRun) has(id crypto.ID) bool {
+	if _, staged := b.pending[id]; staged {
+		return true
+	}
+	return b.repo.index.Has(id)
 }
 
 // add puts one new chunk into the current pack, flushing when full.
@@ -384,6 +406,7 @@ func (b *backupRun) add(ctx context.Context, id crypto.ID, data []byte) error {
 	if err := b.writer.Add(id, data); err != nil {
 		return err
 	}
+	b.pending[id] = struct{}{}
 	b.stats.ChunksNew++
 
 	if b.writer.Full() {
@@ -404,6 +427,7 @@ func (b *backupRun) flush(ctx context.Context) error {
 		return fmt.Errorf("backup: %w", err)
 	}
 
+	clear(b.pending)
 	b.repo.index.AddPack(packID, entries)
 	b.written[packID] = entries
 	b.stats.PacksAdded++

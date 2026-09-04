@@ -219,3 +219,8 @@ func TestClientIDRejectsGarbageOnDisk(t *testing.T) {
 		t.Fatalf("client id: err = %v, want ErrCorrupt", err)
 	}
 }
+
+// createLocalAt and openLocalAt keep the acceptance test from importing
+// the backend package under a name that shadows its own helpers.
+func createLocalAt(dir string) (backend.Backend, error) { return backend.CreateLocal(dir) }
+func openLocalAt(dir string) (backend.Backend, error)   { return backend.OpenLocal(dir) }

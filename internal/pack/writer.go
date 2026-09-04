@@ -31,6 +31,7 @@ type Writer struct {
 	hasher  io.Writer
 	digest  interface{ Sum(b []byte) []byte }
 	entries []Entry
+	seen    map[crypto.ID]struct{}
 	size    uint64
 
 	finished bool
@@ -72,6 +73,7 @@ func NewWriter(keys *crypto.Keys, dir string, nonceSource io.Reader) (*Writer, e
 		spool:       spool,
 		hasher:      io.MultiWriter(spool, hasher),
 		digest:      hasher,
+		seen:        make(map[crypto.ID]struct{}),
 	}, nil
 }
 
@@ -80,9 +82,18 @@ func NewWriter(keys *crypto.Keys, dir string, nonceSource io.Reader) (*Writer, e
 // id must be the chunk's content address; it is used as the AAD, so a
 // sealed chunk cannot be moved to another chunk's slot even by someone
 // holding the key.
+//
+// Adding a chunk this pack already holds returns ErrDuplicateChunk. It is
+// a caller error, not a condition to route around: a trailer that lists
+// one chunk twice fails its own consistency check, so silently accepting
+// it would produce an unreadable pack. Callers deduplicate before they
+// get here.
 func (w *Writer) Add(id crypto.ID, plaintext []byte) error {
 	if w.finished {
 		return errors.New("add to pack: writer is already finished")
+	}
+	if _, dup := w.seen[id]; dup {
+		return fmt.Errorf("add chunk %s: %w", id, ErrDuplicateChunk)
 	}
 
 	algorithm, payload, err := compress(plaintext)
@@ -111,6 +122,7 @@ func (w *Writer) Add(id crypto.ID, plaintext []byte) error {
 		return fmt.Errorf("add chunk %s: write spool file: %w", id, err)
 	}
 
+	w.seen[id] = struct{}{}
 	w.entries = append(w.entries, Entry{ID: id, Offset: w.size, Length: uint32(len(sealed))}) //nolint:gosec // bounds-checked against MaxUint32 just above
 	w.size += uint64(len(sealed))
 	return nil

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/at-least/kist/internal/crypto"
@@ -104,7 +105,10 @@ func (run *restoreRun) restoreTree(ctx context.Context, id crypto.ID, dir string
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		path := filepath.Join(dir, entry.Name)
+		path, err := safeJoin(dir, entry.Name)
+		if err != nil {
+			return err
+		}
 
 		switch entry.Type {
 		case tree.TypeDir:
@@ -141,6 +145,29 @@ func (run *restoreRun) restoreTree(ctx context.Context, id crypto.ID, dir string
 		}
 	}
 	return nil
+}
+
+// safeJoin builds a path for one tree entry inside dir, refusing anything
+// that would land outside it.
+//
+// tree.validate already rejects names containing a separator, a NUL, "."
+// or "..", so a tree that reached here cannot carry a traversal. This
+// checks again anyway, because the two guards protect against different
+// things: that one keeps kist from *writing* a bad tree, this one keeps a
+// repository someone else controls from making a restore write outside
+// the directory the user named. A restore is the moment an attacker who
+// owns the repository gets to choose filenames on the victim's machine.
+func safeJoin(dir, name string) (string, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") || strings.ContainsRune(name, os.PathSeparator) {
+		return "", fmt.Errorf("restore: %w: entry name %q is not a single path component", tree.ErrCorrupt, name)
+	}
+
+	path := filepath.Join(dir, name)
+	within, err := filepath.Rel(dir, path)
+	if err != nil || within != name {
+		return "", fmt.Errorf("restore: %w: entry name %q escapes %s", tree.ErrCorrupt, name, dir)
+	}
+	return path, nil
 }
 
 func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path string) error {
@@ -225,7 +252,9 @@ func (run *restoreRun) applyMetadata(path string, entry tree.Entry, isSymlink bo
 	}
 
 	mode := entry.FileMode().Perm()
-	if err := os.Chmod(path, mode); err != nil {
+	// path came from safeJoin, which rejects anything that is not a
+	// single component inside the parent directory.
+	if err := os.Chmod(path, mode); err != nil { //nolint:gosec // path is bounded by safeJoin
 		return fmt.Errorf("restore: set mode on %s: %w", path, err)
 	}
 

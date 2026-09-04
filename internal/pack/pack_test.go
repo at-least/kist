@@ -572,3 +572,29 @@ func TestDecompressRejectsAnUnknownEncoding(t *testing.T) {
 		t.Fatalf("decompress with an unknown algorithm byte: err = %v, want ErrCorrupt", err)
 	}
 }
+
+// A pack listing one chunk twice fails its own trailer consistency check
+// and is unreadable, so the writer refuses the duplicate rather than
+// producing it. Callers deduplicate before they get here; this is the
+// backstop that turns a caller bug into an error instead of a corrupt
+// object.
+func TestWriterRefusesADuplicateChunk(t *testing.T) {
+	keys := testKeys(t)
+
+	w, err := NewWriter(keys, t.TempDir(), crypto.DeterministicReader("duplicate"))
+	if err != nil {
+		t.Fatalf("new writer: %v", err)
+	}
+	defer w.Abort()
+
+	id, payload := chunkOf(keys, []byte("repeated content"))
+	if err := w.Add(id, payload); err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+	if err := w.Add(id, payload); !errors.Is(err, ErrDuplicateChunk) {
+		t.Fatalf("second add: err = %v, want ErrDuplicateChunk", err)
+	}
+	if w.Count() != 1 {
+		t.Errorf("pack holds %d chunks, want 1", w.Count())
+	}
+}

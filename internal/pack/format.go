@@ -75,6 +75,10 @@ var (
 	// one this build does not know how to read.
 	ErrUnsupportedVersion = errors.New("unsupported pack version")
 
+	// ErrDuplicateChunk means a caller tried to add a chunk a pack
+	// already holds. See Writer.Add.
+	ErrDuplicateChunk = errors.New("chunk is already in this pack")
+
 	// ErrCorrupt means the pack is structurally invalid: a trailer that
 	// does not fit, an entry that points outside the file, and so on.
 	ErrCorrupt = errors.New("pack is corrupt")

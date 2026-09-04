@@ -438,3 +438,50 @@ func sameInode(t *testing.T, a, b string) bool {
 	}
 	return os.SameFile(infoA, infoB)
 }
+
+// Two identical files in one backup produce the same chunk twice. The
+// index only learns about a chunk when its pack is finished, so a
+// duplicate inside the pack still being built is invisible to the
+// deduplicator -- and a pack listing one chunk twice fails its own
+// trailer consistency check, which makes it unreadable.
+//
+// Found by the full-scale acceptance test, not by the small ones: it
+// needs the same content to repeat inside a single pack.
+func TestDuplicateContentWithinOnePackIsStoredOnce(t *testing.T) {
+	ctx := context.Background()
+	r, dir := initRepo(t, "duplicate")
+
+	// Larger than the chunker minimum, so each copy is a real chunk, and
+	// small enough that all of them land in one pack.
+	payload := randomBytes(t, "duplicate-payload", 1<<20)
+	source := t.TempDir()
+	writeTree(t, source, []fileSpec{
+		{path: "a/first.bin", data: payload},
+		{path: "b/second.bin", data: payload},
+		{path: "c/third.bin", data: payload},
+	})
+
+	snap, handle, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if snap.Stats.ChunksNew != 1 {
+		t.Errorf("stored %d chunks for three copies of one payload, want 1", snap.Stats.ChunksNew)
+	}
+
+	// The pack must be readable, and the restore must produce all three.
+	fresh := reopen(t, dir, "duplicate-2")
+	report, err := fresh.Check(ctx, CheckOptions{ReadData: true})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !report.OK() {
+		t.Fatalf("check found problems: %v", report.Problems)
+	}
+
+	target := filepath.Join(t.TempDir(), "out")
+	if _, err := fresh.Restore(ctx, handle.Key, target, RestoreOptions{}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	compareTrees(t, source, filepath.Join(target, filepath.Base(source)))
+}

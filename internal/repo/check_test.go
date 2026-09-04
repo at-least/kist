@@ -295,3 +295,35 @@ func replace(t *testing.T, r *Repository, key string, data []byte) {
 		t.Fatalf("store %s: %v", key, err)
 	}
 }
+
+// A restore is the one moment when whoever controls the repository gets
+// to choose filenames on the machine doing the restoring. Names that are
+// not a single component inside the parent must be refused, whatever a
+// tree object claims.
+func TestSafeJoinRefusesEscapes(t *testing.T) {
+	dir := filepath.Join(string(filepath.Separator), "restore", "target")
+
+	for _, name := range []string{
+		"", ".", "..",
+		"../escape",
+		"a/b",
+		"a" + string(filepath.Separator) + "b",
+		"/absolute",
+		"nul\x00byte",
+		"..",
+	} {
+		t.Run(strings.ReplaceAll(name, "\x00", "NUL"), func(t *testing.T) {
+			if got, err := safeJoin(dir, name); err == nil {
+				t.Fatalf("safeJoin(%q) = %q, want an error", name, got)
+			}
+		})
+	}
+
+	got, err := safeJoin(dir, "ordinary.txt")
+	if err != nil {
+		t.Fatalf("safeJoin of an ordinary name: %v", err)
+	}
+	if want := filepath.Join(dir, "ordinary.txt"); got != want {
+		t.Errorf("safeJoin = %q, want %q", got, want)
+	}
+}
