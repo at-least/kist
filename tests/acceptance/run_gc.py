@@ -65,8 +65,10 @@ print(f"after prune 2: {count('gc')} markers, {packs_p2} packs, repo {repo_p2/2*
 # 整包死掉的 pack 在這輪刪；被 repack 的舊 pack 這輪才變孤兒被標記，下一輪刪
 assert repo_p2 <= repo_p1
 
-# 再跑兩輪把被 repack 的舊 pack、舊 index 清掉
+# 被 repack 的舊 pack 在 prune 2 才被標記；活躍 client 要在那之後再備份一次，prune 3 才會刪
+run([KIST, "backup", SRC])
 _, t_p3 = run([KIST, "prune", "--grace", "0s"])
+run([KIST, "backup", SRC])
 run([KIST, "prune", "--grace", "0s"])
 repo_final = du(REPO)
 print(f"final: {count('gc')} markers, {count('packs')} packs, {count('indexes')} indexes, repo {repo_final/2**30:.2f} GiB", flush=True)

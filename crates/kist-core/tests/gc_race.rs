@@ -228,6 +228,8 @@ impl World {
             }
         }
         self.stamp_new_objects();
+        // 每一步至少過一秒：同一個注入奈秒連續 backup 會撞 snapshot key（現實不會）
+        self.clock += Duration::seconds(1);
     }
 
     fn record_commit(

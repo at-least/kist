@@ -139,6 +139,26 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 後者對每個 chunk 各發一次 range GET（71 040 次）。
 UNVERIFIED（未做 profile，只是從請求數推測）。兩者都列在 M3/M4 待辦（ADR 004「沒做」）。
 
+## M3 驗收數據（GC）
+
+2026-09-05，commit `f81ba02`，本機目錄後端，同一份資料集，腳本 `tests/acceptance/run_gc.py`，
+完整 log `tests/acceptance/m3-acceptance-gc-2026-09-05.log`。流程：backup → 刪掉一成的目錄再 backup →
+forget 舊 snapshot → `prune --grace 0s`（標記 + repack）→ backup → prune（刪）→ backup → prune（刪被 repack 的舊 pack）
+→ `check --read-data` → restore 與 `diff -r`。
+
+| 項目 | 結果 |
+| --- | --- |
+| prune 1（標記 112 個 tree、repack 8 個 pack） | 2.4 s |
+| prune 2（刪 112 個、標記 9 個孤兒） | 0.7 s |
+| prune 3（刪 9 個孤兒 pack / index，522 MiB） | 0.7 s |
+| repo 大小 | 4.90 GiB → **4.41 GiB**（刪掉的一成資料全部回收） |
+| `check --read-data` 之後 | 25 s，無錯誤 |
+| restore 最新 snapshot | 56 s，`diff -r` **完全相同** |
+| 峰值 RSS（整個流程） | 223 MiB |
+| 競態 proptest（`tests/gc_race.rs`） | 24 案例進 `cargo test`；200 案例本機跑過（見 ADR 005） |
+
+grace 設 0 只是為了驗收能在幾分鐘內走完；實際使用請保留預設 72 h。
+
 ## Clean build 時間
 
 機器：AMD Ryzen 7 7700（8C/16T）、Linux 7.2.0、rustc 1.98.1、cargo 1.98.1。
