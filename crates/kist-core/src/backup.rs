@@ -117,6 +117,8 @@ pub struct PreparedBackup {
     stats: SnapshotStats,
     /// 引用到的 pack → 其中被引用的 chunk（這次新寫的 pack 也在內）。
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
+    /// 這次 put 過的 tree。
+    written_trees: HashSet<ObjectId>,
 }
 
 impl PreparedBackup {
@@ -126,8 +128,13 @@ impl PreparedBackup {
 
     /// 驗證引用到的每個 pack 都還在，然後寫 snapshot。
     pub async fn commit(self) -> Result<BackupSummary> {
+        let marks = self.repo.list_gc_marks().await?;
+        let now = time::OffsetDateTime::now_utc();
         self.repo
-            .verify_referenced_packs(&self.referenced, self.opts.gc_grace)
+            .verify_referenced_packs(&self.referenced, &marks, self.opts.gc_grace, now)
+            .await?;
+        self.repo
+            .verify_written_trees(&self.written_trees, &marks, self.opts.gc_grace, now)
             .await?;
         let snapshot_key = self
             .repo
@@ -174,10 +181,10 @@ impl Repository {
     async fn verify_referenced_packs(
         &self,
         referenced: &HashMap<ObjectId, Vec<ChunkId>>,
+        marks: &HashMap<ObjectId, time::OffsetDateTime>,
         grace: std::time::Duration,
+        now: time::OffsetDateTime,
     ) -> Result<()> {
-        let marks = self.list_gc_marks().await?;
-        let now = time::OffsetDateTime::now_utc();
         let expired = |pack: &ObjectId| marks.get(pack).is_some_and(|m| *m + grace <= now);
         let mut suspects = Vec::new();
         for pack in referenced.keys() {
@@ -224,6 +231,28 @@ impl Repository {
                         chunk: Some(*chunk),
                     });
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// commit 前：這次寫過的 tree 若有**已超過 grace** 的標記，prune 隨時會刪它。
+    /// 我們的 put 會刷新它的修改時間（prune 刪前會再看一眼、看到就撤銷標記），
+    /// 所以只有「修改時間沒比標記新」才是危險的——那表示 put 發生在標記之前，backup 已經跑了超過 grace。
+    async fn verify_written_trees(
+        &self,
+        written: &HashSet<ObjectId>,
+        marks: &HashMap<ObjectId, time::OffsetDateTime>,
+        grace: std::time::Duration,
+        now: time::OffsetDateTime,
+    ) -> Result<()> {
+        for (id, marked_at) in marks {
+            if *marked_at + grace > now || !written.contains(id) {
+                continue;
+            }
+            let info = self.backend().head(&keys::tree(id)).await?;
+            if info.modified <= *marked_at {
+                return Err(CoreError::TreeMarked(*id));
             }
         }
         Ok(())
@@ -337,6 +366,7 @@ impl Repository {
             parent_key: parent.as_ref().map(|(k, _)| k.clone()),
             stats: b.stats,
             referenced: std::mem::take(&mut b.referenced),
+            written_trees: std::mem::take(&mut b.written_trees),
             opts,
             started,
         })

@@ -7,7 +7,7 @@
 //! indexes/<ObjectId hex>       envelope(Index)
 //! trees/<ObjectId hex>         envelope(Tree)
 //! snapshots/<client hex>/<ts>  envelope(Snapshot)
-//! gc/<pack ObjectId hex>       待刪標記（M3）
+//! gc/<ObjectId hex>            待刪標記：pack / tree / index 共用（內容固定為 GC_MARK_MAGIC）
 //! ```
 
 use crate::{FormatError, ObjectId, Result};
@@ -19,6 +19,10 @@ pub const INDEXES_PREFIX: &str = "indexes";
 pub const TREES_PREFIX: &str = "trees";
 pub const SNAPSHOTS_PREFIX: &str = "snapshots";
 pub const GC_PREFIX: &str = "gc";
+
+/// GC 標記的內容。標記本身不帶資訊：「誰、何時」看後端記的修改時間；
+/// 內容固定只是讓人（與 check）能認出它是 kist 寫的。
+pub const GC_MARK_MAGIC: &[u8; 8] = b"KISTGC1\n";
 
 pub fn pack(id: &ObjectId) -> String {
     format!("{PACKS_PREFIX}/{id}")
@@ -36,8 +40,9 @@ pub fn key_slot(slot_id: &str) -> String {
     format!("{KEYS_PREFIX}/{slot_id}")
 }
 
-pub fn gc(pack_id: &ObjectId) -> String {
-    format!("{GC_PREFIX}/{pack_id}")
+/// 待刪標記；`id` 是 pack / tree / index 的名稱。
+pub fn gc(id: &ObjectId) -> String {
+    format!("{GC_PREFIX}/{id}")
 }
 
 /// `snapshots/<client id hex>/<timestamp>`。

@@ -258,3 +258,42 @@ async fn reading_a_moved_chunk_reloads_the_index() {
     let err = repo.read_chunk_reloading(&bogus, &stale).await.unwrap_err();
     assert!(matches!(err, CoreError::ChunkMissing(_)), "{err}");
 }
+
+/// 寫過的 tree 有過期標記：我們的 put 比標記新 → 可以 commit；put 比標記舊（backup 跑超過 grace）→ 不行。
+#[tokio::test]
+async fn commit_checks_expired_markers_on_written_trees() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let first = repo
+        .backup(std::slice::from_ref(&src), client(1))
+        .await
+        .unwrap();
+    let four_days = std::time::Duration::from_secs(4 * 24 * 3600);
+
+    let prepared = repo
+        .backup_prepare(std::slice::from_ref(&src), client(1))
+        .await
+        .unwrap();
+    // 標記比我們的 put 舊：prune 刪前會看到 tree 被重寫過而撤銷標記 → 允許
+    mark(&t, &first.root, four_days);
+    prepared.commit().await.unwrap();
+    assert_eq!(t.count("snapshots"), 2);
+
+    let prepared = repo
+        .backup_prepare(std::slice::from_ref(&src), client(1))
+        .await
+        .unwrap();
+    // 把 tree 的修改時間改到標記之前：等於 put 發生在標記前、backup 跑了超過 grace
+    let tree_path = t.repo_path().join(keys::tree(&first.root));
+    let older = std::time::SystemTime::now() - five_days();
+    filetime::set_file_mtime(&tree_path, filetime::FileTime::from_system_time(older)).unwrap();
+    let err = prepared.commit().await.unwrap_err();
+    assert!(matches!(err, CoreError::TreeMarked(_)), "{err}");
+    assert_eq!(t.count("snapshots"), 2);
+}
+
+fn five_days() -> std::time::Duration {
+    std::time::Duration::from_secs(5 * 24 * 3600)
+}

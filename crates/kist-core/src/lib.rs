@@ -21,6 +21,7 @@ pub mod forget;
 pub mod fsmeta;
 pub mod index;
 pub mod pack;
+pub mod prune;
 pub mod reach;
 pub mod rebuild;
 pub mod repo;
@@ -31,6 +32,7 @@ pub use backup::{BackupOptions, BackupSummary, PreparedBackup, DEFAULT_GC_GRACE}
 pub use check::{CheckOptions, CheckReport};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
+pub use prune::{PruneOptions, PruneReport};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
 pub use restore::{ReloadableIndex, RestoreOptions, RestoreSummary};
@@ -75,6 +77,12 @@ pub enum CoreError {
     /// 使用者的要求本身不成立（例如 forget 沒給任何條件）。
     #[error("{0}")]
     Usage(String),
+    /// prune 拒絕執行：引用不完整時分不出什麼是垃圾。
+    #[error("refusing to prune: {0}")]
+    Unsafe(String),
+    /// backup 寫過的 tree 在寫之前就被標記且標記已超過 grace：可能隨時被刪，不寫 snapshot。
+    #[error("tree {0} written by this backup is about to be garbage-collected; rerun the backup")]
+    TreeMarked(kist_format::ObjectId),
     #[error(transparent)]
     Backend(#[from] kist_backend::BackendError),
     #[error(transparent)]

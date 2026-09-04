@@ -15,8 +15,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use kist_backend::Backend;
 use kist_core::{
-    BackupOptions, CheckOptions, ForgetOptions, InitOptions, Repository, RestoreOptions,
-    RetentionPolicy,
+    BackupOptions, CheckOptions, ForgetOptions, InitOptions, PruneOptions, PruneReport, Repository,
+    RestoreOptions, RetentionPolicy,
 };
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
@@ -41,6 +41,35 @@ impl std::error::Error for Incomplete {}
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Args)]
+struct PruneArgs {
+    /// Minimum time between marking an object and deleting it. Must be longer than your longest
+    /// backup, and match `backup --gc-grace`.
+    #[arg(long, value_name = "DURATION", default_value = "72h", value_parser = parse_duration)]
+    grace: std::time::Duration,
+    /// Clients without a snapshot for this long no longer hold back deletion.
+    #[arg(long, value_name = "DURATION", default_value = "30d", value_parser = parse_duration)]
+    inactive_after: std::time::Duration,
+    /// Repack packs whose live data is below this percentage (0 disables repacking).
+    #[arg(long, value_name = "PERCENT", default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
+    repack_below: u8,
+    /// Report what would happen without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl PruneArgs {
+    fn options(&self) -> PruneOptions {
+        PruneOptions {
+            grace: self.grace,
+            inactive_after: self.inactive_after,
+            repack_below_percent: self.repack_below,
+            dry_run: self.dry_run,
+            now: None,
+        }
+    }
 }
 
 /// 每個需要 repo 的命令共用的參數。
@@ -141,6 +170,17 @@ enum Command {
         /// Show what would be removed without removing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Run `prune` (with default settings) afterwards.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Reclaim space: mark unreferenced data, delete what was marked longer ago than the
+    /// grace period, and repack mostly-unused packs. Safe to run while backups are running.
+    Prune {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[command(flatten)]
+        prune: PruneArgs,
     },
     /// Rebuild the index from the pack files (after index objects were lost or corrupted).
     RebuildIndex {
@@ -312,6 +352,7 @@ async fn run(cli: Cli) -> Result<()> {
             keep_yearly,
             keep_within,
             dry_run,
+            prune,
         } => {
             let r = open_repo(&repo).await?;
             let mut keys = Vec::new();
@@ -351,10 +392,23 @@ async fn run(cli: Cli) -> Result<()> {
                 summary.removed.len(),
                 summary.kept.len()
             );
-            if !dry_run && !summary.removed.is_empty() {
+            if prune {
+                let report = r
+                    .prune(PruneOptions {
+                        dry_run,
+                        ..PruneOptions::default()
+                    })
+                    .await?;
+                print_prune_report(&report, dry_run)?;
+            } else if !dry_run && !summary.removed.is_empty() {
                 println!("run `kist prune` to reclaim the space");
             }
             Ok(())
+        }
+        Command::Prune { repo, prune } => {
+            let r = open_repo(&repo).await?;
+            let report = r.prune(prune.options()).await?;
+            print_prune_report(&report, prune.dry_run)
         }
         Command::RebuildIndex { repo } => {
             let r = open_repo(&repo).await?;
@@ -390,6 +444,45 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
     }
+}
+
+fn print_prune_report(p: &PruneReport, dry_run: bool) -> Result<()> {
+    let would = if dry_run { "would " } else { "" };
+    println!(
+        "{} snapshots, {} live trees, {} live packs",
+        p.snapshots, p.live_trees, p.live_packs
+    );
+    println!(
+        "{would}marked {} object(s) ({}) for deletion; {} marker(s) revived, {} stale",
+        p.marked,
+        human_bytes(p.marked_bytes),
+        p.revived,
+        p.stale_marks
+    );
+    println!(
+        "{would}deleted {} object(s) ({}); {} waiting for the grace period, {} held back by active clients",
+        p.deleted,
+        human_bytes(p.deleted_bytes),
+        p.waiting,
+        p.blocked
+    );
+    println!(
+        "{would}repacked {} pack(s) ({} of live data moved into {} new pack(s))",
+        p.repacked_packs,
+        human_bytes(p.repacked_bytes),
+        p.new_packs
+    );
+    if !p.skipped.is_empty() {
+        for s in &p.skipped {
+            eprintln!("warning: {s}");
+        }
+        return Err(Incomplete(format!(
+            "{} object(s) could not be deleted (object lock or permissions); their markers were kept",
+            p.skipped.len()
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// `<number><unit>`，單位 s / m / h / d / w（週）。給 clap 用。

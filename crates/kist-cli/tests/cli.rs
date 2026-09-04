@@ -386,3 +386,71 @@ fn concurrent_backup_with_the_same_client_id_is_refused() {
     drop(holder);
     env.ok(&["backup", src.to_str().unwrap()]);
 }
+
+#[test]
+fn prune_marks_then_deletes() {
+    fn packs(env: &Env) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(env.repo().join("packs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let original = packs(&env);
+    std::fs::remove_file(src.join("big.bin")).unwrap();
+    env.ok(&["backup", src.to_str().unwrap()]);
+    // 拿掉第一個 snapshot：big.bin 的 chunk 沒人引用（跟小檔同一個 pack → 部分死亡 → repack）
+    let out = env.ok(&["snapshots"]);
+    let first_ts = out
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    env.ok(&["forget", &first_ts]);
+
+    // grace 0：立刻標記；repack 產生新 pack，舊 pack 還在（要等下一輪）
+    let out = env.ok(&["prune", "--grace", "0s"]);
+    assert!(out.contains("deleted 0 object"), "{out}");
+    assert!(out.contains("repacked 1 pack"), "{out}");
+    assert!(original.is_subset(&packs(&env)), "第一階段不能刪 pack");
+    // 活躍 client 在標記後要有新 snapshot 才會刪
+    let out = env.ok(&["prune", "--grace", "0s"]);
+    assert!(out.contains("deleted 0 object"), "{out}");
+    assert!(!out.contains(", 0 held back"), "{out}");
+    assert!(env.repo().join("gc").is_dir());
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let out = env.ok(&["prune", "--grace", "0s"]);
+    assert!(!out.contains("deleted 0 object"), "{out}");
+    assert!(
+        original.is_disjoint(&packs(&env)),
+        "被 repack 的舊 pack 應該刪掉了"
+    );
+    env.ok(&["check", "--read-data"]);
+
+    // dry-run 不動任何東西
+    let before: Vec<_> = std::fs::read_dir(env.repo().join("indexes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    env.ok(&["prune", "--grace", "0s", "--dry-run"]);
+    let after: Vec<_> = std::fs::read_dir(env.repo().join("indexes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+
+    // forget --prune 一次做完
+    let out = env.ok(&["forget", "--keep-last", "1", "--prune"]);
+    assert!(
+        out.contains("removed 1 snapshot(s)") && out.contains("live packs"),
+        "{out}"
+    );
+    env.ok(&["check", "--read-data"]);
+}
