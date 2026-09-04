@@ -57,11 +57,12 @@ type Backend interface {
 	// Put stores size bytes read from r at key, replacing any object
 	// already there.
 	//
-	// Nothing in kist calls this yet: even config is written with
-	// PutIfAbsent, guarded by Init's own existence check. It is here for
-	// the one object the format allows to be replaced -- config, when a
-	// future `key add` has to rewrite its key slots -- and for nothing
-	// else. Everything a backup writes goes through PutIfAbsent.
+	// Two callers are allowed: a future `key add` rewriting config's
+	// key slots, and check --repair, which replaces a damaged pack with
+	// bytes proven -- by hashing to the pack's name -- to be the ones
+	// that were there before. Everything a backup writes goes through
+	// PutIfAbsent. On a versioned bucket Put makes a new version, which
+	// Object Lock permits where a delete would not.
 	Put(ctx context.Context, key string, r io.Reader, size int64) error
 
 	// PutIfAbsent stores size bytes read from r at key, or returns

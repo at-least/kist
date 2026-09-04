@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/pack"
+	"github.com/at-least/kist/internal/parity"
 )
 
 // The S3 tests in this package share one MinIO with the backend package's
@@ -295,7 +297,7 @@ func backupPolicy(bucket, prefix string, enforceConditional bool) string {
       "Sid": "ConditionalWriteOnly",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": [%s, %s, %s, %s, %s]%s
+      "Resource": [%s, %s, %s, %s, %s, %s]%s
     },
     {
       "Sid": "ReviveMarkedPacks",
@@ -305,7 +307,7 @@ func backupPolicy(bucket, prefix string, enforceConditional bool) string {
     }
   ]
 }`, res("config"), res("indexes/*"), bucket, prefix, prefix,
-		res("packs/*"), res("indexes/*"), res("trees/*"), res("snapshots/*"), res("clients/*"), condition,
+		res("packs/*"), res("indexes/*"), res("trees/*"), res("snapshots/*"), res("clients/*"), res("parity/*"), condition,
 		res("gc/*"))
 }
 
@@ -446,6 +448,16 @@ func TestS3BackupPolicy(t *testing.T) {
 			if err := limited.Delete(ctx, key); !errors.Is(err, backend.ErrDenied) {
 				t.Errorf("delete %s: err = %v, want ErrDenied", key, err)
 			}
+		}
+	})
+
+	t.Run("can write parity and cannot delete it", func(t *testing.T) {
+		key := parity.Key(crypto.ID{7})
+		if err := backend.PutBytesIfAbsent(ctx, limited, key, []byte("parity")); err != nil {
+			t.Fatalf("put parity: %v", err)
+		}
+		if err := limited.Delete(ctx, key); !errors.Is(err, backend.ErrDenied) {
+			t.Errorf("delete parity: err = %v, want ErrDenied", err)
 		}
 	})
 
@@ -750,5 +762,43 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 	}
 	if len(next.Unmarked) != 1 {
 		t.Errorf("next run did not clear the mark of the locked pack: %+v", next)
+	}
+
+	// Repair on a lock bucket: the rewrite is a new version, which the
+	// lock permits, and it reads back repaired.
+	withParity := open("33333333333333333333333333333333")
+	parityDir := t.TempDir()
+	writeTree(t, parityDir, []fileSpec{{path: "p.bin", data: randomBytes(t, "lockparity", 200<<10)}})
+	_, _, err = withParity.Backup(ctx, []string{parityDir}, BackupOptions{SpoolDir: t.TempDir(), Parity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var packID crypto.ID
+	if err := root.List(ctx, parity.Prefix, func(fi backend.FileInfo) error {
+		id, err := crypto.ParseID(strings.TrimPrefix(fi.Key, parity.Prefix))
+		packID = id
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original, err := backend.GetAll(ctx, root, pack.Key(packID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	damaged := append([]byte(nil), original...)
+	damaged[len(damaged)/3] ^= 0x80
+	if err := root.Put(ctx, pack.Key(packID), bytes.NewReader(damaged), int64(len(damaged))); err != nil {
+		t.Fatalf("damage the pack: %v", err)
+	}
+	repaired, err := withParity.Check(ctx, CheckOptions{Repair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repaired.Repaired) != 1 {
+		t.Fatalf("repair on the lock bucket: %+v", repaired)
+	}
+	got, err := backend.GetAll(ctx, root, pack.Key(packID))
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("pack after repair: %v, identical=%v", err, bytes.Equal(got, original))
 	}
 }

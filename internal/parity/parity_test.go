@@ -56,6 +56,29 @@ func TestEncodeIsDeterministicAndParses(t *testing.T) {
 	}
 }
 
+// Sizes around the shard boundary. 178 bytes was the one that broke: a
+// lower bound written as shard_len*15 instead of ceil(size/16) rejected
+// a valid object, and check --repair reported "parity object is corrupt".
+func TestEncodeAndParseAtAwkwardSizes(t *testing.T) {
+	for _, n := range []int{1, 15, 16, 17, 178, 179, 180, 191, 192, 193, 255, 256, 4095, 4097} {
+		pack := fakePack(fmt.Sprint("size", n), n)
+		id := crypto.CiphertextID(pack)
+		raw, err := Encode(id, pack, 2)
+		if err != nil {
+			t.Fatalf("%d bytes: encode: %v", n, err)
+		}
+		obj, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("%d bytes: parse: %v", n, err)
+		}
+		bad := bytes.Clone(pack)
+		bad[n/2] ^= 1
+		if got, err := obj.Repair(id, bad); err != nil || !bytes.Equal(got, pack) {
+			t.Fatalf("%d bytes: repair: %v", n, err)
+		}
+	}
+}
+
 func TestGoldenParity(t *testing.T) {
 	pack := fakePack("golden", 4321)
 	id, _, raw := encoded(t, pack, 2)

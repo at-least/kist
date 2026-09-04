@@ -10,6 +10,7 @@ import (
 
 	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/crypto"
+	"github.com/at-least/kist/internal/parity"
 )
 
 // A Writer assembles one pack.
@@ -35,6 +36,20 @@ type Writer struct {
 	size    uint64
 
 	finished bool
+
+	// parity is how many Reed-Solomon parity shards to write beside the
+	// pack, 0 for none; parityWarn hears about a parity that could not
+	// be written, which is not a failed backup.
+	parity     int
+	parityWarn func(format string, args ...any)
+}
+
+// SetParity asks Finish to write a parity object with m shards beside
+// the pack. A parity that fails to write is reported to warn and does
+// not fail the pack: the data is safe, the redundancy is what is missing.
+func (w *Writer) SetParity(m int, warn func(format string, args ...any)) {
+	w.parity = m
+	w.parityWarn = warn
 }
 
 // NewWriter starts a pack, spooling to a temporary file in dir. Passing
@@ -194,7 +209,32 @@ func (w *Writer) Finish(ctx context.Context, b backend.Backend) (crypto.ID, []En
 		return crypto.ID{}, nil, fmt.Errorf("finish pack %s: %w", id, err)
 	}
 
+	if w.parity > 0 {
+		if err := w.writeParity(ctx, b, id); err != nil && w.parityWarn != nil {
+			w.parityWarn("pack %s is stored but its parity is not: %v", id, err)
+		}
+	}
 	return id, w.entries, nil
+}
+
+// writeParity computes the parity object from the spool file, which is
+// still on disk, and stores it beside the pack.
+func (w *Writer) writeParity(ctx context.Context, b backend.Backend, id crypto.ID) error {
+	if _, err := w.spool.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind spool file: %w", err)
+	}
+	data, err := io.ReadAll(w.spool)
+	if err != nil {
+		return fmt.Errorf("read spool file: %w", err)
+	}
+	encoded, err := parity.Encode(id, data, w.parity)
+	if err != nil {
+		return err
+	}
+	if err := backend.PutBytesIfAbsent(ctx, b, parity.Key(id), encoded); err != nil && !errors.Is(err, backend.ErrExists) {
+		return err
+	}
+	return nil
 }
 
 // Abort discards the pack and its spool file. It is safe to call after

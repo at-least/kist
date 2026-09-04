@@ -240,6 +240,59 @@ func TestJSONOutput(t *testing.T) {
 	}
 }
 
+// backup --parity writes parity; check --repair uses it; the JSON says so.
+func TestParityRepairFromTheCommandLine(t *testing.T) {
+	t.Setenv(PasswordEnv, "a test password")
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "f.txt"), []byte(strings.Repeat("parity ", 5000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := run(t, "init", "--repo", repoDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := run(t, "backup", "--repo", repoDir, "--parity", "2", source); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := run(t, "check", "--json", "--repo", repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev report.Event
+	if err := json.Unmarshal([]byte(stdout), &ev); err != nil || ev.Check.ParityPacks != 1 {
+		t.Fatalf("check: %v %s", err, stdout)
+	}
+
+	// Flip a byte in the one pack.
+	entries, err := os.ReadDir(filepath.Join(repoDir, "packs"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("packs: %v %v", entries, err)
+	}
+	path := filepath.Join(repoDir, "packs", entries[0].Name())
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)/2] ^= 0x01
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := run(t, "check", "--repo", repoDir, "--read-data"); err == nil {
+		t.Fatal("check did not fail on the damaged pack")
+	}
+	stdout, _, err = run(t, "check", "--json", "--repo", repoDir, "--repair")
+	if err != nil {
+		t.Fatalf("check --repair: %v\n%s", err, stdout)
+	}
+	if err := json.Unmarshal([]byte(stdout), &ev); err != nil || !ev.OK || len(ev.Check.Repaired) != 1 || ev.Check.Repaired[0] != entries[0].Name() {
+		t.Fatalf("check --repair: %v %s", err, stdout)
+	}
+	if _, _, err := run(t, "check", "--repo", repoDir, "--read-data"); err != nil {
+		t.Fatalf("check after repair: %v", err)
+	}
+}
+
 // check must exit non-zero when it finds something, or a cron job that
 // runs it learns nothing.
 func TestCheckExitsNonZeroOnDamage(t *testing.T) {

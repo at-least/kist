@@ -13,6 +13,7 @@ import (
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/index"
 	"github.com/at-least/kist/internal/pack"
+	"github.com/at-least/kist/internal/parity"
 	"github.com/at-least/kist/internal/snapshot"
 )
 
@@ -462,6 +463,9 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 			report.BytesReclaimed += size
 		}
 		deleted[id] = struct{}{}
+		if err := r.remove(ctx, parity.Key(id)); err != nil {
+			return report, fmt.Errorf("prune: remove parity of %s: %w", id, err)
+		}
 	}
 
 	// The index must stop naming what is gone: what this run deleted,
@@ -500,6 +504,31 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 		}
 	}
 	for _, key := range junk {
+		if !opts.DryRun {
+			if err := r.remove(ctx, key); err != nil {
+				return report, fmt.Errorf("prune: remove %s: %w", key, err)
+			}
+		}
+	}
+
+	// Parity whose pack is gone -- deleted by a run that died before
+	// this point, or by hand -- goes the same way as an orphaned mark.
+	var orphanedParity []string
+	err = r.backend.List(ctx, parity.Prefix, func(fi backend.FileInfo) error {
+		id, err := crypto.ParseID(fi.Key[len(parity.Prefix):])
+		if err != nil {
+			orphanedParity = append(orphanedParity, fi.Key)
+			return nil //nolint:nilerr // not a parity key: junk to remove
+		}
+		if _, ok := packs[id]; !ok {
+			orphanedParity = append(orphanedParity, fi.Key)
+		}
+		return nil
+	})
+	if err != nil {
+		return report, fmt.Errorf("prune: %w", err)
+	}
+	for _, key := range orphanedParity {
 		if !opts.DryRun {
 			if err := r.remove(ctx, key); err != nil {
 				return report, fmt.Errorf("prune: remove %s: %w", key, err)

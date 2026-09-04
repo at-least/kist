@@ -19,6 +19,7 @@ repo 是一個 key-value 命名空間。除了 `config` 以外，所有物件都
 | `snapshots/<clientID>/<ts>` | 快照 | 固定位置 |
 | `gc/<packID>` | 待刪標記（§12） | 固定位置 |
 | `clients/<clientID>` | client 登記（§12） | 固定位置 |
+| `parity/<packID>` | Reed-Solomon 校驗（§13），**明文** | 固定位置 |
 
 ### Key 文法
 
@@ -40,7 +41,7 @@ key     = segment *( "/" segment )
 ### 不變條件
 
 1. **讀得到的物件就是完整的。** 部分寫入絕不能出現在最終名稱底下，crash 之後也不行。這是「不用鎖也能檢查 repo」的根據。
-2. **物件不就地修改。** 唯一的變更是 Delete，而且只有維護操作會做。
+2. **物件不就地修改。** 例外只有兩個：`config`（未來的 `key add` 要改寫 key slot），以及 `check --repair` 把損壞的 pack 換成**經 hash 證明與名字相符**的位元組（§13）。其他變更只有 Delete，而且只有維護操作會做。
 3. **`PutIfAbsent` 是條件寫入**，不是最佳化。備份客戶端若能覆寫既有的 pack，光靠自己的憑證就能毀掉整個 repo。
 
 ## 2. 金鑰階層
@@ -75,6 +76,7 @@ KEK ──AEAD 解封──▶ master key（32 B，隨機）
 | gc 標記 | meta | 完整 key path（`gc/<packID>`） |
 | client 登記 | meta | 完整 key path（`clients/<clientID>`） |
 | wrapped master key | KEK | `"kist/v1/master" || repoID` |
+| parity | — | **不密封**（§13 說為什麼） |
 
 pack trailer 與 index blob 用**常數** AAD，因為它們的名字是自己密文的 hash——密封的當下名字還不存在，用名字當 AAD 會循環。代價是 A pack 的 trailer 貼到 B pack 上仍然能通過認證；擋住這件事的是兩層：trailer 的**一致性檢查**（entry 必須恰好鋪滿 chunk 資料區，不能有洞、重疊或重複），以及 pack 以密文 hash 命名——貼過去名字就對不上，`check` 會抓到。
 
@@ -230,9 +232,10 @@ chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟
 
 | 操作 | Get | List | Put（條件式） | Delete |
 | --- | --- | --- | --- | --- |
-| `backup` | `config`、`indexes/*` | `indexes/`、`gc/` | `packs/ indexes/ trees/ snapshots/ clients/` | 僅 `gc/*` |
+| `backup` | `config`、`indexes/*` | `indexes/`、`gc/` | `packs/ indexes/ trees/ snapshots/ clients/ parity/` | 僅 `gc/*` |
 | `restore` / `check` | 全部 | 全部 | — | — |
 | `forget` / `prune` / `rebuild-index` | 全部 | 全部 | `gc/*`、`indexes/*` | 全部 |
+| `check --repair` | 全部 | 全部 | **無條件** `packs/*`（只寫回 hash 等於名字的位元組） | — |
 
 backup **不需要**讀 tree：tree 一律用 `PutIfAbsent` 寫，去重靠的是「已存在」的回應，不是先讀再比。
 
@@ -303,6 +306,12 @@ MinIO 上這條全部跑過。AWS S3 的行為文件上相同，**UNVERIFIED**�
 | 時鐘偏差在容許值內會 hold | `TestPruneHoldsWithinTheClockSkew` |
 | backup 權限只能刪 `gc/*` | `TestS3BackupPolicy/can_revive_a_marked_pack_and_nothing_more` |
 | Object Lock 底下：回報、不計回收、index 不再指向、repo 仍健康 | `TestS3ObjectLockIsReportedNotFought` |
+| parity 物件不變、edge size 都對 | `internal/parity/testdata/parity.txt`、`TestEncodeAndParseAtAwkwardSizes` |
+| ≤ M 個 shard 損壞（含 trailer、同 shard 兩處）修得回逐位元組相同；> M 不動 pack | `TestRepairsUpToMShards`、`TestRefusesMoreThanMErasures`、`TestCheckRepairsADamagedPackFromParity`、`TestCheckReportsWhatParityCannotRepair` |
+| 偽造的 parity 修不出錯的東西 | `TestForgedParityCannotRepairWrongly`、`TestCheckReportsWhatParityCannotRepair/forged_parity` |
+| parity header 自相矛盾在配置記憶體之前就被拒 | `TestParseRejectsInconsistentHeaders`、`FuzzParse` |
+| prune 連 parity 一起刪、孤兒 parity 會清 | `TestPruneRemovesParityWithThePack` |
+| backup 憑證能寫 parity 不能刪；Object Lock 下 repair 用 Put 成功 | `TestS3BackupPolicy/can_write_parity_and_cannot_delete_it`、`TestS3ObjectLockIsReportedNotFought` |
 
 ## 12. 垃圾回收（M3）
 
@@ -349,6 +358,22 @@ backup 開頭 =
 3. client 與 pruner 的時鐘差距在 `--clock-skew` 之內。
 4. 一個 backup 不會跑超過 `--forget-clients-after`。
 
+## 13. Parity（M5，可選）
+
+`backup --parity M`（或設定檔 `[repository] parity = M`，M ∈ 1..8，預設 0 = 不寫）在每個 pack 旁邊寫一個 `parity/<packID>`。這是**寫入端的選擇**，不記在 repo 裡：有的 client 開、有的不開都可以，`check` 回報「N of M packs have parity」，沒有不算問題。
+
+```cbor
+parity/<packID>  { "v": 1, "k": 16, "m": M, "pack_size": u64, "shard_len": u32,
+                   "hashes": [16+M] × BLAKE3-256, "parity": [M] × bstr }
+```
+
+- 對**整個密封後的 pack**（chunk 密文、trailer、tail）做 Reed-Solomon：切成固定 16 個等長 shard（最後一個補零，`pack_size` 還原），算 M 個 parity shard。M=2 是 12.5% 開銷，能修任意 2/16 的損壞，包括 trailer。
+- `shard_len` 必須恰好是 `ceil(pack_size/16)`；parse 在配置任何依 header 決定大小的記憶體之前先驗完所有界限。
+- **為什麼是明文**：密文上的 RS 是偽隨機位元組的線性組合，不洩漏任何東西；shard hash 是密文的 hash；而修復的正確性證明是 `CiphertextID(結果) == packID`——pack 的**名字就是 checksum**。所以偽造或損壞的 parity 只能讓修復**失敗**，不能讓它錯誤地成功；也因此一個不持密碼的 scrub 工具可以在儲存端修 pack。
+- **修復**（`check --repair`，隱含 `--read-data`）：讀 pack、切 shard、比 hash 找出壞的（截斷或多出來的部分也算壞）、壞的 > M 就回報無法修復；重建；**驗 `CiphertextID == packID`**；才用 `Put` 寫回（三個後端都是原子替換；Object Lock 底下是新版本，鎖允許）；寫完再 `VerifyAll` 一次——AEAD tag 是最後一句話。
+- prune 刪 pack 時一併刪 parity；孤兒 parity 在 index 重寫之後清。復活不碰 parity。
+- 不做的：tree、snapshot、index blob 沒有 parity（小，或可重建）；parity 不是第二個 repo 的替代品。
+
 ## 相關決策
 
 - [001 — 專案骨架、module path 與工具鏈基準](decisions/001-project-skeleton.md)
@@ -360,3 +385,4 @@ backup 開頭 =
 - [007 — 垃圾回收：標記、grace、登記與復活](decisions/007-garbage-collection.md)
 - [008 — SFTP 後端](decisions/008-sftp-backend.md)
 - [009 — mount：唯讀 FUSE](decisions/009-mount.md)
+- [010 — Parity：明文 sidecar 與以名字為證的修復](decisions/010-parity.md)

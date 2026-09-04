@@ -45,6 +45,10 @@ type Repository struct {
 	// StateDir and CacheDir override the default locations.
 	StateDir string `toml:"state_dir"`
 	CacheDir string `toml:"cache_dir"`
+
+	// Parity is the number of Reed-Solomon parity shards to store beside
+	// each pack this machine writes, out of 16; 0 stores none.
+	Parity int `toml:"parity"`
 }
 
 // Backup is one scheduled backup job.
@@ -149,6 +153,9 @@ func Parse(text string) (*Config, error) {
 func (c *Config) validate() error {
 	if c.Repository.Location == "" {
 		return errors.New("repository.location is required")
+	}
+	if c.Repository.Parity < 0 || c.Repository.Parity > 8 {
+		return fmt.Errorf("repository.parity is %d, want 0..8", c.Repository.Parity)
 	}
 	if len(c.Backups) == 0 && c.Prune == nil {
 		return errors.New("nothing to run: no [[backup]] and no [prune]")

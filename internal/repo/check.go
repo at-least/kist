@@ -1,15 +1,18 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/index"
 	"github.com/at-least/kist/internal/pack"
+	"github.com/at-least/kist/internal/parity"
 	"github.com/at-least/kist/internal/snapshot"
 	"github.com/at-least/kist/internal/tree"
 )
@@ -28,6 +31,13 @@ type CheckOptions struct {
 	// the default.
 	ReadData bool
 
+	// Repair rewrites a damaged pack from its parity object, when it
+	// has one and the damage is within what the parity can rebuild.
+	// The rewrite happens only after the reconstruction hashes to the
+	// pack's own name, and is verified again afterwards. Implies
+	// ReadData: damage inside chunks is only visible by reading them.
+	Repair bool
+
 	// Progressf receives one line per phase, for a human watching.
 	Progressf func(format string, args ...any)
 }
@@ -45,6 +55,15 @@ type CheckReport struct {
 	Chunks    int
 	Packs     int
 
+	// ParityPacks is how many packs have a parity object. Absence is
+	// not a problem: parity is a per-client choice.
+	ParityPacks int
+
+	// Repaired lists packs rewritten from parity; Unrepairable lists
+	// damaged packs that could not be, and why is in Problems.
+	Repaired     []crypto.ID
+	Unrepairable []crypto.ID
+
 	// Problems are the findings, in the order they were discovered. A
 	// check with any problem is a failure, whatever else it managed to
 	// verify.
@@ -60,8 +79,44 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 		report CheckReport
 		err    error
 	)
+	if opts.Repair {
+		opts.ReadData = true
+	}
 	problem := func(format string, args ...any) {
 		report.Problems = append(report.Problems, fmt.Sprintf(format, args...))
+	}
+
+	// 0. Which packs have parity. Read once; consulted whenever a pack
+	// turns out to be damaged.
+	withParity := make(map[crypto.ID]struct{})
+	err = r.backend.List(ctx, parity.Prefix, func(fi backend.FileInfo) error {
+		if id, err := crypto.ParseID(fi.Key[len(parity.Prefix):]); err == nil {
+			withParity[id] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return report, fmt.Errorf("check: %w", err)
+	}
+	// repair tries to rewrite one damaged pack. It returns whether the
+	// caller should try the pack again.
+	repair := func(id crypto.ID, cause error) bool {
+		if !opts.Repair {
+			return false
+		}
+		if _, ok := withParity[id]; !ok {
+			problem("pack %s: %v; no parity to repair it from", id, cause)
+			report.Unrepairable = append(report.Unrepairable, id)
+			return false
+		}
+		if err := r.repairPack(ctx, id); err != nil {
+			problem("pack %s: %v; repair failed: %v", id, cause, err)
+			report.Unrepairable = append(report.Unrepairable, id)
+			return false
+		}
+		opts.progress("repaired pack %s from parity", id)
+		report.Repaired = append(report.Repaired, id)
+		return true
 	}
 
 	// 1. Every pack that exists must have a readable, consistent trailer.
@@ -83,10 +138,18 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 		}
 		stored[id] = struct{}{}
 		report.Packs++
+		if _, ok := withParity[id]; ok {
+			report.ParityPacks++
+		}
 
 		entries, err := pack.ReadTrailer(ctx, r.backend, r.keys, id)
+		if err != nil && repair(id, err) {
+			entries, err = pack.ReadTrailer(ctx, r.backend, r.keys, id)
+		}
 		if err != nil {
-			problem("pack %s: %v", id, err)
+			if !opts.Repair {
+				problem("pack %s: %v", id, err)
+			}
 			return nil
 		}
 		rebuilt.AddPack(id, entries)
@@ -153,18 +216,58 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 		sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
 
 		for _, id := range ids {
-			reader, err := pack.OpenReader(ctx, r.backend, r.keys, id)
-			if err != nil {
-				problem("pack %s: %v", id, err)
-				continue
+			if slices.Contains(report.Repaired, id) || slices.Contains(report.Unrepairable, id) {
+				continue // already dealt with when its trailer failed
 			}
-			if err := reader.VerifyAll(ctx); err != nil {
+			err := verifyPack(ctx, r, id)
+			if err != nil && repair(id, err) {
+				err = verifyPack(ctx, r, id)
+			}
+			if err != nil && (!opts.Repair || !slices.Contains(report.Unrepairable, id)) {
 				problem("pack %s: %v", id, err)
 			}
 		}
 	}
 
 	return report, nil
+}
+
+func verifyPack(ctx context.Context, r *Repository, id crypto.ID) error {
+	reader, err := pack.OpenReader(ctx, r.backend, r.keys, id)
+	if err != nil {
+		return err
+	}
+	return reader.VerifyAll(ctx)
+}
+
+// repairPack rewrites one pack from its parity object. The rewrite is
+// the one place kist replaces an object it did not just create, and it
+// happens only for bytes proven, by hashing to the pack's name, to be
+// the bytes that were there before the damage.
+func (r *Repository) repairPack(ctx context.Context, id crypto.ID) error {
+	raw, err := backend.GetAll(ctx, r.backend, parity.Key(id))
+	if err != nil {
+		return fmt.Errorf("read parity: %w", err)
+	}
+	obj, err := parity.Parse(raw)
+	if err != nil {
+		return err
+	}
+	damaged, err := backend.GetAll(ctx, r.backend, pack.Key(id))
+	if err != nil && !errors.Is(err, backend.ErrNotFound) {
+		return fmt.Errorf("read pack: %w", err)
+	}
+	fixed, err := obj.Repair(id, damaged)
+	if err != nil {
+		return err
+	}
+	if err := r.backend.Put(ctx, pack.Key(id), bytes.NewReader(fixed), int64(len(fixed))); err != nil {
+		return fmt.Errorf("write repaired pack: %w", err)
+	}
+	if err := verifyPack(ctx, r, id); err != nil {
+		return fmt.Errorf("repaired pack does not verify: %w", err)
+	}
+	return nil
 }
 
 // walkTree descends one snapshot, recording what it reaches.

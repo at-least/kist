@@ -14,6 +14,7 @@ func newCheckCommand() *cobra.Command {
 	var (
 		flags    repoFlags
 		readData bool
+		repair   bool
 	)
 
 	cmd := &cobra.Command{
@@ -31,17 +32,21 @@ func newCheckCommand() *cobra.Command {
 			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
 				result, err := r.Check(ctx, repo.CheckOptions{
 					ReadData:  readData,
+					Repair:    repair,
 					Progressf: func(format string, args ...any) { fmt.Fprintf(cmd.ErrOrStderr(), format+"\n", args...) },
 				})
 				if err != nil {
 					return err
 				}
-				ev.Check = report.FromCheck(result, readData)
+				ev.Check = report.FromCheck(result, readData || repair)
 
 				out := cmd.OutOrStdout()
 				if !jsonMode(cmd) {
-					fmt.Fprintf(out, "%d snapshots, %d trees, %d chunks in %d packs\n",
-						result.Snapshots, result.Trees, result.Chunks, result.Packs)
+					fmt.Fprintf(out, "%d snapshots, %d trees, %d chunks in %d packs (%d with parity)\n",
+						result.Snapshots, result.Trees, result.Chunks, result.Packs, result.ParityPacks)
+					for _, id := range result.Repaired {
+						fmt.Fprintf(out, "repaired pack %s from parity\n", id)
+					}
 					if result.OK() {
 						fmt.Fprintln(out, "no problems found")
 					}
@@ -58,6 +63,7 @@ func newCheckCommand() *cobra.Command {
 	}
 
 	flags.register(cmd)
+	cmd.Flags().BoolVar(&repair, "repair", false, "rewrite damaged packs from their parity objects (implies --read-data)")
 	cmd.Flags().BoolVar(&readData, "read-data", false, "read and verify every chunk, not just metadata")
 	return cmd
 }

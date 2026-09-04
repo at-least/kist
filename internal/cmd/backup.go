@@ -15,6 +15,7 @@ func newBackupCommand() *cobra.Command {
 		flags    repoFlags
 		host     string
 		spoolDir string
+		parity   int
 	)
 
 	cmd := &cobra.Command{
@@ -32,6 +33,7 @@ func newBackupCommand() *cobra.Command {
 				snap, handle, err := r.Backup(ctx, args, repo.BackupOptions{
 					Host:     host,
 					SpoolDir: spoolDir,
+					Parity:   parity,
 					Warnf:    warnInto(cmd, ev),
 				})
 				if err != nil {
@@ -55,5 +57,6 @@ func newBackupCommand() *cobra.Command {
 	flags.register(cmd)
 	cmd.Flags().StringVar(&host, "host", "", "host name to record in the snapshot (default: this machine's)")
 	cmd.Flags().StringVar(&spoolDir, "spool-dir", "", "where to stage packs before upload (default: the system temporary directory)")
+	cmd.Flags().IntVar(&parity, "parity", 0, "Reed-Solomon parity shards per pack, out of 16 data shards (0 = none; 2 = 12.5% overhead, repairs up to 2 damaged sixteenths)")
 	return cmd
 }

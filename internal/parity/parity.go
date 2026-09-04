@@ -153,7 +153,9 @@ func (o *Object) validate() error {
 		return fail("%d parity shards, want 1..%d", o.M, MaxParityShards)
 	case o.ShardLen == 0 || o.ShardLen > maxShardLen:
 		return fail("shard length %d", o.ShardLen)
-	case o.PackSize == 0 || o.PackSize > uint64(o.ShardLen)*DataShards || o.PackSize <= uint64(o.ShardLen)*(DataShards-1):
+	case o.PackSize == 0 || (o.PackSize+DataShards-1)/DataShards != uint64(o.ShardLen):
+		// shard_len must be exactly ceil(pack_size / 16): anything else
+		// means the header disagrees with itself.
 		return fail("pack size %d does not fit %d shards of %d bytes", o.PackSize, DataShards, o.ShardLen)
 	case len(o.Hashes) != DataShards+int(o.M):
 		return fail("%d hashes, want %d", len(o.Hashes), DataShards+int(o.M))

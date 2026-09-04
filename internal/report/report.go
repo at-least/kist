@@ -148,6 +148,10 @@ type CheckResult struct {
 	Chunks    int      `json:"chunks"`
 	Packs     int      `json:"packs"`
 	Problems  []string `json:"problems"`
+
+	ParityPacks  int      `json:"parity_packs"`
+	Repaired     []string `json:"repaired,omitempty"`
+	Unrepairable []string `json:"unrepairable,omitempty"`
 }
 
 // FromCheck builds the result of a check.
@@ -156,7 +160,10 @@ func FromCheck(r repo.CheckReport, readData bool) *CheckResult {
 	if problems == nil {
 		problems = []string{}
 	}
-	return &CheckResult{ReadData: readData, Snapshots: r.Snapshots, Trees: r.Trees, Chunks: r.Chunks, Packs: r.Packs, Problems: problems}
+	return &CheckResult{
+		ReadData: readData, Snapshots: r.Snapshots, Trees: r.Trees, Chunks: r.Chunks, Packs: r.Packs, Problems: problems,
+		ParityPacks: r.ParityPacks, Repaired: idStrings(r.Repaired), Unrepairable: idStrings(r.Unrepairable),
+	}
 }
 
 // RestoreResult is one restore.

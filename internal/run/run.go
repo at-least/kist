@@ -195,7 +195,7 @@ func (r *Runner) backup(ctx context.Context, b *config.Backup) error {
 			return err
 		}
 		defer r.closeRepo(rp)
-		snap, handle, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Warnf: warn})
+		snap, handle, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Parity: r.Config.Repository.Parity, Warnf: warn})
 		if err != nil {
 			return err
 		}

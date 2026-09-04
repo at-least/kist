@@ -32,10 +32,10 @@ $ kist check --read-data
 | 指令 | 說明 |
 | --- | --- |
 | `kist init` | 建立 repo（密碼問兩次，救不回來） |
-| `kist backup <path>...` | 備份並提交一個 snapshot |
+| `kist backup [--parity M] <path>...` | 備份並提交一個 snapshot；`--parity 2` 在每個 pack 旁存 12.5% 的 Reed-Solomon 冗餘 |
 | `kist snapshots` | 列出 snapshot，舊的在前 |
 | `kist restore <snapshot> <target>` | 還原到一個空目錄 |
-| `kist check [--read-data]` | 驗證 repo |
+| `kist check [--read-data] [--repair]` | 驗證 repo；`--repair` 用 parity 修回損壞的 pack |
 | `kist forget --keep-daily 7 ...` | 依 retention 規則（或指名）移除 snapshot |
 | `kist prune` | 標記沒人引用的 pack，grace（預設 72h）之後的下一次刪掉 |
 | `kist rebuild-index` | 從 pack trailer 重建 index |
@@ -55,6 +55,7 @@ repo 位置：`--repo` 或 `$KIST_REPOSITORY`——本機路徑、`s3://bucket/p
 [repository]
 location = "s3://bucket/kist"          # 或本機路徑、sftp://user@host/path
 password_file = "/etc/kist/password"   # 或 $KIST_PASSWORD
+parity = 2                             # 可選：每個 pack 的 Reed-Solomon parity shard 數（16 個 data shard）
 
 [[backup]]
 name = "home"
@@ -88,7 +89,7 @@ listen = "127.0.0.1:9345"
 - `backup`：`snapshot host paths files dirs symlinks bytes bytes_stored chunks_new packs_added packs_revived`
 - `forget`：`dry_run removed kept locked`
 - `prune`：`dry_run packs_stored packs_live marked unmarked deleted locked held[{pack,reason}] bytes_reclaimed`
-- `check`：`read_data snapshots trees chunks packs problems`
+- `check`：`read_data snapshots trees chunks packs problems parity_packs repaired unrepairable`
 - `restore`：`snapshot target files dirs symlinks hard_links bytes`
 - `init`：`location client_id`；`rebuild_index`：`chunks`
 

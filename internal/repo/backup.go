@@ -29,6 +29,12 @@ type BackupOptions struct {
 	// system temporary directory.
 	SpoolDir string
 
+	// Parity is how many Reed-Solomon parity shards to store beside each
+	// pack, out of 16 data shards; 0 stores none. It is a property of
+	// this client's backups, not of the repository: check reports how
+	// many packs have parity and repairs the ones that do.
+	Parity int
+
 	// Warnf receives non-fatal problems: an unreadable file, a socket
 	// that cannot be represented. A backup that skips something must say
 	// so; silence would be a lie about what was saved.
@@ -512,6 +518,9 @@ func (b *backupRun) add(ctx context.Context, id crypto.ID, data []byte) error {
 		w, err := pack.NewWriter(b.repo.keys, b.opts.SpoolDir, b.repo.nonceSource)
 		if err != nil {
 			return err
+		}
+		if b.opts.Parity > 0 {
+			w.SetParity(b.opts.Parity, b.opts.warn)
 		}
 		b.writer = w
 	}
