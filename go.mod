@@ -3,6 +3,7 @@ module github.com/at-least/kist
 go 1.26.0
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.2
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.2
@@ -11,6 +12,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.9.3
 	github.com/klauspost/compress v1.20.0
 	github.com/pkg/sftp v1.13.11
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/crypto v0.56.0
 	golang.org/x/sys v0.47.0

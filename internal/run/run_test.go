@@ -1,0 +1,227 @@
+package run
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/at-least/kist/internal/backend"
+	"github.com/at-least/kist/internal/config"
+	"github.com/at-least/kist/internal/crypto"
+	"github.com/at-least/kist/internal/repo"
+	"github.com/at-least/kist/internal/report"
+)
+
+func cheapKDF() *crypto.KDFParams {
+	p := crypto.DefaultKDFParams()
+	p.Time, p.MemoryKiB, p.Threads = 1, 8, 1
+	return &p
+}
+
+// A whole configuration, run once against a local repository: hooks,
+// two backups, retention, prune, the webhook and the metrics.
+func TestRunnerOnceEndToEnd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the hooks use sh")
+	}
+	ctx := context.Background()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	b, err := backend.CreateLocal(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	password := []byte("run-test")
+	stateDir, cacheDir := t.TempDir(), t.TempDir()
+	init, err := repo.Init(ctx, b, repo.Options{Password: password, StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "hooks.log")
+
+	var (
+		mu     sync.Mutex
+		posted []report.Event
+	)
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ev report.Event
+		if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
+			t.Errorf("webhook body: %v", err)
+		}
+		mu.Lock()
+		posted = append(posted, ev)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer hook.Close()
+
+	cfg, err := config.Parse(`
+[repository]
+location = "` + repoDir + `"
+state_dir = "` + stateDir + `"
+cache_dir = "` + cacheDir + `"
+
+[[backup]]
+name = "docs"
+paths = ["` + source + `"]
+schedule = "@daily"
+pre_backup = ["sh", "-c", "echo pre $KIST_JOB $KIST_HOOK >> ` + marker + `"]
+post_backup = ["sh", "-c", "echo post >> ` + marker + `"]
+
+[[backup]]
+name = "broken"
+paths = ["` + filepath.Join(t.TempDir(), "missing") + `"]
+schedule = "@daily"
+pre_backup = ["sh", "-c", "exit 3"]
+
+[retention]
+keep_last = 1
+
+[prune]
+schedule = "@weekly"
+grace = "1h"
+
+[webhook]
+url = "` + hook.URL + `"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs []string
+	var events []report.Event
+	r := &Runner{
+		Config:   cfg,
+		Password: password,
+		Logf:     func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+		OpenBackend: func(_ context.Context, location string) (backend.Backend, error) {
+			return backend.OpenLocal(location)
+		},
+		Events: func(ev report.Event) { events = append(events, ev) },
+	}
+	err = r.Once(ctx)
+	if err == nil || !strings.Contains(err.Error(), "broken") {
+		t.Fatalf("Once: err = %v, want the broken job reported", err)
+	}
+	if len(logs) == 0 {
+		t.Error("nothing logged")
+	}
+
+	if len(events) != 3 {
+		t.Fatalf("%d events, want 3: %+v", len(events), events)
+	}
+	docs, broken, maint := events[0], events[1], events[2]
+	if !docs.OK || docs.Backup == nil || docs.Backup.Files != 1 {
+		t.Errorf("docs: %+v", docs)
+	}
+	if broken.OK || !strings.Contains(broken.Error, "pre_backup") || !strings.Contains(broken.Error, "exit status 3") {
+		t.Errorf("broken: %+v", broken)
+	}
+	if !maint.OK || maint.Prune == nil || maint.Forget == nil || maint.Prune.PacksStored != 1 {
+		t.Errorf("maintenance: %+v", maint)
+	}
+	hooks, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(hooks) != "pre docs pre_backup\npost\n" {
+		t.Errorf("hooks ran: %q", hooks)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(posted) != 3 || posted[0].Kind != "backup" || posted[1].Job != "broken" || posted[2].Kind != "prune" {
+		t.Errorf("webhook received %+v", posted)
+	}
+	text := r.Metrics.Text()
+	for _, want := range []string{
+		`kist_runs_total{job="docs",result="ok"} 1`,
+		`kist_runs_total{job="broken",result="error"} 1`,
+		`kist_last_backup_files{job="docs"} 1`,
+		`kist_last_prune_packs_stored 1`,
+		"# TYPE kist_runs_total counter",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics lack %q:\n%s", want, text)
+		}
+	}
+}
+
+// A webhook that is down does not fail the job.
+func TestWebhookFailureIsNotFatal(t *testing.T) {
+	cfg, err := config.Parse("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl='http://127.0.0.1:1/nope'\ntimeout='200ms'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	r := &Runner{Config: cfg, Logf: func(f string, a ...any) { logs = append(logs, f) }}
+	ev := report.Event{Kind: "backup", Job: "j", Started: time.Now()}
+	if err := r.finish(context.Background(), &ev, nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	found := false
+	for _, l := range logs {
+		if strings.Contains(l, "webhook") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("webhook failure not logged: %v", logs)
+	}
+}
+
+func TestServeExposesMetrics(t *testing.T) {
+	cfg, err := config.Parse("[repository]\nlocation='x'\n[prune]\nschedule='@yearly'\n[metrics]\nlisten='127.0.0.1:0'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	addr := make(chan string, 1)
+	r := &Runner{
+		Config: cfg,
+		Logf: func(f string, a ...any) {
+			line := fmt.Sprintf(f, a...)
+			if strings.HasPrefix(line, "metrics on ") {
+				addr <- strings.TrimPrefix(line, "metrics on ")
+			}
+		},
+		Wait: func(ctx context.Context, _ time.Duration) error { <-ctx.Done(); return ctx.Err() },
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Serve(ctx) }()
+	var url string
+	select {
+	case url = <-addr:
+	case <-time.After(5 * time.Second):
+		t.Fatal("metrics endpoint never announced")
+	}
+	resp, err := http.Get(url) //nolint:gosec // the URL is the test's own listener
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("content type %q", ct)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Serve returned %v", err)
+	}
+}
