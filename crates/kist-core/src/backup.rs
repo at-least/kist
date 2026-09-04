@@ -50,13 +50,22 @@ pub struct BackupSummary {
     pub stats: SnapshotStats,
 }
 
-/// 一個檔案切塊後的結果（從 blocking thread 回傳）。
+/// 一個檔案切塊後的結果。
 struct FileResult {
     chunks: Vec<ChunkId>,
     bytes_total: u64,
     bytes_new: u64,
     chunks_new: u64,
-    finished: Vec<FinishedPack>,
+}
+
+/// 切塊進行到一半的狀態：在 blocking closure 之間移進移出，讓一個大檔可以分多輪處理，
+/// 每輪最多封一個 pack 就交回 async 端上傳（記憶體上限才成立）。
+struct ChunkState<R: std::io::Read> {
+    chunks: kist_chunker::Chunks<R>,
+    ids: Vec<ChunkId>,
+    bytes_total: u64,
+    bytes_new: u64,
+    chunks_new: u64,
 }
 
 struct Backup {
@@ -70,6 +79,8 @@ struct Backup {
     new_packs: Vec<IndexPack>,
     uploads: JoinSet<Result<()>>,
     stats: SnapshotStats,
+    /// parent snapshot 的開始時間（Unix 秒、奈秒）；沒有 parent 時快速路徑不會用到。
+    parent_start: (i64, u32),
 }
 
 impl Repository {
@@ -103,6 +114,10 @@ impl Repository {
             None => Vec::new(),
         };
         let parent_map = nodes_by_name(parent_nodes);
+        let parent_start = parent
+            .as_ref()
+            .and_then(|(_, snap)| parse_rfc3339_unix(&snap.time))
+            .unwrap_or((0, 0));
 
         let mut b = Backup {
             repo: self.clone(),
@@ -117,6 +132,7 @@ impl Repository {
             new_packs: Vec::new(),
             uploads: JoinSet::new(),
             stats: SnapshotStats::default(),
+            parent_start,
         };
 
         // 根 tree：每個來源路徑一個節點，名稱是絕對路徑。
@@ -231,6 +247,12 @@ impl Repository {
     }
 }
 
+/// RFC 3339 → (Unix 秒, 奈秒)。
+fn parse_rfc3339_unix(s: &str) -> Option<(i64, u32)> {
+    let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
+    Some((t.unix_timestamp(), t.nanosecond()))
+}
+
 fn nodes_by_name(nodes: Vec<Node>) -> HashMap<Vec<u8>, Node> {
     nodes.into_iter().map(|n| (n.name.clone(), n)).collect()
 }
@@ -247,7 +269,10 @@ impl Backup {
         let ft = meta.file_type();
         let node_meta = fsmeta::capture(meta);
         let kind = if ft.is_symlink() {
-            let target = std::fs::read_link(path).map_err(|e| CoreError::io(path, e))?;
+            let target = match std::fs::read_link(path) {
+                Ok(t) => t,
+                Err(e) => return Ok(self.skip(path, &e.to_string())),
+            };
             self.stats.symlinks += 1;
             NodeKind::Symlink {
                 target: fsmeta::path_to_bytes(&target)?,
@@ -264,7 +289,9 @@ impl Backup {
             self.stats.dirs += 1;
             NodeKind::Dir { subtree }
         } else if ft.is_file() {
-            let (size, content) = self.process_file(path, meta, &node_meta, parent).await?;
+            let Some((size, content)) = self.process_file(path, &node_meta, parent).await? else {
+                return Ok(None); // 讀不到，已記錄
+            };
             self.stats.files += 1;
             NodeKind::File { size, content }
         } else {
@@ -297,11 +324,28 @@ impl Backup {
             };
 
             let mut entries = Vec::new();
-            let rd = std::fs::read_dir(path).map_err(|e| CoreError::io(path, e))?;
-            for entry in rd {
-                let entry = entry.map_err(|e| CoreError::io(path, e))?;
-                let name = fsmeta::name_to_bytes(&entry.file_name())?;
-                entries.push((name, entry.path()));
+            match std::fs::read_dir(path) {
+                Ok(rd) => {
+                    for entry in rd {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(e) => {
+                                self.skip(path, &e.to_string());
+                                continue;
+                            }
+                        };
+                        match fsmeta::name_to_bytes(&entry.file_name()) {
+                            Ok(name) => entries.push((name, entry.path())),
+                            Err(e) => {
+                                self.skip(&entry.path(), &e.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // 讀不到的目錄：記錄並以空目錄寫出，其他部分照常備份
+                    self.skip(path, &e.to_string());
+                }
             }
             entries.sort();
 
@@ -359,142 +403,196 @@ impl Backup {
         Ok(id)
     }
 
+    /// 記錄一個讀不到的項目：警告、計數、不寫進 tree。回傳 `None` 方便呼叫端直接 return。
+    fn skip(&mut self, path: &Path, reason: &str) -> Option<Node> {
+        tracing::warn!("{}: {reason}; skipped", path.display());
+        self.stats.errors += 1;
+        None
+    }
+
     /// 處理一個檔案：size、mtime、ctime、inode 都與 parent 相同就沿用它的 chunk 清單，否則讀檔切塊。
+    /// 回傳 `None` 表示讀不到、已記錄略過。
     async fn process_file(
         &mut self,
         path: &Path,
-        meta: &std::fs::Metadata,
         node_meta: &NodeMeta,
         parent: Option<&Node>,
-    ) -> Result<(u64, Content)> {
-        let size = meta.len();
-        if let Some(Node {
-            meta: pmeta,
-            kind:
-                NodeKind::File {
-                    size: psize,
-                    content,
-                },
-            ..
-        }) = parent
-        {
-            if *psize == size && fsmeta::unchanged(pmeta, node_meta) {
-                let ids = match content {
-                    Content::Direct { chunks } | Content::Indirect { chunks } => chunks,
-                };
-                let index = self
-                    .index
-                    .as_ref()
-                    .ok_or_else(|| CoreError::Join("index missing".into()))?;
-                if ids.iter().all(|id| index.contains(id)) {
-                    self.stats.bytes_total += size;
-                    self.stats.chunks_total += ids.len() as u64;
-                    return Ok((size, content.clone()));
-                }
-            }
+    ) -> Result<Option<(u64, Content)>> {
+        if let Some(reused) = self.try_reuse(node_meta, parent).await? {
+            return Ok(Some(reused));
         }
 
-        let result = self.chunk_file(path.to_path_buf()).await?;
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.skip(path, &e.to_string());
+                return Ok(None);
+            }
+        };
+        let reader = BufReader::with_capacity(1 << 20, file);
+        let Some(result) = self.chunk_reader(reader, path.to_path_buf()).await? else {
+            return Ok(None);
+        };
+        // size 用實際讀到的長度，不用讀檔前的 metadata：備份途中被 append 的檔案兩者會不同
+        let size = result.bytes_total;
         self.stats.bytes_total += result.bytes_total;
         self.stats.bytes_new += result.bytes_new;
         self.stats.chunks_total += result.chunks.len() as u64;
         self.stats.chunks_new += result.chunks_new;
-        self.handle_finished(result.finished).await?;
 
         if result.chunks.len() <= MAX_INLINE_CHUNKS {
-            return Ok((
+            return Ok(Some((
                 size,
                 Content::Direct {
                     chunks: result.chunks,
                 },
-            ));
+            )));
         }
         // 大檔：chunk 清單本身當資料存
         let list_bytes = cbor::encode(&ChunkList::new(result.chunks))?;
-        let list_result = self.chunk_bytes(list_bytes).await?;
+        let list_result = self
+            .chunk_reader(
+                std::io::Cursor::new(list_bytes),
+                PathBuf::from("<chunk list>"),
+            )
+            .await?
+            .ok_or_else(|| CoreError::Join("chunk list read failed".into()))?;
         self.stats.chunks_new += list_result.chunks_new;
-        self.handle_finished(list_result.finished).await?;
-        Ok((
+        Ok(Some((
             size,
             Content::Indirect {
                 chunks: list_result.chunks,
             },
-        ))
+        )))
     }
 
-    async fn chunk_file(&mut self, path: PathBuf) -> Result<FileResult> {
-        let file = File::open(&path).map_err(|e| CoreError::io(&path, e))?;
-        self.chunk_reader(move || Ok(BufReader::with_capacity(1 << 20, file)), path)
-            .await
+    /// parent 快速路徑：metadata 沒變、而且它引用的**資料** chunk 全都在 index 裡才沿用。
+    async fn try_reuse(
+        &mut self,
+        node_meta: &NodeMeta,
+        parent: Option<&Node>,
+    ) -> Result<Option<(u64, Content)>> {
+        let Some(Node {
+            meta: pmeta,
+            kind: NodeKind::File { size, content },
+            ..
+        }) = parent
+        else {
+            return Ok(None);
+        };
+        if !fsmeta::unchanged(pmeta, node_meta, self.parent_start) {
+            return Ok(None);
+        }
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| CoreError::Join("index missing".into()))?;
+        // Indirect 的 chunks 只是清單；真正要驗的是清單解開後的資料 chunk
+        let data_ids = match content {
+            Content::Direct { chunks } => chunks.clone(),
+            Content::Indirect { chunks } => {
+                if !chunks.iter().all(|id| index.contains(id)) {
+                    return Ok(None);
+                }
+                match self.repo.resolve_content(content, index).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::warn!("cannot read previous chunk list: {e}; re-reading file");
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        if !data_ids.iter().all(|id| index.contains(id)) {
+            return Ok(None);
+        }
+        self.stats.bytes_total += *size;
+        self.stats.chunks_total += data_ids.len() as u64;
+        Ok(Some((*size, content.clone())))
     }
 
-    async fn chunk_bytes(&mut self, bytes: Vec<u8>) -> Result<FileResult> {
-        self.chunk_reader(
-            move || Ok(std::io::Cursor::new(bytes)),
-            PathBuf::from("<chunk list>"),
-        )
-        .await
-    }
-
-    /// 在 blocking thread 裡切塊、去重、打包。packer 與 index 移進去再移出來。
-    async fn chunk_reader<R, F>(&mut self, open: F, path: PathBuf) -> Result<FileResult>
+    /// 切塊、去重、打包。每輪 blocking 最多封一個 pack 就回到 async 端上傳，
+    /// 所以不管檔案多大，在飛的 pack 數都受 `MAX_INFLIGHT_UPLOADS` 限制。
+    /// 讀取途中出錯回 `None`（已記錄略過；已寫進 pack 的 chunk 留著無害）。
+    async fn chunk_reader<R>(&mut self, reader: R, path: PathBuf) -> Result<Option<FileResult>>
     where
         R: std::io::Read + Send + 'static,
-        F: FnOnce() -> Result<R> + Send + 'static,
     {
-        let mut packer = self
-            .packer
-            .take()
-            .ok_or_else(|| CoreError::Join("packer missing".into()))?;
-        let mut index = self
-            .index
-            .take()
-            .ok_or_else(|| CoreError::Join("index missing".into()))?;
-        let chunker = self.chunker;
-        let keys = Arc::clone(&self.keys);
+        let mut state = ChunkState {
+            chunks: self.chunker.chunks(reader),
+            ids: Vec::new(),
+            bytes_total: 0,
+            bytes_new: 0,
+            chunks_new: 0,
+        };
+        loop {
+            let mut packer = self
+                .packer
+                .take()
+                .ok_or_else(|| CoreError::Join("packer missing".into()))?;
+            let mut index = self
+                .index
+                .take()
+                .ok_or_else(|| CoreError::Join("index missing".into()))?;
+            let keys = Arc::clone(&self.keys);
 
-        let (packer, index, result) = blocking(move || {
-            let mut result = FileResult {
-                chunks: Vec::new(),
-                bytes_total: 0,
-                bytes_new: 0,
-                chunks_new: 0,
-                finished: Vec::new(),
-            };
-            let work = (|| -> Result<()> {
-                let reader = open()?;
-                for chunk in chunker.chunks(reader) {
-                    let chunk = chunk.map_err(|e| match e {
-                        kist_chunker::ChunkerError::Io(io) => CoreError::io(&path, io),
-                        other => other.into(),
-                    })?;
-                    let id = keys.chunk_id(&chunk);
-                    result.bytes_total += chunk.len() as u64;
-                    if !index.contains(&id) {
-                        let entry = packer.add(id, &chunk)?;
-                        index.add_pending(&entry);
-                        result.bytes_new += chunk.len() as u64;
-                        result.chunks_new += 1;
-                        if packer.is_full() {
-                            if let Some(p) = packer.finish()? {
-                                index.resolve_pending(p.id, p.bytes.len() as u64, &p.entries);
-                                result.finished.push(p);
-                            }
+            let (packer, index, state_back, finished, done, read_error) = blocking(move || {
+                let mut finished = None;
+                let mut done = false;
+                let mut read_error = None;
+                loop {
+                    let chunk = match state.chunks.next() {
+                        None => {
+                            done = true;
+                            break;
                         }
+                        Some(Err(e)) => {
+                            read_error = Some(e.to_string());
+                            done = true;
+                            break;
+                        }
+                        Some(Ok(c)) => c,
+                    };
+                    let id = keys.chunk_id(&chunk);
+                    state.bytes_total += chunk.len() as u64;
+                    state.ids.push(id);
+                    if index.contains(&id) {
+                        continue;
                     }
-                    result.chunks.push(id);
+                    let entry = packer.add(id, &chunk)?;
+                    index.add_pending(&entry);
+                    state.bytes_new += chunk.len() as u64;
+                    state.chunks_new += 1;
+                    if packer.is_full() {
+                        if let Some(p) = packer.finish()? {
+                            index.resolve_pending(p.id, p.bytes.len() as u64, &p.entries);
+                            finished = Some(p);
+                        }
+                        break;
+                    }
                 }
-                Ok(())
-            })();
-            match work {
-                Ok(()) => Ok((packer, index, result)),
-                Err(e) => Err(e),
+                Ok((packer, index, state, finished, done, read_error))
+            })
+            .await?;
+            self.packer = Some(packer);
+            self.index = Some(index);
+            state = state_back;
+            if let Some(p) = finished {
+                self.handle_finished(vec![p]).await?;
             }
-        })
-        .await?;
-        self.packer = Some(packer);
-        self.index = Some(index);
-        Ok(result)
+            if let Some(reason) = read_error {
+                self.skip(&path, &reason);
+                return Ok(None);
+            }
+            if done {
+                return Ok(Some(FileResult {
+                    chunks: state.ids,
+                    bytes_total: state.bytes_total,
+                    bytes_new: state.bytes_new,
+                    chunks_new: state.chunks_new,
+                }));
+            }
+        }
     }
 
     async fn flush_pack(&mut self) -> Result<()> {

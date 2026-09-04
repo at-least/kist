@@ -55,6 +55,9 @@ pub struct SnapshotStats {
     pub chunks_total: u64,
     pub chunks_new: u64,
     pub packs_new: u64,
+    /// backup 時讀不到而被略過的項目數（檔案或目錄）。snapshot 仍會寫出，CLI 以非 0 結束。
+    #[serde(default)]
+    pub errors: u64,
 }
 
 /// 時間 → snapshot key 用的時間戳。

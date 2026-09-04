@@ -146,6 +146,13 @@ async fn run(cli: Cli) -> Result<()> {
                 s.chunks_new,
                 s.packs_new
             );
+            if s.errors > 0 {
+                // snapshot 已經寫出（不含那些項目）；用非 0 結束讓排程器知道要看警告
+                bail!(
+                    "{} item(s) could not be read and were skipped (see warnings above)",
+                    s.errors
+                );
+            }
             Ok(())
         }
         Command::Snapshots { repo } => {

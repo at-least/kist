@@ -198,3 +198,38 @@ fn password_file_and_client_id_file_are_honoured() {
         id.trim()
     );
 }
+
+/// 讀不到的檔案：snapshot 照寫、有警告、結束碼非 0（restic 的行為）。
+#[cfg(unix)]
+#[test]
+fn backup_with_unreadable_file_writes_snapshot_but_exits_nonzero() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    let secret = src.join("secret");
+    std::fs::write(&secret, b"x").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    env.ok(&["init"]);
+    let (ok, stdout, stderr) = env.kist(&["backup", src.to_str().unwrap()]);
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+    if nix_is_root() {
+        return; // root 讀得到所有檔案，這個測試沒有意義
+    }
+    assert!(!ok, "應以非 0 結束\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("snapshot"), "snapshot 仍要寫出：{stdout}");
+    assert!(stderr.contains("secret"), "要警告哪個檔案被略過：{stderr}");
+    assert!(stderr.contains("1 item"), "要說明略過數：{stderr}");
+    let snaps = std::fs::read_dir(env.repo().join("snapshots"))
+        .unwrap()
+        .count();
+    assert_eq!(snaps, 1);
+}
+
+#[cfg(unix)]
+fn nix_is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self")
+        .map(|m| m.uid() == 0)
+        .unwrap_or(false)
+}

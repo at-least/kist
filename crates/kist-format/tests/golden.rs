@@ -167,6 +167,7 @@ fn sample_snapshot() -> Snapshot {
             chunks_total: 3,
             chunks_new: 2,
             packs_new: 1,
+            errors: 0,
         },
     }
 }

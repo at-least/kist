@@ -197,7 +197,8 @@ Snapshot {
   paths: [bytes],              備份來源路徑
   root: ObjectId,              根 tree（若根目錄分段，是最後一段）
   parent: text | null,         上一個 snapshot 的 key，只用於加速
-  stats: { files, dirs, symlinks, bytes_total, bytes_new, chunks_total, chunks_new, packs_new: u64 },
+  stats: { files, dirs, symlinks, bytes_total, bytes_new, chunks_total, chunks_new, packs_new,
+           errors: u64 },   errors = backup 時讀不到而略過的項目數
 }
 ```
 

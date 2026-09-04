@@ -75,8 +75,12 @@ pub fn capture(meta: &std::fs::Metadata) -> NodeMeta {
 }
 
 /// backup 快速路徑：上一次記錄的 metadata 與現在的是否「看起來沒變」。
-/// mtime 一定比；ctime 與 inode 在上一次有記錄（非 0）時也要相同。
-pub fn unchanged(previous: &NodeMeta, now: &NodeMeta) -> bool {
+///
+/// - mtime 一定比；ctime 與 inode 在上一次有記錄（非 0）時也要相同。
+/// - 另外要求 mtime 與 ctime 都**早於** parent snapshot 的開始時間 `parent_start`（Unix 秒、奈秒）：
+///   檔案若在上一次 backup 讀它的同一個時間刻度內又被改（"racily clean"），metadata 看起來
+///   一樣但內容不同；這種檔案永遠重讀，直到它的時間戳明確早於某次 backup 的開始為止。
+pub fn unchanged(previous: &NodeMeta, now: &NodeMeta, parent_start: (i64, u32)) -> bool {
     if previous.mtime_secs != now.mtime_secs || previous.mtime_nanos != now.mtime_nanos {
         return false;
     }
@@ -87,6 +91,13 @@ pub fn unchanged(previous: &NodeMeta, now: &NodeMeta) -> bool {
         return false;
     }
     if previous.inode != 0 && previous.inode != now.inode {
+        return false;
+    }
+    let before = |secs: i64, nanos: u32| (secs, nanos) < parent_start;
+    if !before(now.mtime_secs, now.mtime_nanos) {
+        return false;
+    }
+    if has_ctime && !before(now.ctime_secs, now.ctime_nanos) {
         return false;
     }
     true
@@ -160,8 +171,10 @@ pub fn apply(path: &Path, meta: &NodeMeta, is_symlink: bool) -> Result<()> {
         let _ = filetime::set_symlink_file_times(path, mtime, mtime);
         return Ok(());
     }
+    // 先設時間再設 mode：`set_file_times` 走 utimensat（路徑），不需要打開檔案，
+    // 所以 mode 是 0o000 的目錄也設得了；`set_file_mtime` 會先 open 檔案，對這種目錄會失敗。
+    filetime::set_file_times(path, mtime, mtime).map_err(|e| CoreError::io(path, e))?;
     apply_mode(path, meta.mode)?;
-    filetime::set_file_mtime(path, mtime).map_err(|e| CoreError::io(path, e))?;
     Ok(())
 }
 
