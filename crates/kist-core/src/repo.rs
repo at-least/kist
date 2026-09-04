@@ -207,7 +207,8 @@ impl Repository {
         Ok(parts.into_iter().flatten().collect())
     }
 
-    pub(crate) async fn write_index(&self, blob: IndexBlob) -> Result<ObjectId> {
+    /// 寫一個 index blob。一般 backup 會自己呼叫；公開給維護工具（rebuild-index、repack）用。
+    pub async fn write_index(&self, blob: IndexBlob) -> Result<ObjectId> {
         let keys = Arc::clone(&self.keys);
         let (id, bytes) = blocking(move || {
             let plain = cbor::encode(&blob)?;
@@ -230,19 +231,36 @@ impl Repository {
     }
 
     /// 讀進所有 index blob，壞掉的記在 `errors` 裡繼續。
+    /// 被其他 blob 的 `supersedes` 列到的 blob 整個忽略（repack 之後新舊並存時以新的為準）。
     pub(crate) async fn load_index_lenient(
         &self,
         errors: &mut Vec<CoreError>,
     ) -> Result<ChunkIndex> {
-        let mut index = ChunkIndex::new();
+        let mut blobs = Vec::new();
         for (key, _) in self.backend.list(keys::INDEXES_PREFIX).await? {
-            match self.read_object::<IndexBlob>(ObjectKind::Index, &key).await {
-                Ok(blob) => {
-                    for pack in &blob.packs {
-                        index.add_pack(pack);
-                    }
+            let id = match keys::object_id_from_key(&key) {
+                Ok(id) => id,
+                Err(e) => {
+                    errors.push(e.into());
+                    continue;
                 }
+            };
+            match self.read_object::<IndexBlob>(ObjectKind::Index, &key).await {
+                Ok(blob) => blobs.push((id, blob)),
                 Err(e) => errors.push(e),
+            }
+        }
+        let superseded: HashSet<ObjectId> = blobs
+            .iter()
+            .flat_map(|(_, b)| b.supersedes.iter().copied())
+            .collect();
+        let mut index = ChunkIndex::new();
+        for (id, blob) in &blobs {
+            if superseded.contains(id) {
+                continue;
+            }
+            for pack in &blob.packs {
+                index.add_pack(pack);
             }
         }
         Ok(index)

@@ -1,12 +1,12 @@
 //! backup：走訪目錄、切塊、去重、寫 pack / tree / index / snapshot。
 //!
-//! 流程（寫入順序是刻意的，見 `docs/format.md` §11）：
-//! 1. 讀進所有 index、列出已存在的 tree（避免重複上傳）。
+//! 流程（寫入順序是刻意的，見 `docs/format.md` §12）：
+//! 1. 讀進所有 index。
 //! 2. 找同一台 client、同一組路徑的上一個 snapshot 當 parent：
 //!    檔案的 size 與 mtime 沒變就直接沿用它的 chunk 清單，不重讀檔案。
 //! 3. 依名稱排序遞迴走訪。檔案在 blocking thread 裡串流切塊、算 ID、對 index 去重、
 //!    新 chunk 壓縮加密進 pack；pack 滿了就交回 async 端上傳（最多 2 個同時在飛）。
-//! 4. 每個目錄結束時封成 tree（決定性加密），名稱沒見過才上傳。
+//! 4. 每個目錄結束時封成 tree（決定性加密）並上傳（冪等，見 `write_tree`）。
 //! 5. 全部結束：flush 最後一個 pack、等上傳完成、寫 index blob、最後寫 snapshot。
 
 use std::collections::{HashMap, HashSet};
@@ -75,7 +75,8 @@ struct Backup {
     /// 走訪期間會被移進 blocking closure 再移回來，所以用 Option。
     packer: Option<PackWriter>,
     index: Option<ChunkIndex>,
-    known_trees: HashSet<ObjectId>,
+    /// 這次 backup 已經寫過的 tree（同一次裡同內容的目錄不重寫）。
+    written_trees: HashSet<ObjectId>,
     new_packs: Vec<IndexPack>,
     uploads: JoinSet<Result<()>>,
     stats: SnapshotStats,
@@ -112,13 +113,6 @@ impl Repository {
         let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = kept.into_iter().unzip();
 
         let index = self.load_index().await?;
-        let known_trees: HashSet<ObjectId> = self
-            .backend()
-            .list(keys::TREES_PREFIX)
-            .await?
-            .into_iter()
-            .filter_map(|(k, _)| keys::object_id_from_key(&k).ok())
-            .collect();
 
         let parent = self.find_parent(&opts.client_id, &path_bytes).await?;
         let parent_nodes = match &parent {
@@ -140,7 +134,7 @@ impl Repository {
                 self.config().pack_target_size,
             )),
             index: Some(index),
-            known_trees,
+            written_trees: HashSet::new(),
             new_packs: Vec::new(),
             uploads: JoinSet::new(),
             stats: SnapshotStats::default(),
@@ -407,9 +401,14 @@ impl Backup {
         }
     }
 
+    /// tree 是 content-addressed 而且 put 冪等（同名同 bytes），所以**一律 put**，
+    /// 不先列 `trees/` 看存不存在：(1) 壞掉或被換掉的 tree 會在下一次 backup 自我修復；
+    /// (2) 不依賴 backup 開始時的列表，M3 GC 在中途刪掉 tree 也不會被漏掉；
+    /// (3) 省掉一次可能有數十萬筆的 list。代價是每個目錄一次 put（S3 上要算錢；
+    /// M2 有本地快取後可以用 cache_id 記住「這台機器寫過的 tree」再省掉）。
     async fn write_tree(&mut self, tree: Tree) -> Result<ObjectId> {
         let (id, bytes) = self.repo.seal_tree(tree).await?;
-        if self.known_trees.insert(id) {
+        if self.written_trees.insert(id) {
             self.repo.backend().put(&keys::tree(&id), bytes).await?;
         }
         Ok(id)

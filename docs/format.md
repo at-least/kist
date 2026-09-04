@@ -185,6 +185,8 @@ Content =
 ChunkList { version: u32, chunks: [ChunkId] }
 ```
 
+- 寫入端**每次 backup 都重新 put 每個 tree**（同名同 bytes，冪等）：壞掉的 tree 會被
+  下一次 backup 修回來，而且不依賴「backup 開始時的物件列表」（GC 可能中途刪掉東西）。
 - `nodes` 依 `name` 的 bytes 升冪排序；同一目錄內名稱不重複。
 - `name` 在 Unix 是原始 OS bytes；Windows 上是檔名的 UTF-8。
 - `mode` 含檔案類型位元（例如一般檔 `0o100644`）。Windows 上 mode/uid/gid 為 0。
@@ -229,7 +231,10 @@ IndexPack { pack: ObjectId, size: u64, entries: [PackEntry] }
 ```
 
 `supersedes` 列出這個 blob 取代的舊 index blob（M3 repack 用；M1/M2 為空）。
-讀取時新舊 blob 同時存在，以新的為準，舊的走兩階段刪除。
+讀取端先讀完所有 blob、收集全部 `supersedes`，被列到的 blob **整個忽略**；
+所以新舊 blob 同時存在時一律以新的為準，舊的之後走兩階段刪除。
+index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪的規則是
+「它被取代了」或「它列的 pack 全部都已經不存在」。
 
 只是 pack trailer 的快取，可從所有 pack 的 trailer 重建。`size` 是 pack 檔總長度，
 讓 `check` 不讀資料也能用 HEAD 抓到被截斷或換掉的 pack。
@@ -242,7 +247,18 @@ IndexPack { pack: ObjectId, size: u64, entries: [PackEntry] }
 - backup 沿用既有 chunk 時，必須記下它引用了哪些 pack（不是只查「存不存在」），
   才能執行「引用到被標記的 pack 就撤銷標記」。
 
-## 12. 寫入順序（commit point）
+## 12. 已知的設計限制（不打算在 v1 解決，寫下來免得被當成 bug）
+
+- **回滾／刪除攻擊不可偵測**：有寫入權限的人刪掉最新幾個 snapshot，`snapshots` 與 `check`
+  都看不出來。對策在 repo 之外：S3 versioning / Object Lock（M2），以及 client 本機記住
+  自己最後寫出的 snapshot key 做比對（M2 的本地快取）。
+- **snapshot key 是明文**：洩漏 client id 與備份時間（奈秒）。內容都是加密的。
+- **時間戳來自 wall clock**：`latest` 與 parent 的選擇依 key 的時間排序，多台 client
+  時鐘偏差會選錯；只影響快速路徑與顯示，不影響資料正確性。
+- **client id 被複製**（clone VM）會讓兩台機器共用一個 snapshot namespace；
+  parent 只在 `paths` 相同時才沿用，所以不會拿錯資料，但 GC 的活躍判定會混在一起。
+
+## 13. 寫入順序（commit point）
 
 backup 的寫入順序固定為：packs → trees → index → snapshot。
 snapshot 是唯一的 commit point：它出現之前 repo 裡多出來的物件都只是垃圾，
