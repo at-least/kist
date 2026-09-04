@@ -66,6 +66,8 @@ client 條件拿 client 時鐘蓋的章跟 pruner 時鐘蓋的章比。一台快
 
 實測（MinIO，`mc mb --with-lock`）：版本控制 bucket 上不帶 version 的 `DeleteObject` 成功（delete marker），之後 Get 404、List 不列出，位元組留著。kist **不刪版本**——那是 bucket 擁有者 lifecycle policy 的事。`backend.Delete` 事後用 `ListObjectVersions` 看一眼，有版本留著就回 `ErrLocked`。`prune` 對它：計入 `locked`、不計回收位元組，其餘跟刪掉的 pack 一樣——index 停止指向它（它已經讀不到了），標記留到下一輪。維護用的刪除（舊 index blob、標記、垃圾）把 `ErrLocked` 當成功。
 
+`DeleteObject` 成功、之後的 `ListObjectVersions` 卻因為 403 以外的原因失敗時，`Delete` 回錯誤、清掃中止：pack 已經沒了、index 還沒重寫。這正是第 7 點修好的 crash 狀態，下一輪會補上 index 重寫。刻意不在這裡「修」成吞掉錯誤——那會把一個已知安全的狀態換成一個沒被證明過的。
+
 ### 11. 不健康的 repo 不能 prune
 
 任何 snapshot、tree、chunk 解析不到，或任何一個 pack 的 trailer 讀不出來（**包括沒人引用的 pack**），一律中止：「跑 `check`」。在壞掉的 repo 上 prune 是壞掉變成消失的方式。限制：一個沒人引用但 trailer 損壞的 pack 會擋住 prune，得手動移除。
