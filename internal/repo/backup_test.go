@@ -17,6 +17,7 @@ import (
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/pack"
 	"github.com/at-least/kist/internal/snapshot"
+	"github.com/at-least/kist/internal/tree"
 )
 
 // fileSpec describes one file to create for a test.
@@ -253,6 +254,7 @@ func TestSecondBackupOfUnchangedDataWritesNoPacks(t *testing.T) {
 	}
 	if got := countKeys(t, second.Backend(), "trees/"); got != treesAfterFirst {
 		t.Errorf("repository now holds %d trees, want the original %d; unchanged subtrees were not reused", got, treesAfterFirst)
+		logTreeDifferences(t, second)
 	}
 	if got := countKeys(t, second.Backend(), snapshot.Prefix); got != 2 {
 		t.Errorf("repository holds %d snapshots, want 2", got)
@@ -489,4 +491,56 @@ func TestDuplicateContentWithinOnePackIsStoredOnce(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	compareTrees(t, source, filepath.Join(target, filepath.Base(source)))
+}
+
+// logTreeDifferences prints, for the two most recent snapshots, every
+// entry whose tree differs between them: what a platform did differently
+// between two walks of the same directory.
+func logTreeDifferences(t *testing.T, r *Repository) {
+	t.Helper()
+	ctx := context.Background()
+	handles, err := r.Snapshots(ctx, "")
+	if err != nil || len(handles) < 2 {
+		t.Logf("cannot diff snapshots: %v", err)
+		return
+	}
+	var roots [2]crypto.ID
+	for i, h := range handles[len(handles)-2:] {
+		snap, err := r.LoadSnapshot(ctx, h.Key)
+		if err != nil {
+			t.Logf("load %s: %v", h.Key, err)
+			return
+		}
+		roots[i] = snap.Root
+	}
+	var walk func(path string, a, b crypto.ID)
+	walk = func(path string, a, b crypto.ID) {
+		if a == b {
+			return
+		}
+		ta, errA := r.LoadTree(ctx, a)
+		tb, errB := r.LoadTree(ctx, b)
+		if errA != nil || errB != nil {
+			t.Logf("%s: load trees: %v %v", path, errA, errB)
+			return
+		}
+		byName := map[string]tree.Entry{}
+		for _, e := range tb.Entries {
+			byName[e.Name] = e
+		}
+		for _, ea := range ta.Entries {
+			eb, ok := byName[ea.Name]
+			if !ok {
+				t.Logf("%s/%s: only in the first snapshot", path, ea.Name)
+				continue
+			}
+			if fmt.Sprintf("%+v", ea) != fmt.Sprintf("%+v", eb) {
+				t.Logf("%s/%s differs:\n  first:  %+v\n  second: %+v", path, ea.Name, ea, eb)
+			}
+			if ea.Type == tree.TypeDir {
+				walk(path+"/"+ea.Name, ea.Subtree, eb.Subtree)
+			}
+		}
+	}
+	walk("", roots[0], roots[1])
 }

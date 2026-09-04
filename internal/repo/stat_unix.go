@@ -32,7 +32,9 @@ func hardLinkOf(info fs.FileInfo) (hardLinkKey, uint64, bool) {
 		return hardLinkKey{}, 0, false
 	}
 	// The conversions look redundant on Linux and are not on Darwin,
-	// where Dev is int32 and Nlink is uint16.
-	//nolint:unconvert // widths differ between Unixes
+	// where Dev is int32 and Nlink is uint16. A device number is an
+	// opaque bit pattern used only as a map key, so a "negative" Dev
+	// widening to a large uint64 is harmless.
+	//nolint:unconvert,gosec // widths differ between Unixes; see above
 	return hardLinkKey{device: uint64(st.Dev), inode: uint64(st.Ino)}, uint64(st.Nlink), true
 }

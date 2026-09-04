@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -547,6 +548,9 @@ func TestPruneRaceRevivalDuringSweep(t *testing.T) {
 // A backup role that cannot remove marks still backs up safely, because
 // the re-upload does not depend on it.
 func TestBackupSurvivesBeingUnableToUnmark(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only directory does not prevent deletion on Windows; the mechanism under test is POSIX")
+	}
 	s := newScenario(t)
 	src := s.source("one", 300<<10)
 	a := s.open(clientA)
@@ -629,6 +633,9 @@ func TestPruneRewritesTheIndexAfterACrashedSweep(t *testing.T) {
 // pack; prune's own recompute is the last line and must find the pack
 // live.
 func TestPruneRaceMarkDuringBackupWithoutUnmarkPermission(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only directory does not prevent deletion on Windows; the mechanism under test is POSIX")
+	}
 	s := newScenario(t)
 	src := s.source("one", 300<<10)
 	a := s.open(clientA)
