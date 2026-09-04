@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
 )
 
@@ -13,9 +14,11 @@ import (
 // what an existing repository means, which is what the version byte in
 // the magic exists to negotiate.
 const (
-	// Version is the pack format version, carried in the last byte of the
-	// magic so that a reader can reject a future pack before it tries to
-	// parse one.
+	// Version is the pack format version. It is carried in two places
+	// that must agree: the last two bytes of the magic, so a reader can
+	// reject a future pack before parsing one, and the trailer's own v
+	// field, so a trailer cannot be lifted from a pack of one version
+	// onto the tail of another.
 	Version = 1
 
 	// TargetSize is the size a writer aims for before flushing. Large
@@ -31,6 +34,10 @@ const (
 	// tailSize is what a reader must have in hand to locate the trailer.
 	tailSize = lengthSize + magicSize
 
+	// maxSealedChunk is the largest a sealed chunk can legitimately be:
+	// the chunker's maximum, plus the encoding byte, plus the envelope.
+	maxSealedChunk = chunker.MaxSize + 1 + crypto.Overhead
+
 	// maxTrailerSize bounds what a reader will allocate from a length
 	// field it has not yet authenticated. A 64 MiB pack of minimum-size
 	// chunks holds at most 128 entries; 16 MiB is many orders of
@@ -38,10 +45,17 @@ const (
 	maxTrailerSize = 16 << 20
 )
 
-// magic is the last 8 bytes of every pack: "kistpk" then two version
-// bytes, so a corrupted or foreign object is rejected by inspection
-// rather than by a confusing parse failure.
-var magic = [magicSize]byte{'k', 'i', 's', 't', 'p', 'k', 0x00, Version}
+// magicPrefix and magic close every pack: "kistpk" followed by the
+// version as a big-endian uint16, so a corrupted or foreign object is
+// rejected by inspection rather than by a confusing parse failure.
+const magicPrefix = "kistpk"
+
+var magic = func() [magicSize]byte {
+	var m [magicSize]byte
+	copy(m[:], magicPrefix)
+	binary.BigEndian.PutUint16(m[len(magicPrefix):], Version)
+	return m
+}()
 
 // Chunk payload encodings. The algorithm is the first byte of the
 // authenticated plaintext, which makes a sealed chunk self-describing
@@ -104,11 +118,11 @@ func parseTail(tail []byte) (uint64, error) {
 	}
 
 	got := tail[lengthSize:]
-	if string(got[:6]) != "kistpk" {
+	if string(got[:len(magicPrefix)]) != magicPrefix {
 		return 0, fmt.Errorf("%w: tail magic is %x", ErrNotAPack, got)
 	}
-	if got[6] != 0x00 || got[7] != Version {
-		return 0, fmt.Errorf("%w: pack declares version %d.%d, this build reads %d.%d", ErrUnsupportedVersion, got[6], got[7], 0, Version)
+	if v := binary.BigEndian.Uint16(got[len(magicPrefix):]); v != Version {
+		return 0, fmt.Errorf("%w: pack declares version %d, this build reads %d", ErrUnsupportedVersion, v, Version)
 	}
 
 	trailerLen := binary.BigEndian.Uint64(tail[:lengthSize])

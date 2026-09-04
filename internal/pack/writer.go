@@ -39,9 +39,25 @@ type Writer struct {
 // NewWriter starts a pack, spooling to a temporary file in dir. Passing
 // an empty dir uses the system temporary directory.
 //
-// nonceSource supplies chunk nonces; production callers pass nil, meaning
-// crypto/rand. Callers must call Finish or Abort.
+// nonceSource seeds the writer's nonces; production callers pass nil,
+// meaning crypto/rand. The seed is expanded through crypto.NonceStream,
+// so every chunk in a pack gets a distinct nonce even if the caller hands
+// over a source that does not advance -- nonce reuse under one key is the
+// one mistake this package cannot survive, so it is made unreachable
+// rather than documented against.
+//
+// Two writers seeded identically do produce identical nonces. That is
+// what makes golden files possible, and it is harmless: identical seed,
+// key and chunks give a byte-identical pack, which is the deduplication
+// case, not a reuse.
+//
+// Callers must call Finish or Abort.
 func NewWriter(keys *crypto.Keys, dir string, nonceSource io.Reader) (*Writer, error) {
+	nonces, err := crypto.NonceStream(nonceSource)
+	if err != nil {
+		return nil, fmt.Errorf("create pack writer: %w", err)
+	}
+
 	spool, err := os.CreateTemp(dir, "kist-pack-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("create pack spool file: %w", err)
@@ -52,7 +68,7 @@ func NewWriter(keys *crypto.Keys, dir string, nonceSource io.Reader) (*Writer, e
 	hasher := crypto.CiphertextHasher()
 	return &Writer{
 		keys:        keys,
-		nonceSource: nonceSource,
+		nonceSource: nonces,
 		spool:       spool,
 		hasher:      io.MultiWriter(spool, hasher),
 		digest:      hasher,

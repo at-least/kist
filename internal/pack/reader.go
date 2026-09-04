@@ -115,22 +115,56 @@ func (r *Reader) decodeChunk(entry Entry, sealed []byte) ([]byte, error) {
 // VerifyAll re-reads the whole pack and checks every chunk in it. It is
 // what `check --read-data` runs, and the only operation that can catch a
 // bit flip inside chunk data.
+//
+// The pack is streamed, not loaded: peak memory is one chunk, not one
+// pack. That matters because this is the operation most likely to be
+// pointed at a repository with thousands of 64 MiB packs.
 func (r *Reader) VerifyAll(ctx context.Context) error {
-	raw, err := backend.GetAll(ctx, r.backend, Key(r.id))
+	fail := func(err error) error { return fmt.Errorf("verify pack %s: %w", r.id, err) }
+
+	body, err := r.backend.Get(ctx, Key(r.id), 0, backend.ReadToEnd)
 	if err != nil {
-		return fmt.Errorf("verify pack %s: %w", r.id, err)
+		return fail(err)
 	}
-	if got := crypto.CiphertextID(raw); got != r.id {
-		return fmt.Errorf("%w: pack %s hashes to %s: its contents are not what its name says", ErrCorrupt, r.id, got)
+	defer func() { _ = body.Close() }()
+
+	// Everything read passes through the hasher, so the pack's name is
+	// checked against its whole contents without a second pass.
+	hasher := crypto.CiphertextHasher()
+	stream := io.TeeReader(body, hasher)
+
+	buf := make([]byte, maxSealedChunk)
+	var read uint64
+	for i, entry := range r.entries {
+		if entry.Offset != read {
+			return fail(fmt.Errorf("%w: entry %d starts at %d, but %d bytes have been read", ErrCorrupt, i, entry.Offset, read))
+		}
+		if _, err := io.ReadFull(stream, buf[:entry.Length]); err != nil {
+			return fail(fmt.Errorf("read chunk %s: %w", entry.ID, err))
+		}
+		if _, err := r.decodeChunk(entry, buf[:entry.Length]); err != nil {
+			return fail(err)
+		}
+		read = entry.End()
 	}
 
-	for _, entry := range r.entries {
-		if entry.End() > uint64(len(raw)) {
-			return fmt.Errorf("%w: pack %s: chunk %s spans bytes %d-%d of a %d-byte pack", ErrCorrupt, r.id, entry.ID, entry.Offset, entry.End(), len(raw))
-		}
-		if _, err := r.decodeChunk(entry, raw[entry.Offset:entry.End()]); err != nil {
-			return fmt.Errorf("verify pack %s: %w", r.id, err)
-		}
+	// Drain the trailer and tail through the hasher as well.
+	copied, err := io.Copy(io.Discard, stream)
+	if err != nil {
+		return fail(err)
+	}
+	rest, err := sizeOf(copied)
+	if err != nil {
+		return fail(err)
+	}
+	if total := read + rest; total != r.size {
+		return fail(fmt.Errorf("%w: read %d bytes of a pack Stat reported as %d", ErrCorrupt, total, r.size))
+	}
+
+	var got crypto.ID
+	copy(got[:], hasher.Sum(nil))
+	if got != r.id {
+		return fail(fmt.Errorf("%w: pack hashes to %s: its contents are not what its name says", ErrCorrupt, got))
 	}
 	return nil
 }
@@ -220,6 +254,11 @@ func readTrailer(ctx context.Context, b backend.Backend, keys *crypto.Keys, id c
 			return nil, fail(fmt.Errorf("%w: entry %d starts at %d, expected %d", ErrCorrupt, i, e.Offset, next))
 		case e.Length < crypto.Overhead+1:
 			return nil, fail(fmt.Errorf("%w: entry %d is %d bytes, shorter than an empty sealed chunk", ErrCorrupt, i, e.Length))
+		case e.Length > maxSealedChunk:
+			// Refused here rather than at the allocation in readRange: a
+			// trailer claiming a gigabyte chunk should fail on open, not
+			// by asking for a gigabyte of memory.
+			return nil, fail(fmt.Errorf("%w: entry %d is %d bytes, over the %d a sealed chunk can be", ErrCorrupt, i, e.Length, maxSealedChunk))
 		case e.End() > dataEnd:
 			return nil, fail(fmt.Errorf("%w: entry %d ends at %d, past the %d bytes of chunk data", ErrCorrupt, i, e.End(), dataEnd))
 		}

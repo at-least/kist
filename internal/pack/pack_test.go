@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/at-least/kist/internal/backend"
+	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
 )
 
@@ -283,6 +284,25 @@ func TestAbortLeavesNoSpoolFile(t *testing.T) {
 	}
 }
 
+// reseal replaces a pack's trailer with one this test constructs, keeping
+// the chunk data and the tail structure intact.
+func reseal(t *testing.T, keys *crypto.Keys, original []byte, entries []Entry, version uint64) []byte {
+	t.Helper()
+
+	encoded, err := crypto.Marshal(trailer{Version: version, Entries: entries})
+	if err != nil {
+		t.Fatalf("marshal trailer: %v", err)
+	}
+	sealed, err := crypto.Seal(&keys.Index, []byte(crypto.AADPackTrailer), encoded, crypto.DeterministicReader("reseal"))
+	if err != nil {
+		t.Fatalf("seal trailer: %v", err)
+	}
+
+	dataEnd := entries[len(entries)-1].End()
+	out := append(bytes.Clone(original[:dataEnd]), sealed...)
+	return append(out, encodeTail(uint64(len(sealed)))...)
+}
+
 func incompressible(t *testing.T, seed string, n int) []byte {
 	t.Helper()
 
@@ -318,6 +338,23 @@ func TestGoldenPack(t *testing.T) {
 		fmt.Fprintf(&out, "entry %d %s %d %d\n", i, e.ID, e.Offset, e.Length)
 	}
 	fmt.Fprintf(&out, "bytes %s\n", hex.EncodeToString(raw))
+
+	// Decoding the golden back proves the trailer says what the entries
+	// say. Without it, a change that encoded the trailer wrongly but
+	// consistently would only report "the format changed", with no
+	// indication of where.
+	decoded, err := ReadTrailer(ctx, b, keys, id)
+	if err != nil {
+		t.Fatalf("read trailer: %v", err)
+	}
+	if len(decoded) != len(entries) {
+		t.Fatalf("trailer lists %d entries, the writer reported %d", len(decoded), len(entries))
+	}
+	for i := range entries {
+		if decoded[i] != entries[i] {
+			t.Errorf("entry %d: trailer says %+v, writer said %+v", i, decoded[i], entries[i])
+		}
+	}
 
 	path := filepath.Join("testdata", "pack.txt")
 	if *update {
@@ -376,6 +413,11 @@ func TestReaderRejectsDamagedPacks(t *testing.T) {
 			}
 			return p
 		}, ErrCorrupt, true},
+		{"trailer from another version", func(p []byte) []byte {
+			p = bytes.Clone(p)
+			// Keep the tail valid but re-seal a trailer claiming v2.
+			return reseal(t, keys, p, entries, Version+1)
+		}, ErrUnsupportedVersion, true},
 		{"flipped trailer byte", func(p []byte) []byte {
 			p = bytes.Clone(p)
 			p[len(p)-tailSize-1] ^= 0x01
@@ -473,6 +515,9 @@ func TestReaderRejectsInconsistentTrailer(t *testing.T) {
 			{ID: crypto.ID{1}, Offset: 0, Length: sealedLen},
 		},
 		"no entries": {},
+		"chunk longer than the format allows": {
+			{ID: crypto.ID{1}, Offset: 0, Length: maxSealedChunk + 1},
+		},
 	}
 
 	for name, entries := range cases {
@@ -499,5 +544,31 @@ func TestTrailerIsBoundToTheRepositoryKeys(t *testing.T) {
 
 	if _, err := OpenReader(ctx, b, other, id); !errors.Is(err, crypto.ErrDecrypt) {
 		t.Fatalf("open with the wrong keys: err = %v, want ErrDecrypt", err)
+	}
+}
+
+// A chunk is never larger than the chunker's maximum, so a zstd frame
+// claiming more is a decompression bomb. The decoder is configured to
+// refuse it rather than allocate what it asks for.
+func TestDecompressionBombIsRefused(t *testing.T) {
+	oversized := make([]byte, 2*chunker.MaxSize)
+
+	enc, err := getEncoder()
+	if err != nil {
+		t.Fatalf("encoder: %v", err)
+	}
+	bomb := enc.EncodeAll(oversized, nil)
+	t.Logf("frame is %d bytes and claims to decode to %d", len(bomb), len(oversized))
+
+	out, err := decompress(algorithmZstd, bomb)
+	if err == nil {
+		t.Fatalf("decompress returned %d bytes; the decoder is not bounded by chunker.MaxSize", len(out))
+	}
+	t.Logf("refused: %v", err)
+}
+
+func TestDecompressRejectsAnUnknownEncoding(t *testing.T) {
+	if _, err := decompress(0xfe, []byte("payload")); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("decompress with an unknown algorithm byte: err = %v, want ErrCorrupt", err)
 	}
 }

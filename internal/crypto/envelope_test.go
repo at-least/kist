@@ -133,3 +133,68 @@ func TestSealFailsWhenNonceSourceDoes(t *testing.T) {
 		t.Errorf("error = %q, want it to mention the nonce", err)
 	}
 }
+
+// A nonce source that does not advance is a plausible mistake and a fatal
+// one. NonceStream makes it unreachable.
+func TestNonceStreamAdvancesEvenWhenItsSourceDoesNot(t *testing.T) {
+	fixed := bytes.Repeat([]byte{0xab}, 4096)
+
+	stream, err := NonceStream(bytes.NewReader(fixed))
+	if err != nil {
+		t.Fatalf("nonce stream: %v", err)
+	}
+
+	key := testKey(7)
+	seen := map[string]bool{}
+	for i := range 64 {
+		sealed, err := Seal(&key, nil, []byte("identical plaintext"), stream)
+		if err != nil {
+			t.Fatalf("seal %d: %v", i, err)
+		}
+		nonce := string(sealed[:NonceSize])
+		if seen[nonce] {
+			t.Fatalf("nonce repeated after %d seals", i)
+		}
+		seen[nonce] = true
+	}
+}
+
+func TestNonceStreamIsReproducibleFromItsSeed(t *testing.T) {
+	read := func() []byte {
+		stream, err := NonceStream(DeterministicReader("nonce-seed"))
+		if err != nil {
+			t.Fatalf("nonce stream: %v", err)
+		}
+		out := make([]byte, 3*NonceSize)
+		if _, err := io.ReadFull(stream, out); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return out
+	}
+	if !bytes.Equal(read(), read()) {
+		t.Error("the same seed gave two different nonce streams")
+	}
+}
+
+func TestNonceStreamDependsOnItsSeed(t *testing.T) {
+	read := func(seed string) []byte {
+		stream, err := NonceStream(DeterministicReader(seed))
+		if err != nil {
+			t.Fatalf("nonce stream: %v", err)
+		}
+		out := make([]byte, NonceSize)
+		if _, err := io.ReadFull(stream, out); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return out
+	}
+	if bytes.Equal(read("a"), read("b")) {
+		t.Error("two seeds gave the same first nonce")
+	}
+}
+
+func TestNonceStreamRejectsAShortSeed(t *testing.T) {
+	if _, err := NonceStream(bytes.NewReader([]byte("too short"))); err == nil {
+		t.Fatal("nonce stream from a short source: got nil error")
+	}
+}

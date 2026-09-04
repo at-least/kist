@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"lukechampine.com/blake3"
 )
 
 const (
@@ -94,4 +95,34 @@ func newAEAD(key *Key) (cipher.AEAD, error) {
 		return nil, fmt.Errorf("init XChaCha20-Poly1305: %w", err)
 	}
 	return aead, nil
+}
+
+// NonceSeedSize is how much entropy NonceStream draws to seed itself.
+const NonceSeedSize = 32
+
+// NonceStream derives a nonce source that cannot repeat within itself.
+//
+// Seal takes whatever reader it is handed, so a caller that passes a
+// fixed 24 bytes -- a plausible mistake in a test, and fatal for
+// XChaCha20-Poly1305 -- would seal every message under one nonce. This
+// removes that possibility structurally: the returned stream is a BLAKE3
+// XOF seeded from NonceSeedSize bytes of source, so it advances no matter
+// what source does, while staying reproducible when source is.
+//
+// Passing nil reads the seed from crypto/rand.
+func NonceStream(source io.Reader) (io.Reader, error) {
+	if source == nil {
+		source = rand.Reader
+	}
+
+	var seed [NonceSeedSize]byte
+	if _, err := io.ReadFull(source, seed[:]); err != nil {
+		return nil, fmt.Errorf("seed nonce stream: %w", err)
+	}
+
+	h := blake3.New(IDSize, nil)
+	// hash.Hash forbids Write from returning an error.
+	_, _ = h.Write([]byte("kist/v1/nonces")) //nolint:errcheck // hash.Hash.Write never fails
+	_, _ = h.Write(seed[:])                  //nolint:errcheck // hash.Hash.Write never fails
+	return h.XOF(), nil
 }
