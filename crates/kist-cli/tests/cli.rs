@@ -73,6 +73,13 @@ fn full_workflow() {
     assert!(env.repo().join("config").is_file());
     let err = env.fails(&["init"]);
     assert!(err.contains("already exists"), "{err}");
+    let out = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["init"])
+        .env("KIST_REPO", env.repo())
+        .env("KIST_PASSWORD", "cli test password")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "硬失敗是 exit 1");
 
     let out = env.ok(&["backup", src.to_str().unwrap()]);
     assert!(out.contains("snapshot"), "{out}");
@@ -211,12 +218,27 @@ fn backup_with_unreadable_file_writes_snapshot_but_exits_nonzero() {
     std::fs::write(&secret, b"x").unwrap();
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
     env.ok(&["init"]);
-    let (ok, stdout, stderr) = env.kist(&["backup", src.to_str().unwrap()]);
+    let out = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["backup", src.to_str().unwrap()])
+        .env("KIST_REPO", env.repo())
+        .env("KIST_PASSWORD", "cli test password")
+        .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .output()
+        .unwrap();
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
     if nix_is_root() {
         return; // root 讀得到所有檔案，這個測試沒有意義
     }
-    assert!(!ok, "應以非 0 結束\nstdout: {stdout}\nstderr: {stderr}");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    );
+    // restic 慣例：有略過但 snapshot 已寫出 → 3；硬失敗才是 1
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("snapshot"), "snapshot 仍要寫出：{stdout}");
     assert!(stderr.contains("secret"), "要警告哪個檔案被略過：{stderr}");
     assert!(stderr.contains("1 item"), "要說明略過數：{stderr}");

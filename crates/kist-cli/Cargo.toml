@@ -18,6 +18,7 @@ kist-crypto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
+gethostname.workspace = true
 hex.workspace = true
 rpassword.workspace = true
 tokio.workspace = true

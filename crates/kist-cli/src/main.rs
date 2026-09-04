@@ -16,6 +16,22 @@ use clap::{Args, Parser, Subcommand};
 use kist_backend::Backend;
 use kist_core::{BackupOptions, CheckOptions, InitOptions, Repository, RestoreOptions};
 
+/// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
+const EXIT_FAILURE: i32 = 1;
+const EXIT_INCOMPLETE: i32 = 3;
+
+/// `run` 回傳「成功但不完整」時用這個錯誤型別告訴 `main` 要用結束碼 3。
+#[derive(Debug)]
+struct Incomplete(String);
+
+impl std::fmt::Display for Incomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Incomplete {}
+
 /// kist: deduplicating, encrypted backups to object storage.
 #[derive(Debug, Parser)]
 #[command(name = "kist", version, about, long_about = None)]
@@ -101,8 +117,12 @@ fn main() {
         }
     };
     if let Err(e) = runtime.block_on(run(cli)) {
+        if e.downcast_ref::<Incomplete>().is_some() {
+            eprintln!("warning: {e:#}");
+            std::process::exit(EXIT_INCOMPLETE);
+        }
         eprintln!("error: {e:#}");
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILURE);
     }
 }
 
@@ -148,11 +168,12 @@ async fn run(cli: Cli) -> Result<()> {
                 s.packs_new
             );
             if s.errors > 0 {
-                // snapshot 已經寫出（不含那些項目）；用非 0 結束讓排程器知道要看警告
-                bail!(
+                // snapshot 已經寫出（不含那些項目）；結束碼 3 讓排程器知道要看警告
+                return Err(Incomplete(format!(
                     "{} item(s) could not be read and were skipped (see warnings above)",
                     s.errors
-                );
+                ))
+                .into());
             }
             Ok(())
         }
@@ -207,7 +228,11 @@ async fn run(cli: Cli) -> Result<()> {
                 for e in &summary.errors {
                     eprintln!("error: {e}");
                 }
-                bail!("{} item(s) could not be restored", summary.errors.len());
+                return Err(Incomplete(format!(
+                    "{} item(s) could not be restored",
+                    summary.errors.len()
+                ))
+                .into());
             }
             Ok(())
         }
@@ -290,13 +315,15 @@ fn human_bytes(n: u64) -> String {
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+    let name = gethostname::gethostname()
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    if name.is_empty() {
+        "unknown".to_owned()
+    } else {
+        name
+    }
 }
 
 fn username() -> String {

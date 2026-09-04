@@ -26,6 +26,7 @@ clap = { version = "4", features = ["derive", "env"] }
 fastcdc = "5"
 filetime = "0.2"
 futures = "0.3"
+gethostname = "1"
 getrandom = "0.4"
 hex = "0.4"
 object_store = "0.14"
