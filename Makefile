@@ -11,7 +11,7 @@ GOLANGCI := $(shell command -v golangci-lint 2>/dev/null)
 
 FUZZTIME ?= 30s
 
-.PHONY: build test test-s3 test-sftp test-race vet lint fuzz verify clean
+.PHONY: build test test-s3 test-sftp test-race vet lint fuzz fuzz-long release-snapshot verify clean
 
 ## build: compile the release binary. No cgo, ever — a kist binary must
 ## run on any machine of its GOOS/GOARCH without a libc to match.
@@ -52,6 +52,17 @@ ifeq ($(GOLANGCI),)
 else
 	$(GOLANGCI) run ./...
 endif
+
+## release-snapshot: every release artifact, built locally from the working
+## tree with no tag and no token. This is how the release config is tested.
+GORELEASER_VERSION ?= v2.18.0
+release-snapshot:
+	go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION) build --snapshot --clean
+
+## fuzz-long: the 24-hour campaign PLAN asks for. Same targets, same
+## loop; only the budget differs.
+fuzz-long:
+	$(MAKE) fuzz FUZZTIME=24h
 
 ## fuzz: run every FuzzXxx target for FUZZTIME each. `go test -fuzz` takes
 ## exactly one package, so the targets are discovered and run one by one.

@@ -107,12 +107,16 @@ Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,r
 
 - [`docs/format.md`](docs/format.md) — 儲存格式 v1（已凍結），含「每個說法由哪個測試守著」的對照表
 - [`docs/decisions/`](docs/decisions/) — ADR，記錄為什麼這樣設計
+- [`docs/release.md`](docs/release.md) — 版本、平台、release 流程
 - [`PLAN.md`](PLAN.md) — 里程碑與工程規範
 
 ## 開發
 
 ```console
 $ make verify        # build + vet + lint + test + test-race，這是「做完了」的判準
+$ make test-s3       # MinIO in Docker；make test-sftp 同理用 OpenSSH
+$ make fuzz          # 每個 Fuzz 目標跑 FUZZTIME（預設 30s）；make fuzz-long 是 24h
+$ make release-snapshot   # 用 goreleaser 在本機建出所有平台的 artifact，不需要 tag
 $ make fuzz          # 跑所有 FuzzXxx target
 ```
 

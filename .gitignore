@@ -5,3 +5,4 @@
 # Go test artifacts.
 *.test
 *.out
+dist/

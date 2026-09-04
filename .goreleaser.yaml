@@ -1,0 +1,53 @@
+# goreleaser v2. Verified locally with
+#   go run github.com/goreleaser/goreleaser/v2@v2.18.0 build --snapshot --clean
+# which needs no tag, no token and no network beyond the module cache.
+version: 2
+
+project_name: kist
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: kist
+    main: ./cmd/kist
+    binary: kist
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/at-least/kist/internal/cmd.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: kist
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - docs/format.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  draft: true
+  prerelease: auto

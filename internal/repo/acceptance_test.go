@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,6 +63,12 @@ func TestAcceptance(t *testing.T) {
 	r, _ := initRepoAt(t, repoDir, "acceptance")
 
 	// --- first backup -------------------------------------------------
+	// PLAN's M5 bar is peak memory under 1 GiB for a million files. The
+	// sampler reads MemStats every 20 ms while the backup runs and keeps
+	// the highest HeapAlloc (live objects) and Sys (what the process holds
+	// from the OS, which with the default GOGC is up to twice the live
+	// heap). The bar is judged on Sys: that is what the machine sees.
+	stopSampling, peak := samplePeakHeap()
 	start = time.Now()
 	first, handle, err := r.Backup(ctx, []string{source}, BackupOptions{
 		SpoolDir: workDir,
@@ -75,8 +82,13 @@ func TestAcceptance(t *testing.T) {
 		first.Stats.Files, human(int64(first.Stats.Bytes)), human(int64(first.Stats.BytesStored)),
 		first.Stats.PacksAdded, first.Stats.ChunksNew, elapsed.Round(time.Second),
 		human(int64(float64(first.Stats.Bytes)/elapsed.Seconds())))
-	// Not a peak: a peak needs sampling, which is M5 profiling work.
-	t.Logf("heap in use after the backup: %s", human(int64(heapInUse())))
+	stopSampling()
+	heapPeak, sysPeak := peak()
+	t.Logf("peak during backup (20 ms samples): heap in use %s, process Sys %s; heap in use after: %s",
+		human(int64(heapPeak)), human(int64(sysPeak)), human(int64(heapInUse())))
+	if limit := int64(envInt(t, "KIST_ACCEPTANCE_HEAP_LIMIT", 0)); limit > 0 && int64(sysPeak) > limit {
+		t.Errorf("peak Sys %s exceeds the limit %s", human(int64(sysPeak)), human(limit))
+	}
 
 	if first.Stats.Files != uint64(files) {
 		t.Errorf("backed up %d files, want %d", first.Stats.Files, files)
@@ -391,6 +403,43 @@ func human(n int64) string {
 // peak. Measuring the peak needs continuous sampling, which is the memory
 // profile M5 calls for; this is here only to catch an order-of-magnitude
 // regression.
+// samplePeakHeap watches MemStats until stopped and reports the highest
+// HeapAlloc and Sys seen.
+func samplePeakHeap() (stop func(), peak func() (heap, sys uint64)) {
+	var (
+		mu       sync.Mutex
+		highHeap uint64
+		highSys  uint64
+		done     = make(chan struct{})
+		once     sync.Once
+	)
+	sample := func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		mu.Lock()
+		highHeap = max(highHeap, m.HeapAlloc)
+		highSys = max(highSys, m.Sys)
+		mu.Unlock()
+	}
+	go func() {
+		t := time.NewTicker(20 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				sample()
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done); sample() }) }, func() (uint64, uint64) {
+		mu.Lock()
+		defer mu.Unlock()
+		return highHeap, highSys
+	}
+}
+
 func heapInUse() uint64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
