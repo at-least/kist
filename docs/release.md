@@ -56,3 +56,9 @@ CI（`.github/workflows/ci.yml`）在每次 push 跑：三個 OS × Go 1.26.x / 
 | windows/amd64 | ✓ CI | ✓ CI | `-race` 全套 CI（兩個依賴 POSIX chmod 的測試 skip） | 沒有 `mount`。CI 抓到一個真 bug：NTFS 父目錄列表裡的子目錄 mtime 會滯後，unchanged subtree 因此不去重——已修（stat 目錄本身） |
 
 `goreleaser release` 已接在 `v*` tag 上；第一次實際發版前 **UNVERIFIED**。
+
+## 曾經 UNVERIFIED、後來在本機補上的
+
+- **百萬檔驗收，chunker buffer 重用之後（2026-09-05，`KIST_ACCEPTANCE_FILES=1000000`，跟 24h fuzz 同機、fuzz 佔三個 worker）**：第一次 backup 1000000 檔 968.6 MiB 讀入、671.7 MiB 存成 11 packs，2m19s（修前 21m54s）；峰值 heap 394.1 MiB / process Sys 532.2 MiB；第二次 backup 0 個新 chunk，57s（修前 19m6s）；restore 1m45s；byte-for-byte 比對 2m7s；`check --read-data` 16s；翻一個位元組被抓到。restore 比修前那次（55s）慢：`git diff m5..HEAD --stat -- internal/repo/restore.go internal/repo/read.go internal/pack internal/backend/local.go internal/crypto internal/tree` 是空的，restore 路徑一行沒改，差異歸給同機的 fuzz 負載；**單次量測，沒有重跑排除**。
+- **真時鐘的 `kist run`**：排程器測試都是注入 `Now`/`Wait`。2026-09-05 用 `schedule = "* * * * *"`、本機 webhook 接收器、`[metrics]` 跑了 150 秒（`timeout 150 kist run --config …`）：06:55:00、06:56:00、06:57:00 三次準時觸發並各產生一個 snapshot（第二次起 0 個新 chunk），webhook 各收到一個 `{"kind":"backup","job":"smoke",…,"ok":true,…}` POST，`/metrics` 在中途被抓到 `kist_runs_total{job="smoke",result="ok"} 1`；SIGTERM 之後記錄 `stopping` 並結束（`timeout` 回 124 是它自己的狀態碼）。
+

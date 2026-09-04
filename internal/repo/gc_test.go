@@ -731,3 +731,45 @@ func TestPruneHoldsWithinTheClockSkew(t *testing.T) {
 	}
 	s.healthy()
 }
+
+// Assumption 4 of format.md §12, violated: a backup that runs longer
+// than --forget-clients-after. The client deduplicated against a pack
+// that was unmarked when it looked; the pack is marked, the client is
+// forgotten, the pack is swept, and the snapshot commits pointing at
+// chunks that are gone. The argument does not hold and the data is
+// lost -- the documented limit. What is promised instead: the loss is
+// visible to check, and the next prune refuses to touch anything.
+func TestPruneRaceBackupLongerThanForgetClientsAfter(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+	a := s.open(clientA)
+	s.forget(a, s.backup(a, src)) // the pack is dead but not yet marked
+
+	client := s.open(clientA)
+	p := s.pruner()
+	var sweep PruneReport
+	backupHooks.afterMarks = func() {
+		backupHooks.afterMarks = nil
+		s.prune(p, shortGrace) // marks the pack the backup is about to rely on
+		s.clock.advance(11 * time.Hour)
+		sweep = s.prune(p, shortGrace) // grace and 10x grace both passed: the client is forgotten
+	}
+	defer func() { backupHooks.afterMarks = nil }()
+	s.backup(client, src)
+
+	if len(sweep.Deleted) != 1 || len(sweep.Held) != 0 {
+		t.Fatalf("sweep with the client forgotten: %+v", sweep)
+	}
+
+	report, err := p.Check(context.Background(), CheckOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OK() {
+		t.Fatal("check passed a snapshot whose pack was swept from under it")
+	}
+	t.Logf("check: %v", report.Problems)
+	if _, err := p.Prune(context.Background(), shortGrace); !errors.Is(err, ErrUnhealthy) {
+		t.Fatalf("prune after the loss: %v, want ErrUnhealthy", err)
+	}
+}

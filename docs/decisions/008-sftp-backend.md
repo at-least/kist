@@ -51,7 +51,7 @@ x/crypto 的坑：`known_hosts` 只有 ed25519、client 預設演算法偏好讓
 
 ## 限制（文件化，沒解）
 
-- `pkg/sftp` 除了 `ReadDirContext` 之外全部忽略 `ctx`：伺服器掛住，kist 跟著掛。
+- `pkg/sftp` 除了 `ReadDirContext` 之外全部忽略 `ctx`：伺服器掛住，kist 跟著掛。量過（`TestSFTPPutAndGetIgnoreACancelledContext`，loopback 容器）：把已經 cancel 的 ctx 丟給 `Put`，32 MiB 照樣在 79 ms 內寫完、回 nil；`Get` 也整份讀回。
 - 持久性只有 `fsync@openssh.com`；協定沒有目錄 fsync。
 - 吞吐量（loopback 上的 Docker OpenSSH，`TestSFTPThroughput`，64 MiB pack）：get 424 MiB/s；put 循序時 61 MiB/s，開 `UseConcurrentWrites(true)` 之後 174 MiB/s——所以開了。安全，因為暫存檔關檔 + fsync 之後才 link。真實網路上的數字沒量過。
 - 沒有 per-prefix 權限（見 format.md §10）；`remove` 不能列進黑名單。

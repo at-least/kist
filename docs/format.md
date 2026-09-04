@@ -304,10 +304,12 @@ MinIO 上這條全部跑過。AWS S3 的行為文件上相同，**UNVERIFIED**�
 | 拿不到 `gc/*` Delete 的 backup 仍然安全 | `TestBackupSurvivesBeingUnableToUnmark` |
 | `clients/` 底下的垃圾擋不住 prune、也不會被刪 | `TestPruneToleratesJunkClientRecords` |
 | 時鐘偏差在容許值內會 hold | `TestPruneHoldsWithinTheClockSkew` |
+| 假設 4 違反（backup 跑超過 `--forget-clients-after`）：資料會丟，但 `check` 看得見、下一次 prune 拒絕動手 | `TestPruneRaceBackupLongerThanForgetClientsAfter` |
 | backup 權限只能刪 `gc/*` | `TestS3BackupPolicy/can_revive_a_marked_pack_and_nothing_more` |
 | Object Lock 底下：回報、不計回收、index 不再指向、repo 仍健康 | `TestS3ObjectLockIsReportedNotFought` |
 | 小檔備份的每檔成本（chunker buffer 重用） | `BenchmarkBackupSmallFiles`、`TestResetChunksLikeAFreshChunker` |
 | SFTP 吞吐量是量過的數字 | `TestSFTPThroughput` |
+| SFTP 的 Put / Get 忽略已取消的 ctx（限制，釘住以便察覺函式庫改變） | `TestSFTPPutAndGetIgnoreACancelledContext` |
 | parity 物件不變、edge size 都對 | `internal/parity/testdata/parity.txt`、`TestEncodeAndParseAtAwkwardSizes` |
 | ≤ M 個 shard 損壞（含 trailer、同 shard 兩處）修得回逐位元組相同；> M 不動 pack | `TestRepairsUpToMShards`、`TestRefusesMoreThanMErasures`、`TestCheckRepairsADamagedPackFromParity`、`TestCheckReportsWhatParityCannotRepair` |
 | 偽造的 parity 修不出錯的東西 | `TestForgedParityCannotRepairWrongly`、`TestCheckReportsWhatParityCannotRepair/forged_parity` |
@@ -358,7 +360,7 @@ backup 開頭 =
 1. 後端 read-after-write 一致：寫完的物件立刻能被 List 和 Get 看到。S3 自 2020 起如此；M4 的 SFTP 後端也必須如此。
 2. 一個 client 同一時間只跑一個 backup。
 3. client 與 pruner 的時鐘差距在 `--clock-skew` 之內。
-4. 一個 backup 不會跑超過 `--forget-clients-after`。
+4. 一個 backup 不會跑超過 `--forget-clients-after`。違反的後果（`TestPruneRaceBackupLongerThanForgetClientsAfter` 演給你看）：那次 backup 去重時倚賴的 pack 在它提交前被標記、等它的 client 被遺忘、pack 被掃掉，snapshot 提交後指著不存在的 chunk。資料就是丟了；保證的只剩 `check` 回報「which no pack holds」、下一次 prune 因此拒絕動任何東西。
 
 ## 13. Parity（M5，可選）
 

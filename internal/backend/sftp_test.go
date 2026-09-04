@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -336,4 +337,33 @@ func TestParseSFTPLocation(t *testing.T) {
 			t.Errorf("%s: got %+v, want %+v", tc.in, got, tc.want)
 		}
 	}
+}
+
+// pkg/sftp has no context-aware Put or Get: the context passed to those
+// methods is ignored, and a cancelled one neither stops the transfer nor
+// fails it. That is a documented limitation (ADR 008); this test pins the
+// observed behaviour so a change in the library is noticed.
+func TestSFTPPutAndGetIgnoreACancelledContext(t *testing.T) {
+	b := newTestSFTP(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	const size = 32 << 20
+	payload := bytes.Repeat([]byte("kist"), size/4)
+	start := time.Now()
+	if err := b.Put(ctx, "packs/cancelled", bytes.NewReader(payload), size); err != nil {
+		t.Fatalf("put with a cancelled context: %v (the library started honouring ctx; update ADR 008)", err)
+	}
+	put := time.Since(start)
+
+	rc, err := b.Get(ctx, "packs/cancelled", 0, ReadToEnd)
+	if err != nil {
+		t.Fatalf("get with a cancelled context: %v", err)
+	}
+	n, err := io.Copy(io.Discard, rc)
+	_ = rc.Close()
+	if err != nil || n != size {
+		t.Fatalf("get with a cancelled context: %d bytes, %v", n, err)
+	}
+	t.Logf("cancelled context ignored: put of %d MiB completed in %v, get returned all %d bytes", size>>20, put.Round(time.Millisecond), n)
 }

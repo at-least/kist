@@ -30,7 +30,7 @@ snapshot 是葉子：沒有東西引用它，刪掉不會讓任何東西懸空�
 
 論證：一個在標記**之前**開始的備份，跳過了 X，snapshot 還沒落地。它的 client 的最新 snapshot（或登記時間）一定早於標記——同一 client 同一時間只跑一個備份——所以 hold。一個在標記**之後**開始的備份，開頭就列了 `gc/`，會看到標記（見 6）。
 
-「還在等的 client」= 最後活動距今不超過 `--forget-clients-after`（預設 10 × grace）。一個 30 天沒動靜的 client 被假設沒有備份在跑；真有的話那次備份已經跑了 30 天。這是文件化的限制，不是漏洞。
+「還在等的 client」= 最後活動距今不超過 `--forget-clients-after`（預設 10 × grace）。一個 30 天沒動靜的 client 被假設沒有備份在跑；真有的話那次備份已經跑了 30 天。這是文件化的限制，不是漏洞。真的違反時會發生什麼，`TestPruneRaceBackupLongerThanForgetClientsAfter` 釘住了：snapshot 指著被掃掉的 pack，`check` 看得見，prune 拒絕再動。
 
 ### 5. `clients/<clientID>` 登記：讓 prune 知道要等誰
 
