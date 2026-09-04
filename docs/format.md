@@ -20,11 +20,15 @@ repo 是一個 key → bytes 的命名空間（本機目錄、S3 bucket…）。
 | `indexes/<hex>` | envelope(`IndexBlob`) | 整段 AEAD | BLAKE3(整檔 bytes) |
 | `trees/<hex>` | envelope(`Tree`) | 整段 AEAD | BLAKE3(整檔 bytes) |
 | `snapshots/<client hex>/<ts>` | envelope(`Snapshot`) | 整段 AEAD | client id + 時間 |
-| `gc/<pack hex>` | 待刪標記（M3 定義） | — | pack 名稱 |
+| `gc/<object hex>` | 待刪標記（M3 定義；pack、tree、index 都適用） | — | 被標記物件的名稱 |
 
 「以 BLAKE3(整檔 bytes) 命名」指的是對**寫進 repo 的密文 bytes** 做一般（無 key）
 BLAKE3，小寫 hex。任何人下載後都能在不持有金鑰的情況下驗證檔案沒被改過；
 而因為 hash 的是密文，名稱不會洩漏明文的任何資訊。
+
+**讀取端必須驗證名稱**：envelope 的 AAD 只綁物件種類，沒綁名稱。把 tree A 的 bytes 複製到
+`trees/<B>` 上，解密會成功。所以讀 `trees/*`、`indexes/*` 時一律先算 hash 對名稱；
+讀 `snapshots/*` 時用內容裡的 `client_id` 與 `time` 反算 key，必須與實際的 key 相同。
 
 ## 2. 識別碼
 
@@ -202,14 +206,25 @@ Snapshot {
 ## 10. Index
 
 ```
-IndexBlob { version: u32, packs: [IndexPack] }
+IndexBlob { version: u32, packs: [IndexPack], supersedes: [ObjectId] }
 IndexPack { pack: ObjectId, size: u64, entries: [PackEntry] }
 ```
+
+`supersedes` 列出這個 blob 取代的舊 index blob（M3 repack 用；M1/M2 為空）。
+讀取時新舊 blob 同時存在，以新的為準，舊的走兩階段刪除。
 
 只是 pack trailer 的快取，可從所有 pack 的 trailer 重建。`size` 是 pack 檔總長度，
 讓 `check` 不讀資料也能用 HEAD 抓到被截斷或換掉的 pack。
 
-## 11. 寫入順序（commit point）
+## 11. GC 的相容性要求（M3 實作，格式現在先定）
+
+- 「未被引用就刪」的物件不只 pack：tree 與 index 也是。backup 開始時列出的 `trees/`
+  在 GC 刪掉某個 tree 後就不可信，所以 `gc/<object hex>` 對 pack、tree、index 一體適用，
+  兩階段刪除（標記 → grace period → 刪）的規則也一樣。
+- backup 沿用既有 chunk 時，必須記下它引用了哪些 pack（不是只查「存不存在」），
+  才能執行「引用到被標記的 pack 就撤銷標記」。
+
+## 12. 寫入順序（commit point）
 
 backup 的寫入順序固定為：packs → trees → index → snapshot。
 snapshot 是唯一的 commit point：它出現之前 repo 裡多出來的物件都只是垃圾，

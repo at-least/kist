@@ -79,12 +79,14 @@ impl Repository {
             let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
             abs_paths.push(abs);
         }
-        abs_paths.sort();
-        abs_paths.dedup();
-        let mut path_bytes = Vec::new();
-        for p in &abs_paths {
-            path_bytes.push(fsmeta::path_to_bytes(p)?);
+        // 根 tree 的節點名稱是路徑的 bytes，排序也必須依 bytes（format.md §8），不是 PathBuf 的順序
+        let mut with_bytes = Vec::new();
+        for p in abs_paths {
+            with_bytes.push((fsmeta::path_to_bytes(&p)?, p));
         }
+        with_bytes.sort();
+        with_bytes.dedup();
+        let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = with_bytes.into_iter().unzip();
 
         let index = self.load_index().await?;
         let known_trees: HashSet<ObjectId> = self

@@ -13,6 +13,10 @@ use crate::{ObjectId, FORMAT_VERSION};
 pub struct IndexBlob {
     pub version: u32,
     pub packs: Vec<IndexPack>,
+    /// 這個 blob 取代了哪些舊的 index blob（M3 repack 用：新 blob 寫好後，舊的走兩階段刪除；
+    /// 讀取時若新舊都在，以新的為準）。M1/M2 一律為空。
+    #[serde(default)]
+    pub supersedes: Vec<ObjectId>,
 }
 
 impl IndexBlob {
@@ -20,6 +24,7 @@ impl IndexBlob {
         Self {
             version: FORMAT_VERSION,
             packs,
+            supersedes: Vec::new(),
         }
     }
 }

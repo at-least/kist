@@ -8,7 +8,7 @@ use kist_crypto::{create_key_slot, unlock_key_slot, KdfCost, RepoKeys};
 use kist_format::config::{ChunkerParams, RepoConfig};
 use kist_format::envelope::{Compression, ObjectKind};
 use kist_format::index::IndexBlob;
-use kist_format::snapshot::{format_rfc3339, Snapshot};
+use kist_format::snapshot::{format_key_timestamp, format_rfc3339, Snapshot};
 use kist_format::tree::{Node, Tree};
 use kist_format::{cbor, keys, ObjectId};
 use serde::de::DeserializeOwned;
@@ -110,6 +110,10 @@ impl Repository {
     }
 
     /// 讀一個 envelope 物件並解出 CBOR。
+    ///
+    /// 以內容命名的物件（`trees/*`、`indexes/*`）會先驗證「名稱 = BLAKE3(bytes)」：
+    /// AAD 只綁物件種類，沒綁名稱，若有人把 tree A 的檔案複製到 tree B 的名稱上，
+    /// 解密照樣成功；只有這一步能抓到。
     pub(crate) async fn read_object<T: DeserializeOwned + Send + 'static>(
         &self,
         kind: ObjectKind,
@@ -118,7 +122,21 @@ impl Repository {
         let bytes = self.backend.get(key).await?;
         let keys = Arc::clone(&self.keys);
         let key_owned = key.to_owned();
+        let expected_name = if matches!(kind, ObjectKind::Tree | ObjectKind::Index) {
+            Some(keys::object_id_from_key(key)?)
+        } else {
+            None
+        };
         blocking(move || {
+            if let Some(expected) = expected_name {
+                let actual = ObjectId::of(&bytes);
+                if actual != expected {
+                    return Err(CoreError::Corrupt {
+                        key: key_owned,
+                        reason: format!("content hash {actual} does not match its name"),
+                    });
+                }
+            }
             let plain = keys
                 .open_object(kind, &bytes)
                 .map_err(|e| CoreError::Corrupt {
@@ -220,12 +238,32 @@ impl Repository {
         Ok(())
     }
 
+    /// 讀 snapshot，並驗證內容與 key 一致（client id、時間戳）：
+    /// snapshot 不是以內容命名，所以用內容裡的欄位反過來對 key。
     pub(crate) async fn read_snapshot(&self, key: &str) -> Result<Snapshot> {
-        match self.read_object(ObjectKind::Snapshot, key).await {
+        let snapshot: Snapshot = match self.read_object(ObjectKind::Snapshot, key).await {
             Err(CoreError::Backend(BackendError::NotFound(_))) => {
-                Err(CoreError::SnapshotNotFound(key.to_owned()))
+                return Err(CoreError::SnapshotNotFound(key.to_owned()))
             }
-            other => other,
+            other => other?,
+        };
+        let expected_key = {
+            let t = time::OffsetDateTime::parse(
+                &snapshot.time,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map_err(|e| CoreError::Corrupt {
+                key: key.to_owned(),
+                reason: format!("bad time {:?}: {e}", snapshot.time),
+            })?;
+            keys::snapshot(&snapshot.client_id, &format_key_timestamp(t)?)
+        };
+        if expected_key != key {
+            return Err(CoreError::Corrupt {
+                key: key.to_owned(),
+                reason: format!("snapshot content belongs to {expected_key}"),
+            });
         }
+        Ok(snapshot)
     }
 }
