@@ -97,7 +97,19 @@ impl Repository {
         }
         with_bytes.sort();
         with_bytes.dedup();
-        let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = with_bytes.into_iter().unzip();
+        // `/a` 與 `/a/b` 同時給：只留 `/a`，否則 b 會備份兩次、restore 時重建同一條路徑
+        let mut kept: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+        for (bytes, path) in with_bytes {
+            if kept.iter().any(|(_, outer)| path.starts_with(outer)) {
+                tracing::warn!(
+                    "{}: already covered by another source path; skipped",
+                    path.display()
+                );
+                continue;
+            }
+            kept.push((bytes, path));
+        }
+        let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = kept.into_iter().unzip();
 
         let index = self.load_index().await?;
         let known_trees: HashSet<ObjectId> = self

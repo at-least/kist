@@ -152,7 +152,7 @@ impl Repository {
                         self.check_tree(subtree, context, index, visited, report)
                             .await;
                     }
-                    NodeKind::File { content, .. } => {
+                    NodeKind::File { size, content } => {
                         let ids = match content {
                             Content::Direct { chunks } => chunks.clone(),
                             Content::Indirect { chunks } => {
@@ -171,12 +171,25 @@ impl Repository {
                                 }
                             }
                         };
+                        let mut sum = 0u64;
+                        let mut complete = true;
                         for c in ids {
-                            if !index.contains(&c) {
-                                report
-                                    .errors
-                                    .push(format!("{key}: chunk {c} is missing from the index"));
+                            match index.get(&c) {
+                                Some(loc) => sum = sum.saturating_add(loc.raw_len),
+                                None => {
+                                    complete = false;
+                                    report.errors.push(format!(
+                                        "{key}: chunk {c} is missing from the index"
+                                    ));
+                                }
                             }
+                        }
+                        // 不讀資料也能抓到 size 與 chunk 總長不符（例如備份中變動的檔）
+                        if complete && sum != *size {
+                            report.errors.push(format!(
+                                "{key}: file {:?} says {size} bytes but its chunks total {sum}",
+                                String::from_utf8_lossy(&node.name)
+                            ));
                         }
                     }
                     NodeKind::Symlink { .. } => {}

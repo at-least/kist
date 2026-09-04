@@ -59,6 +59,33 @@ pub fn bytes_to_relative_path(bytes: &[u8]) -> Result<PathBuf> {
     Ok(rel)
 }
 
+/// restore 用：tree 裡的子節點名稱來自 repo 內容，必須是「單一路徑元件」。
+/// 空字串、`.`、`..`、含分隔符或 NUL 的名稱都可能讓 restore 寫到目標目錄之外。
+pub fn validate_child_name(name: &[u8]) -> Result<()> {
+    let bad = |why: &str| {
+        Err(CoreError::Corrupt {
+            key: format!("tree entry {:?}", String::from_utf8_lossy(name)),
+            reason: format!("invalid file name: {why}"),
+        })
+    };
+    if name.is_empty() {
+        return bad("empty");
+    }
+    if name == b"." || name == b".." {
+        return bad("directory reference");
+    }
+    if name.contains(&b'/') {
+        return bad("contains '/'");
+    }
+    if name.contains(&0) {
+        return bad("contains NUL");
+    }
+    if cfg!(windows) && name.contains(&b'\\') {
+        return bad("contains '\\'");
+    }
+    Ok(())
+}
+
 pub fn capture(meta: &std::fs::Metadata) -> NodeMeta {
     let (secs, nanos) = mtime_of(meta);
     let (ctime_secs, ctime_nanos) = ctime_of(meta);

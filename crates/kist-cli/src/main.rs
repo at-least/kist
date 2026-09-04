@@ -194,12 +194,21 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let r = open_repo(&repo).await?;
             let key = r.resolve_snapshot(&snapshot).await?;
-            r.restore(&key, &target, RestoreOptions::default()).await?;
+            let summary = r.restore(&key, &target, RestoreOptions::default()).await?;
             println!(
-                "restored {} to {}",
+                "restored {} to {}: {} files, {} dirs, {} symlinks",
                 short_snapshot_id(&key),
-                target.display()
+                target.display(),
+                summary.files,
+                summary.dirs,
+                summary.symlinks
             );
+            if !summary.errors.is_empty() {
+                for e in &summary.errors {
+                    eprintln!("error: {e}");
+                }
+                bail!("{} item(s) could not be restored", summary.errors.len());
+            }
             Ok(())
         }
         Command::Check { repo, read_data } => {

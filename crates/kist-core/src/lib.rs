@@ -27,7 +27,7 @@ pub use backup::{BackupOptions, BackupSummary};
 pub use check::{CheckOptions, CheckReport};
 pub use index::{ChunkIndex, ChunkLocation};
 pub use repo::{InitOptions, Repository};
-pub use restore::RestoreOptions;
+pub use restore::{RestoreOptions, RestoreSummary};
 pub use snapshots::SnapshotInfo;
 
 use std::path::PathBuf;

@@ -96,8 +96,18 @@ async fn missing_tree_is_detected() {
 /// 把物件 A 的檔案複製到物件 B 的名稱上：解密會成功（同 key、同種類），
 /// 只有「名稱 = 密文 hash」的驗證能抓到。
 fn swap_objects(dir: &std::path::Path) -> (String, String) {
+    swap_objects_excluding(dir, &[])
+}
+
+/// 同上，但 `exclude`（檔名）不當受害者——例如根 tree，壞了就什麼都還原不了，測不出「其餘照常」。
+fn swap_objects_excluding(dir: &std::path::Path, exclude: &[String]) -> (String, String) {
     let mut files = walk_files(dir);
-    files.retain(|p| p.is_file());
+    files.retain(|p| {
+        p.is_file()
+            && !exclude
+                .iter()
+                .any(|x| p.file_name().unwrap().to_str().unwrap() == x)
+    });
     files.sort();
     let (a, b) = (files[0].clone(), files[1].clone());
     std::fs::copy(&a, &b).unwrap();
@@ -110,7 +120,9 @@ fn swap_objects(dir: &std::path::Path) -> (String, String) {
 #[tokio::test]
 async fn tree_copied_over_another_tree_is_detected() {
     let (t, repo) = repo_with_data().await;
-    let (_a, b) = swap_objects(&t.repo_path().join("trees"));
+    let key = repo.resolve_snapshot("latest").await.unwrap();
+    let root = repo.read_snapshot_by_key(&key).await.unwrap().root.to_hex();
+    let (_a, b) = swap_objects_excluding(&t.repo_path().join("trees"), &[root]);
     let report = repo.check(CheckOptions { read_data: false }).await.unwrap();
     assert!(
         report
@@ -120,16 +132,16 @@ async fn tree_copied_over_another_tree_is_detected() {
         "{:?}",
         report.errors
     );
-    let key = repo.resolve_snapshot("latest").await.unwrap();
-    let err = repo
+    // 壞掉的是某個子目錄的 tree：那個目錄失敗、其餘照常還原，錯誤指名該 tree
+    let summary = repo
         .restore(
             &key,
             &t.dir.path().join("out"),
             kist_core::RestoreOptions::default(),
         )
         .await
-        .unwrap_err();
-    assert!(matches!(err, kist_core::CoreError::Corrupt { .. }), "{err}");
+        .unwrap();
+    assert!(summary.errors.iter().any(|e| e.contains(&b)), "{summary:?}");
 }
 
 #[tokio::test]
