@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use kist_backend::Backend;
-use kist_core::{BackupOptions, CheckOptions, InitOptions, Repository, RestoreOptions};
+use kist_core::{
+    BackupOptions, CheckOptions, ForgetOptions, InitOptions, Repository, RestoreOptions,
+    RetentionPolicy,
+};
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
 const EXIT_FAILURE: i32 = 1;
@@ -103,6 +106,37 @@ enum Command {
         /// Also download every pack and verify every chunk (slow).
         #[arg(long)]
         read_data: bool,
+    },
+    /// Remove snapshots, by id or by retention policy. Data is reclaimed later by `prune`.
+    Forget {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Snapshots to remove (`latest`, a full id, or a unique timestamp prefix).
+        snapshots: Vec<String>,
+        /// Keep the newest N snapshots of each client/path group.
+        #[arg(long, value_name = "N")]
+        keep_last: Option<u32>,
+        /// Keep the newest snapshot of each of the last N hours.
+        #[arg(long, value_name = "N")]
+        keep_hourly: Option<u32>,
+        /// Keep the newest snapshot of each of the last N days.
+        #[arg(long, value_name = "N")]
+        keep_daily: Option<u32>,
+        /// Keep the newest snapshot of each of the last N ISO weeks.
+        #[arg(long, value_name = "N")]
+        keep_weekly: Option<u32>,
+        /// Keep the newest snapshot of each of the last N months.
+        #[arg(long, value_name = "N")]
+        keep_monthly: Option<u32>,
+        /// Keep the newest snapshot of each of the last N years.
+        #[arg(long, value_name = "N")]
+        keep_yearly: Option<u32>,
+        /// Keep every snapshot newer than this (e.g. `36h`, `14d`, `2w`).
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        keep_within: Option<std::time::Duration>,
+        /// Show what would be removed without removing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Rebuild the index from the pack files (after index objects were lost or corrupted).
     RebuildIndex {
@@ -259,6 +293,61 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Forget {
+            repo,
+            snapshots,
+            keep_last,
+            keep_hourly,
+            keep_daily,
+            keep_weekly,
+            keep_monthly,
+            keep_yearly,
+            keep_within,
+            dry_run,
+        } => {
+            let r = open_repo(&repo).await?;
+            let mut keys = Vec::new();
+            for spec in &snapshots {
+                keys.push(r.resolve_snapshot(spec).await?);
+            }
+            let policy = RetentionPolicy {
+                keep_last,
+                keep_hourly,
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+                keep_yearly,
+                keep_within,
+            };
+            let summary = r
+                .forget(ForgetOptions {
+                    snapshots: keys,
+                    policy,
+                    dry_run,
+                    now: None,
+                })
+                .await?;
+            let verb = if dry_run { "would remove" } else { "removed" };
+            for key in &summary.removed {
+                println!("{verb} {}", short_snapshot_id(key));
+            }
+            for (key, reasons) in &summary.kept {
+                println!(
+                    "keep    {} ({})",
+                    short_snapshot_id(key),
+                    reasons.join(", ")
+                );
+            }
+            println!(
+                "{verb} {} snapshot(s), kept {}",
+                summary.removed.len(),
+                summary.kept.len()
+            );
+            if !dry_run && !summary.removed.is_empty() {
+                println!("run `kist prune` to reclaim the space");
+            }
+            Ok(())
+        }
         Command::RebuildIndex { repo } => {
             let r = open_repo(&repo).await?;
             let s = r.rebuild_index().await?;
@@ -293,6 +382,27 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
     }
+}
+
+/// `<number><unit>`，單位 s / m / h / d / w（週）。給 clap 用。
+fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("{s:?}: missing unit (s, m, h, d, w)"))?;
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().map_err(|_| format!("{s:?}: not a number"))?;
+    let secs = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return Err(format!("{s:?}: unknown unit {unit:?} (use s, m, h, d, w)")),
+    };
+    n.checked_mul(secs)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| format!("{s:?}: too large"))
 }
 
 fn repo_url(args: &RepoArgs) -> Result<&str> {

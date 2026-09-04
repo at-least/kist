@@ -1,4 +1,4 @@
-//! kist 的核心流程：init / backup / restore / check / snapshots。
+//! kist 的核心流程：init / backup / restore / check / snapshots / forget / prune。
 //!
 //! 這個 crate 把 `kist-format`（bytes 長什麼樣）、`kist-crypto`（怎麼加解密）、
 //! `kist-chunker`（怎麼切）、`kist-backend`（放哪裡）串起來，實作真正的備份邏輯。
@@ -17,6 +17,7 @@
 pub mod backup;
 pub mod cache;
 pub mod check;
+pub mod forget;
 pub mod fsmeta;
 pub mod index;
 pub mod pack;
@@ -27,6 +28,7 @@ pub mod snapshots;
 
 pub use backup::{BackupOptions, BackupSummary};
 pub use check::{CheckOptions, CheckReport};
+pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
@@ -63,6 +65,9 @@ pub enum CoreError {
     Join(String),
     #[error("invalid repository configuration: {0}")]
     InvalidConfig(String),
+    /// 使用者的要求本身不成立（例如 forget 沒給任何條件）。
+    #[error("{0}")]
+    Usage(String),
     #[error(transparent)]
     Backend(#[from] kist_backend::BackendError),
     #[error(transparent)]

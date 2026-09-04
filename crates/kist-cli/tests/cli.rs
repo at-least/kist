@@ -328,3 +328,38 @@ fn rebuild_index_command() {
     assert!(out.contains("pack"), "{out}");
     env.ok(&["check", "--read-data"]);
 }
+
+#[test]
+fn forget_by_policy_and_by_id() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    for _ in 0..3 {
+        env.ok(&["backup", src.to_str().unwrap()]);
+    }
+    let err = env.fails(&["forget"]);
+    assert!(err.contains("nothing to forget"), "{err}");
+
+    let out = env.ok(&["forget", "--keep-last", "1", "--dry-run"]);
+    assert!(out.contains("would remove 2 snapshot(s), kept 1"), "{out}");
+    assert_eq!(
+        env.ok(&["snapshots"]).lines().count(),
+        4,
+        "dry-run must not delete"
+    );
+
+    let out = env.ok(&["forget", "--keep-last", "1"]);
+    assert!(out.contains("removed 2 snapshot(s), kept 1"), "{out}");
+    assert!(out.contains("keep ") && out.contains("(last)"), "{out}");
+    assert_eq!(env.ok(&["snapshots"]).lines().count(), 2);
+
+    let out = env.ok(&["forget", "latest"]);
+    assert!(out.contains("removed 1 snapshot(s)"), "{out}");
+    assert!(env.ok(&["snapshots"]).contains("no snapshots"));
+
+    let err = env.fails(&["forget", "--keep-within", "3x"]);
+    assert!(err.contains("unknown unit"), "{err}");
+    // 資料仍在，repo 一致（pack 只是沒人引用）
+    env.ok(&["check", "--read-data"]);
+}
