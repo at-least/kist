@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ func testOptions(t *testing.T, seed string) Options {
 		Password:    []byte(testPassword),
 		ClientID:    "00112233445566778899aabbccddeeff",
 		StateDir:    t.TempDir(),
+		CacheDir:    t.TempDir(),
 		KDF:         cheapKDF(),
 		NonceSource: crypto.DeterministicReader(seed),
 		Now: func() time.Time {
@@ -249,4 +251,19 @@ func reopenWarning(t *testing.T, dir, seed string, warnings *[]string) *Reposito
 		}
 	})
 	return r
+}
+
+func freePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("find a free port: %w", err)
+	}
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if err := l.Close(); err != nil {
+		return 0, fmt.Errorf("release the probe port: %w", err)
+	}
+	if !ok {
+		return 0, fmt.Errorf("listener address is %T, not a TCP address", l.Addr())
+	}
+	return addr.Port, nil
 }

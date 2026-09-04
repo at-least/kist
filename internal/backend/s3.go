@@ -318,15 +318,19 @@ func (s *S3) List(ctx context.Context, prefix string, fn func(FileInfo) error) e
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("list %q in %s: %w", prefix, s.location, err)
+			// Classified like every other call: a backup client whose
+			// policy does not cover a prefix must see ErrDenied here, not
+			// an opaque SDK error.
+			return s.wrap("list "+strconv.Quote(prefix), "", err)
 		}
 		for _, obj := range page.Contents {
 			key, ok := s.stripPrefix(aws.ToString(obj.Key))
-			if !ok || ValidateKey(key) != nil {
-				// Something under the prefix that kist did not write.
-				// Not ours to report as an object.
+			if !ok {
 				continue
 			}
+			// Passed through even if it is not a valid kist key, exactly
+			// as the local backend does: check must be able to report
+			// junk under a repository prefix, not have it hidden.
 			if err := fn(FileInfo{Key: key, Size: aws.ToInt64(obj.Size)}); err != nil {
 				return fmt.Errorf("list %q in %s: %w", prefix, s.location, err)
 			}
@@ -355,8 +359,13 @@ func (s *S3) Stat(ctx context.Context, key string) (FileInfo, error) {
 // Delete removes an object. S3 answers 204 for a missing key, so the
 // "already gone" case needs no special handling.
 //
-// A 403 is returned as ErrDenied so that prune can tell "this object is
-// under retention lock" apart from every other failure.
+// A 403 is returned as ErrDenied, kept distinguishable from other
+// failures. It is *not* how Object Lock shows up: on a versioned bucket a
+// DeleteObject without a version ID succeeds by writing a delete marker,
+// even when the version underneath is locked -- the key vanishes from
+// List while the bytes stay. Only version-specific deletes are refused.
+// M3's prune has to reckon with that, and does not get to learn it from
+// this error.
 func (s *S3) Delete(ctx context.Context, key string) error {
 	objectKey, err := s.objectKey(key)
 	if err != nil {
@@ -374,19 +383,22 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 }
 
 // ErrDenied means the service refused the operation for lack of
-// permission -- or, for a delete, because the object is under a
-// retention lock. A backup client is expected to hit this on anything
-// it should not be doing; that is the permission model working.
+// permission. A backup client is expected to hit this on anything it
+// should not be doing; that is the permission model working.
 var ErrDenied = errors.New("access denied")
 
 func (s *S3) wrap(op, key string, err error) error {
+	what := op
+	if key != "" {
+		what += " " + key
+	}
 	switch {
 	case isNotFound(err):
-		return fmt.Errorf("%s %s: %w", op, key, ErrNotFound)
+		return fmt.Errorf("%s: %w", what, ErrNotFound)
 	case isAccessDenied(err):
-		return fmt.Errorf("%s %s in %s: %w: %w", op, key, s.location, ErrDenied, err)
+		return fmt.Errorf("%s in %s: %w: %w", what, s.location, ErrDenied, err)
 	default:
-		return fmt.Errorf("%s %s in %s: %w", op, key, s.location, err)
+		return fmt.Errorf("%s in %s: %w", what, s.location, err)
 	}
 }
 

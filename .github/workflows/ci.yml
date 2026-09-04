@@ -86,7 +86,4 @@ jobs:
         with:
           go-version: stable
       - name: test against minio
-        run: go test -race -count=1 ./internal/backend/ ./internal/repo/ -run 'S3|Concurrent|Policy'
-        env:
-          CGO_ENABLED: "1"
-          KIST_S3_TEST: "1"
+        run: make test-s3

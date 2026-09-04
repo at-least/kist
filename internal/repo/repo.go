@@ -59,6 +59,11 @@ type Options struct {
 	// Now overrides the clock. Production leaves it nil.
 	Now func() time.Time
 
+	// CacheDir holds per-repository caches. Empty means the user's cache
+	// directory; NoCache disables caching entirely.
+	CacheDir string
+	NoCache  bool
+
 	// Warnf receives non-fatal problems found while opening: an index
 	// blob that will not read, for instance. Those are repairable with
 	// rebuild-index and must not stop the repository opening, but they
@@ -166,12 +171,37 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 		return nil, err
 	}
 
-	ix, skipped, err := index.LoadAll(ctx, b, keys)
+	// Index blobs are read through a local cache. The backend the
+	// repository keeps for everything else is the undecorated one: only
+	// the index-loading path benefits, and a decorator on every call is
+	// one more thing for a reader of Backup to think about.
+	source := b
+	var cache *indexCache
+	if !opts.NoCache {
+		root := opts.CacheDir
+		if root == "" {
+			if root, err = DefaultCacheDir(); err != nil {
+				return nil, err
+			}
+		}
+		if cache, err = newIndexCache(b, root, cfg.RepoID); err != nil {
+			opts.warn("%v; continuing without an index cache", err)
+		} else {
+			source = cache
+		}
+	}
+
+	ix, skipped, err := index.LoadAll(ctx, source, keys)
 	if err != nil {
 		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
 	}
 	for _, s := range skipped {
 		opts.warn("%v; run `kist rebuild-index` to repair the index", s)
+	}
+	if cache != nil {
+		if listed, _, err := index.List(ctx, b); err == nil {
+			cache.prune(listed)
+		}
 	}
 
 	// Every nonce this repository writes comes out of one stream, so a

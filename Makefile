@@ -11,7 +11,7 @@ GOLANGCI := $(shell command -v golangci-lint 2>/dev/null)
 
 FUZZTIME ?= 30s
 
-.PHONY: build test test-race vet lint fuzz verify clean
+.PHONY: build test test-s3 test-race vet lint fuzz verify clean
 
 ## build: compile the release binary. No cgo, ever — a kist binary must
 ## run on any machine of its GOOS/GOARCH without a libc to match.
@@ -23,6 +23,12 @@ build:
 ## test: the suite as the shipped binary is built — no cgo.
 test:
 	CGO_ENABLED=0 go test ./...
+
+## test-s3: the S3 backend and the multi-client tests against a MinIO the
+## tests start in Docker. Offline by default; this is the one command
+## both CI and a developer run for it.
+test-s3:
+	KIST_S3_TEST=1 CGO_ENABLED=1 go test -race -count=1 ./internal/backend/ ./internal/repo/ -run 'S3|Concurrent|Policy'
 
 ## test-race: the same suite under the race detector. -race needs cgo, so
 ## this is a test-only build and never produces a shipped artifact.

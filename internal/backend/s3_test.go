@@ -296,3 +296,40 @@ func TestS3PrefixesAreIsolated(t *testing.T) {
 		t.Errorf("prefix iso/a lists %v, want [packs/one]; prefix iso/ab leaked in", seen)
 	}
 }
+
+// ListObjectsV2 pages at 1000 keys. The paginator is SDK code, but the
+// prefix stripping around it is not, and nothing else crosses a page.
+func TestS3ListCrossesPageBoundary(t *testing.T) {
+	ctx := context.Background()
+	b := newTestS3(t)
+
+	const n = 1001
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 32)
+	errs := make(chan error, n)
+	for i := range n {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			key := fmt.Sprintf("packs/%04d", i)
+			if err := PutBytesIfAbsent(ctx, b, key, []byte(key)); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("put: %v", err)
+	}
+
+	seen := 0
+	if err := b.List(ctx, "packs/", func(FileInfo) error { seen++; return nil }); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if seen != n {
+		t.Errorf("listed %d objects, want %d", seen, n)
+	}
+}

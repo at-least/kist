@@ -219,15 +219,39 @@ chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟
 
 ## 10. 權限模型
 
-`PLAN.md` 說「backup 只需要 Put 權限」。**實作之後這句話要修正**，M2 的 IAM 測試要照下表寫，不是照 `s3:PutObject` 寫：
+`PLAN.md` 說「backup 只需要 Put 權限」。**實作之後這句話要修正**。下表不是推理出來的，是 `TestS3BackupPolicy` 用一個只持有這張表權限的 MinIO 使用者跑完整個 backup 得到的——少一項就跑不完：
 
 | 操作 | Get | List | Put | Delete |
 | --- | --- | --- | --- | --- |
-| `backup` | `config`、`indexes/*`、`trees/*` | `indexes/`、（M3：`gc/`） | `packs/ indexes/ trees/ snapshots/` | 僅 `gc/*`（M3 的復活步驟） |
+| `backup` | `config`、`indexes/*` | 僅 `indexes/` | `packs/ indexes/ trees/ snapshots/` | 無（M3 加 `gc/*`） |
 | `restore` / `check` | 全部 | 全部 | — | — |
 | `prune`（M3） | 全部 | 全部 | `gc/*` | 全部 |
 
-真正的抗勒索性質不是「只有 Put」，是**在資料前綴上沒有 Delete，而且 Put 是條件式的**。備份角色拿不到覆寫既有 pack 的能力，也拿不到刪除的能力。
+backup **不需要**讀 tree：tree 一律用 `PutIfAbsent` 寫，去重靠的是「已存在」的回應，不是先讀再比。
+
+同一個測試也驗了反面：持有 backup 權限的 client 對 pack 做 Delete → `ErrDenied`；對 `packs/`、`trees/`、`snapshots/`、`` 做 List → `ErrDenied`；讀 pack → `ErrDenied`；對既有 pack 做 `PutIfAbsent` → `ErrExists`（條件寫入在政策限制下仍然正常運作）。
+
+### 抗勒索性質，以及它在哪裡成立
+
+真正的性質不是「只有 Put」，是：
+
+> **在資料前綴上沒有 Delete，而且 Put 是條件式的。**
+
+前半由 IAM 保證，兩個服務都成立。後半分兩種情況：
+
+- **AWS S3**：bucket policy 可以用 `s3:if-none-match` 條件鍵**要求** PutObject 必須帶 `If-None-Match`（[AWS 文件](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html)，2024-11 起）：
+  ```json
+  "Action": "s3:PutObject",
+  "Condition": {"Null": {"s3:if-none-match": "false"}}
+  ```
+  這樣一個被入侵的 client 送出無條件的 PutObject 會被儲存端拒絕。性質屬於**儲存端**。**UNVERIFIED**：本機沒有 AWS 帳號，這一條沒有實際跑過。
+- **MinIO（RELEASE.2025-09-07）**：拒絕這個條件鍵（`invalid condition key 's3:if-none-match'`）。政策裡放不進去，所以無條件的 PutObject 會成功並覆寫 pack——`TestS3BackupPolicy` 實測 `err=<nil>, overwrote=true`。在 MinIO 上，覆寫保護只對**誠實的 client** 成立：kist 自己永遠送 `If-None-Match: *`，MinIO 也正確地以 412 拒絕（conformance 測試證明），但政策攔不住一個不送這個 header 的攻擊者。
+
+所以 `PLAN.md` 的「Put 權限-only 的 IAM policy 可完成 backup」驗收條件通過了，但它證明的東西比看起來少：它證明 backup 不需要 Delete，沒有證明 backup 不能覆寫。後者在 AWS 上可以用一行條件補上，在 MinIO 上目前不行。
+
+### Object Lock（M3 的前提）
+
+`PLAN.md` 說 `prune` 對受鎖物件「直接略過並回報」。實作前要先知道 Object Lock 不是靠 403 出現的：在有版本控制的 bucket 上，不帶 version ID 的 `DeleteObject` 會**成功**（寫一個 delete marker），即使底下的版本被鎖住——key 從 List 消失，位元組留著繼續計費。只有指定 version 的刪除才會被拒絕。M3 的 `prune` 若要在鎖底下真的回收空間，得列舉版本，不是刪 key。
 
 ## 11. 這些說法各自由什麼守著
 
@@ -261,3 +285,4 @@ chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟
 - [003 — Pack 格式與壓縮](decisions/003-pack-format.md)
 - [004 — Tree、Snapshot 與命名](decisions/004-tree-and-naming.md)
 - [005 — Backend 原子性與權限模型](decisions/005-backend-atomicity.md)
+- [006 — S3 後端與無鎖並發](decisions/006-s3-backend.md)
