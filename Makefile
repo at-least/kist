@@ -67,7 +67,7 @@ release-snapshot:
 ## the per-target budget is 24h divided by the number of targets. Same
 ## targets, same loop; only the budget differs.
 fuzz-long:
-	@n=$$(grep -rho --include='*_test.go' -E '^func Fuzz[A-Za-z0-9_]*' . | sort -u | wc -l); \
+	@n=$$(grep -rho --include='*_test.go' -E '^func Fuzz[A-Za-z0-9_]*' . | wc -l); \
 	each=$$((24 * 60 / n)); \
 	echo "$$n targets, $${each}m each"; \
 	$(MAKE) fuzz FUZZTIME=$${each}m
