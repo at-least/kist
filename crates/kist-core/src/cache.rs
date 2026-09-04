@@ -120,7 +120,9 @@ impl IndexCache {
                     // 舊 blob 被取代：增量合併會留下過期的紀錄，重建
                     return self.rebuild(live, fetch).await;
                 }
-                let mut records: Vec<TableRecord> = t.iter()?.collect::<Result<_>>()?;
+                // 新 blob 的紀錄放前面：同一個 chunk 兩邊都有時取新的位置（DiskTable 去重保留第一筆）。
+                // 別台 client 因為舊 pack 被 GC 標記而重寫了同一個 chunk，這台才不會一直解析到被標記的 pack。
+                let mut records: Vec<TableRecord> = Vec::new();
                 let mut packs = m.packs.clone();
                 let mut blobs = known;
                 for (id, blob) in new_blobs {
@@ -130,6 +132,7 @@ impl IndexCache {
                     push_blob(&mut records, &mut packs, &blob);
                     blobs.push(id);
                 }
+                records.extend(t.iter()?.collect::<Result<Vec<_>>>()?);
                 (records, blobs, packs)
             }
             _ => return self.rebuild(live, fetch).await,

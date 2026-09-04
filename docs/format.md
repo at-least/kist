@@ -240,8 +240,7 @@ IndexPack { pack: ObjectId, size: u64, entries: [PackEntry] }
 `supersedes` 列出這個 blob 取代的舊 index blob（M3 repack 用；M1/M2 為空）。
 讀取端先讀完所有 blob、收集全部 `supersedes`，被列到的 blob **整個忽略**；
 所以新舊 blob 同時存在時一律以新的為準，舊的之後走兩階段刪除。
-index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪的規則是
-「它被取代了」或「它列的 pack 全部都已經不存在」。
+index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪的規則只有一條：「它被取代了」。
 
 只是 pack trailer 的快取，可從所有 pack 的 trailer 重建。`size` 是 pack 檔總長度，
 讓 `check` 不讀資料也能用 HEAD 抓到被截斷或換掉的 pack。

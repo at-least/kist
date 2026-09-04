@@ -155,6 +155,9 @@ async fn forget_and_prune_on_s3() {
         grace: std::time::Duration::ZERO,
         ..PruneOptions::default()
     };
+    // S3 的修改時間是秒級：標記若與物件同一秒，prune 會當作「標記後被重寫過」而不刪（安全那邊）。
+    // grace 0 的測試要先等過這一秒；真實的 grace 不受影響。
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let p1 = repo.prune(zero.clone()).await.unwrap();
     assert!(p1.marked > 0 && p1.deleted == 0, "{p1:?}");
     assert_eq!(backend.list("gc").await.unwrap().len() as u64, p1.marked);
