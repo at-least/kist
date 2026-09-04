@@ -26,7 +26,9 @@ pub struct Snapshot {
     pub client_id: Vec<u8>,
     pub hostname: String,
     pub username: String,
-    /// RFC 3339 UTC。
+    /// RFC 3339 UTC，**backup 開始**的時間（不是寫出 snapshot 的時間）：
+    /// 下一次 backup 用它判斷「檔案的 mtime/ctime 早於上次開始 → 中間沒動過」。
+    /// 與 key 裡的時間戳來自同一個瞬間。
     pub time: String,
     /// 備份的來源路徑（原始 OS bytes，見 tree 模組對檔名的說明）。
     pub paths: Vec<serde_bytes::ByteBuf>,
@@ -58,6 +60,9 @@ pub struct SnapshotStats {
     /// backup 時讀不到而被略過的項目數（檔案或目錄）。snapshot 仍會寫出，CLI 以非 0 結束。
     #[serde(default)]
     pub errors: u64,
+    /// 走快速路徑（metadata 沒變、直接沿用上一個 snapshot 的 chunk 清單）的檔案數。
+    #[serde(default)]
+    pub files_reused: u64,
 }
 
 /// 時間 → snapshot key 用的時間戳。

@@ -183,3 +183,83 @@ fn fast_path_rejects_files_changed_at_or_after_parent_start() {
         "沒有 ctime 就看 mtime，同樣不可沿用"
     );
 }
+
+/// snapshot 的時間必須是 backup 的**開始**時間：快速路徑用它判斷「檔案早於上次備份就沒再動過」。
+/// 把一個檔案的 mtime 設成剛好等於上一個 snapshot 的時間 → 不能沿用。
+#[tokio::test]
+async fn fast_path_uses_parent_start_time_and_reports_reused_files() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let s1 = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert_eq!(s1.stats.files_reused, 0);
+    let s2 = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert_eq!(s2.stats.files_reused, s2.stats.files, "{:?}", s2.stats);
+
+    let snap2 = repo.read_snapshot_by_key(&s2.snapshot_key).await.unwrap();
+    let start =
+        time::OffsetDateTime::parse(&snap2.time, &time::format_description::well_known::Rfc3339)
+            .unwrap();
+    let at_start = filetime::FileTime::from_unix_time(start.unix_timestamp(), start.nanosecond());
+    filetime::set_file_mtime(src.join("random.bin"), at_start).unwrap();
+
+    let s3 = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert_eq!(
+        s3.stats.files_reused,
+        s3.stats.files - 1,
+        "mtime == parent 開始時間的檔案必須重讀：{:?}",
+        s3.stats
+    );
+    assert_eq!(s3.stats.chunks_new, 0, "內容沒變，重讀也不寫新 chunk");
+}
+
+/// snapshot 內容的 `time` 與 key 裡的時間戳必須來自同一個瞬間（開始時間）。
+#[tokio::test]
+async fn snapshot_time_is_backup_start_and_matches_key() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let before = time::OffsetDateTime::now_utc();
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let after = time::OffsetDateTime::now_utc();
+    let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+    let time =
+        time::OffsetDateTime::parse(&snap.time, &time::format_description::well_known::Rfc3339)
+            .unwrap();
+    assert!(before <= time && time <= after);
+    let ts = s.snapshot_key.rsplit('/').next().unwrap();
+    assert_eq!(
+        kist_format::snapshot::format_key_timestamp(time).unwrap(),
+        ts
+    );
+}
+
+/// 沒有 ctime / inode 的平台（Windows）只剩 size + mtime：size 不同就不能沿用。
+#[test]
+fn fast_path_compares_size_even_without_ctime() {
+    use kist_core::fsmeta::file_unchanged;
+    use kist_format::tree::NodeMeta;
+    let meta = NodeMeta {
+        mtime_secs: 1000,
+        ..NodeMeta::default()
+    };
+    assert!(file_unchanged(&meta, 10, &meta, 10, (2000, 0)));
+    assert!(
+        !file_unchanged(&meta, 10, &meta, 11, (2000, 0)),
+        "size 變了不能沿用"
+    );
+}

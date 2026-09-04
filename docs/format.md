@@ -4,8 +4,11 @@
 每種結構在 `crates/kist-format/tests/golden/` 都有一份固定的範例 bytes；
 任何會改變 on-disk bytes 的修改都會讓 golden 測試失敗，這是刻意的。
 
-> 狀態：**v1 已於 2026-09-04（M1 結束）凍結**。之後只能透過 `version` 欄位演進；
+> 狀態：**v1 已於 2026-09-05（M1 審查修正後）凍結**。之後只能透過 `version` 欄位演進；
 > 任何改動都需要專案負責人確認，並同步更新 golden files 與這份文件。
+> 注意：2026-09-05 把 `repo_id` 與 chunker 參數綁進 master key 的 AAD（§3），這是
+> **不相容的改動**——之前建立的 repo 打不開。當時沒有任何真實 repo，所以直接改；
+> 這種「bytes 沒變、意義變了」的改動 golden files 抓不到，靠這裡的紀錄。
 
 ## 1. 總覽
 
@@ -212,12 +215,13 @@ Snapshot {
   client_id: bytes(16),
   hostname: text,
   username: text,
-  time: text,                  RFC 3339 UTC，給人看
+  time: text,                  RFC 3339 UTC，backup 開始的時間（與 key 的時間戳同一瞬間）
   paths: [bytes],              備份來源路徑
   root: ObjectId,              根 tree（若根目錄分段，是最後一段）
   parent: text | null,         上一個 snapshot 的 key，只用於加速
   stats: { files, dirs, symlinks, bytes_total, bytes_new, chunks_total, chunks_new, packs_new,
-           errors: u64 },   errors = backup 時讀不到而略過的項目數
+           errors, files_reused: u64 },
+           errors = 讀不到而略過的項目數；files_reused = 走快速路徑沿用上次 chunk 清單的檔案數
 }
 ```
 

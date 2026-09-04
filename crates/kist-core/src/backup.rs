@@ -86,6 +86,8 @@ struct Backup {
 
 impl Repository {
     pub async fn backup(&self, paths: &[PathBuf], opts: BackupOptions) -> Result<BackupSummary> {
+        // snapshot 的時間 = 開始時間：任何在這之後改動的檔案，下一次都必須重讀
+        let started = time::OffsetDateTime::now_utc();
         let mut abs_paths = Vec::new();
         for p in paths {
             let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
@@ -168,7 +170,7 @@ impl Repository {
         let parent_key = parent.as_ref().map(|(k, _)| k.clone());
         let stats = b.stats;
         let snapshot_key = self
-            .commit_snapshot(&opts, path_bytes, root, parent_key.clone(), stats)
+            .commit_snapshot(&opts, started, path_bytes, root, parent_key.clone(), stats)
             .await?;
         Ok(BackupSummary {
             snapshot_key,
@@ -217,14 +219,15 @@ impl Repository {
     async fn commit_snapshot(
         &self,
         opts: &BackupOptions,
+        started: time::OffsetDateTime,
         paths: Vec<Vec<u8>>,
         root: ObjectId,
         parent: Option<String>,
         stats: SnapshotStats,
     ) -> Result<String> {
-        // 同一奈秒撞 key 幾乎不可能，但 conditional put 失敗時換個時間戳再試。
-        for _ in 0..3 {
-            let now = time::OffsetDateTime::now_utc();
+        // 同一奈秒撞 key 幾乎不可能，但 conditional put 失敗時把時間戳往後推 1 ns 再試。
+        for attempt in 0..3i64 {
+            let now = started + time::Duration::nanoseconds(attempt);
             let key = keys::snapshot(&opts.client_id, &format_key_timestamp(now)?);
             let snapshot = Snapshot {
                 version: Snapshot::VERSION,
@@ -295,7 +298,10 @@ impl Backup {
             self.stats.dirs += 1;
             NodeKind::Dir { subtree }
         } else if ft.is_file() {
-            let Some((size, content)) = self.process_file(path, &node_meta, parent).await? else {
+            let Some((size, content)) = self
+                .process_file(path, &node_meta, meta.len(), parent)
+                .await?
+            else {
                 return Ok(None); // 讀不到，已記錄
             };
             self.stats.files += 1;
@@ -427,9 +433,11 @@ impl Backup {
         &mut self,
         path: &Path,
         node_meta: &NodeMeta,
+        current_size: u64,
         parent: Option<&Node>,
     ) -> Result<Option<(u64, Content)>> {
-        if let Some(reused) = self.try_reuse(node_meta, parent).await? {
+        if let Some(reused) = self.try_reuse(node_meta, current_size, parent).await? {
+            self.stats.files_reused += 1;
             return Ok(Some(reused));
         }
 
@@ -481,6 +489,7 @@ impl Backup {
     async fn try_reuse(
         &mut self,
         node_meta: &NodeMeta,
+        current_size: u64,
         parent: Option<&Node>,
     ) -> Result<Option<(u64, Content)>> {
         let Some(Node {
@@ -491,7 +500,7 @@ impl Backup {
         else {
             return Ok(None);
         };
-        if !fsmeta::unchanged(pmeta, node_meta, self.parent_start) {
+        if !fsmeta::file_unchanged(pmeta, *size, node_meta, current_size, self.parent_start) {
             return Ok(None);
         }
         let index = self

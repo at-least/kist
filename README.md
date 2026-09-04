@@ -56,18 +56,20 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 
 ## M1 驗收數據
 
-2026-09-04，同一台機器（Ryzen 7 7700、NVMe/btrfs，本機目錄後端），release build。
-資料集：100 000 個檔案、9.75 GiB（一半亂數、一半可壓縮），腳本在 `tests/acceptance/`。
+2026-09-05，commit `26637f0`（審查修正後），同一台機器（Ryzen 7 7700、NVMe/btrfs，
+本機目錄後端），release build。資料集：100 000 個檔案、9.75 GiB（一半亂數、一半可壓縮），
+腳本與完整 log 在 `tests/acceptance/`。
 
 | 項目 | 結果 |
 | --- | --- |
-| 第一次 backup | 58 s；寫 77 個 pack（repo 4.90 GiB，可壓縮的那一半被壓掉了） |
-| 第二次 backup（內容未變） | 0.5 s；**0 個新 pack、0 個新 chunk** |
-| restore | 33 s；`diff -r` 與原始資料**完全相同** |
+| 第一次 backup | 54 s；寫 77 個 pack（repo 4.90 GiB，可壓縮的那一半被壓掉了） |
+| 第二次 backup（內容未變） | 0.8 s；**0 個新 pack、0 個新 chunk**（含重新 put 1 102 個 tree） |
+| restore | 41 s；`diff -r` 與原始資料**完全相同** |
 | `check` | 0.3 s |
-| `check --read-data` | 16 s |
+| `check --read-data` | 17 s |
 | 人為翻轉 pack 中一個 bit | `check --read-data` 以非 0 結束並指名該 pack |
-| 峰值 RSS（backup 期間，取樣 `ru_maxrss`） | **253 MiB** |
+| 峰值 RSS（backup 期間，`ru_maxrss`） | **186 MiB**（審查修正前 253 MiB） |
+| 512 MiB 單一大檔的 RSS 成長（reviewer 的 probe） | 22 MiB（修正前 736 MiB） |
 
 ## Clean build 時間
 

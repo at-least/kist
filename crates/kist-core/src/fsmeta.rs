@@ -101,6 +101,18 @@ pub fn capture(meta: &std::fs::Metadata) -> NodeMeta {
     }
 }
 
+/// backup 快速路徑的完整判斷：size 相同，且 [`unchanged`] 成立。
+/// size 要另外傳：`NodeMeta` 不含大小，而沒有 ctime / inode 的平台只剩 size + mtime 可比。
+pub fn file_unchanged(
+    previous: &NodeMeta,
+    previous_size: u64,
+    now: &NodeMeta,
+    now_size: u64,
+    parent_start: (i64, u32),
+) -> bool {
+    previous_size == now_size && unchanged(previous, now, parent_start)
+}
+
 /// backup 快速路徑：上一次記錄的 metadata 與現在的是否「看起來沒變」。
 ///
 /// - mtime 一定比；ctime 與 inode 在上一次有記錄（非 0）時也要相同。
