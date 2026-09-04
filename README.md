@@ -27,6 +27,20 @@ kist check                              # 檢查一致性（不下載資料）
 kist check --read-data                  # 下載並驗證每個 chunk
 ```
 
+### S3 / MinIO
+
+```sh
+export KIST_REPO=s3://my-bucket/backups/laptop
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=us-east-1
+# MinIO 或其他自架的 S3 相容服務：
+export AWS_ENDPOINT=http://minio.local:9000 AWS_ALLOW_HTTP=true
+kist init
+```
+
+`config` 是 repo 裡唯一可覆寫的物件，被蓋掉就打不開 repo：請對 bucket 開 versioning 或
+Object Lock，並把 `config` 另存一份。backup 需要的權限是 `PutObject`、`GetObject`、
+`ListBucket`（不需要 `DeleteObject`）。
+
 每台機器第一次 backup 時會產生一個 client id（`~/.local/share/kist/client-id`，
 可用 `--client-id-file` 或 `KIST_CLIENT_ID_FILE` 指定）。
 
@@ -40,6 +54,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check          # 需先 cargo install --locked cargo-deny
 ```
+
+S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
 ## Workspace 結構
 

@@ -43,9 +43,11 @@ struct Cli {
 /// 每個需要 repo 的命令共用的參數。
 #[derive(Debug, Args)]
 struct RepoArgs {
-    /// Repository location (a local directory for now).
+    /// Repository location: a local directory, or `s3://bucket[/prefix]`.
+    /// For S3 set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION,
+    /// plus AWS_ENDPOINT (and AWS_ALLOW_HTTP=true) for MinIO and other S3-compatible services.
     #[arg(long, short = 'r', env = "KIST_REPO", global = true)]
-    repo: Option<PathBuf>,
+    repo: Option<String>,
 
     /// Read the repository password from this file (first line).
     /// Otherwise the KIST_PASSWORD environment variable is used, or you are prompted.
@@ -135,8 +137,16 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Init { repo } => {
             let backend = open_backend(&repo)?;
             let password = password::obtain(&repo.password_file, true)?;
+            let remote = backend.location().is_remote();
             Repository::init(backend, password.as_bytes(), InitOptions::default()).await?;
             println!("repository initialized at {}", repo_display(&repo)?);
+            if remote {
+                // config 是唯一可覆寫的物件；被蓋掉就打不開 repo。kist 自己驗不了 bucket 設定，只能提醒。
+                eprintln!(
+                    "note: enable bucket versioning or Object Lock so that `config` cannot be \
+                     overwritten or deleted, and keep a copy of the `config` object somewhere safe"
+                );
+            }
             Ok(())
         }
         Command::Backup {
@@ -263,18 +273,18 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn repo_path(args: &RepoArgs) -> Result<&PathBuf> {
+fn repo_url(args: &RepoArgs) -> Result<&str> {
     args.repo
-        .as_ref()
-        .context("no repository given: use --repo <path> or set KIST_REPO")
+        .as_deref()
+        .context("no repository given: use --repo <path|s3://bucket/prefix> or set KIST_REPO")
 }
 
 fn repo_display(args: &RepoArgs) -> Result<String> {
-    Ok(repo_path(args)?.display().to_string())
+    Ok(repo_url(args)?.to_owned())
 }
 
 fn open_backend(args: &RepoArgs) -> Result<Backend> {
-    Ok(Backend::local(repo_path(args)?)?)
+    Ok(Backend::from_url(repo_url(args)?)?)
 }
 
 async fn open_repo(args: &RepoArgs) -> Result<Repository> {

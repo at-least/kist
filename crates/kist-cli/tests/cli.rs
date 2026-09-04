@@ -255,3 +255,54 @@ fn nix_is_root() -> bool {
         .map(|m| m.uid() == 0)
         .unwrap_or(false)
 }
+
+/// `--repo s3://…`：需要 MinIO（見 crates/kist-backend/tests/s3.rs），沒設環境變數就略過。
+#[test]
+fn s3_repo_url_works_end_to_end() {
+    let (Some(endpoint), Some(bucket)) = (
+        std::env::var("KIST_TEST_S3_ENDPOINT").ok(),
+        std::env::var("KIST_TEST_S3_BUCKET").ok(),
+    ) else {
+        eprintln!("S3 env not set; skipped");
+        return;
+    };
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    let url = format!("s3://{bucket}/cli-{}", std::process::id());
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_kist"))
+            .args(args)
+            .env("KIST_REPO", &url)
+            .env("KIST_PASSWORD", "cli test password")
+            .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+            .env("AWS_ENDPOINT", &endpoint)
+            .env("AWS_ALLOW_HTTP", "true")
+            .env("AWS_DEFAULT_REGION", "us-east-1")
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, _, stderr) = run(&["init"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("versioning"),
+        "S3 repo 要提醒開 versioning：{stderr}"
+    );
+    let (code, stdout, stderr) = run(&["backup", src.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let target = env.dir.path().join("out");
+    let (code, _, stderr) = run(&["restore", "latest", target.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(
+        std::fs::read(restored.join("big.bin")).unwrap(),
+        std::fs::read(src.join("big.bin")).unwrap()
+    );
+    let (code, stdout, stderr) = run(&["check", "--read-data"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+}

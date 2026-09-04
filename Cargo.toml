@@ -29,8 +29,12 @@ futures = "0.3"
 gethostname = "1"
 getrandom = "0.4"
 hex = "0.4"
-object_store = "0.14"
+object_store = { version = "0.14", default-features = false, features = ["fs", "aws-base", "reqwest", "ring"] }
 proptest = "1"
+# reqwest 用「不帶 provider」的 rustls，TLS 的 crypto provider 由 rustls/ring 提供並在後端建構時安裝：
+# 這樣就不會拉進 aws-lc-sys（Windows 上要 CMake + NASM 才編得起來）。
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rand = "0.10"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }

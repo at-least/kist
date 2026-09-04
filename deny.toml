@@ -21,6 +21,8 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
+    # webpki-root-certs：Mozilla 根憑證資料，CDLA-Permissive-2.0 是給資料用的寬鬆授權
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

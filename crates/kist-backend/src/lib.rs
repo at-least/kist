@@ -4,16 +4,25 @@
 //! - backup 只用 `put` / `put_if_absent` / `get` / `get_range` / `list`；
 //! - `delete` 只有 maintenance（prune）會用。
 //!
-//! M1 只有本機目錄後端；M2 透過 `object_store` 加上 S3。本地 index 快取也在 M2。
+//! 支援兩種位置（見 [`RepoLocation`]）：本機目錄，以及 `s3://bucket/prefix`（AWS S3 與
+//! MinIO 等相容服務）。S3 的憑證與端點走 `object_store` 讀的環境變數：
+//! `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_DEFAULT_REGION`、
+//! `AWS_ENDPOINT`（MinIO 等自架服務）、`AWS_ALLOW_HTTP=true`（端點不是 https 時）。
+//!
+//! TLS：reqwest 用 rustls 但不帶 crypto provider，由這裡在建構時安裝 ring
+//! （避免 aws-lc-sys 在 Windows 上需要 CMake + NASM）。
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
+use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as StorePath;
+use object_store::prefix::PrefixStore;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +33,10 @@ pub enum BackendError {
     AlreadyExists(String),
     #[error("invalid object key {0:?}: {1}")]
     InvalidKey(String, String),
+    #[error(
+        "invalid repository location {0:?}: expected a directory path or s3://bucket[/prefix]"
+    )]
+    InvalidUrl(String),
     #[error("cannot open local repository at {path}: {source}")]
     LocalPath {
         path: String,
@@ -35,20 +48,77 @@ pub enum BackendError {
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
+/// repo 在哪裡：使用者給 `--repo` 的字串解析後的結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoLocation {
+    Local(PathBuf),
+    S3 { bucket: String, prefix: String },
+}
+
+impl RepoLocation {
+    /// `s3://bucket/prefix` → S3；其他任何字串都當本機路徑。
+    pub fn parse(s: &str) -> Result<Self> {
+        if let Some(rest) = s.strip_prefix("s3://") {
+            let (bucket, prefix) = match rest.split_once('/') {
+                Some((b, p)) => (b, p),
+                None => (rest, ""),
+            };
+            if bucket.is_empty() {
+                return Err(BackendError::InvalidUrl(s.to_owned()));
+            }
+            return Ok(Self::S3 {
+                bucket: bucket.to_owned(),
+                prefix: prefix.trim_matches('/').to_owned(),
+            });
+        }
+        if s.contains("://") || s.is_empty() {
+            return Err(BackendError::InvalidUrl(s.to_owned()));
+        }
+        Ok(Self::Local(PathBuf::from(s)))
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::S3 { .. })
+    }
+}
+
+impl std::fmt::Display for RepoLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(p) => write!(f, "{}", p.display()),
+            Self::S3 { bucket, prefix } if prefix.is_empty() => write!(f, "s3://{bucket}"),
+            Self::S3 { bucket, prefix } => write!(f, "s3://{bucket}/{prefix}"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Backend {
     store: Arc<dyn ObjectStore>,
+    location: RepoLocation,
 }
 
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Backend({})", self.store)
+        write!(f, "Backend({})", self.location)
     }
 }
 
 impl Backend {
+    /// 依 `--repo` 字串開後端。
+    pub fn from_url(s: &str) -> Result<Self> {
+        match RepoLocation::parse(s)? {
+            RepoLocation::Local(p) => Self::local(&p),
+            RepoLocation::S3 { bucket, prefix } => Self::s3(&bucket, &prefix),
+        }
+    }
+
+    pub fn location(&self) -> &RepoLocation {
+        &self.location
+    }
+
     /// 本機目錄。不存在會建立。
-    pub fn local(path: &std::path::Path) -> Result<Self> {
+    pub fn local(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|source| BackendError::LocalPath {
             path: path.display().to_string(),
             source,
@@ -56,12 +126,32 @@ impl Backend {
         let store = object_store::local::LocalFileSystem::new_with_prefix(path)?;
         Ok(Self {
             store: Arc::new(store),
+            location: RepoLocation::Local(path.to_path_buf()),
         })
     }
 
-    /// 包任何 `object_store` 實作（測試或 M2 的 S3 用）。
-    pub fn from_store(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+    /// S3（或相容服務）。憑證與端點來自環境變數（見 crate 說明）。
+    /// `prefix` 非空時所有 key 都放在它底下（`object_store` 的 `with_url` 不會自己套 prefix）。
+    pub fn s3(bucket: &str, prefix: &str) -> Result<Self> {
+        install_tls_provider();
+        let s3 = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .build()?;
+        let location = RepoLocation::S3 {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+        };
+        let store: Arc<dyn ObjectStore> = if prefix.is_empty() {
+            Arc::new(s3)
+        } else {
+            Arc::new(PrefixStore::new(s3, Self::path(prefix)?))
+        };
+        Ok(Self { store, location })
+    }
+
+    /// 包任何 `object_store` 實作（測試用）。
+    pub fn from_store(store: Arc<dyn ObjectStore>, location: RepoLocation) -> Self {
+        Self { store, location }
     }
 
     fn path(key: &str) -> Result<StorePath> {
@@ -154,4 +244,9 @@ impl Backend {
             .await
             .map_err(|e| Self::map_err(key, e))
     }
+}
+
+/// rustls 需要程序層級的 crypto provider；`install_default` 第二次會回 Err，忽略即可。
+fn install_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }

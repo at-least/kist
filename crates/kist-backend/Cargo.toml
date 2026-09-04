@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 futures.workspace = true
 object_store.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
