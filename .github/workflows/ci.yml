@@ -46,10 +46,11 @@ jobs:
           CGO_ENABLED: "0"
 
       # -race requires cgo, so this is a test-only build, never a shipped
-      # artifact. Skipped on Windows, where the runner's C toolchain is not
-      # something the suite should depend on.
+      # artifact -- which is why it does not conflict with the no-cgo rule
+      # for the binary. A data race in Go is silent memory corruption, and
+      # in a backup tool that is silent data corruption, so every platform
+      # runs it.
       - name: test (race)
-        if: runner.os != 'Windows'
         run: go test -race ./...
         env:
           CGO_ENABLED: "1"

@@ -94,6 +94,16 @@ gc/<packID>                 待刪標記（timestamp + 由誰標記）
 ## 工程規範
 - 每個 package 都有 `doc.go` 說明職責；對外介面有 godoc。
 - 錯誤一律 `fmt.Errorf("...: %w", err)` 包裝，不吞錯。
+- **CI 強制 `go vet` + staticcheck + errcheck**（含 `check-blank`，`_ = err` 也算吞錯）。
+  Go 讓忽略 error 只要打兩個字，這三個是唯一會攔下它的東西。要吞必須寫
+  `//nolint:errcheck // 理由`，把「我知道我在做什麼」變成 code review 看得到的一行。
+- **所有測試都跑 `-race`。** `-race` 需要 cgo，跟「出貨 binary 禁止 cgo」不衝突：
+  `make test` 用 `CGO_ENABLED=0`（跟出貨一致），`make test-race` 用 `CGO_ENABLED=1`
+  且只產生測試 binary。CI 兩種都跑，三個 OS 都跑。Go 的 data race 是靜默的
+  記憶體損毀，對備份工具而言那等於靜默的資料損毀。
+- **`exhaustive` linter 檢查 switch 窮舉。** 加一個 `NodeType`、一個壓縮演算法、
+  一個後端錯誤種類而漏掉某個 switch，Go 只會安靜地走 default 或什麼都不做。
+  格式演進靠的就是加列舉值，所以這個檢查直接對應「格式可以演進」這個目標。
 - 任何寫入 repo 的操作都要先寫測試再實作。
 - 格式相關程式碼變更必須附上 `testdata/` 的 golden files。
 - 不做的事：不支援非加密 repo、不做 GUI、不自己實作加密原語。
