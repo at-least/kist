@@ -258,9 +258,9 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
 ### 11.2 活的定義（每次 prune 都從 snapshot 重算）
 
 - tree：從任一 snapshot 走得到（含 `prev` 鏈）。
-- pack：在**有效**的 index（未被 `supersedes` 的 blob）裡，**且**持有任一被活 tree 引用的 chunk
-  （資料 chunk 與 Indirect 的清單 chunk 都算）。同一個 chunk 出現在多個 pack 時每個 pack 都算活，
-  不挑正本。不在有效 index 裡的 pack（backup 中途壞掉、被 repack 掉的）不算活。
+- pack：是某個被引用 chunk（資料 chunk 與 Indirect 的清單 chunk 都算）的**正本**。正本 = 在**有效**
+  index（未被 `supersedes` 的 blob）裡持有該 chunk 的 pack 中，沒被標記者優先、其次名稱最小者。
+  其他副本所在的 pack 不因此算活（重複的空間會被回收）。不在有效 index 裡的 pack（backup 中途壞掉的）不算活。
 - index blob：沒被別的 blob `supersedes`。
 
 ### 11.3 兩階段
@@ -272,20 +272,26 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
    不含它的 index blob（`supersedes` 全部既有 blob）；刪之前再 HEAD 一次，物件在標記後被重寫過
    （另一台 client 重 put 同一個 tree）就撤銷標記。
 3. 被標記的物件又活了 → 撤銷標記。標記指到的物件不存在 → 清掉標記。
-4. repack：活的、比 grace 老、活 bytes 比例低於門檻的 pack，把活 chunk（解密驗證後重新封裝）搬進
-   新 pack；新 index blob 只列新 pack（supersedes 全部既有 blob）；舊 pack 變孤兒，走 1–2。
-   **沒被引用的 chunk 從此不在 index 裡**。
+4. repack：活的、比 grace 老、正本 bytes 比例低於門檻的 pack，把它是正本的 chunk（解密驗證後重新封裝）
+   搬進新 pack；新 index blob 列出新 pack 與**全部**既有 pack（新 pack 在前、被 repack 的舊 pack 在最後；
+   supersedes 全部既有 blob）；舊 pack **留在 index 裡並打標記**，走 1–2。這樣 prune 走訪之後才 commit、
+   引用到舊 pack 裡「當時沒人引用」的 chunk 的 snapshot 不會失去資料：下一輪舊 pack 又是那些 chunk 的
+   正本，標記撤銷、再 repack 一次。
 
-引用不完整（任何 snapshot / tree / index 讀不出來）時 prune 整個拒絕：不標、不刪。
+引用不完整（任何 snapshot / tree / index 讀不出來，或被引用的 chunk 不在有效 index 裡）時 prune 整個拒絕：
+不標、不刪。
 
 ### 11.4 backup 這邊的義務
 
 - 開始時列出 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。backup 因此不需要刪標記，
   維持 Put-only（PLAN 原本寫「引用到被標記的 pack 就刪除標記」，改成這樣）。
-- 從開始到寫 snapshot 之前若已經過了 grace 這麼久，一律不寫 snapshot、以錯誤結束（重跑會沿用已上傳的資料）。
+- 從開始到寫 snapshot 之前若已經過了 grace（減一小時的安全邊界，容忍 backup 與 prune 主機的時鐘差）
+  這麼久，一律不寫 snapshot、以錯誤結束（重跑會沿用已上傳的資料）。
 - 寫 snapshot 之前重新載入 index：這次引用到的**每一個 chunk**（沿用的與新寫的）都要在目前的 index
   裡解析得到，解析到的 pack 要存在、標記沒有超過 grace；這次 put 過的 tree 若有超過 grace 的標記，
-  它的修改時間必須比標記新。任一不成立 → 不寫 snapshot、以錯誤結束（重跑會重傳）。
+  它的修改時間必須比標記新；開始時就已被標記、這次又 put 過的 tree 要 HEAD 一次，必須存在且修改時間比
+  開始時的標記新（prune 可能在我們 put 之後才刪它並清掉標記）。任一不成立 → 不寫 snapshot、以錯誤結束（重跑會重傳）。
+  自己這次寫出的 pack 不驗（存在與否由上一條保證）。
 - 讀取端（restore）chunk 的 pack 不見了就重新載入 index 再試一次（repack 把它搬走了）。
 
 ### 11.5 安全性依賴的假設
@@ -300,7 +306,9 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
   之後的 backup 會在 commit 時失敗（安全），需要再 rebuild 一次。
 - bucket 開 versioning 時，prune 刪掉的只是目前版本；要真的釋放空間需要 lifecycle 規則清掉
   noncurrent 版本。Object Lock 保護中的物件刪不掉，prune 會回報並保留標記。
-- 兩個 pack 各持有同一個 chunk 的副本時，只要 chunk 活著兩個 pack 都活；重複佔的空間 v1 不回收。
+- 後端必須支援條件寫入（S3 的 `If-None-Match: *`；本機用 `O_EXCL`）：snapshot 與 gc 標記都靠它。
+- 標記時間與物件修改時間以後端的時鐘為準，S3 是秒級：同一秒內「重寫過」與「標記」分不出先後，
+  prune 一律當作重寫過（不刪），backup 一律當作沒重寫（不 commit）——都是安全那邊。
 
 ## 12. 已知的設計限制（不打算在 v1 解決，寫下來免得被當成 bug）
 
@@ -317,6 +325,6 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
 
 ## 13. 寫入順序（commit point）
 
-backup 的寫入順序固定為：packs → trees → index → snapshot。
+backup 的寫入順序固定為：(packs、trees，走訪途中交錯) → index → snapshot。
 snapshot 是唯一的 commit point：它出現之前 repo 裡多出來的物件都只是垃圾，
 GC 可以安全回收；它出現之後，它引用的所有東西都已經在 repo 裡。

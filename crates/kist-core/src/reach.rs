@@ -1,7 +1,7 @@
 //! 可達性走訪：從所有 snapshot 出發，走遍 tree，收集「活著的 tree」與「被引用的 chunk」。
 //!
-//! `check` 與 `prune` 共用同一個走訪：check 對每個檔案另外做大小與 index 的驗證，
-//! prune 只要集合。任何讀不到的 snapshot / tree / chunk 清單都記在 `errors`；
+//! `check` 與 `prune` 共用同一個走訪：check 對每個檔案另外做大小的驗證，prune 只要集合。
+//! 任何讀不到的 snapshot / tree / chunk 清單、以及**不在 index 裡的被引用 chunk**都記在 `errors`；
 //! prune 看到 `errors` 非空必須拒絕做任何標記或刪除（引用不完整就不能說誰是垃圾），
 //! check 則照常回報。
 
@@ -112,6 +112,13 @@ impl Repository {
                             }
                         };
                         reach.referenced_chunks.extend(data.iter().copied());
+                        for c in &data {
+                            if !index.contains(c) {
+                                reach
+                                    .errors
+                                    .push(format!("{key}: chunk {c} is missing from the index"));
+                            }
+                        }
                         on_file(FileVisit {
                             tree_key: &key,
                             node,

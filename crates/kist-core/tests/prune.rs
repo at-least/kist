@@ -85,7 +85,6 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
         snapshots: vec![b1.snapshot_key.clone()],
         policy: Default::default(),
         dry_run: false,
-        now: None,
     })
     .await
     .unwrap();
@@ -198,7 +197,6 @@ async fn young_objects_are_not_marked_and_dry_run_changes_nothing() {
         snapshots: vec![b1.snapshot_key],
         policy: Default::default(),
         dry_run: false,
-        now: None,
     })
     .await
     .unwrap();
@@ -267,7 +265,6 @@ async fn marked_objects_referenced_by_a_new_snapshot_are_revived() {
         snapshots: vec![b1.snapshot_key],
         policy: Default::default(),
         dry_run: false,
-        now: None,
     })
     .await
     .unwrap();
@@ -315,7 +312,6 @@ async fn active_client_without_a_newer_snapshot_blocks_deletion_but_inactive_doe
         snapshots: vec![b1.snapshot_key],
         policy: Default::default(),
         dry_run: false,
-        now: None,
     })
     .await
     .unwrap();
@@ -368,4 +364,142 @@ async fn stale_marker_for_a_missing_object_is_removed() {
         .unwrap();
     assert_eq!(p.stale_marks, 1, "{p:?}");
     assert!(!path.exists());
+}
+
+/// reviewer 的 1-A：prune 走訪之後、寫新 index 之前，另一個 backup commit 了一個引用「走訪時沒人引用」
+/// 的 chunk 的 snapshot。舊 pack 必須留在 index（帶標記），下一輪復活、再 repack，資料不能不見。
+#[tokio::test]
+async fn snapshot_committed_inside_a_prune_keeps_its_chunks() {
+    let t = TestRepo::new().await;
+    let src_a = t.dir.path().join("a");
+    let src_b = t.dir.path().join("b");
+    for s in [&src_a, &src_b] {
+        std::fs::create_dir_all(s).unwrap();
+        std::fs::write(s.join("shared.bin"), random_bytes(93, 60 * 1024)).unwrap();
+    }
+    std::fs::write(src_a.join("zz-big.bin"), random_bytes(94, 900 * 1024)).unwrap();
+    let repo = t.open().await;
+    let r = OffsetDateTime::now_utc();
+    // a 被備份又被 forget：大檔的 chunk 沒人引用，pack 因 shared 還活著
+    let b1 = repo
+        .backup(std::slice::from_ref(&src_a), client(1, r))
+        .await
+        .unwrap();
+    repo.forget(kist_core::ForgetOptions {
+        snapshots: vec![b1.snapshot_key],
+        policy: Default::default(),
+        dry_run: false,
+    })
+    .await
+    .unwrap();
+    t.open()
+        .await
+        .backup(
+            std::slice::from_ref(&src_b),
+            client(2, r + Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+    // client 1 再備份 a，大檔全部去重到舊 pack；停在 commit 前
+    let prepared = repo
+        .backup_prepare(
+            std::slice::from_ref(&src_a),
+            client(1, r + Duration::hours(2)),
+        )
+        .await
+        .unwrap();
+    // prune 走訪（大檔的 chunk 不算被引用 → 舊 pack 會被 repack）
+    let plan = repo
+        .prune_plan(prune_opts(r + Duration::days(4)))
+        .await
+        .unwrap();
+    assert!(plan.report().repacked_packs >= 1, "{:?}", plan.report());
+    // 走訪之後 commit
+    let s = prepared.commit().await.unwrap();
+    // 然後 prune 才寫新 index、標記舊 pack
+    let p1 = plan.execute().await.unwrap();
+    assert!(p1.marked >= 1, "{p1:?}");
+    let out = t.dir.path().join("out");
+    let fresh = t.open().await;
+    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    restore_matches(&fresh, &s.snapshot_key, &src_a, &out).await;
+
+    // 之後的每一輪：舊 pack 先復活（它是大檔 chunk 的正本）、再被 repack、最後刪掉；資料一直都在
+    for day in [8, 12, 16, 20] {
+        repo.backup(
+            std::slice::from_ref(&src_a),
+            client(1, r + Duration::days(day) - Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+        let p = repo
+            .prune(prune_opts(r + Duration::days(day)))
+            .await
+            .unwrap();
+        assert!(p.skipped.is_empty(), "{p:?}");
+        let fresh = t.open().await;
+        let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+        assert!(report.errors.is_empty(), "day {day}: {:?}", report.errors);
+        restore_matches(&fresh, &s.snapshot_key, &src_a, &out).await;
+    }
+    assert!(ids_under(&t, "gc").is_empty());
+}
+
+/// 同一個 chunk 在兩個 pack 都有副本（兩台 client 同時寫）：只有正本那個 pack 是需要的，
+/// 另一個走兩階段刪掉；資料一直讀得到。
+#[tokio::test]
+async fn duplicate_copies_are_reclaimed() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_src(&src);
+    let repo = t.open().await;
+    let r = OffsetDateTime::now_utc();
+    repo.backup(std::slice::from_ref(&src), client(1, r))
+        .await
+        .unwrap();
+    let first = ids_under(&t, "packs");
+    // 假裝所有 pack 被標記，讓 client 2 把同樣的資料再寫一份
+    for id in &first {
+        let path = t.repo_path().join(keys::gc(id));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, keys::GC_MARK_MAGIC).unwrap();
+    }
+    let s2 = t
+        .open()
+        .await
+        .backup(
+            std::slice::from_ref(&src),
+            client(2, r + Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+    assert!(s2.stats.chunks_new > 0);
+    for id in &first {
+        std::fs::remove_file(t.repo_path().join(keys::gc(id))).unwrap();
+    }
+    assert!(ids_under(&t, "packs").len() > first.len());
+
+    let p1 = repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
+    assert!(p1.marked > 0, "{p1:?}");
+    assert_eq!(p1.revived, 0, "{p1:?}");
+    // 每個 pack 要嘛是正本、要嘛被標記；兩份都有的 chunk 只留一份
+    let marked = ids_under(&t, "gc");
+    assert_eq!(
+        p1.live_packs as usize + marked.len(),
+        ids_under(&t, "packs").len()
+    );
+    repo.backup(std::slice::from_ref(&src), client(1, r + Duration::days(5)))
+        .await
+        .unwrap();
+    repo.backup(std::slice::from_ref(&src), client(2, r + Duration::days(5)))
+        .await
+        .unwrap();
+    let p2 = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
+    assert_eq!(p2.deleted as usize, marked.len(), "{p2:?}");
+    let fresh = t.open().await;
+    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let out = t.dir.path().join("out");
+    restore_matches(&fresh, &s2.snapshot_key, &src, &out).await;
 }

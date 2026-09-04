@@ -1,6 +1,6 @@
 //! backup：走訪目錄、切塊、去重、寫 pack / tree / index / snapshot。
 //!
-//! 流程（寫入順序是刻意的，見 `docs/format.md` §12）：
+//! 流程（寫入順序是刻意的，見 `docs/format.md` §13）：
 //! 1. 讀進所有 index。
 //! 2. 找同一台 client、同一組路徑的上一個 snapshot 當 parent：
 //!    檔案的 size 與 mtime 沒變就直接沿用它的 chunk 清單，不重讀檔案。
@@ -101,6 +101,8 @@ struct Backup {
     parent_start: (i64, u32),
     /// backup 開始時已被 GC 標記的 pack：不拿來去重。
     marked: Arc<HashSet<ObjectId>>,
+    /// backup 開始時所有的標記（含 tree）：commit 時要驗「開始時已被標記、這次又 put 過」的 tree。
+    marks_at_start: HashMap<ObjectId, time::OffsetDateTime>,
     /// 這次沿用的既有 chunk 各自在哪個 pack（commit 前要驗這些 pack 還在）。
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
 }
@@ -119,7 +121,13 @@ pub struct PreparedBackup {
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
     /// 這次 put 過的 tree。
     written_trees: HashSet<ObjectId>,
+    marks_at_start: HashMap<ObjectId, time::OffsetDateTime>,
+    /// 這次自己寫出的 pack：commit 時不需要再驗（存在與否由 BackupTooLong 保證）。
+    own_packs: HashSet<ObjectId>,
 }
+
+/// backup 與 prune 的時鐘可能相差幾分鐘：BackupTooLong 提早這麼多觸發。
+const GRACE_SAFETY_MARGIN: time::Duration = time::Duration::hours(1);
 
 impl PreparedBackup {
     pub fn stats(&self) -> &SnapshotStats {
@@ -138,7 +146,8 @@ impl PreparedBackup {
         let elapsed = now - self.started;
         let grace = time::Duration::try_from(self.opts.gc_grace)
             .map_err(|_| CoreError::Usage("gc_grace is too large".to_owned()))?;
-        if elapsed >= grace {
+        let margin = GRACE_SAFETY_MARGIN.min(grace / 2);
+        if elapsed + margin >= grace {
             return Err(CoreError::BackupTooLong {
                 elapsed_secs: elapsed.whole_seconds(),
                 grace_secs: self.opts.gc_grace.as_secs(),
@@ -146,10 +155,22 @@ impl PreparedBackup {
         }
         let marks = self.repo.list_gc_marks().await?;
         self.repo
-            .verify_referenced_chunks(&self.referenced, &marks, self.opts.gc_grace, now)
+            .verify_referenced_chunks(
+                &self.referenced,
+                &self.own_packs,
+                &marks,
+                self.opts.gc_grace,
+                now,
+            )
             .await?;
         self.repo
-            .verify_written_trees(&self.written_trees, &marks, self.opts.gc_grace, now)
+            .verify_written_trees(
+                &self.written_trees,
+                &self.marks_at_start,
+                &marks,
+                self.opts.gc_grace,
+                now,
+            )
             .await?;
         let snapshot_key = self
             .repo
@@ -200,6 +221,7 @@ impl Repository {
     async fn verify_referenced_chunks(
         &self,
         referenced: &HashMap<ObjectId, Vec<ChunkId>>,
+        own_packs: &HashSet<ObjectId>,
         marks: &HashMap<ObjectId, time::OffsetDateTime>,
         grace: std::time::Duration,
         now: time::OffsetDateTime,
@@ -208,6 +230,10 @@ impl Repository {
         let fresh = self.load_index().await?;
         let mut pack_ok: HashMap<ObjectId, bool> = HashMap::new();
         for (old_pack, chunks) in referenced {
+            if own_packs.contains(old_pack) {
+                // 自己剛寫的 pack：index 可能把同一個 chunk 解析到別的（甚至被標記的）pack，那不代表我們的副本有問題
+                continue;
+            }
             for chunk in chunks {
                 let Some(loc) = fresh.get(chunk) else {
                     return Err(CoreError::PackMissing {
@@ -235,12 +261,16 @@ impl Repository {
         Ok(())
     }
 
-    /// commit 前：這次寫過的 tree 若有**已超過 grace** 的標記，prune 隨時會刪它。
-    /// 我們的 put 會刷新它的修改時間（prune 刪前會再看一眼、看到就撤銷標記），
-    /// 所以只有「修改時間沒比標記新」才是危險的——那表示 put 發生在標記之前，backup 已經跑了超過 grace。
+    /// commit 前對這次 put 過的 tree 做兩個檢查（兩個集合平常都是空的，零成本）：
+    /// 1. 現在有**已超過 grace** 的標記：prune 隨時會刪它。我們的 put 會刷新它的修改時間
+    ///    （prune 刪前會再看一眼、看到就撤銷標記），所以只有「修改時間沒比標記新」才危險——
+    ///    那表示 put 發生在標記之前，backup 已經跑了超過 grace。
+    /// 2. **開始時就已被標記**的 tree：prune 可能在我們 put 之後才刪它、連標記一起清掉，
+    ///    事後從標記看不出來，所以直接 HEAD：要存在，而且修改時間比開始時的標記新。
     async fn verify_written_trees(
         &self,
         written: &HashSet<ObjectId>,
+        marks_at_start: &HashMap<ObjectId, time::OffsetDateTime>,
         marks: &HashMap<ObjectId, time::OffsetDateTime>,
         grace: std::time::Duration,
         now: time::OffsetDateTime,
@@ -252,6 +282,16 @@ impl Repository {
             let info = self.backend().head(&keys::tree(id)).await?;
             if info.modified <= *marked_at {
                 return Err(CoreError::TreeMarked(*id));
+            }
+        }
+        for (id, marked_at) in marks_at_start {
+            if !written.contains(id) {
+                continue;
+            }
+            match self.backend().head(&keys::tree(id)).await {
+                Ok(info) if info.modified > *marked_at => {}
+                Ok(_) | Err(BackendError::NotFound(_)) => return Err(CoreError::TreeMarked(*id)),
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(())
@@ -292,7 +332,8 @@ impl Repository {
         let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = kept.into_iter().unzip();
 
         let index = self.load_index().await?;
-        let marked: HashSet<ObjectId> = self.list_gc_marks().await?.into_keys().collect();
+        let marks_at_start = self.list_gc_marks().await?;
+        let marked: HashSet<ObjectId> = marks_at_start.keys().copied().collect();
         if !marked.is_empty() {
             tracing::info!(
                 "{} pack(s) are marked for deletion and will not be used for deduplication",
@@ -326,6 +367,7 @@ impl Repository {
             stats: SnapshotStats::default(),
             parent_start,
             marked: Arc::new(marked),
+            marks_at_start,
             referenced: HashMap::new(),
         };
 
@@ -346,15 +388,11 @@ impl Repository {
         b.flush_pack().await?;
         b.wait_uploads(0).await?;
 
-        // index blob（只包含這次新寫的 pack）；這些 pack 也列入 commit 前要驗的清單
+        // index blob（只包含這次新寫的 pack）
+        let mut own_packs = HashSet::new();
         if !b.new_packs.is_empty() {
             let packs = std::mem::take(&mut b.new_packs);
-            for p in &packs {
-                b.referenced
-                    .entry(p.pack)
-                    .or_default()
-                    .extend(p.entries.iter().map(|e| e.id));
-            }
+            own_packs.extend(packs.iter().map(|p| p.pack));
             self.write_index(IndexBlob::new(packs)).await?;
         }
 
@@ -366,6 +404,8 @@ impl Repository {
             stats: b.stats,
             referenced: std::mem::take(&mut b.referenced),
             written_trees: std::mem::take(&mut b.written_trees),
+            marks_at_start: std::mem::take(&mut b.marks_at_start),
+            own_packs,
             opts,
             started,
         })

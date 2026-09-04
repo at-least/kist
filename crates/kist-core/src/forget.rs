@@ -5,9 +5,11 @@
 //! 政策以 (client id, paths) 分組套用，與 backup 選 parent 的分組一致；
 //! 明確指定的 snapshot 不管政策一律刪。
 //!
-//! 政策的語意沿用 restic：由新到舊逐一看，每個「桶」（小時、日、ISO 週、月、年）
+//! 政策的語意沿用 restic（`keep_within` 見下）：由新到舊逐一看，每個「桶」（小時、日、ISO 週、月、年）
 //! 只保留該桶裡最新的一個，各類桶各自有數量上限；`keep_last` 保留最新 N 個；
-//! `keep_within` 保留距 `now` 一段時間內的全部。任何一條理由成立就保留。
+//! `keep_within` 保留距**該組最新 snapshot** 一段時間內的全部（restic 語意；不是距現在，
+//! 否則一台停機的機器回來時 forget 會把它的 snapshot 全刪光）。任何一條理由成立就保留。
+//! 任何 `keep_*` 設成 0 一律拒絕（restic 也是）：那會把整組刪光，幾乎不會是本意。
 
 use std::collections::BTreeMap;
 
@@ -34,6 +36,31 @@ impl RetentionPolicy {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// 0 不是合法的保留數量。
+    pub fn validate(&self) -> Result<()> {
+        let counts = [
+            ("--keep-last", self.keep_last),
+            ("--keep-hourly", self.keep_hourly),
+            ("--keep-daily", self.keep_daily),
+            ("--keep-weekly", self.keep_weekly),
+            ("--keep-monthly", self.keep_monthly),
+            ("--keep-yearly", self.keep_yearly),
+        ];
+        for (name, n) in counts {
+            if n == Some(0) {
+                return Err(CoreError::Usage(format!(
+                    "{name} 0 would remove every snapshot in a group; refusing"
+                )));
+            }
+        }
+        if self.keep_within == Some(std::time::Duration::ZERO) {
+            return Err(CoreError::Usage(
+                "--keep-within 0 would remove every snapshot in a group; refusing".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +70,6 @@ pub struct ForgetOptions {
     pub policy: RetentionPolicy,
     /// 只算不刪。
     pub dry_run: bool,
-    /// `keep_within` 的基準時間；`None` = 現在。測試用。
-    pub now: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,14 +91,14 @@ pub struct Candidate {
 }
 
 /// 對**同一組**的候選套用政策。輸入不需排序；輸出依時間新 → 舊，
-/// 每個 key 附上保留理由（空 = 刪）。
+/// 每個 key 附上保留理由（空 = 刪）。`keep_within` 以這組最新的 snapshot 為基準。
 pub fn apply_policy(
     candidates: &[Candidate],
     policy: &RetentionPolicy,
-    now: OffsetDateTime,
 ) -> Vec<(String, Vec<&'static str>)> {
     let mut sorted: Vec<&Candidate> = candidates.iter().collect();
     sorted.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| b.key.cmp(&a.key)));
+    let latest = sorted.first().map(|c| c.time);
 
     // 每種桶：(理由, 剩餘數量, 上一個保留的桶 key)
     struct Bucket {
@@ -108,8 +133,8 @@ pub fn apply_policy(
             last_remaining -= 1;
             reasons.push("last");
         }
-        if let Some(within) = policy.keep_within {
-            if c.time >= now - within {
+        if let (Some(within), Some(latest)) = (policy.keep_within, latest) {
+            if c.time >= latest - within {
                 reasons.push("within");
             }
         }
@@ -157,6 +182,7 @@ impl Repository {
                 "nothing to forget: give snapshot ids or a retention policy (--keep-*)".to_owned(),
             ));
         }
+        opts.policy.validate()?;
         let all = self.list_snapshots().await?;
         for key in &opts.snapshots {
             if !all.iter().any(|s| &s.key == key) {
@@ -169,7 +195,6 @@ impl Repository {
         let mut summary = ForgetSummary::default();
 
         if !opts.policy.is_empty() {
-            let now = opts.now.unwrap_or_else(OffsetDateTime::now_utc);
             // 分組：(client id, paths)
             let mut groups: BTreeMap<GroupKey, Vec<Candidate>> = BTreeMap::new();
             for s in &all {
@@ -194,7 +219,7 @@ impl Repository {
                     });
             }
             for candidates in groups.values() {
-                for (key, reasons) in apply_policy(candidates, &opts.policy, now) {
+                for (key, reasons) in apply_policy(candidates, &opts.policy) {
                     if reasons.is_empty() {
                         removed.push(key);
                     } else {

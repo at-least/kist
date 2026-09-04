@@ -55,18 +55,15 @@ struct PruneArgs {
     /// Repack packs whose live data is below this percentage (0 disables repacking).
     #[arg(long, value_name = "PERCENT", default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
     repack_below: u8,
-    /// Report what would happen without writing anything.
-    #[arg(long)]
-    dry_run: bool,
 }
 
 impl PruneArgs {
-    fn options(&self) -> PruneOptions {
+    fn options(&self, dry_run: bool) -> PruneOptions {
         PruneOptions {
             grace: self.grace,
             inactive_after: self.inactive_after,
             repack_below_percent: self.repack_below,
-            dry_run: self.dry_run,
+            dry_run,
             now: None,
         }
     }
@@ -147,22 +144,22 @@ enum Command {
         /// Snapshots to remove (`latest`, a full id, or a unique timestamp prefix).
         snapshots: Vec<String>,
         /// Keep the newest N snapshots of each client/path group.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         keep_last: Option<u32>,
         /// Keep the newest snapshot of each of the last N hours.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         keep_hourly: Option<u32>,
         /// Keep the newest snapshot of each of the last N days.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         keep_daily: Option<u32>,
         /// Keep the newest snapshot of each of the last N ISO weeks.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         keep_weekly: Option<u32>,
         /// Keep the newest snapshot of each of the last N months.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         keep_monthly: Option<u32>,
         /// Keep the newest snapshot of each of the last N years.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         keep_yearly: Option<u32>,
         /// Keep every snapshot newer than this (e.g. `36h`, `14d`, `2w`).
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
@@ -170,9 +167,11 @@ enum Command {
         /// Show what would be removed without removing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Run `prune` (with default settings) afterwards.
+        /// Run `prune` afterwards (the prune options below apply).
         #[arg(long)]
         prune: bool,
+        #[command(flatten)]
+        prune_args: PruneArgs,
     },
     /// Reclaim space: mark unreferenced data, delete what was marked longer ago than the
     /// grace period, and repack mostly-unused packs. Safe to run while backups are running.
@@ -181,6 +180,9 @@ enum Command {
         repo: RepoArgs,
         #[command(flatten)]
         prune: PruneArgs,
+        /// Report what would happen without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Rebuild the index from the pack files (after index objects were lost or corrupted).
     RebuildIndex {
@@ -353,6 +355,7 @@ async fn run(cli: Cli) -> Result<()> {
             keep_within,
             dry_run,
             prune,
+            prune_args,
         } => {
             let r = open_repo(&repo).await?;
             let mut keys = Vec::new();
@@ -373,7 +376,6 @@ async fn run(cli: Cli) -> Result<()> {
                     snapshots: keys,
                     policy,
                     dry_run,
-                    now: None,
                 })
                 .await?;
             let verb = if dry_run { "would remove" } else { "removed" };
@@ -393,22 +395,21 @@ async fn run(cli: Cli) -> Result<()> {
                 summary.kept.len()
             );
             if prune {
-                let report = r
-                    .prune(PruneOptions {
-                        dry_run,
-                        ..PruneOptions::default()
-                    })
-                    .await?;
+                let report = r.prune(prune_args.options(dry_run)).await?;
                 print_prune_report(&report, dry_run)?;
             } else if !dry_run && !summary.removed.is_empty() {
                 println!("run `kist prune` to reclaim the space");
             }
             Ok(())
         }
-        Command::Prune { repo, prune } => {
+        Command::Prune {
+            repo,
+            prune,
+            dry_run,
+        } => {
             let r = open_repo(&repo).await?;
-            let report = r.prune(prune.options()).await?;
-            print_prune_report(&report, prune.dry_run)
+            let report = r.prune(prune.options(dry_run)).await?;
+            print_prune_report(&report, dry_run)
         }
         Command::RebuildIndex { repo } => {
             let r = open_repo(&repo).await?;

@@ -90,13 +90,7 @@ impl Repository {
                 for c in f.data_chunks {
                     match index.get(c) {
                         Some(loc) => sum = sum.saturating_add(loc.raw_len),
-                        None => {
-                            complete = false;
-                            file_errors.push(format!(
-                                "{}: chunk {c} is missing from the index",
-                                f.tree_key
-                            ));
-                        }
+                        None => complete = false, // 走訪已經報了「chunk 不在 index 裡」
                     }
                 }
                 // 不讀資料也能抓到 size 與 chunk 總長不符（例如備份中變動的檔）

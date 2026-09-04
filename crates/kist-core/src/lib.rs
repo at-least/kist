@@ -32,7 +32,7 @@ pub use backup::{BackupOptions, BackupSummary, PreparedBackup, DEFAULT_GC_GRACE}
 pub use check::{CheckOptions, CheckReport};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
-pub use prune::{PruneOptions, PruneReport};
+pub use prune::{PruneOptions, PrunePlan, PruneReport};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
 pub use restore::{ReloadableIndex, RestoreOptions, RestoreSummary};

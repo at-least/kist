@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use kist_core::{BackupOptions, CheckOptions, CoreError, PreparedBackup, PruneOptions, Repository};
+use kist_core::{
+    BackupOptions, CheckOptions, CoreError, PreparedBackup, PruneOptions, PrunePlan, Repository,
+};
 use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 
@@ -43,6 +45,9 @@ enum Op {
         nth: u8,
     },
     Prune,
+    /// prune 拆成兩半：先讀與決定，之後才寫與刪——中間可以插 backup 的 commit（1-A 的視窗）。
+    PrunePlan,
+    PruneExecute,
     Advance {
         hours: u8,
     },
@@ -54,7 +59,9 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => (0u8..2, 1u8..16).prop_map(|(client, variant)| Op::Prepare { client, variant }),
         2 => (0u8..2).prop_map(|client| Op::Commit { client }),
         2 => (0u8..8).prop_map(|nth| Op::Forget { nth }),
-        3 => Just(Op::Prune),
+        2 => Just(Op::Prune),
+        2 => Just(Op::PrunePlan),
+        2 => Just(Op::PruneExecute),
         3 => (1u8..120).prop_map(|hours| Op::Advance { hours }),
     ]
 }
@@ -109,6 +116,7 @@ struct World {
     srcs: [PathBuf; 2],
     /// 進行中的 backup 與它備份的 variant。
     pending: [Option<(PreparedBackup, u8)>; 2],
+    pending_prune: Option<PrunePlan>,
     /// 已寫出的 snapshot → 它備份的 (client, variant)。
     snapshots: BTreeMap<String, (u8, u8)>,
     log: Vec<String>,
@@ -127,6 +135,7 @@ impl World {
             clock: OffsetDateTime::now_utc() + Duration::days(365),
             srcs,
             pending: [None, None],
+            pending_prune: None,
             snapshots: BTreeMap::new(),
             log: Vec::new(),
             real_horizon: std::time::SystemTime::now()
@@ -200,7 +209,6 @@ impl World {
                         snapshots: vec![key.clone()],
                         policy: Default::default(),
                         dry_run: false,
-                        now: Some(self.clock),
                     })
                     .await
                     .unwrap();
@@ -221,6 +229,31 @@ impl World {
                     .unwrap();
                 assert!(r.skipped.is_empty(), "{r:?}");
                 self.log.push(format!("prune → {r:?}"));
+            }
+            Op::PrunePlan => {
+                if self.pending_prune.is_some() {
+                    return;
+                }
+                let plan = self
+                    .repo
+                    .prune_plan(PruneOptions {
+                        grace: H * (GRACE_HOURS as u32),
+                        inactive_after: 30 * 24 * H,
+                        repack_below_percent: 50,
+                        dry_run: false,
+                        now: Some(self.clock),
+                    })
+                    .await
+                    .unwrap();
+                self.log.push(format!("prune plan → {:?}", plan.report()));
+                self.pending_prune = Some(plan);
+            }
+            Op::PruneExecute => {
+                if let Some(plan) = self.pending_prune.take() {
+                    let r = plan.execute().await.unwrap();
+                    assert!(r.skipped.is_empty(), "{r:?}");
+                    self.log.push(format!("prune execute → {r:?}"));
+                }
             }
             Op::Advance { hours } => {
                 self.clock += Duration::hours(i64::from(*hours));
@@ -327,11 +360,13 @@ proptest! {
                 w.step(op).await;
                 w.check_invariants().await;
             }
-            // 把還沒 commit 的都 commit 掉（可能安全失敗），再跑一次 prune 與收尾檢查
+            // 把還沒 commit 的都 commit 掉（可能安全失敗）、還沒執行的 prune 執行掉，再跑一次 prune 與收尾檢查
             for client in 0..2u8 {
                 w.step(&Op::Commit { client }).await;
                 w.check_invariants().await;
             }
+            w.step(&Op::PruneExecute).await;
+            w.check_invariants().await;
             w.step(&Op::Prune).await;
             w.check_invariants().await;
             w.check_restores().await;

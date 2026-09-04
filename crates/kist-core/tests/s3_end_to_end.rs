@@ -148,7 +148,6 @@ async fn forget_and_prune_on_s3() {
         snapshots: vec![b1.snapshot_key],
         policy: Default::default(),
         dry_run: false,
-        now: None,
     })
     .await
     .unwrap();

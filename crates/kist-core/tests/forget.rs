@@ -33,7 +33,7 @@ fn keep_last_keeps_the_newest_n() {
         keep_last: Some(3),
         ..Default::default()
     };
-    let d = apply_policy(&hourly(end, 10), &policy, end);
+    let d = apply_policy(&hourly(end, 10), &policy);
     assert_eq!(
         kept(&d),
         ["snapshots/aa/000", "snapshots/aa/001", "snapshots/aa/002"]
@@ -49,7 +49,7 @@ fn keep_daily_keeps_newest_of_each_day() {
         keep_daily: Some(2),
         ..Default::default()
     };
-    let d = apply_policy(&hourly(end, 48), &policy, end);
+    let d = apply_policy(&hourly(end, 48), &policy);
     // 09-05 最新的是 000（10:30）；09-04 最新的是 11 小時前（23:30）= 011
     assert_eq!(kept(&d), ["snapshots/aa/000", "snapshots/aa/011"]);
 }
@@ -65,7 +65,7 @@ fn keep_hourly_weekly_monthly_yearly_use_distinct_buckets() {
         ..Default::default()
     };
     // 每小時一個、往回 40 天
-    let d = apply_policy(&hourly(end, 24 * 40), &policy, end);
+    let d = apply_policy(&hourly(end, 24 * 40), &policy);
     let k = kept(&d);
     // hourly：000（00:10）、001（23:10 前一天）
     assert!(k.contains(&"snapshots/aa/000") && k.contains(&"snapshots/aa/001"));
@@ -79,21 +79,38 @@ fn keep_hourly_weekly_monthly_yearly_use_distinct_buckets() {
 }
 
 #[test]
-fn keep_within_uses_now() {
-    let end = datetime!(2026-09-05 10:30:00 UTC);
+fn keep_within_is_relative_to_the_newest_snapshot() {
+    // 最新的 snapshot 是 10 天前：距「現在」都超過 2 小時，但 restic 語意是距最新的那個
+    let end = datetime!(2026-08-26 10:30:00 UTC);
     let policy = RetentionPolicy {
         keep_within: Some(std::time::Duration::from_secs(2 * 3600)),
         ..Default::default()
     };
-    // now 比最新的 snapshot 晚 1 小時：2 小時內只有 000 與 001
-    let d = apply_policy(&hourly(end, 10), &policy, end + Duration::hours(1));
-    assert_eq!(kept(&d), ["snapshots/aa/000", "snapshots/aa/001"]);
+    let d = apply_policy(&hourly(end, 10), &policy);
+    assert_eq!(
+        kept(&d),
+        ["snapshots/aa/000", "snapshots/aa/001", "snapshots/aa/002"]
+    );
+}
+
+#[test]
+fn zero_counts_are_rejected() {
+    let policy = RetentionPolicy {
+        keep_last: Some(0),
+        ..Default::default()
+    };
+    assert!(matches!(policy.validate(), Err(CoreError::Usage(_))));
+    let policy = RetentionPolicy {
+        keep_within: Some(std::time::Duration::ZERO),
+        ..Default::default()
+    };
+    assert!(matches!(policy.validate(), Err(CoreError::Usage(_))));
 }
 
 #[test]
 fn empty_policy_keeps_nothing() {
     let end = datetime!(2026-09-05 10:30:00 UTC);
-    let d = apply_policy(&hourly(end, 3), &RetentionPolicy::default(), end);
+    let d = apply_policy(&hourly(end, 3), &RetentionPolicy::default());
     assert!(kept(&d).is_empty());
 }
 
@@ -149,7 +166,6 @@ async fn forget_applies_policy_per_client_and_path_group() {
             snapshots: vec![],
             policy: policy.clone(),
             dry_run: true,
-            now: None,
         })
         .await
         .unwrap();
@@ -161,7 +177,6 @@ async fn forget_applies_policy_per_client_and_path_group() {
             snapshots: vec![],
             policy,
             dry_run: false,
-            now: None,
         })
         .await
         .unwrap();
@@ -202,7 +217,6 @@ async fn forget_explicit_snapshots_and_refuses_empty_request() {
             snapshots: vec![],
             policy: RetentionPolicy::default(),
             dry_run: false,
-            now: None,
         })
         .await
         .unwrap_err();
@@ -214,7 +228,6 @@ async fn forget_explicit_snapshots_and_refuses_empty_request() {
             snapshots: vec![first.clone()],
             policy: RetentionPolicy::default(),
             dry_run: false,
-            now: None,
         })
         .await
         .unwrap();
@@ -227,7 +240,6 @@ async fn forget_explicit_snapshots_and_refuses_empty_request() {
             snapshots: vec![first],
             policy: RetentionPolicy::default(),
             dry_run: false,
-            now: None,
         })
         .await
         .unwrap_err();
