@@ -126,10 +126,25 @@ impl PreparedBackup {
         &self.stats
     }
 
-    /// 驗證引用到的每個 pack 都還在，然後寫 snapshot。
+    /// 驗證引用到的資料都還在，然後寫 snapshot。
     pub async fn commit(self) -> Result<BackupSummary> {
+        self.commit_at(time::OffsetDateTime::now_utc()).await
+    }
+
+    /// 同 `commit`，「現在」由呼叫端給（競態測試用注入的時鐘）。
+    pub async fn commit_at(self, now: time::OffsetDateTime) -> Result<BackupSummary> {
+        // 跑超過 grace 的 backup 一律不 commit：它寫的 tree 可能已經被標記、刪掉、連標記都清了，
+        // 下面的檢查看不到。這是「grace 必須長於最長的一次 backup」的可執行版本。
+        let elapsed = now - self.started;
+        let grace = time::Duration::try_from(self.opts.gc_grace)
+            .map_err(|_| CoreError::Usage("gc_grace is too large".to_owned()))?;
+        if elapsed >= grace {
+            return Err(CoreError::BackupTooLong {
+                elapsed_secs: elapsed.whole_seconds(),
+                grace_secs: self.opts.gc_grace.as_secs(),
+            });
+        }
         let marks = self.repo.list_gc_marks().await?;
-        let now = time::OffsetDateTime::now_utc();
         self.repo
             .verify_referenced_chunks(&self.referenced, &marks, self.opts.gc_grace, now)
             .await?;

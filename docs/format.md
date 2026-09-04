@@ -282,6 +282,7 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
 
 - 開始時列出 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。backup 因此不需要刪標記，
   維持 Put-only（PLAN 原本寫「引用到被標記的 pack 就刪除標記」，改成這樣）。
+- 從開始到寫 snapshot 之前若已經過了 grace 這麼久，一律不寫 snapshot、以錯誤結束（重跑會沿用已上傳的資料）。
 - 寫 snapshot 之前重新載入 index：這次引用到的**每一個 chunk**（沿用的與新寫的）都要在目前的 index
   裡解析得到，解析到的 pack 要存在、標記沒有超過 grace；這次 put 過的 tree 若有超過 grace 的標記，
   它的修改時間必須比標記新。任一不成立 → 不寫 snapshot、以錯誤結束（重跑會重傳）。
@@ -289,7 +290,8 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
 
 ### 11.5 安全性依賴的假設
 
-- **grace 長於最長的一次 backup。** 跑得更久的 backup 不會悄悄留下壞 snapshot，而是在 commit 時失敗。
+- **grace 長於最長的一次 backup。** 跑得更久的 backup 不會悄悄留下壞 snapshot：commit 時直接以
+  `BackupTooLong` 失敗（它寫的 tree 可能已經被標記、刪掉、連標記都清了，事後檢查不到）。
 - **同一個 client id 一次只跑一個 backup**（CLI 用 client id 檔旁的檔案鎖保證）。
   「活躍 client 在標記後有新 snapshot」這條保護假設每台 client 的 backup 一個接一個。
 - 一台 client 的 snapshot 全被 forget 之後，它就是 inactive；新機器第一次備份也是。它們的

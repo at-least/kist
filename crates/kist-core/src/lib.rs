@@ -80,6 +80,9 @@ pub enum CoreError {
     /// prune 拒絕執行：引用不完整時分不出什麼是垃圾。
     #[error("refusing to prune: {0}")]
     Unsafe(String),
+    /// backup 跑得比 GC 的 grace 還久：它寫過的東西可能已經被標記甚至刪掉，不寫 snapshot。
+    #[error("backup took {elapsed_secs}s, longer than the GC grace period ({grace_secs}s); rerun it (uploaded data is reused) or raise --gc-grace and prune --grace")]
+    BackupTooLong { elapsed_secs: i64, grace_secs: u64 },
     /// backup 寫過的 tree 在寫之前就被標記且標記已超過 grace：可能隨時被刪，不寫 snapshot。
     #[error("tree {0} written by this backup is about to be garbage-collected; rerun the backup")]
     TreeMarked(kist_format::ObjectId),

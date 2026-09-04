@@ -5,6 +5,10 @@
 //! - 最後每個 snapshot 都能還原成當初備份的內容。
 //!
 //! 「永遠不會刪到活的 chunk」就是由這三條合起來證明的。
+//!
+//! 時鐘是注入的（從真實時間 + 1 年起算，只往前推）。本機後端的物件「修改時間」是檔案 mtime，
+//! 每一步之後把剛寫出的檔案（mtime 還是真實時間的）蓋成目前的時鐘，讓 prune 看到的年齡與
+//! snapshot 的時間在同一條時間軸上。
 
 mod common;
 
@@ -108,6 +112,8 @@ struct World {
     /// 已寫出的 snapshot → 它備份的 (client, variant)。
     snapshots: BTreeMap<String, (u8, u8)>,
     log: Vec<String>,
+    /// mtime 早於這個時間的檔案是這一步剛寫出的（真實時間），要蓋成時鐘。
+    real_horizon: std::time::SystemTime,
 }
 
 impl World {
@@ -118,11 +124,26 @@ impl World {
         Self {
             t,
             repo,
-            clock: OffsetDateTime::now_utc(),
+            clock: OffsetDateTime::now_utc() + Duration::days(365),
             srcs,
             pending: [None, None],
             snapshots: BTreeMap::new(),
             log: Vec::new(),
+            real_horizon: std::time::SystemTime::now()
+                + std::time::Duration::from_secs(180 * 86_400),
+        }
+    }
+
+    /// 把這一步剛寫出的物件（mtime 仍是真實時間）蓋成目前的時鐘。
+    fn stamp_new_objects(&self) {
+        let clock = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_nanos(self.clock.unix_timestamp_nanos() as u64);
+        for path in walk_files(&self.t.repo_path()) {
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_file() && meta.modified().unwrap() < self.real_horizon {
+                filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(clock))
+                    .unwrap();
+            }
         }
     }
 
@@ -164,7 +185,7 @@ impl World {
             Op::Commit { client } => {
                 let c = *client as usize;
                 if let Some((p, variant)) = self.pending[c].take() {
-                    let r = p.commit().await;
+                    let r = p.commit_at(self.clock).await;
                     self.record_commit(*client, variant, r);
                 }
             }
@@ -206,6 +227,7 @@ impl World {
                 self.log.push(format!("advance {hours}h"));
             }
         }
+        self.stamp_new_objects();
     }
 
     fn record_commit(
@@ -225,7 +247,12 @@ impl World {
             }
             Err(e) => {
                 assert!(
-                    matches!(e, CoreError::PackMissing { .. } | CoreError::TreeMarked(_)),
+                    matches!(
+                        e,
+                        CoreError::PackMissing { .. }
+                            | CoreError::TreeMarked(_)
+                            | CoreError::BackupTooLong { .. }
+                    ),
                     "commit failed unsafely: {e}\nlog:\n{}",
                     self.log.join("\n")
                 );

@@ -133,10 +133,8 @@ async fn forget_and_prune_on_s3() {
     let repo = Repository::open(backend.clone(), PASSWORD.as_bytes())
         .await
         .unwrap();
-    let opts = BackupOptions {
-        gc_grace: std::time::Duration::ZERO,
-        ..backup_options()
-    };
+    // backup 的 gc_grace 維持預設（0 會讓每個 backup 都被當成「跑超過 grace」）；prune 用 grace 0
+    let opts: BackupOptions = backup_options();
     let b1 = repo
         .backup(std::slice::from_ref(&src), opts.clone())
         .await
