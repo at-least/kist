@@ -183,6 +183,10 @@ type backupRun struct {
 
 	writer *pack.Writer
 
+	// chunker is reused across files: its 16 MiB buffer is the single
+	// largest per-file cost when files are small.
+	chunker *chunker.Chunker
+
 	// marked is the set of packs prune has marked for deletion, as of
 	// the start of this backup. See has.
 	marked map[crypto.ID]struct{}
@@ -429,8 +433,14 @@ func (b *backupRun) backupFile(ctx context.Context, path string, info fs.FileInf
 }
 
 func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uint64, error) {
-	c, err := chunker.New(r)
-	if err != nil {
+	c := b.chunker
+	if c == nil {
+		var err error
+		if c, err = chunker.New(r); err != nil {
+			return nil, 0, err
+		}
+		b.chunker = c
+	} else if err := c.Reset(r); err != nil {
 		return nil, 0, err
 	}
 

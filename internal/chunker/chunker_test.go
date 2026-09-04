@@ -285,3 +285,53 @@ func TestGearTableDigest(t *testing.T) {
 		t.Errorf("gear table digest = %s, want %s", got, want)
 	}
 }
+
+// A reset chunker must find exactly the boundaries a fresh one finds,
+// whatever it read before: nothing of the previous file may leak into
+// the next.
+func TestResetChunksLikeAFreshChunker(t *testing.T) {
+	first := pseudorandom(t, "reset-first", 3*MinSize+123)
+	second := pseudorandom(t, "reset-second", 5*MinSize+7)
+	small := []byte("tiny")
+
+	c, err := New(bytes.NewReader(first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain := func() [][]byte {
+		var out [][]byte
+		for {
+			chunk, err := c.Next()
+			if errors.Is(err, io.EOF) {
+				return out
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, bytes.Clone(chunk.Data))
+		}
+	}
+	// Leave the first input half-consumed, then reset: a reset in the
+	// middle of a file must not carry the rest of it over.
+	if _, err := c.Next(); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range [][]byte{second, small, nil, first} {
+		if err := c.Reset(bytes.NewReader(data)); err != nil {
+			t.Fatal(err)
+		}
+		got := drain()
+		want := chunkAll(t, data)
+		if len(got) != len(want) {
+			t.Fatalf("%d chunks after reset, fresh chunker gives %d", len(got), len(want))
+		}
+		for i := range want {
+			if !bytes.Equal(got[i], want[i]) {
+				t.Fatalf("chunk %d differs after reset", i)
+			}
+		}
+	}
+	if err := c.Reset(nil); err == nil {
+		t.Error("Reset(nil) succeeded")
+	}
+}
