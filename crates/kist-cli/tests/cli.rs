@@ -415,17 +415,22 @@ fn prune_marks_then_deletes() {
         .to_owned();
     env.ok(&["forget", &first_ts]);
 
-    // grace 0：立刻標記；repack 產生新 pack，舊 pack 還在（要等下一輪）
+    // grace 0：立刻標記；repack 產生新 pack，舊 pack 還在（要等下一輪）。
+    // 修改時間是整秒，標記不能跟物件同一秒：每次 prune 前等一下
+    let settle = || std::thread::sleep(std::time::Duration::from_millis(1100));
+    settle();
     let out = env.ok(&["prune", "--grace", "0s"]);
     assert!(out.contains("deleted 0 object"), "{out}");
     assert!(out.contains("repacked 1 pack"), "{out}");
     assert!(original.is_subset(&packs(&env)), "第一階段不能刪 pack");
     // 活躍 client 在標記後要有新 snapshot 才會刪
+    settle();
     let out = env.ok(&["prune", "--grace", "0s"]);
     assert!(out.contains("deleted 0 object"), "{out}");
     assert!(!out.contains(", 0 held back"), "{out}");
     assert!(env.repo().join("gc").is_dir());
     env.ok(&["backup", src.to_str().unwrap()]);
+    settle();
     let out = env.ok(&["prune", "--grace", "0s"]);
     assert!(!out.contains("deleted 0 object"), "{out}");
     assert!(
@@ -447,6 +452,7 @@ fn prune_marks_then_deletes() {
     assert_eq!(before, after);
 
     // forget --prune 一次做完
+    settle();
     let out = env.ok(&["forget", "--keep-last", "1", "--prune"]);
     assert!(
         out.contains("removed 1 snapshot(s)") && out.contains("live packs"),

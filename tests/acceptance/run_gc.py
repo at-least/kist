@@ -12,6 +12,8 @@ ENV = dict(os.environ, KIST_REPO=REPO, KIST_PASSWORD="acceptance", KIST_CLIENT_I
            KIST_CACHE_DIR=os.path.join(BASE, "cache-gc"))
 
 def run(args, check=True):
+    if args[1:2] == ["prune"]:
+        time.sleep(1.1)  # 後端修改時間是整秒：標記不能跟物件同一秒（grace 0 才會遇到）
     t0 = time.time()
     p = subprocess.run(args, env=ENV, capture_output=True, text=True)
     dt = time.time() - t0

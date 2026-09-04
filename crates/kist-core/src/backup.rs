@@ -280,7 +280,8 @@ impl Repository {
                 continue;
             }
             let info = self.backend().head(&keys::tree(id)).await?;
-            if info.modified <= *marked_at {
+            // 時間是整秒：同一秒算重寫過。prune 刪前的比較也是 >=（同一秒不刪），兩邊一致才安全。
+            if info.modified < *marked_at {
                 return Err(CoreError::TreeMarked(*id));
             }
         }
@@ -289,7 +290,7 @@ impl Repository {
                 continue;
             }
             match self.backend().head(&keys::tree(id)).await {
-                Ok(info) if info.modified > *marked_at => {}
+                Ok(info) if info.modified >= *marked_at => {}
                 Ok(_) | Err(BackendError::NotFound(_)) => return Err(CoreError::TreeMarked(*id)),
                 Err(e) => return Err(e.into()),
             }

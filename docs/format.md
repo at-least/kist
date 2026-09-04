@@ -310,8 +310,9 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
 - bucket 開 versioning 時，prune 刪掉的只是目前版本；要真的釋放空間需要 lifecycle 規則清掉
   noncurrent 版本。Object Lock 保護中的物件刪不掉，prune 會回報並保留標記。
 - 後端必須支援條件寫入（S3 的 `If-None-Match: *`；本機用 `O_EXCL`）：snapshot 與 gc 標記都靠它。
-- 標記時間與物件修改時間以後端的時鐘為準，S3 是秒級：同一秒內「重寫過」與「標記」分不出先後，
-  prune 一律當作重寫過（不刪），backup 一律當作沒重寫（不 commit）——都是安全那邊。
+- 標記時間與物件修改時間以後端的時鐘為準，**一律取整到秒**（S3 本來就是秒級，而且 list 與 head 的精度
+  不同；本機 mtime 也截到秒）：同一秒內「重寫過」與「標記」分不出先後，prune 一律當作重寫過（不刪），
+  backup 一律當作沒重寫（不 commit）——都是安全那邊。
 
 ## 12. 已知的設計限制（不打算在 v1 解決，寫下來免得被當成 bug）
 

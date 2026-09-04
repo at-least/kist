@@ -8,13 +8,10 @@
 
 use kist_backend::{Backend, BackendError};
 
-async fn contract(b: &Backend, second_granularity: bool) {
+async fn contract(b: &Backend) {
+    // `modified` 統一是整秒：要看到「變新」得等過一秒
     let settle = || async {
-        if second_granularity {
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        } else {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     };
     b.put("trees/aa", b"one".to_vec()).await.unwrap();
     let t1 = b.head("trees/aa").await.unwrap();
@@ -113,7 +110,7 @@ async fn contract(b: &Backend, second_granularity: bool) {
 async fn local_backend_meets_the_contract() {
     let dir = tempfile::tempdir().unwrap();
     let b = Backend::local(&dir.path().join("repo")).unwrap();
-    contract(&b, false).await;
+    contract(&b).await;
 }
 
 #[tokio::test]
@@ -131,5 +128,5 @@ async fn s3_backend_meets_the_contract() {
         std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
     }
     let b = Backend::from_url(&format!("s3://{bucket}/contract-{}", std::process::id())).unwrap();
-    contract(&b, true).await;
+    contract(&b).await;
 }

@@ -13,6 +13,12 @@ use time::{Duration, OffsetDateTime};
 
 const H: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// 後端的修改時間是整秒：標記不能跟它標的物件同一秒（否則 prune 會當作「標記後被重寫過」而不刪）。
+/// 真實世界 grace 是幾天，不會發生；測試裡物件剛寫出就標記，要先等過這一秒。
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+}
+
 fn client(id: u8, now: OffsetDateTime) -> BackupOptions {
     BackupOptions {
         client_id: [id; 16],
@@ -90,6 +96,8 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
     .unwrap();
 
     // 第一次 prune（物件已經比 grace 老）：只標記、不刪；部分死掉的 pack 被 repack
+    settle().await;
+    settle().await;
     let p1 = repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
     assert!(p1.marked >= 3, "{p1:?}");
     assert_eq!(p1.deleted, 0, "{p1:?}");
@@ -124,6 +132,8 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
     assert_eq!(b3.stats.chunks_new, 0, "{:?}", b3.stats);
 
     // 第二次 prune：標記已超過 grace，且唯一的活躍 client 在標記後有新 snapshot → 刪
+    settle().await;
+    settle().await;
     let p2 = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
     assert!(p2.deleted >= 3, "{p2:?}");
     assert_eq!(p2.blocked, 0, "{p2:?}");
@@ -154,6 +164,7 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
     // 每一步 repo 都要一致
     let mut quiet = 0;
     for day in [12, 16, 20, 24, 28] {
+        settle().await;
         let p = repo
             .prune(prune_opts(r + Duration::days(day)))
             .await
@@ -201,6 +212,7 @@ async fn young_objects_are_not_marked_and_dry_run_changes_nothing() {
     .await
     .unwrap();
     // 剛寫的物件（可能是進行中的 backup）：不標
+    settle().await;
     let p = repo
         .prune(prune_opts(r + Duration::hours(1)))
         .await
@@ -210,6 +222,8 @@ async fn young_objects_are_not_marked_and_dry_run_changes_nothing() {
 
     let mut opts = prune_opts(r + Duration::days(4));
     opts.dry_run = true;
+    settle().await;
+    settle().await;
     let p = repo.prune(opts).await.unwrap();
     assert!(p.marked > 0, "{p:?}");
     assert!(ids_under(&t, "gc").is_empty(), "dry-run 不能寫標記");
@@ -268,12 +282,16 @@ async fn marked_objects_referenced_by_a_new_snapshot_are_revived() {
     })
     .await
     .unwrap();
+    settle().await;
+    settle().await;
     let p1 = repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
     assert!(p1.marked > 0, "{p1:?}");
     let marked = ids_under(&t, "gc");
     // client 2 commit（標記很年輕，允許）
     let b2 = prepared.commit().await.unwrap();
     // 第二次 prune：那些 pack / tree 又被引用了 → 撤銷標記，不刪
+    settle().await;
+    settle().await;
     let p2 = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
     assert!(p2.revived > 0, "{p2:?}");
     assert_eq!(p2.deleted, 0, "{p2:?}");
@@ -315,6 +333,7 @@ async fn active_client_without_a_newer_snapshot_blocks_deletion_but_inactive_doe
     })
     .await
     .unwrap();
+    settle().await;
     repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
     let marked = ids_under(&t, "gc");
     assert!(!marked.is_empty());
@@ -323,12 +342,15 @@ async fn active_client_without_a_newer_snapshot_blocks_deletion_but_inactive_doe
     repo.backup(std::slice::from_ref(&src), client(1, r + Duration::days(5)))
         .await
         .unwrap();
+    settle().await;
+    settle().await;
     let p = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
     assert_eq!(p.deleted, 0, "{p:?}");
     assert!(p.blocked > 0, "{p:?}");
     // （client 1 重備份時內容相同的子目錄 tree 會被重新引用而復活，所以不能要求標記原封不動）
     assert!(!ids_under(&t, "gc").is_empty(), "{p:?}");
     // 30 天後 client 2 變成 inactive：不再阻擋
+    settle().await;
     let p = repo
         .prune(prune_opts(r + Duration::days(40)))
         .await
@@ -358,6 +380,7 @@ async fn stale_marker_for_a_missing_object_is_removed() {
     let path = t.repo_path().join(keys::gc(&bogus));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, b"KISTGC1\n").unwrap();
+    settle().await;
     let p = repo
         .prune(prune_opts(r + Duration::hours(1)))
         .await
@@ -409,6 +432,7 @@ async fn snapshot_committed_inside_a_prune_keeps_its_chunks() {
         .await
         .unwrap();
     // prune 走訪（大檔的 chunk 不算被引用 → 舊 pack 會被 repack）
+    settle().await;
     let plan = repo
         .prune_plan(prune_opts(r + Duration::days(4)))
         .await
@@ -433,6 +457,7 @@ async fn snapshot_committed_inside_a_prune_keeps_its_chunks() {
         )
         .await
         .unwrap();
+        settle().await;
         let p = repo
             .prune(prune_opts(r + Duration::days(day)))
             .await
@@ -480,6 +505,10 @@ async fn duplicate_copies_are_reclaimed() {
     }
     assert!(ids_under(&t, "packs").len() > first.len());
 
+    settle().await;
+
+    settle().await;
+
     let p1 = repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
     assert!(p1.marked > 0, "{p1:?}");
     assert_eq!(p1.revived, 0, "{p1:?}");
@@ -495,6 +524,8 @@ async fn duplicate_copies_are_reclaimed() {
     repo.backup(std::slice::from_ref(&src), client(2, r + Duration::days(5)))
         .await
         .unwrap();
+    settle().await;
+    settle().await;
     let p2 = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
     assert_eq!(p2.deleted as usize, marked.len(), "{p2:?}");
     let fresh = t.open().await;
@@ -542,6 +573,10 @@ async fn phantom_packs_do_not_steal_canonical_from_real_holders() {
     let second: HashSet<ObjectId> = ids_under(&t, "packs");
     assert!(second.is_disjoint(&first));
 
+    settle().await;
+
+    settle().await;
+
     let p1 = repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
     // 真正的持有者一個都不能被標記
     let marked = ids_under(&t, "gc");
@@ -567,6 +602,8 @@ async fn phantom_packs_do_not_steal_canonical_from_real_holders() {
     repo.backup(std::slice::from_ref(&src), client(1, r + Duration::days(5)))
         .await
         .unwrap();
+    settle().await;
+    settle().await;
     let p2 = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
     assert!(p2.skipped.is_empty(), "{p2:?}");
     let report = t

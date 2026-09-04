@@ -50,6 +50,8 @@ pub enum BackendError {
 
 /// list / head 回傳的物件資訊。`modified` 是後端記的最後修改時間
 /// （本機 = 檔案 mtime；S3 = LastModified），GC 用它判斷物件夠不夠「老」。
+/// **一律取整到秒**：S3 的 list 有毫秒、head 只有秒，不取整的話兩邊比較會不一致；
+/// GC 的所有比較都只需要秒級（見 docs/format.md §11.5）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectInfo {
     pub key: String,
@@ -60,9 +62,7 @@ pub struct ObjectInfo {
 impl ObjectInfo {
     fn from_meta(m: object_store::ObjectMeta) -> Result<Self> {
         let key = m.location.to_string();
-        let nanos = i128::from(m.last_modified.timestamp()) * 1_000_000_000
-            + i128::from(m.last_modified.timestamp_subsec_nanos());
-        let modified = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        let modified = time::OffsetDateTime::from_unix_timestamp(m.last_modified.timestamp())
             .map_err(|_| BackendError::BadTimestamp(key.clone()))?;
         Ok(Self {
             key,
