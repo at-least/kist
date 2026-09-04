@@ -256,7 +256,11 @@ impl Repository {
                     self.read_object::<IndexBlob>(ObjectKind::Index, &keys::index(&id))
                         .await
                 })
-                .await;
+                .await
+                .map_err(|e| CoreError::Corrupt {
+                    key: "index".to_owned(),
+                    reason: format!("{e}; run `kist rebuild-index`"),
+                });
         }
         let mut errors = Vec::new();
         let index = self.load_index_lenient(&mut errors).await?;

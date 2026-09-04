@@ -7,7 +7,8 @@ KIST = sys.argv[1]
 SRC = os.path.join(BASE, "src")
 REPO = os.path.join(BASE, "repo")
 OUT = os.path.join(BASE, "out")
-ENV = dict(os.environ, KIST_REPO=REPO, KIST_PASSWORD="acceptance", KIST_CLIENT_ID_FILE=os.path.join(BASE, "client-id"))
+ENV = dict(os.environ, KIST_REPO=REPO, KIST_PASSWORD="acceptance", KIST_CLIENT_ID_FILE=os.path.join(BASE, "client-id"),
+           KIST_CACHE_DIR=os.path.join(BASE, "cache"))
 
 def run(args, check=True):
     before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
@@ -31,7 +32,7 @@ def count(prefix):
 def du(path):
     return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(path) for f in fs)
 
-for d in (REPO, OUT):
+for d in (REPO, OUT, os.path.join(BASE, "cache")):
     shutil.rmtree(d, ignore_errors=True)
 
 nfiles = sum(len(f) for _, _, f in os.walk(SRC))

@@ -274,3 +274,56 @@ fn disk_table_rejects_garbage() {
         "紀錄數與檔案長度不符要拒絕"
     );
 }
+
+/// rebuild-index 產生的新 blob supersedes 舊的：快取必須重建（不能把舊紀錄留著增量合併），
+/// manifest 只剩那一個 blob。這是 M3 repack（舊 blob 指向已刪 pack）依賴的分支。
+#[tokio::test]
+async fn cache_rebuilds_when_blobs_are_superseded() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = open_cached(&t).await;
+    repo.backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    std::fs::write(src.join("more.bin"), random_bytes(61, 100 * 1024)).unwrap();
+    repo.backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let repo = open_cached(&t).await;
+    assert!(repo.load_index().await.unwrap().is_cached());
+    assert_eq!(t.count("indexes"), 2);
+
+    let summary = repo.rebuild_index().await.unwrap();
+    assert_eq!(summary.superseded, 2);
+
+    let repo = open_cached(&t).await;
+    let cached = repo.load_index().await.unwrap();
+    let fresh = t.open().await.load_index().await.unwrap();
+    assert!(cached.is_cached());
+    assert_eq!(cached.len(), fresh.len());
+    assert_eq!(cached.pack_count(), fresh.pack_count());
+    for (id, loc) in fresh.chunks() {
+        assert_eq!(cached.get(&id), Some(loc));
+    }
+    let manifest: serde_value_free::Manifest = {
+        let dir = repo.cache().unwrap().dir().to_path_buf();
+        let bytes = std::fs::read(dir.join("manifest.cbor")).unwrap();
+        kist_format::cbor::decode(&bytes).unwrap()
+    };
+    assert_eq!(
+        manifest.blobs.len(),
+        1,
+        "manifest 只該剩 rebuild 出來的那個 blob"
+    );
+}
+
+/// manifest 的最小讀法（欄位順序與 core 的 Manifest 相同；多的欄位忽略）。
+mod serde_value_free {
+    #[derive(serde::Deserialize)]
+    pub struct Manifest {
+        #[allow(dead_code)]
+        pub version: u32,
+        pub blobs: Vec<kist_format::ObjectId>,
+    }
+}

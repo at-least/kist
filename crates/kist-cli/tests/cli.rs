@@ -27,6 +27,7 @@ impl Env {
             .env("KIST_REPO", self.repo())
             .env("KIST_PASSWORD", "cli test password")
             .env("KIST_CLIENT_ID_FILE", self.dir.path().join("client-id"))
+            .env("KIST_CACHE_DIR", self.dir.path().join("cache"))
             .env_remove("RUST_LOG")
             .output()
             .unwrap();
@@ -150,6 +151,7 @@ fn wrong_password_and_missing_repo_fail_cleanly() {
         .env("KIST_REPO", env.repo())
         .env("KIST_PASSWORD", "wrong")
         .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -166,6 +168,7 @@ fn password_file_and_client_id_file_are_honoured() {
         .env("KIST_REPO", env.repo())
         .env_remove("KIST_PASSWORD")
         .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
         .output()
         .unwrap();
     assert!(
@@ -186,6 +189,7 @@ fn password_file_and_client_id_file_are_honoured() {
         .env("KIST_REPO", env.repo())
         .env_remove("KIST_PASSWORD")
         .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
         .output()
         .unwrap();
     assert!(
@@ -223,6 +227,7 @@ fn backup_with_unreadable_file_writes_snapshot_but_exits_nonzero() {
         .env("KIST_REPO", env.repo())
         .env("KIST_PASSWORD", "cli test password")
         .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
         .output()
         .unwrap();
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -276,6 +281,7 @@ fn s3_repo_url_works_end_to_end() {
             .env("KIST_REPO", &url)
             .env("KIST_PASSWORD", "cli test password")
             .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+            .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
             .env("AWS_ENDPOINT", &endpoint)
             .env("AWS_ALLOW_HTTP", "true")
             .env("AWS_DEFAULT_REGION", "us-east-1")

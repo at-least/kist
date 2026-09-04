@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
 # 起一個 MinIO 容器給整合測試用：建 bucket、建一個「只能 Put/Get/List、不能 Delete」的使用者。
-# 本機：`sh tests/minio-setup.sh` 然後照它印出的 export 設環境變數。CI 也用這支。
+# 本機：`eval "$(sh tests/minio-setup.sh)"`。CI 也用這支。
+# 影像釘在本機驗證過的版本（mc admin policy create 的語法在舊版不同）。
 set -eu
 NAME=${MINIO_CONTAINER:-kist-minio}
 PORT=${MINIO_PORT:-19000}
@@ -13,7 +14,7 @@ PUTONLY_PASS=kistbackupsecret
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" -p "127.0.0.1:$PORT:9000" \
   -e MINIO_ROOT_USER=$ROOT_USER -e MINIO_ROOT_PASSWORD=$ROOT_PASS \
-  minio/minio:latest server /data >/dev/null
+  minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null
 i=0
 until curl -sf "http://127.0.0.1:$PORT/minio/health/live" >/dev/null; do
   i=$((i+1)); [ $i -gt 60 ] && { echo "minio did not start" >&2; exit 1; }; sleep 1
