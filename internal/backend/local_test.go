@@ -52,7 +52,7 @@ func TestLocalPutIfAbsentHasOneWinner(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			err := b.PutIfAbsent(ctx, "packs/contended", []byte("shared content"))
+			err := PutBytesIfAbsent(ctx, b, "packs/contended", []byte("shared content"))
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -121,7 +121,7 @@ func TestLocalIgnoresLeftoverScratchFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := b.PutIfAbsent(ctx, "packs/real", []byte("real")); err != nil {
+	if err := PutBytesIfAbsent(ctx, b, "packs/real", []byte("real")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
@@ -152,7 +152,7 @@ func TestLocalPutCreatesNestedDirectories(t *testing.T) {
 	ctx := context.Background()
 	b := newTestLocal(t)
 
-	if err := b.PutIfAbsent(ctx, "snapshots/deadbeef/20260102t030405.000000000z", []byte("snap")); err != nil {
+	if err := PutBytesIfAbsent(ctx, b, "snapshots/deadbeef/20260102t030405.000000000z", []byte("snap")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if ok, err := Exists(ctx, b, "snapshots/deadbeef/20260102t030405.000000000z"); err != nil || !ok {

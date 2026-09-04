@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -154,17 +153,21 @@ func (l *Local) Put(_ context.Context, key string, r io.Reader, size int64) erro
 // while O_EXCL would create the real name first and fill it afterwards --
 // leaving a window, and after a crash a permanent truncated object under
 // a name that is supposed to be immutable.
-func (l *Local) PutIfAbsent(_ context.Context, key string, data []byte) error {
+func (l *Local) PutIfAbsent(_ context.Context, key string, r io.Reader, size int64) error {
 	path, err := l.path(key)
 	if err != nil {
 		return err
 	}
 
-	tmp, _, err := l.spool(filepath.Dir(path), bytes.NewReader(data))
+	tmp, written, err := l.spool(filepath.Dir(path), r)
 	if err != nil {
 		return fmt.Errorf("put %s: %w", key, err)
 	}
 	defer func() { _ = os.Remove(tmp) }()
+
+	if size >= 0 && written != size {
+		return fmt.Errorf("put %s: read %d bytes, expected %d", key, written, size)
+	}
 
 	switch err := os.Link(tmp, path); {
 	case err == nil:

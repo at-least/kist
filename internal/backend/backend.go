@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -52,10 +53,16 @@ type Backend interface {
 	// else in a repository goes through PutIfAbsent.
 	Put(ctx context.Context, key string, r io.Reader, size int64) error
 
-	// PutIfAbsent stores data at key, or returns ErrExists if the key is
-	// taken. The object must not become visible under key until it is
-	// complete.
-	PutIfAbsent(ctx context.Context, key string, data []byte) error
+	// PutIfAbsent stores size bytes read from r at key, or returns
+	// ErrExists if the key is taken. The object must not become visible
+	// under key until it is complete.
+	//
+	// Everything a repository writes except config goes through here, and
+	// not only for the snapshot commit: a backup client that could
+	// overwrite an existing pack could destroy a repository with nothing
+	// but its own credentials. A conditional write is what makes "backup
+	// cannot delete data" true rather than aspirational.
+	PutIfAbsent(ctx context.Context, key string, r io.Reader, size int64) error
 
 	// List calls fn for every object whose key starts with prefix, in no
 	// particular order. Returning a non-nil error from fn stops the walk
@@ -142,6 +149,12 @@ func GetAll(ctx context.Context, b Backend, key string) ([]byte, error) {
 		return nil, fmt.Errorf("read %s from %s: %w", key, b.Location(), err)
 	}
 	return data, nil
+}
+
+// PutBytesIfAbsent is PutIfAbsent for an object already in memory: trees,
+// snapshots, index blobs and gc markers.
+func PutBytesIfAbsent(ctx context.Context, b Backend, key string, data []byte) error {
+	return b.PutIfAbsent(ctx, key, bytes.NewReader(data), int64(len(data)))
 }
 
 // Exists reports whether an object is stored under key.

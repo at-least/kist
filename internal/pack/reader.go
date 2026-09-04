@@ -1,0 +1,251 @@
+package pack
+
+import (
+	"context"
+	"fmt"
+	"io"
+
+	"github.com/at-least/kist/internal/backend"
+	"github.com/at-least/kist/internal/crypto"
+)
+
+// tailWindow is how much of a pack's end a reader fetches on the first
+// request. A 64 MiB pack holds at most a few hundred chunks, so its
+// sealed trailer runs to a few kilobytes; 64 KiB covers every realistic
+// pack in one round trip, and a larger trailer just costs a second one.
+const tailWindow = 64 << 10
+
+// A Reader reads chunks out of one pack.
+//
+// It holds the pack's trailer, not its data: each chunk is fetched with a
+// ranged read when it is asked for, so restoring one file out of a large
+// backup does not transfer the packs it happens to share with others.
+type Reader struct {
+	backend backend.Backend
+	keys    *crypto.Keys
+	id      crypto.ID
+	size    uint64
+	entries []Entry
+	byID    map[crypto.ID]Entry
+}
+
+// OpenReader fetches and authenticates a pack's trailer.
+func OpenReader(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.ID) (*Reader, error) {
+	info, err := b.Stat(ctx, Key(id))
+	if err != nil {
+		return nil, fmt.Errorf("open pack %s: %w", id, err)
+	}
+	size, err := sizeOf(info.Size)
+	if err != nil {
+		return nil, fmt.Errorf("open pack %s: %w", id, err)
+	}
+
+	entries, err := readTrailer(ctx, b, keys, id, size)
+	if err != nil {
+		return nil, err
+	}
+
+	byID := make(map[crypto.ID]Entry, len(entries))
+	for _, e := range entries {
+		byID[e.ID] = e
+	}
+	return &Reader{backend: b, keys: keys, id: id, size: size, entries: entries, byID: byID}, nil
+}
+
+// ID is the pack's content address.
+func (r *Reader) ID() crypto.ID { return r.id }
+
+// Size is the pack's length in bytes.
+func (r *Reader) Size() uint64 { return r.size }
+
+// Entries returns the pack's trailer index, in the order chunks appear in
+// the file. The slice is the reader's; callers must not modify it.
+func (r *Reader) Entries() []Entry { return r.entries }
+
+// Lookup finds a chunk's entry in this pack.
+func (r *Reader) Lookup(id crypto.ID) (Entry, bool) {
+	e, ok := r.byID[id]
+	return e, ok
+}
+
+// Chunk fetches, decrypts, decompresses and verifies one chunk.
+//
+// The content address is recomputed from the recovered plaintext and
+// compared. The AEAD tag already proves the bytes are the ones that were
+// sealed under this ID; this second check proves the ID was not a lie
+// when the chunk was written, which is the property `check --read-data`
+// exists to establish.
+func (r *Reader) Chunk(ctx context.Context, entry Entry) ([]byte, error) {
+	if entry.End() > r.size {
+		return nil, fmt.Errorf("%w: pack %s: chunk %s spans bytes %d-%d of a %d-byte pack", ErrCorrupt, r.id, entry.ID, entry.Offset, entry.End(), r.size)
+	}
+
+	offset, err := offsetOf(entry.Offset)
+	if err != nil {
+		return nil, fmt.Errorf("read chunk %s from pack %s: %w", entry.ID, r.id, err)
+	}
+	sealed, err := readRange(ctx, r.backend, Key(r.id), offset, int64(entry.Length))
+	if err != nil {
+		return nil, fmt.Errorf("read chunk %s from pack %s: %w", entry.ID, r.id, err)
+	}
+	return r.decodeChunk(entry, sealed)
+}
+
+func (r *Reader) decodeChunk(entry Entry, sealed []byte) ([]byte, error) {
+	id := entry.ID
+
+	framed, err := crypto.Open(&r.keys.Chunk, id[:], sealed)
+	if err != nil {
+		return nil, fmt.Errorf("chunk %s in pack %s: %w", id, r.id, err)
+	}
+	if len(framed) == 0 {
+		return nil, fmt.Errorf("%w: chunk %s in pack %s has no encoding byte", ErrCorrupt, id, r.id)
+	}
+
+	plaintext, err := decompress(framed[0], framed[1:])
+	if err != nil {
+		return nil, fmt.Errorf("chunk %s in pack %s: %w", id, r.id, err)
+	}
+	if got := crypto.ContentID(&r.keys.Hash, plaintext); got != id {
+		return nil, fmt.Errorf("%w: chunk in pack %s is stored as %s but hashes to %s", ErrCorrupt, r.id, id, got)
+	}
+	return plaintext, nil
+}
+
+// VerifyAll re-reads the whole pack and checks every chunk in it. It is
+// what `check --read-data` runs, and the only operation that can catch a
+// bit flip inside chunk data.
+func (r *Reader) VerifyAll(ctx context.Context) error {
+	raw, err := backend.GetAll(ctx, r.backend, Key(r.id))
+	if err != nil {
+		return fmt.Errorf("verify pack %s: %w", r.id, err)
+	}
+	if got := crypto.CiphertextID(raw); got != r.id {
+		return fmt.Errorf("%w: pack %s hashes to %s: its contents are not what its name says", ErrCorrupt, r.id, got)
+	}
+
+	for _, entry := range r.entries {
+		if entry.End() > uint64(len(raw)) {
+			return fmt.Errorf("%w: pack %s: chunk %s spans bytes %d-%d of a %d-byte pack", ErrCorrupt, r.id, entry.ID, entry.Offset, entry.End(), len(raw))
+		}
+		if _, err := r.decodeChunk(entry, raw[entry.Offset:entry.End()]); err != nil {
+			return fmt.Errorf("verify pack %s: %w", r.id, err)
+		}
+	}
+	return nil
+}
+
+// ReadTrailer returns a pack's entries without keeping a reader open. It
+// is what rebuild-index and structural checks use.
+func ReadTrailer(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.ID) ([]Entry, error) {
+	info, err := b.Stat(ctx, Key(id))
+	if err != nil {
+		return nil, fmt.Errorf("read trailer of pack %s: %w", id, err)
+	}
+	size, err := sizeOf(info.Size)
+	if err != nil {
+		return nil, fmt.Errorf("read trailer of pack %s: %w", id, err)
+	}
+	return readTrailer(ctx, b, keys, id, size)
+}
+
+func readTrailer(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.ID, size uint64) ([]Entry, error) {
+	fail := func(err error) error { return fmt.Errorf("read trailer of pack %s: %w", id, err) }
+
+	if size < tailSize {
+		return nil, fail(fmt.Errorf("%w: pack is %d bytes, shorter than its %d-byte tail", ErrNotAPack, size, tailSize))
+	}
+
+	window := uint64(tailWindow)
+	if window > size {
+		window = size
+	}
+	windowStart, err := offsetOf(size - window)
+	if err != nil {
+		return nil, fail(err)
+	}
+	tail, err := readRange(ctx, b, Key(id), windowStart, int64(window)) //nolint:gosec // window <= tailWindow
+	if err != nil {
+		return nil, fail(err)
+	}
+
+	trailerLen, err := parseTail(tail[len(tail)-tailSize:])
+	if err != nil {
+		return nil, fail(err)
+	}
+	if trailerLen+tailSize > size {
+		return nil, fail(fmt.Errorf("%w: trailer claims %d bytes but the pack is only %d", ErrCorrupt, trailerLen, size))
+	}
+
+	var sealed []byte
+	if have := uint64(len(tail)) - tailSize; have >= trailerLen {
+		sealed = tail[uint64(len(tail))-tailSize-trailerLen : len(tail)-tailSize]
+	} else {
+		// A trailer larger than the window: one more ranged read, rather
+		// than growing the window for every pack.
+		trailerStart, err := offsetOf(size - tailSize - trailerLen)
+		if err != nil {
+			return nil, fail(err)
+		}
+		//nolint:gosec // parseTail caps trailerLen at maxTrailerSize
+		if sealed, err = readRange(ctx, b, Key(id), trailerStart, int64(trailerLen)); err != nil {
+			return nil, fail(err)
+		}
+	}
+
+	encoded, err := crypto.Open(&keys.Index, []byte(crypto.AADPackTrailer), sealed)
+	if err != nil {
+		return nil, fail(err)
+	}
+
+	var t trailer
+	if err := crypto.Unmarshal(encoded, &t); err != nil {
+		return nil, fail(err)
+	}
+	if t.Version != Version {
+		return nil, fail(fmt.Errorf("%w: trailer declares version %d", ErrUnsupportedVersion, t.Version))
+	}
+	if len(t.Entries) == 0 {
+		return nil, fail(fmt.Errorf("%w: trailer lists no chunks", ErrCorrupt))
+	}
+
+	// The trailer is authenticated, but "authentic" is not "consistent":
+	// a pack written by a buggy client is still signed by a valid key.
+	dataEnd := size - tailSize - trailerLen
+	seen := make(map[crypto.ID]struct{}, len(t.Entries))
+	var next uint64
+	for i, e := range t.Entries {
+		switch {
+		case e.Offset != next:
+			return nil, fail(fmt.Errorf("%w: entry %d starts at %d, expected %d", ErrCorrupt, i, e.Offset, next))
+		case e.Length < crypto.Overhead+1:
+			return nil, fail(fmt.Errorf("%w: entry %d is %d bytes, shorter than an empty sealed chunk", ErrCorrupt, i, e.Length))
+		case e.End() > dataEnd:
+			return nil, fail(fmt.Errorf("%w: entry %d ends at %d, past the %d bytes of chunk data", ErrCorrupt, i, e.End(), dataEnd))
+		}
+		if _, dup := seen[e.ID]; dup {
+			return nil, fail(fmt.Errorf("%w: chunk %s is listed twice", ErrCorrupt, e.ID))
+		}
+		seen[e.ID] = struct{}{}
+		next = e.End()
+	}
+	if next != dataEnd {
+		return nil, fail(fmt.Errorf("%w: entries cover %d bytes but the pack holds %d of chunk data", ErrCorrupt, next, dataEnd))
+	}
+
+	return t.Entries, nil
+}
+
+func readRange(ctx context.Context, b backend.Backend, key string, off, length int64) ([]byte, error) {
+	r, err := b.Get(ctx, key, off, length)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = r.Close() }()
+
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, fmt.Errorf("read %d bytes at offset %d of %s: %w", length, off, key, err)
+	}
+	return buf, nil
+}

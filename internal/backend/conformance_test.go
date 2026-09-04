@@ -20,7 +20,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 		b := newBackend(t)
 		payload := []byte("the object body")
 
-		if err := b.PutIfAbsent(ctx, "packs/aa", payload); err != nil {
+		if err := PutBytesIfAbsent(ctx, b, "packs/aa", payload); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		got, err := GetAll(ctx, b, "packs/aa")
@@ -35,7 +35,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 	t.Run("get is ranged", func(t *testing.T) {
 		b := newBackend(t)
 		payload := []byte("0123456789")
-		if err := b.PutIfAbsent(ctx, "packs/bb", payload); err != nil {
+		if err := PutBytesIfAbsent(ctx, b, "packs/bb", payload); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 
@@ -82,11 +82,11 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 
 	t.Run("PutIfAbsent will not overwrite", func(t *testing.T) {
 		b := newBackend(t)
-		if err := b.PutIfAbsent(ctx, "trees/cc", []byte("first")); err != nil {
+		if err := PutBytesIfAbsent(ctx, b, "trees/cc", []byte("first")); err != nil {
 			t.Fatalf("first put: %v", err)
 		}
 
-		err := b.PutIfAbsent(ctx, "trees/cc", []byte("second"))
+		err := PutBytesIfAbsent(ctx, b, "trees/cc", []byte("second"))
 		if !errors.Is(err, ErrExists) {
 			t.Fatalf("second put: err = %v, want ErrExists", err)
 		}
@@ -117,6 +117,34 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 		}
 	})
 
+	t.Run("PutIfAbsent streams", func(t *testing.T) {
+		b := newBackend(t)
+		payload := bytes.Repeat([]byte("streamed "), 4096)
+
+		if err := b.PutIfAbsent(ctx, "packs/streamed", bytes.NewReader(payload), int64(len(payload))); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		got, err := GetAll(ctx, b, "packs/streamed")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Errorf("object differs from what was streamed in")
+		}
+	})
+
+	t.Run("PutIfAbsent rejects a short reader", func(t *testing.T) {
+		b := newBackend(t)
+
+		err := b.PutIfAbsent(ctx, "packs/short", bytes.NewReader([]byte("ab")), 100)
+		if err == nil {
+			t.Fatal("put with a wrong size: got nil error")
+		}
+		if ok, err := Exists(ctx, b, "packs/short"); err != nil || ok {
+			t.Errorf("object exists after a failed put: %v, %v", ok, err)
+		}
+	})
+
 	t.Run("Put rejects a short reader", func(t *testing.T) {
 		b := newBackend(t)
 
@@ -131,7 +159,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 
 	t.Run("stat reports size", func(t *testing.T) {
 		b := newBackend(t)
-		if err := b.PutIfAbsent(ctx, "packs/dd", []byte("12345")); err != nil {
+		if err := PutBytesIfAbsent(ctx, b, "packs/dd", []byte("12345")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 
@@ -147,7 +175,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 	t.Run("list by prefix", func(t *testing.T) {
 		b := newBackend(t)
 		for _, key := range []string{"packs/a1", "packs/a2", "indexes/i1", "snapshots/client1/t1", "config"} {
-			if err := b.PutIfAbsent(ctx, key, []byte(key)); err != nil {
+			if err := PutBytesIfAbsent(ctx, b, key, []byte(key)); err != nil {
 				t.Fatalf("put %s: %v", key, err)
 			}
 		}
@@ -190,7 +218,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 	t.Run("list stops on error", func(t *testing.T) {
 		b := newBackend(t)
 		for _, key := range []string{"packs/a1", "packs/a2", "packs/a3"} {
-			if err := b.PutIfAbsent(ctx, key, []byte("x")); err != nil {
+			if err := PutBytesIfAbsent(ctx, b, key, []byte("x")); err != nil {
 				t.Fatalf("put: %v", err)
 			}
 		}
@@ -211,7 +239,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 
 	t.Run("delete", func(t *testing.T) {
 		b := newBackend(t)
-		if err := b.PutIfAbsent(ctx, "gc/ee", []byte("marker")); err != nil {
+		if err := PutBytesIfAbsent(ctx, b, "gc/ee", []byte("marker")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		if err := b.Delete(ctx, "gc/ee"); err != nil {
@@ -227,7 +255,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 		}
 
 		// And the key is free again.
-		if err := b.PutIfAbsent(ctx, "gc/ee", []byte("again")); err != nil {
+		if err := PutBytesIfAbsent(ctx, b, "gc/ee", []byte("again")); err != nil {
 			t.Errorf("put after delete: %v", err)
 		}
 	})
@@ -238,7 +266,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 
 		for _, key := range bad {
 			t.Run(key, func(t *testing.T) {
-				if err := b.PutIfAbsent(ctx, key, []byte("x")); !errors.Is(err, ErrInvalidKey) {
+				if err := PutBytesIfAbsent(ctx, b, key, []byte("x")); !errors.Is(err, ErrInvalidKey) {
 					t.Errorf("PutIfAbsent: err = %v, want ErrInvalidKey", err)
 				}
 				if _, err := b.Get(ctx, key, 0, ReadToEnd); !errors.Is(err, ErrInvalidKey) {
@@ -256,7 +284,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 
 	t.Run("empty object", func(t *testing.T) {
 		b := newBackend(t)
-		if err := b.PutIfAbsent(ctx, "packs/empty", nil); err != nil {
+		if err := PutBytesIfAbsent(ctx, b, "packs/empty", nil); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		got, err := GetAll(ctx, b, "packs/empty")
