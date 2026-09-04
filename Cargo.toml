@@ -15,8 +15,12 @@ kist-chunker = { path = "crates/kist-chunker" }
 kist-core = { path = "crates/kist-core" }
 kist-crypto = { path = "crates/kist-crypto" }
 kist-format = { path = "crates/kist-format" }
+kist-app = { path = "crates/kist-app" }
 
 anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+croner = "4"
 argon2 = "0.6"
 blake3 = "1.8"
 chacha20poly1305 = "0.11"
@@ -39,10 +43,12 @@ rand = "0.10"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal", "net"] }
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"

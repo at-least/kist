@@ -72,7 +72,7 @@ pub struct ForgetOptions {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ForgetSummary {
     /// 已刪（dry-run 時是「會刪」）的 snapshot key。
     pub removed: Vec<String>,

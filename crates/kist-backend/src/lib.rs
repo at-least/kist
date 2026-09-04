@@ -293,6 +293,7 @@ impl Backend {
 }
 
 /// rustls 需要程序層級的 crypto provider；`install_default` 第二次會回 Err，忽略即可。
-fn install_tls_provider() {
+/// 公開給其他用 reqwest 的地方（webhook）用：不安裝的話 reqwest 會 panic。
+pub fn install_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }

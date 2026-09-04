@@ -57,7 +57,7 @@ pub struct BackupOptions {
     pub gc_grace: std::time::Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupSummary {
     pub snapshot_key: String,
     pub parent: Option<String>,

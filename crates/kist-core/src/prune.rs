@@ -73,7 +73,7 @@ impl Default for PruneOptions {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PruneReport {
     pub snapshots: u64,
     pub live_trees: u64,

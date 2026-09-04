@@ -18,7 +18,7 @@ use crate::{blocking, CoreError, Result};
 /// 同時讀幾個 pack 的 trailer。
 const CONCURRENCY: usize = 8;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct RebuildSummary {
     pub packs: u64,
     pub chunks: u64,

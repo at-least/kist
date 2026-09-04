@@ -36,6 +36,43 @@ kist forget --keep-last 10 --prune      # 一次做完
 結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
 請看警告。
 
+### 設定檔與排程
+
+```toml
+# /etc/kist/backup.toml —— backup 主機：只需要 Put/Get/List 權限
+repo = "s3://my-bucket/backups/laptop"
+password_file = "/etc/kist/password"      # 只能用檔案
+timezone = "local"                        # 排程用的時區，或 "utc"
+
+[backup]
+paths = ["/home", "/etc"]
+schedule = "0 2 * * *"                    # cron（5 欄；前面可多加一欄秒）
+
+[notify]
+webhook_url = "https://example.com/hook"  # 每件工作結束 POST 一個 JSON
+on = ["failure", "incomplete"]            # 也可以加 "success"
+```
+
+```toml
+# /etc/kist/maintenance.toml —— 另一台維護主機：需要 Delete 權限
+repo = "s3://my-bucket/backups/laptop"
+password_file = "/etc/kist/password"
+[forget]
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 12
+schedule = "0 4 * * *"
+[prune]
+schedule = "0 5 * * *"
+```
+
+```sh
+kist run --config /etc/kist/backup.toml          # 常駐，照排程跑（Ctrl-C 等目前工作做完再結束）
+kist run --config /etc/kist/backup.toml --once   # 每件工作各跑一次就結束（給外部 cron / systemd timer）
+```
+
+`[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
+
 ### 空間回收（GC）
 
 `forget` 只刪 snapshot；`prune` 才回收資料，而且分兩階段：第一次執行把沒人引用的 pack / tree / index

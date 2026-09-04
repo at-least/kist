@@ -24,7 +24,7 @@ pub struct CheckOptions {
     pub read_data: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CheckReport {
     pub snapshots: u64,
     pub trees: u64,

@@ -6,8 +6,10 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-mod client_id;
 mod password;
+
+use kist_app::client_id;
+use kist_app::duration::parse_duration;
 
 use std::path::PathBuf;
 
@@ -189,6 +191,15 @@ enum Command {
         #[command(flatten)]
         repo: RepoArgs,
     },
+    /// Run the jobs described in a config file: on their cron schedules (daemon), or once each.
+    Run {
+        /// Path to the TOML config file (see README).
+        #[arg(long, short = 'c', env = "KIST_CONFIG")]
+        config: PathBuf,
+        /// Run every configured job once (backup, forget, prune) and exit; for external cron.
+        #[arg(long)]
+        once: bool,
+    },
     /// Print version information.
     Version,
 }
@@ -225,6 +236,57 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Version => {
             println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Command::Run { config, once } => {
+            let cfg = kist_app::Config::load(&config)?;
+            let daemon = kist_app::Daemon::new(cfg)?;
+            let print = |o: &kist_app::JobOutcome| {
+                println!(
+                    "{} {} ({:.1}s){}",
+                    o.job.name(),
+                    o.status.name(),
+                    o.duration_secs,
+                    o.error
+                        .as_ref()
+                        .map(|e| format!(": {e}"))
+                        .unwrap_or_default()
+                );
+            };
+            if once {
+                let outcomes = daemon.run_once(print).await;
+                let failed = outcomes
+                    .iter()
+                    .filter(|o| o.status == kist_app::JobStatus::Failure)
+                    .count();
+                let incomplete = outcomes
+                    .iter()
+                    .filter(|o| o.status == kist_app::JobStatus::Incomplete)
+                    .count();
+                if failed > 0 {
+                    bail!("{failed} job(s) failed");
+                }
+                if incomplete > 0 {
+                    return Err(Incomplete(format!("{incomplete} job(s) incomplete")).into());
+                }
+                return Ok(());
+            }
+            for (job, next) in daemon.next_runs(time_now()) {
+                eprintln!(
+                    "{}: next run {}",
+                    job.name(),
+                    next.map(|t| t.to_string())
+                        .unwrap_or_else(|| "never".to_owned())
+                );
+            }
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    eprintln!("shutting down after the current job");
+                    let _ = tx.send(true);
+                }
+            });
+            daemon.run(rx, print).await?;
             Ok(())
         }
         Command::Init { repo } => {
@@ -486,27 +548,6 @@ fn print_prune_report(p: &PruneReport, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// `<number><unit>`，單位 s / m / h / d / w（週）。給 clap 用。
-fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
-    let s = s.trim();
-    let split = s
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| format!("{s:?}: missing unit (s, m, h, d, w)"))?;
-    let (num, unit) = s.split_at(split);
-    let n: u64 = num.parse().map_err(|_| format!("{s:?}: not a number"))?;
-    let secs = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 7 * 86_400,
-        _ => return Err(format!("{s:?}: unknown unit {unit:?} (use s, m, h, d, w)")),
-    };
-    n.checked_mul(secs)
-        .map(std::time::Duration::from_secs)
-        .ok_or_else(|| format!("{s:?}: too large"))
-}
-
 fn repo_url(args: &RepoArgs) -> Result<&str> {
     args.repo
         .as_deref()
@@ -570,19 +611,13 @@ fn human_bytes(n: u64) -> String {
 }
 
 fn hostname() -> String {
-    let name = gethostname::gethostname()
-        .to_string_lossy()
-        .trim()
-        .to_owned();
-    if name.is_empty() {
-        "unknown".to_owned()
-    } else {
-        name
-    }
+    client_id::hostname()
 }
 
 fn username() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_owned())
+    client_id::username()
+}
+
+fn time_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
 }

@@ -44,7 +44,7 @@ impl ReloadableIndex {
 const RELOAD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// restore 的結果：單一檔案失敗不會中止整個 restore，而是記在 `errors` 裡。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RestoreSummary {
     pub files: u64,
     pub dirs: u64,

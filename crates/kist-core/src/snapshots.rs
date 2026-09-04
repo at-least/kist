@@ -6,7 +6,7 @@ use kist_format::snapshot::Snapshot;
 use crate::repo::Repository;
 use crate::{CoreError, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotInfo {
     /// repo 裡的 key：`snapshots/<client hex>/<ts>`。
     pub key: String,
