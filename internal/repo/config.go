@@ -12,8 +12,10 @@ import (
 )
 
 // ConfigKey is where a repository's parameters live. It is the only
-// object in a repository that is written unconditionally, and the only
-// one that is not encrypted.
+// object in a repository that is not encrypted, and the only one the
+// format permits replacing -- a future `key add` has to rewrite its key
+// slots. Nothing does today: it is written with PutIfAbsent, and Init
+// checks for it first.
 const ConfigKey = "config"
 
 // ConfigVersion is the schema version of the config object.

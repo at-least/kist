@@ -11,7 +11,7 @@ repo 是一個 key-value 命名空間。除了 `config` 以外，所有物件都
 
 | Key | 內容 | 命名依據 |
 | --- | --- | --- |
-| `config` | repo 參數 + 金鑰封裝 | 固定名稱，**唯一的明文物件、唯一可覆寫的物件** |
+| `config` | repo 參數 + 金鑰封裝 | 固定名稱，**唯一的明文物件** |
 | `keys/<id>` | 額外 key slot（多密碼 / 還原金鑰） | *M1 未實作*，格式已保留 |
 | `packs/<hash>` | pack file | 密文全檔的 **unkeyed** BLAKE3-256 |
 | `indexes/<hash>` | index blob | 密文的 unkeyed BLAKE3-256 |
@@ -195,7 +195,9 @@ Key：`snapshots/<clientID>/<ts>`，`ts` 格式 `20060102t150405.000000000z`。
 
 ## 8. Config
 
-**唯一的明文物件，唯一可以覆寫的物件。**
+**唯一的明文物件。**
+
+也是格式上唯一**允許**被覆寫的物件——未來的 `key add`（新增 key slot）需要這個能力。但**目前沒有任何生產程式碼會覆寫它**：`saveConfig` 走的是 `PutIfAbsent`，`Init` 另外還先檢查 config 是否已存在。`Backend.Put`（無條件覆寫）現在沒有生產呼叫者，它存在是為了 M2 之後的 `key add`。
 
 ```cbor
 { "v": 1, "repo_id": 16 B, "created": int64 ns,

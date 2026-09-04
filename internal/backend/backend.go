@@ -49,8 +49,13 @@ type Backend interface {
 	Get(ctx context.Context, key string, off, length int64) (io.ReadCloser, error)
 
 	// Put stores size bytes read from r at key, replacing any object
-	// already there. It is for the mutable config object only; everything
-	// else in a repository goes through PutIfAbsent.
+	// already there.
+	//
+	// Nothing in kist calls this yet: even config is written with
+	// PutIfAbsent, guarded by Init's own existence check. It is here for
+	// the one object the format allows to be replaced -- config, when a
+	// future `key add` has to rewrite its key slots -- and for nothing
+	// else. Everything a backup writes goes through PutIfAbsent.
 	Put(ctx context.Context, key string, r io.Reader, size int64) error
 
 	// PutIfAbsent stores size bytes read from r at key, or returns
