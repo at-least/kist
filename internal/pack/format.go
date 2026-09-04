@@ -135,8 +135,11 @@ func parseTail(tail []byte) (uint64, error) {
 	return trailerLen, nil
 }
 
+// Prefix is the repository prefix pack files live under.
+const Prefix = "packs/"
+
 // Key returns the repository key a pack is stored under.
-func Key(id crypto.ID) string { return "packs/" + id.String() }
+func Key(id crypto.ID) string { return Prefix + id.String() }
 
 // The format speaks in unsigned sizes and the backend API in signed
 // offsets, and the values crossing between them come from a pack's own
