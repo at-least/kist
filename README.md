@@ -141,21 +141,22 @@ UNVERIFIED（未做 profile，只是從請求數推測）。兩者都列在 M3/M
 
 ## M3 驗收數據（GC）
 
-2026-09-05，commit `f81ba02`，本機目錄後端，同一份資料集，腳本 `tests/acceptance/run_gc.py`，
+2026-09-05，commit `783a570`（審查修正後），本機目錄後端，同一份資料集，腳本 `tests/acceptance/run_gc.py`，
 完整 log `tests/acceptance/m3-acceptance-gc-2026-09-05.log`。流程：backup → 刪掉一成的目錄再 backup →
-forget 舊 snapshot → `prune --grace 0s`（標記 + repack）→ backup → prune（刪）→ backup → prune（刪被 repack 的舊 pack）
+forget 舊 snapshot → `prune --grace 0s`（標記 + repack）→ backup → prune（刪）→ 再兩輪 backup + prune 收尾
 → `check --read-data` → restore 與 `diff -r`。
 
 | 項目 | 結果 |
 | --- | --- |
-| prune 1（標記 112 個 tree、repack 8 個 pack） | 2.4 s |
-| prune 2（刪 112 個、標記 9 個孤兒） | 0.7 s |
-| prune 3（刪 9 個孤兒 pack / index，522 MiB） | 0.7 s |
+| prune 1（標記 112 個 tree + 8 個被 repack 的 pack，搬 18 MiB 活資料到 1 個新 pack） | 3.3 s |
+| 標記後的 backup（內容未變） | 5 s；**0 個新 chunk**（不會把被標記 pack 裡的資料重傳） |
+| prune 2（刪 120 個物件、520 MiB） | 1.1 s |
+| prune 3–4（清掉被取代的 index blob，之後無事可做） | 1.1 s 各 |
 | repo 大小 | 4.90 GiB → **4.41 GiB**（刪掉的一成資料全部回收） |
-| `check --read-data` 之後 | 25 s，無錯誤 |
-| restore 最新 snapshot | 56 s，`diff -r` **完全相同** |
-| 峰值 RSS（整個流程） | 223 MiB |
-| 競態 proptest（`tests/gc_race.rs`） | 24 案例進 `cargo test`；200 案例本機跑過（見 ADR 005） |
+| `check --read-data` 之後 | 26 s，無錯誤、無警告 |
+| restore 最新 snapshot | 57 s，`diff -r` **完全相同** |
+| 峰值 RSS（整個流程） | 233 MiB |
+| 競態 proptest（`tests/gc_race.rs`） | 24 案例進 `cargo test`；200 案例本機跑（見 ADR 005 §10） |
 
 grace 設 0 只是為了驗收能在幾分鐘內走完；實際使用請保留預設 72 h。
 
