@@ -297,3 +297,75 @@ async fn commit_checks_expired_markers_on_written_trees() {
 fn five_days() -> std::time::Duration {
     std::time::Duration::from_secs(5 * 24 * 3600)
 }
+
+/// proptest 找到的 bug 的回歸測試：prune 的 repack 丟掉「沒有 snapshot 引用」的 chunk，
+/// 但進行中的 backup 已經去重到它們。commit 必須發現解析不到而安全失敗，repo 保持一致。
+#[tokio::test]
+async fn commit_fails_safely_when_repack_dropped_its_chunks() {
+    let t = TestRepo::new().await;
+    let src_a = t.dir.path().join("a");
+    let src_b = t.dir.path().join("b");
+    // a 與 b 共用一個檔案（會去重），a 另有一個大檔
+    for s in [&src_a, &src_b] {
+        std::fs::create_dir_all(s).unwrap();
+        std::fs::write(s.join("shared.bin"), random_bytes(91, 60 * 1024)).unwrap();
+    }
+    std::fs::write(src_a.join("zz-big.bin"), random_bytes(92, 900 * 1024)).unwrap();
+    let repo = t.open().await;
+    // client 1 備份 a 後 forget：大檔的 chunk 沒人引用，但仍在 index 裡（pack 還活著：shared 在裡面）
+    let b1 = repo
+        .backup(std::slice::from_ref(&src_a), client(1))
+        .await
+        .unwrap();
+    repo.forget(kist_core::ForgetOptions {
+        snapshots: vec![b1.snapshot_key],
+        policy: Default::default(),
+        dry_run: false,
+        now: None,
+    })
+    .await
+    .unwrap();
+    // client 2 備份 b：shared 存在 → 有 snapshot 引用，pack 活著
+    t.open()
+        .await
+        .backup(std::slice::from_ref(&src_b), client(2))
+        .await
+        .unwrap();
+    // client 1 再備份 a（大檔全部去重到既有 pack），停在 commit 之前
+    let prepared = repo
+        .backup_prepare(std::slice::from_ref(&src_a), client(1))
+        .await
+        .unwrap();
+    // 把 pack 弄「老」，prune 才會 repack；repack 只搬 shared 的 chunk，大檔的 chunk 從 index 消失
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 24 * 3600);
+    for id in pack_ids(&t) {
+        let p = t.repo_path().join(keys::pack(&id));
+        filetime::set_file_mtime(&p, filetime::FileTime::from_system_time(old)).unwrap();
+    }
+    let report = t
+        .open()
+        .await
+        .prune(kist_core::PruneOptions::default())
+        .await
+        .unwrap();
+    assert!(report.repacked_packs >= 1, "{report:?}");
+
+    let err = prepared.commit().await.unwrap_err();
+    assert!(matches!(err, CoreError::PackMissing { .. }), "{err}");
+    assert_eq!(
+        t.count("snapshots"),
+        1,
+        "不能寫出指到消失 chunk 的 snapshot"
+    );
+    let fresh = t.open().await;
+    let r = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    // 重跑就好：大檔重傳
+    let again = fresh
+        .backup(std::slice::from_ref(&src_a), client(1))
+        .await
+        .unwrap();
+    assert!(again.stats.chunks_new > 0);
+    let r = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+}

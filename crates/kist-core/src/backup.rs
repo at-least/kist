@@ -13,9 +13,9 @@
 //! 面對 GC（M3，見 `docs/format.md` §11）：
 //! - 開始時列 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。backup 因此不需要
 //!   刪標記（維持 Put-only），prune 第二階段看到新 snapshot 引用會自己撤銷標記。
-//! - commit 前對引用到的每個 pack 做 HEAD；不見了（或標記已超過 grace、隨時會被刪）就重新載入
-//!   index 找同一個 chunk 的其他副本；找不到就失敗、不寫 snapshot。這把「backup 跑得比 grace 還久」
-//!   從悄悄留下壞 snapshot 變成安全失敗。
+//! - commit 前重新載入 index：引用到的每個 chunk 都要解析得到，且解析到的 pack 存在、標記沒超過
+//!   grace；否則失敗、不寫 snapshot。這把「backup 跑得比 grace 還久」與「prune 在 backup 途中
+//!   repack 掉它去重到的 chunk」都從悄悄留下壞 snapshot 變成安全失敗（重跑會重傳）。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -131,7 +131,7 @@ impl PreparedBackup {
         let marks = self.repo.list_gc_marks().await?;
         let now = time::OffsetDateTime::now_utc();
         self.repo
-            .verify_referenced_packs(&self.referenced, &marks, self.opts.gc_grace, now)
+            .verify_referenced_chunks(&self.referenced, &marks, self.opts.gc_grace, now)
             .await?;
         self.repo
             .verify_written_trees(&self.written_trees, &marks, self.opts.gc_grace, now)
@@ -176,9 +176,13 @@ impl Repository {
         Ok(out)
     }
 
-    /// commit 前：引用到的每個 pack 都要存在，且沒有超過 grace 的 GC 標記。
-    /// 不符合的 pack 重新載入 index，看它的每個 chunk 在別的 pack 有沒有副本。
-    async fn verify_referenced_packs(
+    /// commit 前：重新載入 index，這次引用到的**每一個 chunk**（沿用的與新寫的）都必須在目前的
+    /// index 裡解析得到，而且解析到的 pack 存在、沒有超過 grace 的 GC 標記。
+    ///
+    /// 為什麼要逐 chunk 而不是逐 pack：prune 的 repack 只搬「有 snapshot 引用」的 chunk，
+    /// 進行中的 backup 去重到的 chunk 在它看來是死的，會被丟掉；舊 pack 雖然還在（孤兒、等 grace），
+    /// 但 index 已經不指它，下一輪 GC 就會刪。這裡抓到就安全失敗（不寫 snapshot），重跑會重傳那些 chunk。
+    async fn verify_referenced_chunks(
         &self,
         referenced: &HashMap<ObjectId, Vec<ChunkId>>,
         marks: &HashMap<ObjectId, time::OffsetDateTime>,
@@ -186,42 +190,22 @@ impl Repository {
         now: time::OffsetDateTime,
     ) -> Result<()> {
         let expired = |pack: &ObjectId| marks.get(pack).is_some_and(|m| *m + grace <= now);
-        let mut suspects = Vec::new();
-        for pack in referenced.keys() {
-            let exists = self.backend().exists(&keys::pack(pack)).await?;
-            if !exists || expired(pack) {
-                suspects.push(*pack);
-            }
-        }
-        if suspects.is_empty() {
-            return Ok(());
-        }
-        tracing::warn!(
-            "{} referenced pack(s) vanished or are about to be deleted; reloading the index",
-            suspects.len()
-        );
         let fresh = self.load_index().await?;
-        let mut checked: HashMap<ObjectId, bool> = HashMap::new();
-        for pack in suspects {
-            for chunk in referenced.get(&pack).into_iter().flatten() {
+        let mut pack_ok: HashMap<ObjectId, bool> = HashMap::new();
+        for (old_pack, chunks) in referenced {
+            for chunk in chunks {
                 let Some(loc) = fresh.get(chunk) else {
                     return Err(CoreError::PackMissing {
-                        pack,
+                        pack: *old_pack,
                         chunk: Some(*chunk),
                     });
                 };
-                if loc.pack == pack {
-                    return Err(CoreError::PackMissing {
-                        pack,
-                        chunk: Some(*chunk),
-                    });
-                }
-                let ok = match checked.get(&loc.pack) {
+                let ok = match pack_ok.get(&loc.pack) {
                     Some(ok) => *ok,
                     None => {
                         let ok = !expired(&loc.pack)
                             && self.backend().exists(&keys::pack(&loc.pack)).await?;
-                        checked.insert(loc.pack, ok);
+                        pack_ok.insert(loc.pack, ok);
                         ok
                     }
                 };

@@ -2,10 +2,10 @@
 
 去重、加密、可多台機器共用 repo 的備份工具（Rust）。
 
-> 目前狀態：**M2 完成** —— 本機與 S3（含 MinIO）repo 的 `init` / `backup` / `snapshots` /
-> `restore` / `check` / `rebuild-index` 可用，多台機器可同時備份到同一個 repo，
-> on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
-> GC（`forget` / `prune`）在 M3；**在那之前不會自動釋放空間，也還不建議日常使用。**
+> 目前狀態：**M3 完成** —— 本機與 S3（含 MinIO）repo 的 `init` / `backup` / `snapshots` /
+> `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，多台機器可同時備份到同一個 repo，
+> GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
+> 依 PLAN，到這裡可以開始自己使用；M4（SFTP、mount、設定檔、排程、Web UI）與 M5（硬化）還沒做。
 
 ## 建置
 
@@ -27,10 +27,32 @@ kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路
 kist check                              # 檢查一致性（不下載資料）
 kist check --read-data                  # 下載並驗證每個 chunk
 kist rebuild-index                      # index 物件遺失或損壞時，從 pack 重建
+kist forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12   # 依保留政策刪 snapshot
+kist forget latest                      # 或指定 snapshot（id、時間戳前綴、latest）
+kist prune                              # 回收空間（兩階段，見下）
+kist forget --keep-last 10 --prune      # 一次做完
 ```
 
-結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）或還原失敗（restore）——snapshot 已寫出，
+結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
 請看警告。
+
+### 空間回收（GC）
+
+`forget` 只刪 snapshot；`prune` 才回收資料，而且分兩階段：第一次執行把沒人引用的 pack / tree / index
+**標記**起來，等超過 grace（預設 72 小時）而且每台活躍的機器在標記後都又備份過一次，
+第二次執行才真的刪。中間任何一台機器重新用到那些資料，標記就撤銷。所以 `prune` 可以跟 backup
+同時跑、可以排程每天跑，不需要鎖；剛 forget 完馬上 prune 不會釋放空間，那是設計。
+
+- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值）。
+  跑得更久的 backup 不會悄悄壞掉，會在最後以錯誤結束，重跑即可。
+- 超過 `--inactive-after`（預設 30 天）沒備份的機器不再擋住刪除；它回來備份時若用到已刪的資料，
+  同樣會在最後失敗、重跑。
+- 活資料比例低於 `--repack-below`（預設 50%）的 pack 會被重新打包。
+- `--dry-run` 只報告。刪不掉的物件（S3 Object Lock、權限）會回報並保留標記，結束碼 3。
+- 同一台機器同時只能跑一個 backup（client id 檔旁邊有鎖）。
+- bucket 有 versioning 時，真的釋放空間還需要 lifecycle 規則清掉舊版本。
+
+細節與安全性論證：[docs/format.md §11](docs/format.md)、[ADR 005](docs/decisions/005-m3-gc.md)。
 
 本地 index 快取放在使用者快取目錄（Linux：`~/.cache/kist/`），可用 `--cache-dir` /
 `KIST_CACHE_DIR` 指定、`--no-cache` 關閉。`check` 永遠不用快取。
@@ -47,7 +69,8 @@ kist init
 
 `config` 是 repo 裡唯一可覆寫的物件，被蓋掉就打不開 repo：請對 bucket 開 versioning 或
 Object Lock，並把 `config` 另存一份。backup 需要的權限是 `PutObject`、`GetObject`、
-`ListBucket`（不需要 `DeleteObject`）。
+`ListBucket`（不需要 `DeleteObject`）；`forget` / `prune` 另外需要 `DeleteObject`，
+建議用另一組憑證在別台機器跑。
 
 每台機器第一次 backup 時會產生一個 client id（`~/.local/share/kist/client-id`，
 可用 `--client-id-file` 或 `KIST_CLIENT_ID_FILE` 指定）。

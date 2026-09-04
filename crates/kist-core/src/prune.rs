@@ -19,6 +19,8 @@
 //!
 //! repack：活的 pack 裡活 bytes 比例低於門檻時，把活 chunk（解密驗證後重新封裝）搬到新 pack；
 //! 新 index 只指新 pack，舊 pack 變成沒人指的孤兒，下一輪標記、再下一輪刪。
+//! 沒被引用的 chunk 就此從 index 消失：進行中的 backup 若去重到它們，commit 時會發現解析不到而
+//! 安全失敗（見 backup 模組）。比 grace 年輕的 pack 不 repack。
 //!
 //! 安全性依賴兩個假設（寫在 docs/format.md §11）：grace 長於最長的一次 backup；
 //! 同一個 client id 一次只跑一個 backup（CLI 用檔案鎖保證）。
@@ -247,13 +249,19 @@ impl Repository {
             ));
         }
 
-        // 7. repack 候選：活的、沒被標記的 pack，活 bytes 比例低於門檻
+        // 7. repack 候選：活的、沒被標記、比 grace 老的 pack（年輕的可能是進行中的 backup 剛寫的），
+        //    活 bytes 比例低於門檻
         let repack: Vec<ObjectId> = if opts.repack_below_percent == 0 {
             Vec::new()
         } else {
             let mut v: Vec<ObjectId> = live_packs
                 .iter()
-                .filter(|id| !marks.contains_key(id) && packs_listed.contains_key(id))
+                .filter(|id| !marks.contains_key(id))
+                .filter(|id| {
+                    packs_listed
+                        .get(id)
+                        .is_some_and(|info| info.modified + grace <= now)
+                })
                 .filter(|id| {
                     let (live, total) = pack_bytes.get(id).copied().unwrap_or((0, 0));
                     total > 0

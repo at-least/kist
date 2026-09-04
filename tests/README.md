@@ -17,3 +17,7 @@ docker rm -f kist-minio             # 用完關掉
 ## 驗收
 
 見 `tests/acceptance/README.md`。
+
+## 競態測試（M3）
+
+`crates/kist-core/tests/gc_race.rs` 用 proptest 隨機交錯兩台 client 的 backup（拆成 prepare / commit）、forget、prune 與時鐘推進，每一步驗 repo 一致。預設 24 個案例；`PROPTEST_CASES=200 cargo test -p kist-core --test gc_race` 跑更多。

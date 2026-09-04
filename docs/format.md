@@ -23,7 +23,7 @@ repo 是一個 key → bytes 的命名空間（本機目錄、S3 bucket…）。
 | `indexes/<hex>` | envelope(`IndexBlob`) | 整段 AEAD | BLAKE3(整檔 bytes) |
 | `trees/<hex>` | envelope(`Tree`) | 整段 AEAD | BLAKE3(整檔 bytes) |
 | `snapshots/<client hex>/<ts>` | envelope(`Snapshot`) | 整段 AEAD | client id + 時間 |
-| `gc/<object hex>` | 待刪標記（M3 定義；pack、tree、index 都適用） | — | 被標記物件的名稱 |
+| `gc/<object hex>` | 待刪標記：固定 8 bytes `KISTGC1\n`（pack、tree、index 共用） | 否（不含資訊） | 被標記物件的名稱 |
 
 「以 BLAKE3(整檔 bytes) 命名」指的是對**寫進 repo 的密文 bytes** 做一般（無 key）
 BLAKE3，小寫 hex。任何人下載後都能在不持有金鑰的情況下驗證檔案沒被改過；
@@ -246,13 +246,59 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
 只是 pack trailer 的快取，可從所有 pack 的 trailer 重建。`size` 是 pack 檔總長度，
 讓 `check` 不讀資料也能用 HEAD 抓到被截斷或換掉的 pack。
 
-## 11. GC 的相容性要求（M3 實作，格式現在先定）
+## 11. GC（M3）
 
-- 「未被引用就刪」的物件不只 pack：tree 與 index 也是。backup 開始時列出的 `trees/`
-  在 GC 刪掉某個 tree 後就不可信，所以 `gc/<object hex>` 對 pack、tree、index 一體適用，
-  兩階段刪除（標記 → grace period → 刪）的規則也一樣。
-- backup 沿用既有 chunk 時，必須記下它引用了哪些 pack（不是只查「存不存在」），
-  才能執行「引用到被標記的 pack 就撤銷標記」。
+### 11.1 標記
+
+`gc/<object hex>` 是一個待刪標記，內容固定為 8 bytes `KISTGC1\n`。它**不帶任何資訊**：
+「何時標記」看後端記的物件修改時間（本機 = mtime；S3 = LastModified），「標記什麼」看名稱。
+標記用 conditional put 寫入（已存在就不動，時間才不會被重設）。pack、tree、index 共用同一個
+命名空間（三者的名稱都是 BLAKE3，不會撞）。
+
+### 11.2 活的定義（每次 prune 都從 snapshot 重算）
+
+- tree：從任一 snapshot 走得到（含 `prev` 鏈）。
+- pack：在**有效**的 index（未被 `supersedes` 的 blob）裡，**且**持有任一被活 tree 引用的 chunk
+  （資料 chunk 與 Indirect 的清單 chunk 都算）。同一個 chunk 出現在多個 pack 時每個 pack 都算活，
+  不挑正本。不在有效 index 裡的 pack（backup 中途壞掉、被 repack 掉的）不算活。
+- index blob：沒被別的 blob `supersedes`。
+
+### 11.3 兩階段
+
+1. 不活、而且修改時間距今超過 grace（預設 72 h）的物件 → 寫標記。剛寫出的物件可能屬於進行中的
+   backup，不標。
+2. 標記超過 grace，**且每個活躍 client**（`inactive_after`，預設 30 天，內有 snapshot）在標記之後
+   都有新的 snapshot（比較的是 snapshot 的開始時間，保守方向）→ 刪。刪 index 裡的 pack 之前必須先寫一個
+   不含它的 index blob（`supersedes` 全部既有 blob）；刪之前再 HEAD 一次，物件在標記後被重寫過
+   （另一台 client 重 put 同一個 tree）就撤銷標記。
+3. 被標記的物件又活了 → 撤銷標記。標記指到的物件不存在 → 清掉標記。
+4. repack：活的、比 grace 老、活 bytes 比例低於門檻的 pack，把活 chunk（解密驗證後重新封裝）搬進
+   新 pack；新 index blob 只列新 pack（supersedes 全部既有 blob）；舊 pack 變孤兒，走 1–2。
+   **沒被引用的 chunk 從此不在 index 裡**。
+
+引用不完整（任何 snapshot / tree / index 讀不出來）時 prune 整個拒絕：不標、不刪。
+
+### 11.4 backup 這邊的義務
+
+- 開始時列出 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。backup 因此不需要刪標記，
+  維持 Put-only（PLAN 原本寫「引用到被標記的 pack 就刪除標記」，改成這樣）。
+- 寫 snapshot 之前重新載入 index：這次引用到的**每一個 chunk**（沿用的與新寫的）都要在目前的 index
+  裡解析得到，解析到的 pack 要存在、標記沒有超過 grace；這次 put 過的 tree 若有超過 grace 的標記，
+  它的修改時間必須比標記新。任一不成立 → 不寫 snapshot、以錯誤結束（重跑會重傳）。
+- 讀取端（restore）chunk 的 pack 不見了就重新載入 index 再試一次（repack 把它搬走了）。
+
+### 11.5 安全性依賴的假設
+
+- **grace 長於最長的一次 backup。** 跑得更久的 backup 不會悄悄留下壞 snapshot，而是在 commit 時失敗。
+- **同一個 client id 一次只跑一個 backup**（CLI 用 client id 檔旁的檔案鎖保證）。
+  「活躍 client 在標記後有新 snapshot」這條保護假設每台 client 的 backup 一個接一個。
+- 一台 client 的 snapshot 全被 forget 之後，它就是 inactive；新機器第一次備份也是。它們的
+  backup 靠 11.4 的 commit 檢查保護。
+- `rebuild-index` 與 `prune` 不要同時跑：重建出來的 blob 可能把正被刪的 pack 加回 index，
+  之後的 backup 會在 commit 時失敗（安全），需要再 rebuild 一次。
+- bucket 開 versioning 時，prune 刪掉的只是目前版本；要真的釋放空間需要 lifecycle 規則清掉
+  noncurrent 版本。Object Lock 保護中的物件刪不掉，prune 會回報並保留標記。
+- 兩個 pack 各持有同一個 chunk 的副本時，只要 chunk 活著兩個 pack 都活；重複佔的空間 v1 不回收。
 
 ## 12. 已知的設計限制（不打算在 v1 解決，寫下來免得被當成 bug）
 
@@ -264,6 +310,8 @@ index blob 本身沒有 snapshot 引用它；GC 判斷一個 blob 可不可刪�
   時鐘偏差會選錯；只影響快速路徑與顯示，不影響資料正確性。
 - **client id 被複製**（clone VM）會讓兩台機器共用一個 snapshot namespace；
   parent 只在 `paths` 相同時才沿用，所以不會拿錯資料，但 GC 的活躍判定會混在一起。
+- **GC 的時間來自後端的修改時間與 client 的時鐘**（§11）：偏差幾分鐘無妨，偏差以天計會讓
+  grace 失效。
 
 ## 13. 寫入順序（commit point）
 
