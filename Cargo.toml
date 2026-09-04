@@ -21,7 +21,8 @@ argon2 = "0.6"
 blake3 = "1.8"
 chacha20poly1305 = "0.11"
 ciborium = "0.2"
-clap = { version = "4", features = ["derive"] }
+dirs = "6"
+clap = { version = "4", features = ["derive", "env"] }
 fastcdc = "5"
 filetime = "0.2"
 futures = "0.3"
@@ -29,6 +30,7 @@ hex = "0.4"
 object_store = "0.14"
 proptest = "1"
 rand = "0.10"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 tempfile = "3"

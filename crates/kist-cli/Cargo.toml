@@ -12,10 +12,18 @@ path = "src/main.rs"
 
 [dependencies]
 kist-backend.workspace = true
-kist-chunker.workspace = true
 kist-core.workspace = true
 kist-crypto.workspace = true
-kist-format.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
+dirs.workspace = true
+hex.workspace = true
+rpassword.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true
