@@ -24,6 +24,9 @@ linters:
       # returning, or already failing. There is nothing a caller can do
       # with the error and no way to write the discard other than `_ =`,
       # so requiring a comment on each one would add noise, not safety.
+      # The list is by concrete type, so a Close reached through some
+      # other interface still needs a real check or a nolint with a
+      # reason -- which is the right default for anything not listed.
       exclude-functions:
         - (io.Closer).Close
         - (io.ReadCloser).Close
