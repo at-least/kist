@@ -42,7 +42,7 @@ $ make release-snapshot     # = go run github.com/goreleaser/goreleaser/v2@v2.18
 $ ls dist/
 ```
 
-正式發版是 CI 在 tag 上跑 `goreleaser release`；**尚未接上**（CI 從未推送過，見 README 的 UNVERIFIED）。接上的時候只需要 `GITHUB_TOKEN`，release 預設是 draft。
+正式發版：推一個 `vX.Y.Z` tag，`.github/workflows/release.yml` 用 goreleaser 建所有 artifact 並開一個 **draft** release（用 Actions 內建的 `GITHUB_TOKEN`，不需要別的 secret）。draft 要人看過再按 publish。release 不重跑測試——tag 要打在 CI 已經綠的 commit 上。
 
 ## 平台
 
@@ -55,4 +55,4 @@ CI（`.github/workflows/ci.yml`）在每次 push 跑：三個 OS × Go 1.26.x / 
 | darwin/amd64 | ✓ CI | ✓ CI | `-race` 全套 CI；`mount` 的 FUSE 案例需要 macFUSE，runner 沒有 → skip，**UNVERIFIED** | |
 | windows/amd64 | ✓ CI | ✓ CI | `-race` 全套 CI（兩個依賴 POSIX chmod 的測試 skip） | 沒有 `mount`。CI 抓到一個真 bug：NTFS 父目錄列表裡的子目錄 mtime 會滯後，unchanged subtree 因此不去重——已修（stat 目錄本身） |
 
-正式的 `goreleaser release`（tag 上跑、發 draft release）**尚未接上**。
+`goreleaser release` 已接在 `v*` tag 上；第一次實際發版前 **UNVERIFIED**。

@@ -1,0 +1,30 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the changelog needs history
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+      # The tag must have passed CI on the same commit; release does not
+      # re-run the suites, it only builds what CI already tested.
+      - name: build and publish a draft release
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: v2.18.0
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
