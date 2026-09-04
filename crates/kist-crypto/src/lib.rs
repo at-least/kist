@@ -18,7 +18,7 @@ use kist_format::config::{KdfParams, KeySlot, WrappedKey, KDF_ARGON2ID};
 use kist_format::envelope::{Compression, Envelope, ObjectKind, NONCE_LEN};
 use kist_format::pack::{CHUNK_NONCE_LEN, TAG_LEN};
 use kist_format::{ChunkId, FormatError, FORMAT_VERSION};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// 包住 master key 時的 AAD。
 const MASTER_KEY_AAD: &[u8] = b"kist v1 master key";
@@ -111,7 +111,7 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
-fn kdf(password: &[u8], params: &KdfParams) -> Result<[u8; 32]> {
+fn kdf(password: &[u8], params: &KdfParams) -> Result<Zeroizing<[u8; 32]>> {
     if params.algorithm != KDF_ARGON2ID {
         return Err(CryptoError::UnsupportedKdf(params.algorithm.clone()));
     }
@@ -123,9 +123,9 @@ fn kdf(password: &[u8], params: &KdfParams) -> Result<[u8; 32]> {
         argon2::Version::V0x13,
         argon_params,
     );
-    let mut kek = [0u8; 32];
+    let mut kek = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(password, &params.salt, &mut kek)
+        .hash_password_into(password, &params.salt, kek.as_mut())
         .map_err(|e| CryptoError::BadKdfParams(e.to_string()))?;
     Ok(kek)
 }
@@ -161,7 +161,7 @@ pub fn wrap_master_key(
         p_cost: cost.p_cost,
         salt: random_bytes::<16>().to_vec(),
     };
-    let mut kek = kdf(password, &params)?;
+    let kek = kdf(password, &params)?;
     let nonce = random_bytes::<NONCE_LEN>();
     let ciphertext = cipher(&kek)
         .encrypt(
@@ -172,7 +172,6 @@ pub fn wrap_master_key(
             },
         )
         .map_err(|_| CryptoError::AuthFailed)?;
-    kek.zeroize();
     Ok(KeySlot {
         version: FORMAT_VERSION,
         name: name.to_owned(),
@@ -187,7 +186,7 @@ pub fn wrap_master_key(
 
 /// 用密碼解開 key slot 裡的 master key。
 pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<MasterKey> {
-    let mut kek = kdf(password, &slot.kdf)?;
+    let kek = kdf(password, &slot.kdf)?;
     let nonce = nonce_from_slice(&slot.wrapped_master_key.nonce)?;
     let result = cipher(&kek).decrypt(
         &XNonce::from(nonce),
@@ -196,7 +195,6 @@ pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<MasterKey> {
             aad: MASTER_KEY_AAD,
         },
     );
-    kek.zeroize();
     let mut plain = result.map_err(|_| CryptoError::WrongPassword)?;
     let key: [u8; 32] = plain
         .as_slice()
@@ -302,11 +300,11 @@ impl RepoKeys {
             Compression::Zstd => zstd::encode_all(plaintext, ZSTD_LEVEL)
                 .map_err(|e| CryptoError::Compression(e.to_string()))?,
         };
+        // 決定性 nonce 必須從「真正被加密的 bytes」（壓縮後的 body）推導，而不是壓縮前的明文：
+        // 否則 zstd 換版本時，同一個 nonce 會拿去加密不同的 body，等於 nonce 重用。
         let nonce: [u8; NONCE_LEN] = if kind == ObjectKind::Tree {
             let mut n = [0u8; NONCE_LEN];
-            n.copy_from_slice(
-                &blake3::keyed_hash(&self.nonce_key, plaintext).as_bytes()[..NONCE_LEN],
-            );
+            n.copy_from_slice(&blake3::keyed_hash(&self.nonce_key, &body).as_bytes()[..NONCE_LEN]);
             n
         } else {
             random_bytes()

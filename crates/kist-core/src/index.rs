@@ -49,6 +49,10 @@ impl ChunkIndex {
         self.chunks.is_empty()
     }
 
+    pub fn chunks(&self) -> impl Iterator<Item = (&ChunkId, &ChunkLocation)> {
+        self.chunks.iter()
+    }
+
     pub fn packs(&self) -> impl Iterator<Item = (&ObjectId, &u64)> {
         self.packs.iter()
     }

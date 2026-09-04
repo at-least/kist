@@ -84,10 +84,17 @@ offset  size  欄位
 ### 5.2 決定性 nonce（只用於 tree）
 
 tree 要能「目錄沒變就整棵重用」，前提是同樣的明文要編出同樣的密文（名稱才會一樣）。
-所以 tree 的 nonce 不是隨機，而是 `keyed BLAKE3(nonce key, 明文)` 的前 24 bytes。
-nonce 是明文的函數，兩份不同明文撞到同一 nonce 的機率等同 BLAKE3 碰撞，可忽略；
-同一明文得到同一 nonce 則本來就是我們要的（密文完全相同，沒有多洩漏任何資訊）。
-nonce key 是祕密，所以外人無法從 nonce 推出任何關於明文的事。
+所以 tree 的 nonce 不是隨機，而是 `keyed BLAKE3(nonce key, 被加密的 body)` 的前 24 bytes，
+其中 body 是壓縮後（若有壓縮）真正送進 AEAD 的 bytes。**必須用 body 而不是壓縮前的明文**：
+nonce 重用的定義是「同一 key、同一 nonce、不同的輸入 bytes」，而 zstd 換版本時同一份明文
+可能壓出不同的 body。從 body 推導後，body 不同 → nonce 不同，永遠不會重用。
+兩份不同 body 撞到同一 nonce 的機率等同 BLAKE3 碰撞，可忽略；同一 body 得到同一 nonce
+則本來就是我們要的（密文完全相同，沒有多洩漏任何資訊）。nonce key 是祕密，
+外人無法從 nonce 推出任何關於明文的事。
+
+副作用：zstd 升級後同一個目錄可能壓出不同 body，tree 名稱就會變，第一次 backup 會把
+這些 tree 重新上傳一次；舊的仍然有效，只是多佔一點空間，沒有任何東西會壞。
+nonce 存在 header 裡，讀取端從不重算，所以這條規則只約束寫入端，不影響 on-disk 相容性。
 
 其他物件（index / snapshot / pack trailer / chunk）一律用 OS 亂數產生 24-byte nonce。
 

@@ -13,9 +13,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use kist_format::tree::{Content, NodeKind};
-use kist_format::{keys, ObjectId};
+use kist_format::{keys, ChunkId, ObjectId};
 
-use crate::index::ChunkIndex;
+use crate::index::{ChunkIndex, ChunkLocation};
 use crate::pack::{decode_chunk, read_trailer};
 use crate::repo::Repository;
 use crate::{blocking, Result};
@@ -105,8 +105,18 @@ impl Repository {
 
         // 4. 讀資料
         if opts.read_data {
+            // index 沒有反向表：先把「每個 pack 在 index 裡有哪些 chunk」整理出來
+            let mut by_pack: HashMap<ObjectId, HashMap<ChunkId, ChunkLocation>> = HashMap::new();
+            let mut all_ids = HashSet::new();
+            for (id, loc) in index.chunks() {
+                by_pack.entry(loc.pack).or_default().insert(*id, *loc);
+                all_ids.insert(*id);
+            }
+            let all_ids = Arc::new(all_ids);
             for (id, _) in index.packs() {
-                self.check_pack_data(id, &mut report).await;
+                let expected = by_pack.remove(id).unwrap_or_default();
+                self.check_pack_data(id, expected, Arc::clone(&all_ids), &mut report)
+                    .await;
             }
         }
         Ok(report)
@@ -175,7 +185,14 @@ impl Repository {
         })
     }
 
-    async fn check_pack_data(&self, id: &ObjectId, report: &mut CheckReport) {
+    /// 下載整個 pack：名稱 = hash(bytes)、trailer 解得開、trailer 與 index 一致、每個 chunk 解得開且 ID 相符。
+    async fn check_pack_data(
+        &self,
+        id: &ObjectId,
+        expected: HashMap<ChunkId, ChunkLocation>,
+        all_ids: Arc<HashSet<ChunkId>>,
+        report: &mut CheckReport,
+    ) {
         let key = keys::pack(id);
         let bytes = match self.backend().get(&key).await {
             Ok(b) => b,
@@ -202,7 +219,29 @@ impl Repository {
                     return Ok(errs);
                 }
             };
+            let mut seen = HashSet::new();
             for entry in &trailer.entries {
+                seen.insert(entry.id);
+                match expected.get(&entry.id) {
+                    // 同一個 chunk 也可能存在別的 pack 裡（index 只記第一個），那是重複不是錯
+                    None if all_ids.contains(&entry.id) => {}
+                    None => errs.push(format!(
+                        "{key_for_task}: chunk {} is in the pack but not in the index (rebuild-index needed)",
+                        entry.id
+                    )),
+                    Some(loc)
+                        if loc.offset != entry.offset
+                            || loc.length != entry.length
+                            || loc.raw_len != entry.raw_len
+                            || loc.flags != entry.flags =>
+                    {
+                        errs.push(format!(
+                            "{key_for_task}: chunk {} location in index differs from the pack trailer",
+                            entry.id
+                        ));
+                    }
+                    Some(_) => {}
+                }
                 let start = usize::try_from(entry.offset).unwrap_or(usize::MAX);
                 let end = start.saturating_add(usize::try_from(entry.length).unwrap_or(usize::MAX));
                 let Some(slice) = bytes.get(start..end) else {
@@ -214,6 +253,13 @@ impl Repository {
                 };
                 if let Err(e) = decode_chunk(&keys, &entry.id, slice, entry.flags, entry.raw_len) {
                     errs.push(format!("{key_for_task}: chunk {}: {e}", entry.id));
+                }
+            }
+            for id in expected.keys() {
+                if !seen.contains(id) {
+                    errs.push(format!(
+                        "{key_for_task}: index lists chunk {id} in this pack but the trailer does not"
+                    ));
                 }
             }
             Ok(errs)

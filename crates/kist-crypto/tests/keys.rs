@@ -217,3 +217,22 @@ fn tree_sealing_is_deterministic_but_others_are_not() {
         .unwrap();
     assert_ne!(a[8..32], z[8..32], "nonce 不能只是明文的公開 hash");
 }
+
+#[test]
+fn tree_nonce_is_derived_from_the_encrypted_body_not_the_plaintext() {
+    // 同一份明文、不同壓縮設定 → 加密的 bytes 不同 → nonce 必須不同，否則就是 nonce 重用。
+    let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
+    let plaintext = vec![b'a'; 1000];
+    let zstd = keys
+        .seal_object(ObjectKind::Tree, Compression::Zstd, &plaintext)
+        .unwrap();
+    let raw = keys
+        .seal_object(ObjectKind::Tree, Compression::None, &plaintext)
+        .unwrap();
+    assert_ne!(zstd[8..32], raw[8..32], "nonce 必須隨被加密的 body 而異");
+    assert_eq!(
+        keys.open_object(ObjectKind::Tree, &zstd).unwrap(),
+        plaintext
+    );
+    assert_eq!(keys.open_object(ObjectKind::Tree, &raw).unwrap(), plaintext);
+}

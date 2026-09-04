@@ -32,12 +32,16 @@ index / tree 裡。拿到 repo 的人看不到任何 chunk ID，自然無法用�
 
 「目錄沒變就整棵重用」需要同樣的目錄編出同樣的 bytes。但一般 AEAD 每次用隨機
 nonce，密文每次都不同，名稱也就不同。解法：tree 的 nonce 不是隨機，而是
-`keyed BLAKE3(nonce key, 明文)` 的前 24 bytes。
+`keyed BLAKE3(nonce key, 壓縮後真正被加密的 bytes)` 的前 24 bytes。
 
-這安全嗎？nonce 重複只有在「同一把 key、同一個 nonce、**不同**明文」時才危險。
-這裡 nonce 是明文的函數：明文相同 → nonce 相同 → 密文完全相同（本來就是我們要的，
-沒有多洩漏什麼）；明文不同 → nonce 不同（撞到的機率等於 hash 碰撞）。nonce key
+這安全嗎？nonce 重複只有在「同一把 key、同一個 nonce、**不同的輸入**」時才危險。
+這裡 nonce 是輸入的函數：輸入相同 → nonce 相同 → 密文完全相同（本來就是我們要的，
+沒有多洩漏什麼）；輸入不同 → nonce 不同（撞到的機率等於 hash 碰撞）。nonce key
 是祕密，外人無法從 nonce 反推明文的任何事。這是 Kopia 也採用的做法。
+
+一個曾經寫錯、審查時抓到的細節：第一版是從「壓縮前的明文」算 nonce。這在 zstd
+換版本（同樣明文壓出不同 bytes）時就變成 nonce 重用。現在改從壓縮後的 bytes 算，
+代價只是 zstd 升級後 tree 會重新上傳一次。
 
 其他物件（index、snapshot、pack trailer、每個 chunk）沒有重用需求，維持隨機 nonce。
 
