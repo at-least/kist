@@ -306,3 +306,19 @@ fn s3_repo_url_works_end_to_end() {
     let (code, stdout, stderr) = run(&["check", "--read-data"]);
     assert_eq!(code, Some(0), "{stdout}\n{stderr}");
 }
+
+#[test]
+fn rebuild_index_command() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    for e in std::fs::read_dir(env.repo().join("indexes")).unwrap() {
+        std::fs::remove_file(e.unwrap().path()).unwrap();
+    }
+    env.fails(&["check"]);
+    let out = env.ok(&["rebuild-index"]);
+    assert!(out.contains("pack"), "{out}");
+    env.ok(&["check", "--read-data"]);
+}

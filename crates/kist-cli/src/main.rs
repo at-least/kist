@@ -104,6 +104,11 @@ enum Command {
         #[arg(long)]
         read_data: bool,
     },
+    /// Rebuild the index from the pack files (after index objects were lost or corrupted).
+    RebuildIndex {
+        #[command(flatten)]
+        repo: RepoArgs,
+    },
     /// Print version information.
     Version,
 }
@@ -252,6 +257,15 @@ async fn run(cli: Cli) -> Result<()> {
                 ))
                 .into());
             }
+            Ok(())
+        }
+        Command::RebuildIndex { repo } => {
+            let r = open_repo(&repo).await?;
+            let s = r.rebuild_index().await?;
+            println!(
+                "rebuilt index from {} packs ({} chunks); {} old index object(s) superseded",
+                s.packs, s.chunks, s.superseded
+            );
             Ok(())
         }
         Command::Check { repo, read_data } => {
