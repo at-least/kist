@@ -1,0 +1,41 @@
+# golangci-lint v2 configuration. The version is pinned here and in
+# .github/workflows/ci.yml; bump both together.
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose # a leaked HTTP body is a leaked connection in the S3 backend
+    - errorlint # error comparisons must respect %w wrapping
+    - gosec # this tool handles keys and other people's data
+    - misspell
+    - nilerr # returning nil after a non-nil err is how data loss starts
+    - predeclared
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    revive:
+      rules:
+        - name: package-comments # 工程規範: every package has a doc.go
+        - name: exported # 工程規範: exported API carries godoc
+  exclusions:
+    generated: lax
+    rules:
+      # Tests may take shortcuts that production code may not.
+      - path: _test\.go$
+        linters:
+          - gosec
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/at-least/kist
