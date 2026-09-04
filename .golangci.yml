@@ -29,6 +29,12 @@ linters:
       # other interface still needs a real check or a nolint with a
       # reason -- which is the right default for anything not listed.
       exclude-functions:
+        # Writing to the command's own stdout or stderr. A failed write
+        # there means the pipe is gone; there is no recovery and no
+        # second channel to report it on.
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
         - (io.Closer).Close
         - (io.ReadCloser).Close
         - (*os.File).Close

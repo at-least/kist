@@ -19,7 +19,15 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 	}
 
-	root.AddCommand(newVersionCommand())
+	root.AddCommand(
+		newInitCommand(),
+		newBackupCommand(),
+		newSnapshotsCommand(),
+		newRestoreCommand(),
+		newCheckCommand(),
+		newRebuildIndexCommand(),
+		newVersionCommand(),
+	)
 
 	return root
 }

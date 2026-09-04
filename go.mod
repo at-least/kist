@@ -16,4 +16,5 @@ require (
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
+	golang.org/x/term v0.45.0 // indirect
 )

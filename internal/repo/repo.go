@@ -11,6 +11,7 @@ import (
 	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/index"
+	"github.com/at-least/kist/internal/snapshot"
 )
 
 // A Repository is an open, unlocked repository.
@@ -208,4 +209,19 @@ func hexRepoID(id crypto.RepoID) string {
 		out = append(out, digits[b>>4], digits[b&0x0f])
 	}
 	return string(out)
+}
+
+// Snapshots lists the repository's snapshots, oldest first. An empty
+// clientID lists every client's.
+func (r *Repository) Snapshots(ctx context.Context, clientID string) ([]snapshot.Handle, error) {
+	return snapshot.List(ctx, r.backend, clientID)
+}
+
+// LoadSnapshot reads one snapshot.
+//
+// This exists so that callers never need the repository's keys. Handing
+// out crypto.Keys would make every future caller a place key material can
+// escape from, and the CLI has no reason to hold it.
+func (r *Repository) LoadSnapshot(ctx context.Context, key string) (*snapshot.Snapshot, error) {
+	return snapshot.Load(ctx, r.backend, r.keys, key)
 }
