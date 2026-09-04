@@ -34,7 +34,9 @@ pub fn bytes_to_name(bytes: &[u8]) -> Result<OsString> {
 pub fn bytes_to_name(bytes: &[u8]) -> Result<OsString> {
     String::from_utf8(bytes.to_vec())
         .map(OsString::from)
-        .map_err(|_| CoreError::BadFileName(PathBuf::from(String::from_utf8_lossy(bytes).as_ref())))
+        .map_err(|_| {
+            CoreError::BadFileName(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
+        })
 }
 
 /// 整條路徑 → bytes（snapshot 的 `paths` 與根節點名稱用）。

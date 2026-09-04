@@ -4,7 +4,8 @@
 每種結構在 `crates/kist-format/tests/golden/` 都有一份固定的範例 bytes；
 任何會改變 on-disk bytes 的修改都會讓 golden 測試失敗，這是刻意的。
 
-> 狀態：M1 進行中，**尚未凍結**。M1 結束後凍結，之後只能透過 `version` 欄位演進。
+> 狀態：**v1 已於 2026-09-04（M1 結束）凍結**。之後只能透過 `version` 欄位演進；
+> 任何改動都需要專案負責人確認，並同步更新 golden files 與這份文件。
 
 ## 1. 總覽
 
