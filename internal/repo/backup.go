@@ -347,7 +347,7 @@ func (b *backupRun) backupDir(ctx context.Context, path string) (crypto.ID, erro
 
 	entries := make([]tree.Entry, 0, len(names))
 	for _, child := range names {
-		info, err := child.Info()
+		info, err := childInfo(path, child)
 		if err != nil {
 			if isSkippable(err) {
 				b.opts.warn("skipping %s: %v", filepath.Join(path, child.Name()), err)
@@ -366,6 +366,24 @@ func (b *backupRun) backupDir(ctx context.Context, path string) (crypto.ID, erro
 	}
 
 	return tree.New(entries).Save(ctx, b.repo.backend, b.repo.keys, b.repo.nonceSource)
+}
+
+// childInfo returns a directory entry's metadata. Files take the parent
+// listing's word for it; directories are stat'ed themselves.
+//
+// On NTFS a directory's modification time as reported by its parent's
+// listing lags the directory's own record for a while after the
+// directory changed. Two walks of an unchanged tree then disagree about
+// a subdirectory's mtime, the subtree gets a new name, and deduplication
+// of unchanged directories -- the point of content addressing -- fails.
+// The Windows CI run found it; stat'ing the directory itself reads the
+// authoritative record on every platform, at one extra system call per
+// directory.
+func childInfo(parent string, child fs.DirEntry) (fs.FileInfo, error) {
+	if child.IsDir() {
+		return os.Lstat(filepath.Join(parent, child.Name()))
+	}
+	return child.Info()
 }
 
 // backupFile chunks a file and fills in its entry.
