@@ -34,9 +34,13 @@ $ ls dist/
 
 ## 平台
 
+CI（`.github/workflows/ci.yml`）在每次 push 跑：三個 OS × Go 1.26.x / stable 的 build、vet、test、`-race`；三個 OS 的 golangci-lint；ubuntu 上的 MinIO 與 OpenSSH suite。2026-09-05 首次推送後全綠（run 33903651553）。
+
 | | build | vet | 測試 | 備註 |
 | --- | --- | --- | --- | --- |
-| linux/amd64 | ✓ | ✓ | 全部，含 `-race`、FUSE、Docker suites | 開發機 |
+| linux/amd64 | ✓ | ✓ | 全部，含 `-race`、FUSE、Docker suites、兩個規模的驗收 | 開發機 + CI |
 | linux/arm64 | 交叉編譯 | ✓ | 無 | |
-| darwin/* | 交叉編譯 | ✓ | 無 | `mount` 需要 macFUSE，**UNVERIFIED** |
-| windows/* | 交叉編譯 | ✓ | 無（`-race` 從未在 Windows 上跑過） | 沒有 `mount` |
+| darwin/amd64 | ✓ CI | ✓ CI | `-race` 全套 CI；`mount` 的 FUSE 案例需要 macFUSE，runner 沒有 → skip，**UNVERIFIED** | |
+| windows/amd64 | ✓ CI | ✓ CI | `-race` 全套 CI（兩個依賴 POSIX chmod 的測試 skip） | 沒有 `mount`。CI 抓到一個真 bug：NTFS 父目錄列表裡的子目錄 mtime 會滯後，unchanged subtree 因此不去重——已修（stat 目錄本身） |
+
+正式的 `goreleaser release`（tag 上跑、發 draft release）**尚未接上**。
