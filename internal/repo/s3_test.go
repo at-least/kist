@@ -120,8 +120,13 @@ var s3PrefixCounter int
 // credentials.
 func s3Backend(t *testing.T, srv *minioServer, prefix, accessKey, secretKey string) backend.Backend {
 	t.Helper()
+	return s3BucketBackend(t, srv, srv.bucket, prefix, accessKey, secretKey)
+}
+
+func s3BucketBackend(t *testing.T, srv *minioServer, bucket, prefix, accessKey, secretKey string) backend.Backend {
+	t.Helper()
 	b, err := backend.OpenS3(context.Background(), backend.S3Config{
-		Bucket: srv.bucket, Prefix: prefix, Endpoint: srv.endpoint, PathStyle: true,
+		Bucket: bucket, Prefix: prefix, Endpoint: srv.endpoint, PathStyle: true,
 		AccessKey: accessKey, SecretKey: secretKey, Region: "us-east-1",
 	})
 	if err != nil {
@@ -629,5 +634,121 @@ func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
 	}
 	if again.Stats.ChunksNew != 0 {
 		t.Errorf("backup after prune stored %d new chunks, want 0", again.Stats.ChunksNew)
+	}
+}
+
+// A bucket with Object Lock and a default retention. Deleting there
+// writes a delete marker and keeps the bytes; kist must say so, must not
+// count the bytes as reclaimed, and must go on working: the pack no
+// longer reads, so the index must stop naming it exactly as if it had
+// been deleted.
+func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
+	srv := startMinio(t)
+	ctx := context.Background()
+	const bucket = "kist-lock"
+	if err := srv.mc("mb", "--with-lock", "local/"+bucket); err != nil {
+		t.Fatalf("make lock bucket: %v", err)
+	}
+	if err := srv.mc("retention", "set", "--default", "governance", "1d", "local/"+bucket); err != nil {
+		t.Fatalf("set default retention: %v", err)
+	}
+
+	prefix := freshPrefix()
+	clk := newClock()
+	options := func(clientID string) Options {
+		o := s3Options(t, clientID)
+		o.Now = clk.now
+		return o
+	}
+	open := func(clientID string) *Repository {
+		t.Helper()
+		r, err := Open(ctx, s3BucketBackend(t, srv, bucket, prefix, srv.accessKey, srv.secretKey), options(clientID))
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := r.Close(); err != nil {
+				t.Errorf("close: %v", err)
+			}
+		})
+		return r
+	}
+
+	root := s3BucketBackend(t, srv, bucket, prefix, srv.accessKey, srv.secretKey)
+	init, err := Init(ctx, root, options("ffffffffffffffffffffffffffffffff"))
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source := t.TempDir()
+	writeTree(t, source, sampleFiles(t))
+	client := open("11111111111111111111111111111111")
+	_, first, err := client.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	keep := t.TempDir()
+	writeTree(t, keep, []fileSpec{{path: "keep.txt", data: []byte("kept\n")}})
+	if _, _, err := client.Backup(ctx, []string{keep}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	pruner := open("ffffffffffffffffffffffffffffffff")
+	forgot, err := pruner.Forget(ctx, ForgetOptions{Keys: []string{first.Key}})
+	if err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if len(forgot.Locked) != 1 {
+		t.Fatalf("forget on a lock bucket: locked %d, want 1: %+v", len(forgot.Locked), forgot)
+	}
+	if _, err := backend.GetAll(ctx, root, first.Key); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("forgotten snapshot still reads on the lock bucket: %v", err)
+	}
+
+	marked, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(marked.Marked) != 1 {
+		t.Fatalf("first prune: %+v", marked)
+	}
+	clk.advance(2 * time.Hour)
+	if _, _, err := client.Backup(ctx, []string{keep}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	sweep, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(sweep.Locked) != 1 || len(sweep.Deleted) != 0 || sweep.BytesReclaimed != 0 {
+		t.Fatalf("sweep on a lock bucket: %+v", sweep)
+	}
+	packKey := pack.Key(sweep.Locked[0])
+	if _, err := backend.GetAll(ctx, root, packKey); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("locked pack still reads after delete: %v", err)
+	}
+
+	fresh := open("22222222222222222222222222222222")
+	for _, id := range fresh.Index().Packs() {
+		if id == sweep.Locked[0] {
+			t.Error("the index still names the locked pack, which no longer reads")
+		}
+	}
+	report, err := fresh.Check(ctx, CheckOptions{ReadData: true})
+	if err != nil || !report.OK() {
+		t.Fatalf("check after a locked sweep: %v %v", err, report.Problems)
+	}
+	if report.Snapshots != 2 {
+		t.Errorf("%d snapshots, want 2", report.Snapshots)
+	}
+	next, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(next.Unmarked) != 1 {
+		t.Errorf("next run did not clear the mark of the locked pack: %+v", next)
 	}
 }

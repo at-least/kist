@@ -379,6 +379,33 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	if err != nil {
 		return s.wrap("delete", key, err)
 	}
+
+	// On a versioned bucket a delete without a version ID writes a
+	// delete marker and keeps every version: the object no longer reads,
+	// but nothing was reclaimed. Under Object Lock that is the only kind
+	// of delete the service allows before the retention runs out. kist
+	// never deletes versions -- that is the bucket owner's lifecycle
+	// policy to set -- so the caller is told the bytes are retained.
+	//
+	// Listing versions is a separate permission that a role allowed to
+	// delete may well lack. Being unable to look is not a failure of the
+	// delete, which has already happened.
+	versions, err := s.client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket:  aws.String(s.bucket),
+		Prefix:  aws.String(objectKey),
+		MaxKeys: aws.Int32(1000),
+	})
+	if err != nil {
+		if isAccessDenied(err) {
+			return nil
+		}
+		return s.wrap("delete", key, err)
+	}
+	for _, v := range versions.Versions {
+		if aws.ToString(v.Key) == objectKey {
+			return fmt.Errorf("delete %s: %w", key, ErrLocked)
+		}
+	}
 	return nil
 }
 

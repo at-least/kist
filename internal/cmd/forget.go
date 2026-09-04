@@ -45,6 +45,9 @@ func newForgetCommand() *cobra.Command {
 				for _, h := range result.Removed {
 					fmt.Fprintf(out, "%s %s\n", verb, h.Key)
 				}
+				for _, h := range result.Locked {
+					fmt.Fprintf(out, "retained by the storage: %s\n", h.Key)
+				}
 				fmt.Fprintf(out, "%s %d snapshot(s), kept %d\n", verb, len(result.Removed), len(result.Kept))
 				return nil
 			})

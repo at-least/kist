@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/snapshot"
 )
 
@@ -115,6 +116,11 @@ type ForgetOptions struct {
 type ForgetResult struct {
 	Kept    []snapshot.Handle
 	Removed []snapshot.Handle
+
+	// Locked snapshots were removed as far as this repository is
+	// concerned but the storage retains their bytes. See
+	// backend.ErrLocked.
+	Locked []snapshot.Handle
 }
 
 // ErrNothingToForget means no rule and no key was given. Forgetting
@@ -170,7 +176,10 @@ func (r *Repository) Forget(ctx context.Context, opts ForgetOptions) (ForgetResu
 		return result, nil
 	}
 	for _, h := range result.Removed {
-		if err := r.backend.Delete(ctx, h.Key); err != nil {
+		switch err := r.backend.Delete(ctx, h.Key); {
+		case errors.Is(err, backend.ErrLocked):
+			result.Locked = append(result.Locked, h)
+		case err != nil:
 			return result, fmt.Errorf("forget %s: %w", h.Key, err)
 		}
 	}

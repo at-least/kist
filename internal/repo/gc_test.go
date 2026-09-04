@@ -583,3 +583,144 @@ func TestBackupSurvivesBeingUnableToUnmark(t *testing.T) {
 	restore()
 	s.healthy()
 }
+
+// A sweep that deleted the pack and crashed before rewriting the index
+// leaves blobs naming a pack that is gone. The next run must rewrite the
+// index before it removes the mark; removing the mark first would leave
+// a window where a client trusts the stale blob and skips the upload.
+func TestPruneRewritesTheIndexAfterACrashedSweep(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+	a := s.open(clientA)
+	s.forget(a, s.backup(a, src))
+	p := s.pruner()
+	s.prune(p, shortGrace)
+	s.clock.advance(2 * time.Hour)
+
+	// The crash state: pack gone, mark present, blobs untouched.
+	packID := s.marks()[0]
+	if err := p.Backend().Delete(context.Background(), pack.Key(packID)); err != nil {
+		t.Fatal(err)
+	}
+
+	report := s.prune(p, shortGrace)
+	if len(report.Unmarked) != 1 {
+		t.Fatalf("orphaned mark not removed: %+v", report)
+	}
+	fresh := s.pruner()
+	for _, id := range fresh.Index().Packs() {
+		if id == packID {
+			t.Fatalf("a fresh open still sees pack %s in the index after the mark was removed", packID)
+		}
+	}
+	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.sources[h.Key] = src
+	if snap.Stats.PacksAdded == 0 {
+		t.Error("the client trusted the stale index and uploaded nothing")
+	}
+	s.healthy()
+}
+
+// A mark placed during a backup, on a client that cannot remove marks.
+// The commit-time revival fails; the snapshot lands referencing the
+// pack; prune's own recompute is the last line and must find the pack
+// live.
+func TestPruneRaceMarkDuringBackupWithoutUnmarkPermission(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+	a := s.open(clientA)
+	s.forget(a, s.backup(a, src))
+	p := s.pruner()
+	gcDir := filepath.Join(s.dir, "gc")
+
+	restore := func() {
+		if err := os.Chmod(gcDir, 0o755); err != nil {
+			t.Errorf("restore permissions: %v", err)
+		}
+	}
+	backupHooks.afterMarks = func() {
+		backupHooks.afterMarks = nil
+		s.prune(p, shortGrace)
+		if err := os.Chmod(gcDir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { backupHooks.afterMarks = nil }()
+	t.Cleanup(restore)
+
+	var warnings []string
+	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{
+		SpoolDir: t.TempDir(),
+		Warnf:    func(f string, a ...any) { warnings = append(warnings, f) },
+	})
+	restore()
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	s.sources[h.Key] = src
+	if len(warnings) == 0 || snap.Stats.PacksAdded != 0 {
+		t.Fatalf("expected a warning and no upload; warnings %v, packs added %d", warnings, snap.Stats.PacksAdded)
+	}
+	if len(s.marks()) != 1 {
+		t.Fatal("the mark should have survived: the client could not remove it")
+	}
+
+	s.clock.advance(2 * time.Hour)
+	report := s.prune(p, shortGrace)
+	if len(report.Deleted) != 0 || len(report.Unmarked) != 1 {
+		t.Fatalf("prune after the backup: %+v", report)
+	}
+	if s.packs() != 1 {
+		t.Errorf("%d packs, want 1", s.packs())
+	}
+	s.healthy()
+}
+
+// Backup credentials can write under clients/. Junk there must not stop
+// prune, and must not be deleted either: an honest client's damaged
+// record is its only protection while its first backup runs.
+func TestPruneToleratesJunkClientRecords(t *testing.T) {
+	s := newScenario(t)
+	p := s.pruner()
+	ctx := context.Background()
+	if err := backend.PutBytesIfAbsent(ctx, p.Backend(), clientKey("cccccccccccccccccccccccccccccccc"), []byte("junk")); err != nil {
+		t.Fatal(err)
+	}
+	report := s.prune(p, shortGrace)
+	if len(report.UnreadableClients) != 1 {
+		t.Errorf("unreadable clients = %v, want the junk record", report.UnreadableClients)
+	}
+	if n := countKeys(t, p.Backend(), ClientsPrefix); n != 1 {
+		t.Errorf("%d keys under clients/, want the junk left in place", n)
+	}
+}
+
+// A client whose clock runs ahead can look active since a mark it never
+// saw. The skew margin holds the pack for it.
+func TestPruneHoldsWithinTheClockSkew(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+	a := s.open(clientA)
+	s.forget(a, s.backup(a, src))
+	p := s.pruner()
+	s.prune(p, shortGrace)
+
+	// Active 30 minutes after the mark, well after the grace by the
+	// time of the sweep, but inside a one-hour skew.
+	s.clock.advance(30 * time.Minute)
+	s.backup(a, s.source("two", 10<<10))
+	s.clock.advance(2 * time.Hour)
+
+	held := s.prune(p, PruneOptions{Grace: time.Hour, ClockSkew: time.Hour})
+	if len(held.Deleted) != 0 || len(held.Held) != 1 {
+		t.Fatalf("with a one-hour skew: %+v", held)
+	}
+	swept := s.prune(p, PruneOptions{Grace: time.Hour, ClockSkew: time.Minute})
+	if len(swept.Deleted) != 1 {
+		t.Fatalf("with a one-minute skew: %+v", swept)
+	}
+	s.healthy()
+}

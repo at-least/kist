@@ -15,6 +15,7 @@ func newPruneCommand() *cobra.Command {
 		flags              repoFlags
 		grace              time.Duration
 		forgetClientsAfter time.Duration
+		clockSkew          time.Duration
 		dryRun             bool
 	)
 
@@ -33,6 +34,7 @@ func newPruneCommand() *cobra.Command {
 				report, err := r.Prune(ctx, repo.PruneOptions{
 					Grace:              grace,
 					ForgetClientsAfter: forgetClientsAfter,
+					ClockSkew:          clockSkew,
 					DryRun:             dryRun,
 					Progressf:          warnTo(cmd),
 				})
@@ -55,7 +57,10 @@ func newPruneCommand() *cobra.Command {
 					fmt.Fprintf(out, "held %s: %s\n", h.Pack, h.Reason)
 				}
 				for _, id := range report.Locked {
-					fmt.Fprintf(out, "locked %s: retained by the storage, not reclaimed\n", id)
+					fmt.Fprintf(out, "%sdeleted %s: retained by the storage, nothing reclaimed\n", would, id)
+				}
+				for _, key := range report.UnreadableClients {
+					warnTo(cmd)("%s is not a readable client record; left in place", key)
 				}
 				for _, id := range report.Deleted {
 					fmt.Fprintf(out, "%sdeleted %s\n", would, id)
@@ -71,6 +76,7 @@ func newPruneCommand() *cobra.Command {
 	f := cmd.Flags()
 	f.DurationVar(&grace, "grace", repo.DefaultGrace, "how long a pack stays marked before it can be deleted")
 	f.DurationVar(&forgetClientsAfter, "forget-clients-after", 0, "stop waiting for a client that has not backed up in this long (default 10x grace)")
+	f.DurationVar(&clockSkew, "clock-skew", repo.DefaultClockSkew, "clock disagreement tolerated between clients and this machine")
 	f.BoolVar(&dryRun, "dry-run", false, "report what would happen and change nothing")
 	return cmd
 }

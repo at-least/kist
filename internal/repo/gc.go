@@ -73,9 +73,18 @@ func (r *Repository) register(ctx context.Context, now time.Time) error {
 	return nil
 }
 
-// listClients returns when each registered client was first seen.
-func (r *Repository) listClients(ctx context.Context) (map[string]time.Time, error) {
+// listClients returns when each registered client was first seen, and
+// the keys under ClientsPrefix that are not readable records.
+//
+// An unreadable record is reported and skipped, never deleted and never
+// fatal. Backup credentials can write under clients/, so a record that
+// will not open may be an honest client's damaged record -- its only
+// protection while its first backup runs -- or junk written to keep
+// prune from running. Neither is a reason to stop, and the first is a
+// reason not to delete.
+func (r *Repository) listClients(ctx context.Context) (map[string]time.Time, []string, error) {
 	seen := make(map[string]time.Time)
+	var junk []string
 	err := r.backend.List(ctx, ClientsPrefix, func(fi backend.FileInfo) error {
 		clientID := strings.TrimPrefix(fi.Key, ClientsPrefix)
 		sealed, err := backend.GetAll(ctx, r.backend, fi.Key)
@@ -84,19 +93,21 @@ func (r *Repository) listClients(ctx context.Context) (map[string]time.Time, err
 		}
 		encoded, err := crypto.Open(&r.keys.Meta, []byte(fi.Key), sealed)
 		if err != nil {
-			return fmt.Errorf("%s: %w", fi.Key, err)
+			junk = append(junk, fi.Key)
+			return nil //nolint:nilerr // reported as junk above
 		}
 		var rec clientRecord
-		if err := crypto.Unmarshal(encoded, &rec); err != nil {
-			return fmt.Errorf("%s: %w", fi.Key, err)
+		if err := crypto.Unmarshal(encoded, &rec); err != nil || rec.Version != gcVersion {
+			junk = append(junk, fi.Key)
+			return nil //nolint:nilerr // reported as junk above
 		}
 		seen[clientID] = time.Unix(0, rec.FirstSeenNs).UTC()
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list clients: %w", err)
+		return nil, nil, fmt.Errorf("list clients: %w", err)
 	}
-	return seen, nil
+	return seen, junk, nil
 }
 
 // gcMark is what a mark object holds.
@@ -205,12 +216,23 @@ type PruneOptions struct {
 	// of the repository more than ForgetClientsAfter ago.
 	ForgetClientsAfter time.Duration
 
+	// ClockSkew is how far apart the clocks of the pruner and a client
+	// are allowed to be. Zero means DefaultClockSkew.
+	//
+	// The sweep compares a client's activity, stamped by the client's
+	// clock, with a mark, stamped by the pruner's. A client whose clock
+	// runs fast could otherwise look active since a mark it never saw.
+	ClockSkew time.Duration
+
 	// DryRun reports what would happen and changes nothing.
 	DryRun bool
 
 	// Progressf receives one line per phase, for a human watching.
 	Progressf func(format string, args ...any)
 }
+
+// DefaultClockSkew is the clock disagreement prune tolerates by default.
+const DefaultClockSkew = time.Hour
 
 func (o PruneOptions) progress(format string, args ...any) {
 	if o.Progressf != nil {
@@ -223,6 +245,13 @@ func (o PruneOptions) grace() time.Duration {
 		return o.Grace
 	}
 	return DefaultGrace
+}
+
+func (o PruneOptions) clockSkew() time.Duration {
+	if o.ClockSkew > 0 {
+		return o.ClockSkew
+	}
+	return DefaultClockSkew
 }
 
 func (o PruneOptions) forgetClientsAfter() time.Duration {
@@ -248,10 +277,13 @@ type PruneReport struct {
 	Deleted  []crypto.ID // packs deleted by this run
 	Held     []HeldPack  // marked packs left for a later run
 
-	// Locked packs could not be deleted because the storage retains
-	// them. Their marks and index entries are left in place: the bytes
-	// are still there, and still what the index says they are.
+	// Locked packs were deleted as far as this repository is concerned
+	// -- they no longer read -- but the storage retains their bytes, so
+	// nothing was reclaimed. See backend.ErrLocked.
 	Locked []crypto.ID
+
+	// UnreadableClients are keys under clients/ that are not records.
+	UnreadableClients []string
 
 	BytesReclaimed uint64
 }
@@ -321,12 +353,19 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	if err != nil {
 		return report, fmt.Errorf("prune: %w", err)
 	}
-	clients, err := r.listClients(ctx)
+	clients, unreadableClients, err := r.listClients(ctx)
 	if err != nil {
 		return report, fmt.Errorf("prune: %w", err)
 	}
+	report.UnreadableClients = unreadableClients
 	handles, err := snapshot.List(ctx, r.backend, "")
 	if err != nil {
+		return report, fmt.Errorf("prune: %w", err)
+	}
+
+	// The loaded index is what clients see; it is compared with the
+	// stored packs below, and rewritten if it names one that is gone.
+	if err := r.refreshIndex(ctx, func(string, ...any) {}); err != nil {
 		return report, fmt.Errorf("prune: %w", err)
 	}
 
@@ -336,6 +375,10 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 		return report, fmt.Errorf("%w: %w", ErrUnhealthy, err)
 	}
 	report.Stored = len(packs)
+	stored := make(map[crypto.ID]struct{}, len(packs))
+	for id := range packs {
+		stored[id] = struct{}{}
+	}
 
 	opts.progress("walking %d snapshots", len(handles))
 	live := make(map[crypto.ID]struct{})
@@ -360,7 +403,8 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 		pruneHooks.afterLiveness()
 	}
 
-	// Phase 1: mark the dead, unmark the living and the departed.
+	// Phase 1: mark the dead, unmark the living. Marks whose packs are
+	// gone are dealt with last, after the index has stopped naming them.
 	opts.progress("marking")
 	for _, id := range sortedIDs(packs) {
 		_, isLive := live[id]
@@ -377,28 +421,9 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 			report.Unmarked = append(report.Unmarked, id)
 			delete(marks, id)
 			if !opts.DryRun {
-				if err := r.backend.Delete(ctx, gcKey(id)); err != nil {
+				if err := r.remove(ctx, gcKey(id)); err != nil {
 					return report, fmt.Errorf("prune: unmark %s: %w", id, err)
 				}
-			}
-		}
-	}
-	for _, id := range sortedIDs(marks) {
-		if _, stored := packs[id]; stored {
-			continue
-		}
-		report.Unmarked = append(report.Unmarked, id)
-		delete(marks, id)
-		if !opts.DryRun {
-			if err := r.backend.Delete(ctx, gcKey(id)); err != nil {
-				return report, fmt.Errorf("prune: unmark %s: %w", id, err)
-			}
-		}
-	}
-	for _, key := range junk {
-		if !opts.DryRun {
-			if err := r.backend.Delete(ctx, key); err != nil {
-				return report, fmt.Errorf("prune: remove %s: %w", key, err)
 			}
 		}
 	}
@@ -409,6 +434,9 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	activity := lastActivity(clients, handles)
 	deleted := make(map[crypto.ID]struct{})
 	for _, id := range sortedIDs(marks) {
+		if _, stored := packs[id]; !stored {
+			continue
+		}
 		m := marks[id]
 		markedAt := time.Unix(0, m.MarkedNs).UTC()
 		if hold := holdReason(markedAt, now, activity, opts); hold != "" {
@@ -427,24 +455,55 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 		switch err := r.backend.Delete(ctx, pack.Key(id)); {
 		case errors.Is(err, backend.ErrLocked):
 			report.Locked = append(report.Locked, id)
-			continue
 		case err != nil:
 			return report, fmt.Errorf("prune: delete pack %s: %w", id, err)
+		default:
+			report.Deleted = append(report.Deleted, id)
+			report.BytesReclaimed += size
 		}
-		report.Deleted = append(report.Deleted, id)
-		report.BytesReclaimed += size
 		deleted[id] = struct{}{}
 	}
 
-	// The index must stop pointing at what is gone. This is the
-	// rebuild-index write-then-delete, over the trailers already read.
+	// The index must stop naming what is gone: what this run deleted,
+	// and anything a previous run deleted before it could get here. Only
+	// once that is done may a mark whose pack is gone be removed. In the
+	// other order a client could load a blob naming the pack, find no
+	// mark, and skip an upload it needed to make.
+	for id := range deleted {
+		delete(packs, id)
+	}
+	for _, id := range r.index.Packs() {
+		if _, stored := packs[id]; !stored {
+			deleted[id] = struct{}{}
+		}
+	}
 	if len(deleted) > 0 && !opts.DryRun {
 		opts.progress("rewriting the index")
-		for id := range deleted {
-			delete(packs, id)
-		}
 		if err := r.replaceIndex(ctx, staleBlobs, unusableBlobs, packs); err != nil {
 			return report, fmt.Errorf("prune: %w", err)
+		}
+	}
+
+	// A pack this run deleted keeps its mark until the next run: a client
+	// that lists the marks in this very instant must still see it. Only
+	// a mark whose pack was already gone when this run started goes now.
+	opts.progress("removing marks of packs that are gone")
+	for _, id := range sortedIDs(marks) {
+		if _, wasStored := stored[id]; wasStored {
+			continue
+		}
+		report.Unmarked = append(report.Unmarked, id)
+		if !opts.DryRun {
+			if err := r.remove(ctx, gcKey(id)); err != nil {
+				return report, fmt.Errorf("prune: unmark %s: %w", id, err)
+			}
+		}
+	}
+	for _, key := range junk {
+		if !opts.DryRun {
+			if err := r.remove(ctx, key); err != nil {
+				return report, fmt.Errorf("prune: remove %s: %w", key, err)
+			}
 		}
 	}
 	return report, nil
@@ -461,7 +520,7 @@ func holdReason(markedAt, now time.Time, activity map[string]time.Time, opts Pru
 		if now.Sub(at) > opts.forgetClientsAfter() {
 			continue // not heard from in so long that it is not waited for
 		}
-		if !at.After(markedAt) {
+		if !at.After(markedAt.Add(opts.clockSkew())) {
 			waiting = append(waiting, client)
 		}
 	}
@@ -505,6 +564,20 @@ func sortedIDs[V any](m map[crypto.ID]V) []crypto.ID {
 	return ids
 }
 
+// remove deletes a housekeeping object: an old index blob, a mark, junk.
+//
+// Storage that retains versions reports ErrLocked for every delete. For
+// these objects the outcome asked for -- the key no longer reads -- holds
+// all the same, and the retained bytes are nobody's concern here. Packs
+// and snapshots are deleted directly, because for them the retention is
+// worth reporting.
+func (r *Repository) remove(ctx context.Context, key string) error {
+	if err := r.backend.Delete(ctx, key); err != nil && !errors.Is(err, backend.ErrLocked) {
+		return err
+	}
+	return nil
+}
+
 // replaceIndex writes one blob describing packs, then removes the blobs
 // listed in stale and the keys in unusable, and installs the result as
 // this repository's index.
@@ -524,12 +597,12 @@ func (r *Repository) replaceIndex(ctx context.Context, stale []crypto.ID, unusab
 		if id == fresh {
 			continue
 		}
-		if err := r.backend.Delete(ctx, index.Key(id)); err != nil {
+		if err := r.remove(ctx, index.Key(id)); err != nil {
 			return fmt.Errorf("remove the old index blob %s: %w", id, err)
 		}
 	}
 	for _, key := range unusable {
-		if err := r.backend.Delete(ctx, key); err != nil {
+		if err := r.remove(ctx, key); err != nil {
 			return fmt.Errorf("remove %s: %w", key, err)
 		}
 	}

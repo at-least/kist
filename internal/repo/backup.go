@@ -70,19 +70,23 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	// from them: a client is registered before it deduplicates against
 	// anything, so a sweep that lists clients after this point waits for
 	// this backup; and a backup that started after a pack was marked
-	// refreshed its index and read the marks after the mark, so it sees
-	// the mark and uploads the pack's chunks again. A client whose
+	// read the marks after the mark, so it sees the mark and uploads the
+	// pack's chunks again. A client whose
 	// credentials cannot register or list gc/ is on a data-loss path,
 	// not in a degraded mode.
 	started := r.now().UTC()
 	if err := r.register(ctx, started); err != nil {
 		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
 	}
-	if err := r.refreshIndex(ctx, opts.warn); err != nil {
-		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
-	}
+	// Marks before the index. Prune rewrites the index before it removes
+	// the mark of a pack that is gone, so a backup that misses the mark
+	// is one that lists after the removal, and its index refresh, later
+	// still, cannot name the pack.
 	marked, err := r.listMarkedPacks(ctx)
 	if err != nil {
+		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
+	}
+	if err := r.refreshIndex(ctx, opts.warn); err != nil {
 		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
 	}
 	if backupHooks.afterMarks != nil {
@@ -427,7 +431,7 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 		ids = append(ids, id)
 		total += uint64(len(chunk.Data))
 
-		if b.has(id) {
+		if b.has(ctx, id) {
 			continue
 		}
 		if err := b.add(ctx, id, chunk.Data); err != nil {
@@ -447,7 +451,7 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 // it: whichever way the race goes, a pack holding the chunk survives.
 // The upload costs nothing worth counting, since the data it repeats
 // was about to be deleted.
-func (b *backupRun) has(id crypto.ID) bool {
+func (b *backupRun) has(ctx context.Context, id crypto.ID) bool {
 	if _, ok := b.uploaded[id]; ok {
 		return true
 	}
@@ -456,7 +460,7 @@ func (b *backupRun) has(id crypto.ID) bool {
 		return false
 	}
 	if _, doomed := b.marked[loc.Pack]; doomed {
-		b.revive(loc.Pack)
+		b.revive(ctx, loc.Pack)
 		return false
 	}
 	b.referenced[loc.Pack] = struct{}{}
@@ -475,7 +479,7 @@ func (b *backupRun) reviveReferenced(ctx context.Context) error {
 	}
 	for _, id := range sortedIDs(marked) {
 		if _, ok := b.referenced[id]; ok {
-			b.revive(id)
+			b.revive(ctx, id)
 		}
 	}
 	return nil
@@ -491,12 +495,12 @@ func (b *backupRun) reviveReferenced(ctx context.Context) error {
 // reported, not fatal: the re-upload in has is what keeps the data
 // safe, and a backup role without Delete on gc/ must still be able to
 // back up.
-func (b *backupRun) revive(id crypto.ID) {
+func (b *backupRun) revive(ctx context.Context, id crypto.ID) {
 	if _, done := b.revived[id]; done {
 		return
 	}
 	b.revived[id] = struct{}{}
-	if err := b.repo.backend.Delete(context.Background(), gcKey(id)); err != nil {
+	if err := b.repo.remove(ctx, gcKey(id)); err != nil {
 		b.opts.warn("could not remove the gc mark on pack %s: %v; the data is re-uploaded, prune will re-evaluate the mark", id, err)
 	}
 	b.stats.PacksRevived++

@@ -36,7 +36,11 @@ $ kist check --read-data
 | `kist snapshots` | 列出 snapshot，舊的在前 |
 | `kist restore <snapshot> <target>` | 還原到一個空目錄 |
 | `kist check [--read-data]` | 驗證 repo |
+| `kist forget --keep-daily 7 ...` | 依 retention 規則（或指名）移除 snapshot |
+| `kist prune` | 標記沒人引用的 pack，grace（預設 72h）之後的下一次刪掉 |
 | `kist rebuild-index` | 從 pack trailer 重建 index |
+
+`forget` 與 `prune` 要用持有 Delete 權限的憑證跑；備份用的憑證做不到（[權限表](docs/format.md#10-權限模型)）。`prune` 定期跑：第一次只標記，grace 過後的下一次才刪，中間有 client 引用到被標記的 pack 會自動復活它。
 
 repo 位置：`--repo` 或 `$KIST_REPOSITORY`。
 密碼：`--password-file`、`$KIST_PASSWORD`，或終端機提示，依此順序。
