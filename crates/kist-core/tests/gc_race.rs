@@ -48,6 +48,8 @@ enum Op {
     /// prune 拆成兩半：先讀與決定，之後才寫與刪——中間可以插 backup 的 commit（1-A 的視窗）。
     PrunePlan,
     PruneExecute,
+    /// rebuild-index 也是 index 的寫入者，插在 prune 中間會製造幽靈 pack。
+    RebuildIndex,
     Advance {
         hours: u8,
     },
@@ -62,6 +64,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => Just(Op::Prune),
         2 => Just(Op::PrunePlan),
         2 => Just(Op::PruneExecute),
+        1 => Just(Op::RebuildIndex),
         3 => (1u8..120).prop_map(|hours| Op::Advance { hours }),
     ]
 }
@@ -247,6 +250,10 @@ impl World {
                     .unwrap();
                 self.log.push(format!("prune plan → {:?}", plan.report()));
                 self.pending_prune = Some(plan);
+            }
+            Op::RebuildIndex => {
+                let r = self.repo.rebuild_index().await.unwrap();
+                self.log.push(format!("rebuild-index → {r:?}"));
             }
             Op::PruneExecute => {
                 if let Some(plan) = self.pending_prune.take() {
