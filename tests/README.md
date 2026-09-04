@@ -6,17 +6,13 @@ S3 相關的測試（`crates/kist-backend/tests/s3.rs`、`crates/kist-core/tests
 `crates/kist-cli/tests/cli.rs` 裡的 `s3_*`）預設略過，設了環境變數才會跑：
 
 ```sh
-docker run -d --name kist-minio -p 127.0.0.1:19000:9000 \
-  -e MINIO_ROOT_USER=kistadmin -e MINIO_ROOT_PASSWORD=kistsecret123 \
-  minio/minio:latest server /data
-docker exec kist-minio sh -c 'mc alias set local http://127.0.0.1:9000 kistadmin kistsecret123 && mc mb -p local/kist-test'
-
-export KIST_TEST_S3_ENDPOINT=http://127.0.0.1:19000 KIST_TEST_S3_BUCKET=kist-test
-export AWS_ACCESS_KEY_ID=kistadmin AWS_SECRET_ACCESS_KEY=kistsecret123
+eval "$(sh tests/minio-setup.sh)"   # 起容器、建 bucket、建 Put-only 使用者，並設好環境變數
 cargo test --workspace
+docker rm -f kist-minio             # 用完關掉
 ```
 
-每個測試用隨機 prefix，同一個 bucket 可以重複跑。CI 在 ubuntu 上用同樣的方式起 MinIO。
+`tests/minio-setup.sh` 會印出要 export 的環境變數（root 帳號、Put/Get/List-only 的 `kistbackup`
+帳號）。每個測試用隨機 prefix，同一個 bucket 可以重複跑。CI 在 ubuntu 上用同一支腳本。
 
 ## 驗收
 

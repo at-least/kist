@@ -24,6 +24,10 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: start MinIO (S3 integration tests)
+        if: runner.os == 'Linux'
+        run: sh tests/minio-setup.sh | sed "s/^export //" >> "$GITHUB_ENV"
+        shell: bash
       - name: cargo test
         run: cargo test --workspace
 

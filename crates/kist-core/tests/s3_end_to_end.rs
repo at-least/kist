@@ -68,3 +68,49 @@ async fn backup_restore_check_on_s3() {
     }
     backend.delete("config").await.unwrap();
 }
+
+/// M2 驗收：只有 Put/Get/List 權限的使用者能完成整個 backup（含 snapshot 的 conditional put）。
+#[tokio::test]
+async fn put_only_user_completes_a_backup() {
+    let Some(root_backend) = s3_backend("putonly") else {
+        return;
+    };
+    let (Some(key), Some(secret)) = (
+        std::env::var("KIST_TEST_S3_PUTONLY_KEY").ok(),
+        std::env::var("KIST_TEST_S3_PUTONLY_SECRET").ok(),
+    ) else {
+        eprintln!("KIST_TEST_S3_PUTONLY_KEY / _SECRET not set; skipped");
+        return;
+    };
+    // 管理者建 repo
+    Repository::init(root_backend.clone(), PASSWORD.as_bytes(), init_options())
+        .await
+        .unwrap();
+    // 備份機器只有受限帳號
+    let kist_backend::RepoLocation::S3 { bucket, prefix } = root_backend.location().clone() else {
+        panic!("not s3");
+    };
+    let limited = Backend::s3_with_credentials(&bucket, &prefix, &key, &secret).unwrap();
+    let repo = Repository::open(limited.clone(), PASSWORD.as_bytes())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    make_source(&src);
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert!(s.stats.packs_new > 0);
+    let s2 = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert_eq!(s2.stats.chunks_new, 0);
+    // 受限帳號也能 check（只需 Get / List）
+    let report = repo.check(CheckOptions { read_data: true }).await.unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    // 但刪不掉任何東西
+    assert!(limited.delete("config").await.is_err());
+    assert!(root_backend.exists("config").await.unwrap());
+}

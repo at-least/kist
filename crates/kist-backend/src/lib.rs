@@ -133,10 +133,28 @@ impl Backend {
     /// S3（或相容服務）。憑證與端點來自環境變數（見 crate 說明）。
     /// `prefix` 非空時所有 key 都放在它底下（`object_store` 的 `with_url` 不會自己套 prefix）。
     pub fn s3(bucket: &str, prefix: &str) -> Result<Self> {
+        Self::s3_with(bucket, prefix, None)
+    }
+
+    /// 同 [`Self::s3`]，但憑證明確給定（不從環境變數讀）。端點與 region 仍來自環境變數。
+    pub fn s3_with_credentials(
+        bucket: &str,
+        prefix: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> Result<Self> {
+        Self::s3_with(bucket, prefix, Some((access_key_id, secret_access_key)))
+    }
+
+    fn s3_with(bucket: &str, prefix: &str, credentials: Option<(&str, &str)>) -> Result<Self> {
         install_tls_provider();
-        let s3 = AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .build()?;
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+        if let Some((key, secret)) = credentials {
+            builder = builder
+                .with_access_key_id(key)
+                .with_secret_access_key(secret);
+        }
+        let s3 = builder.build()?;
         let location = RepoLocation::S3 {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),

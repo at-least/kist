@@ -98,3 +98,53 @@ async fn large_single_put() {
     );
     b.delete("packs/big").await.unwrap();
 }
+
+/// 只有 Put / Get / List 權限（沒有 Delete）的使用者：backup 需要的操作都要成功，delete 要被拒。
+/// 需要 tests/minio-setup.sh 建的 kistbackup 使用者（KIST_TEST_S3_PUTONLY_KEY / _SECRET）。
+#[tokio::test]
+async fn put_only_user_can_write_and_read_but_not_delete() {
+    let Some((endpoint, bucket)) = s3_env() else {
+        eprintln!("S3 env not set; skipped");
+        return;
+    };
+    let (Some(key), Some(secret)) = (
+        std::env::var("KIST_TEST_S3_PUTONLY_KEY").ok(),
+        std::env::var("KIST_TEST_S3_PUTONLY_SECRET").ok(),
+    ) else {
+        eprintln!("KIST_TEST_S3_PUTONLY_KEY / _SECRET not set; skipped");
+        return;
+    };
+    // 憑證明確給定，不碰 process 共用的 AWS_ACCESS_KEY_ID（其他測試同時在用 root 帳號）
+    std::env::set_var("AWS_ENDPOINT", &endpoint);
+    std::env::set_var("AWS_ALLOW_HTTP", "true");
+    if std::env::var("AWS_DEFAULT_REGION").is_err() {
+        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+    }
+    let b = Backend::s3_with_credentials(
+        &bucket,
+        &format!("putonly-{}", std::process::id()),
+        &key,
+        &secret,
+    )
+    .unwrap();
+
+    b.put("config", vec![1]).await.unwrap();
+    b.put_if_absent("snapshots/c/1", vec![2]).await.unwrap();
+    assert!(matches!(
+        b.put_if_absent("snapshots/c/1", vec![3]).await,
+        Err(BackendError::AlreadyExists(_))
+    ));
+    assert_eq!(b.get("config").await.unwrap(), vec![1]);
+    assert_eq!(b.get_range("config", 0..1).await.unwrap(), vec![1]);
+    assert_eq!(b.size("config").await.unwrap(), 1);
+    assert_eq!(b.list("snapshots").await.unwrap().len(), 1);
+    let denied = b.delete("config").await;
+    assert!(
+        matches!(denied, Err(BackendError::Store(_))),
+        "delete 必須被拒：{denied:?}"
+    );
+    assert!(
+        b.exists("config").await.unwrap(),
+        "被拒的 delete 不能真的刪掉"
+    );
+}
