@@ -1,0 +1,38 @@
+# cargo-deny 設定：CI 會用它檢查相依套件的漏洞與授權。
+# 文件：https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# 有已知漏洞就讓 CI 紅燈。
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# 只允許這些寬鬆授權；出現其他授權要先討論再加進來。
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+# 本專案自己的 crate 還沒選定授權（見 docs/decisions/001）；先不檢查自己。
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+# 自家 crate 之間用 path 相依（沒有版本號），cargo-deny 預設把它算成 wildcard；
+# 這個 workspace 不發布到 crates.io，所以放行 path 相依，外部套件仍禁止 wildcard。
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

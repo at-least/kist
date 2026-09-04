@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+repository = "https://github.com/newlix/kist"
+publish = false
+
+[workspace.dependencies]
+kist-backend = { path = "crates/kist-backend" }
+kist-chunker = { path = "crates/kist-chunker" }
+kist-core = { path = "crates/kist-core" }
+kist-crypto = { path = "crates/kist-crypto" }
+kist-format = { path = "crates/kist-format" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"

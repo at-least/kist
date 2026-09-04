@@ -1,0 +1,20 @@
+[package]
+name = "kist-cli"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kist"
+path = "src/main.rs"
+
+[dependencies]
+kist-backend.workspace = true
+kist-chunker.workspace = true
+kist-core.workspace = true
+kist-crypto.workspace = true
+kist-format.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
