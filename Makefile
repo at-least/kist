@@ -59,10 +59,14 @@ GORELEASER_VERSION ?= v2.18.0
 release-snapshot:
 	go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION) build --snapshot --clean
 
-## fuzz-long: the 24-hour campaign PLAN asks for. Same targets, same
-## loop; only the budget differs.
+## fuzz-long: the 24-hour campaign PLAN asks for: 24 hours in total, so
+## the per-target budget is 24h divided by the number of targets. Same
+## targets, same loop; only the budget differs.
 fuzz-long:
-	$(MAKE) fuzz FUZZTIME=24h
+	@n=$$(grep -rho --include='*_test.go' -E '^func Fuzz[A-Za-z0-9_]*' . | sort -u | wc -l); \
+	each=$$((24 * 60 / n)); \
+	echo "$$n targets, $${each}m each"; \
+	$(MAKE) fuzz FUZZTIME=$${each}m
 
 ## fuzz: run every FuzzXxx target for FUZZTIME each. `go test -fuzz` takes
 ## exactly one package, so the targets are discovered and run one by one.
