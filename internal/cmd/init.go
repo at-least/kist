@@ -29,7 +29,7 @@ func newInitCommand() *cobra.Command {
 				return err
 			}
 
-			b, err := openBackend(location, true)
+			b, err := openBackend(cmd.Context(), location, true)
 			if err != nil {
 				return err
 			}

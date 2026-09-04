@@ -94,17 +94,34 @@ func (f *repoFlags) password(cmd *cobra.Command, confirm bool) ([]byte, error) {
 	return first, nil
 }
 
-// openBackend resolves a location to a backend. Only local paths are
-// supported in M1; S3 and SFTP arrive with their milestones, and an
-// unknown scheme says so rather than being treated as a directory name.
-func openBackend(location string, create bool) (backend.Backend, error) {
-	if scheme, _, ok := strings.Cut(location, "://"); ok {
-		return nil, fmt.Errorf("repository scheme %q is not supported yet; this build stores repositories on the local filesystem", scheme)
+// openBackend resolves a location to a backend.
+//
+//	/path/to/dir            local filesystem
+//	s3://bucket[/prefix]    S3-compatible object storage; credentials
+//	                        from the AWS_* environment, endpoint from
+//	                        $KIST_S3_ENDPOINT, path-style addressing
+//	                        from $KIST_S3_PATH_STYLE=1
+//
+// An unknown scheme says so rather than being treated as a directory.
+func openBackend(ctx context.Context, location string, create bool) (backend.Backend, error) {
+	scheme, _, hasScheme := strings.Cut(location, "://")
+	switch {
+	case !hasScheme:
+		if create {
+			return backend.CreateLocal(location)
+		}
+		return backend.OpenLocal(location)
+	case scheme == "s3":
+		cfg, err := backend.ParseS3Location(location)
+		if err != nil {
+			return nil, err
+		}
+		// Create is a no-op for S3: the bucket must already exist, and
+		// Init's own check refuses a prefix that already holds a config.
+		return backend.OpenS3(ctx, cfg)
+	default:
+		return nil, fmt.Errorf("repository scheme %q is not supported; this build knows local paths and s3://", scheme)
 	}
-	if create {
-		return backend.CreateLocal(location)
-	}
-	return backend.OpenLocal(location)
 }
 
 // withRepository opens a repository, runs fn, and closes it.
@@ -118,7 +135,7 @@ func (f *repoFlags) withRepository(cmd *cobra.Command, fn func(context.Context, 
 		return err
 	}
 
-	b, err := openBackend(location, false)
+	b, err := openBackend(cmd.Context(), location, false)
 	if err != nil {
 		return err
 	}

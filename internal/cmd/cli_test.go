@@ -182,8 +182,8 @@ func TestRepositoryComesFromTheEnvironment(t *testing.T) {
 func TestUnsupportedSchemeIsRejectedClearly(t *testing.T) {
 	t.Setenv(PasswordEnv, "a test password")
 
-	_, _, err := run(t, "snapshots", "--repo", "s3://bucket/path")
-	if err == nil || !strings.Contains(err.Error(), "not supported yet") {
+	_, _, err := run(t, "snapshots", "--repo", "sftp://host/path")
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Fatalf("err = %v, want a clear unsupported-scheme error", err)
 	}
 }

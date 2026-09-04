@@ -74,3 +74,19 @@ jobs:
         with:
           # Pinned in lockstep with the Makefile. Bump both together.
           version: v2.13.2
+
+  # The S3 backend against a real MinIO, on Linux only: the tests start
+  # the container themselves and need a Docker daemon.
+  s3:
+    name: s3 (minio)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: test against minio
+        run: go test -race -count=1 ./internal/backend/ ./internal/repo/ -run 'S3|Concurrent|Policy'
+        env:
+          CGO_ENABLED: "1"
+          KIST_S3_TEST: "1"
