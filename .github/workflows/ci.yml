@@ -55,6 +55,13 @@ jobs:
         env:
           CGO_ENABLED: "1"
 
+      # The FUSE cases skip where /dev/fuse cannot be opened (macOS without
+      # macFUSE). Verbose, so the log says which it was.
+      - name: mount test, verbosely
+        if: runner.os != 'Windows'
+        shell: bash
+        run: go test -count=1 -v ./internal/mount/ 2>&1 | grep -E "^(--- |\s+mount_test.go|ok|FAIL)"
+
   # Lint on all three, not just Linux: golangci-lint only analyses files
   # whose build constraints match the runner's GOOS, so a Linux-only job
   # would silently skip the _windows.go and FUSE code M4 adds.
