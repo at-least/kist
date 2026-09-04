@@ -33,7 +33,7 @@ pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
-pub use restore::{RestoreOptions, RestoreSummary};
+pub use restore::{ReloadableIndex, RestoreOptions, RestoreSummary};
 pub use snapshots::SnapshotInfo;
 
 use std::path::PathBuf;

@@ -363,3 +363,26 @@ fn forget_by_policy_and_by_id() {
     // 資料仍在，repo 一致（pack 只是沒人引用）
     env.ok(&["check", "--read-data"]);
 }
+
+#[test]
+fn concurrent_backup_with_the_same_client_id_is_refused() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    // 模擬另一個還在跑的 backup：抓住同一個鎖
+    let lock_path = env.dir.path().join("client-id.lock");
+    let holder = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    holder.try_lock().unwrap();
+    let err = env.fails(&["backup", src.to_str().unwrap()]);
+    assert!(
+        err.contains("another kist backup is already running"),
+        "{err}"
+    );
+    drop(holder);
+    env.ok(&["backup", src.to_str().unwrap()]);
+}

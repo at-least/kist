@@ -9,7 +9,7 @@ mod common;
 use std::collections::HashSet;
 
 use common::*;
-use kist_core::{BackupOptions, CheckOptions, CoreError, Repository};
+use kist_core::{BackupOptions, CheckOptions, CoreError, ReloadableIndex, Repository};
 use kist_format::{keys, ObjectId};
 
 fn client(id: u8) -> BackupOptions {
@@ -212,4 +212,49 @@ async fn snapshot_time_can_be_injected() {
     );
     let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
     assert_eq!(snap.time, "2030-01-02T03:04:05.000000006Z");
+}
+
+/// 開始得早的 restore 手上是舊 index：chunk 被 repack 搬走後，重載 index 就讀得到。
+#[tokio::test]
+async fn reading_a_moved_chunk_reloads_the_index() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    repo.backup(std::slice::from_ref(&src), client(1))
+        .await
+        .unwrap();
+    let victim = pack_ids(&t)[0];
+    let victim_chunks = chunks_in_pack(&repo, &victim).await;
+    let stale = ReloadableIndex::new(repo.load_index().await.unwrap());
+    let chunk = *victim_chunks.iter().next().unwrap();
+    let before = repo.read_chunk_reloading(&chunk, &stale).await.unwrap();
+
+    // 「repack」：chunk 被重寫到新 pack、index 重寫、舊 pack 刪掉
+    mark(&t, &victim, std::time::Duration::from_secs(60));
+    t.open()
+        .await
+        .backup(std::slice::from_ref(&src), client(2))
+        .await
+        .unwrap();
+    std::fs::remove_file(t.repo_path().join(keys::pack(&victim))).unwrap();
+    t.open().await.rebuild_index().await.unwrap();
+
+    assert_eq!(
+        stale.get().await.get(&chunk).unwrap().pack,
+        victim,
+        "還是舊 index"
+    );
+    let after = repo.read_chunk_reloading(&chunk, &stale).await.unwrap();
+    assert_eq!(before, after);
+    assert_ne!(
+        stale.get().await.get(&chunk).unwrap().pack,
+        victim,
+        "重載後指到新 pack"
+    );
+
+    // 真的不存在的 chunk：重載後仍然是錯，不會無限重試
+    let bogus = kist_format::ChunkId::from_bytes([0xEE; 32]);
+    let err = repo.read_chunk_reloading(&bogus, &stale).await.unwrap_err();
+    assert!(matches!(err, CoreError::ChunkMissing(_)), "{err}");
 }

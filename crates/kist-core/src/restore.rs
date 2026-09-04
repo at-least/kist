@@ -7,6 +7,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tokio::sync::{Mutex, RwLock};
+
 use kist_format::tree::{ChunkList, Content, Node, NodeKind};
 use kist_format::{cbor, keys, ChunkId};
 
@@ -18,6 +20,28 @@ use crate::{blocking, CoreError, Result};
 
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {}
+
+/// 讀取途中 chunk 的 pack 不見了（prune 的 repack 把它搬走了）就重新載入的 index。
+/// 重載最多每分鐘一次：真的壞掉的 repo 不會每個 chunk 都重載一遍。
+pub struct ReloadableIndex {
+    index: RwLock<ChunkIndex>,
+    last_reload: Mutex<Option<std::time::Instant>>,
+}
+
+impl ReloadableIndex {
+    pub fn new(index: ChunkIndex) -> Self {
+        Self {
+            index: RwLock::new(index),
+            last_reload: Mutex::new(None),
+        }
+    }
+
+    pub async fn get(&self) -> tokio::sync::RwLockReadGuard<'_, ChunkIndex> {
+        self.index.read().await
+    }
+}
+
+const RELOAD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// restore 的結果：單一檔案失敗不會中止整個 restore，而是記在 `errors` 裡。
 #[derive(Debug, Clone, Default)]
@@ -37,7 +61,7 @@ impl Repository {
         _opts: RestoreOptions,
     ) -> Result<RestoreSummary> {
         let snapshot = self.read_snapshot(snapshot_key).await?;
-        let index = self.load_index().await?;
+        let index = ReloadableIndex::new(self.load_index().await?);
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
         let nodes = self.read_tree_chain(&snapshot.root).await?;
         let mut summary = RestoreSummary::default();
@@ -57,7 +81,7 @@ impl Repository {
         &'a self,
         node: &'a Node,
         path: &'a Path,
-        index: &'a ChunkIndex,
+        index: &'a ReloadableIndex,
         summary: &'a mut RestoreSummary,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
@@ -101,7 +125,7 @@ impl Repository {
         subtree: &kist_format::ObjectId,
         node: &Node,
         path: &Path,
-        index: &ChunkIndex,
+        index: &ReloadableIndex,
         summary: &mut RestoreSummary,
     ) -> Result<()> {
         std::fs::create_dir_all(path).map_err(|e| CoreError::io(path, e))?;
@@ -124,14 +148,27 @@ impl Repository {
         path: &Path,
         size: u64,
         content: &Content,
-        index: &ChunkIndex,
+        index: &ReloadableIndex,
     ) -> Result<()> {
-        let chunk_ids = self.resolve_content(content, index).await?;
+        let chunk_ids = match content {
+            Content::Direct { chunks } => chunks.clone(),
+            Content::Indirect { chunks } => {
+                let mut bytes = Vec::new();
+                for id in chunks {
+                    bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
+                }
+                let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+                    key: "<chunk list>".to_owned(),
+                    reason: e.to_string(),
+                })?;
+                list.chunks
+            }
+        };
         let file = std::fs::File::create(path).map_err(|e| CoreError::io(path, e))?;
         let mut writer = std::io::BufWriter::new(file);
         let mut written = 0u64;
         for id in &chunk_ids {
-            let data = self.read_chunk(id, index).await?;
+            let data = self.read_chunk_reloading(id, index).await?;
             writer
                 .write_all(&data)
                 .map_err(|e| CoreError::io(path, e))?;
@@ -167,6 +204,39 @@ impl Repository {
                 Ok(list.chunks)
             }
         }
+    }
+
+    /// 同 `read_chunk`，但 chunk 不在 index 或它的 pack 不見了時重新載入 index 再試一次：
+    /// prune 的 repack 會把活 chunk 搬到新 pack、之後刪舊 pack，開始得比較早的 restore
+    /// 手上的 index 指到舊位置。重載後還是找不到才是真的壞。
+    pub async fn read_chunk_reloading(
+        &self,
+        id: &ChunkId,
+        index: &ReloadableIndex,
+    ) -> Result<Vec<u8>> {
+        let first = {
+            let guard = index.index.read().await;
+            self.read_chunk(id, &guard).await
+        };
+        match first {
+            Err(CoreError::ChunkMissing(_))
+            | Err(CoreError::Backend(kist_backend::BackendError::NotFound(_))) => {}
+            other => return other,
+        }
+        {
+            let mut last = index.last_reload.lock().await;
+            let due = last.is_none_or(|t| t.elapsed() >= RELOAD_MIN_INTERVAL);
+            if due {
+                tracing::warn!(
+                    "chunk {id}: its pack is missing; reloading the index (a repack may be in progress)"
+                );
+                let fresh = self.load_index().await?;
+                *index.index.write().await = fresh;
+                *last = Some(std::time::Instant::now());
+            }
+        }
+        let guard = index.index.read().await;
+        self.read_chunk(id, &guard).await
     }
 
     /// 從 pack 讀一個 chunk 的明文（range read + 解密 + 驗證）。

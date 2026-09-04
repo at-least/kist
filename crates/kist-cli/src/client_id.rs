@@ -8,10 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 pub fn load_or_create(explicit: Option<&Path>) -> Result<[u8; 16]> {
-    let path = match explicit {
-        Some(p) => p.to_path_buf(),
-        None => default_path()?,
-    };
+    let path = resolve_path(explicit)?;
     if path.is_file() {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read client id file {}", path.display()))?;
@@ -30,6 +27,40 @@ pub fn load_or_create(explicit: Option<&Path>) -> Result<[u8; 16]> {
     std::fs::write(&path, format!("{}\n", hex::encode(id)))
         .with_context(|| format!("cannot write client id file {}", path.display()))?;
     Ok(id)
+}
+
+/// 同一個 client id 一次只能跑一個 backup：GC 的「活躍 client 在標記後有新 snapshot」
+/// 這條保護假設每台 client 的 backup 是一個接一個的；排程重疊（上一輪還沒跑完）會破壞它。
+/// 鎖是 client id 檔旁邊的 `client-id.lock`，程序結束自動釋放。
+pub fn lock(explicit: Option<&Path>) -> Result<std::fs::File> {
+    let path = resolve_path(explicit)?.with_extension("lock");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("cannot open lock file {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "another kist backup is already running for this client id (lock file {})",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("cannot lock {}", path.display()))
+        }
+    }
+}
+
+fn resolve_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    match explicit {
+        Some(p) => Ok(p.to_path_buf()),
+        None => default_path(),
+    }
 }
 
 fn default_path() -> Result<PathBuf> {

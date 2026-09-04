@@ -208,6 +208,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let r = open_repo(&repo).await?;
             let client_id = client_id::load_or_create(client_id_file.as_deref())?;
+            let _lock = client_id::lock(client_id_file.as_deref())?;
             let opts = BackupOptions {
                 client_id,
                 hostname: hostname(),
