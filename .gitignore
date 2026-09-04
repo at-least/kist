@@ -1,0 +1,7 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# 專案規劃文件（不進版控）
+/PLAN.md
