@@ -15,7 +15,11 @@ func FuzzChunker(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte("short"))
 	f.Add(bytes.Repeat([]byte{0}, MinSize+1))
-	seed := make([]byte, MinSize*3)
+	// Just past MinSize is enough for two chunks. A larger seed makes
+	// every mutated input large, and a coverage-guided corpus of
+	// megabyte inputs across several workers is what got a 24-hour
+	// campaign killed for memory.
+	seed := make([]byte, MinSize+64<<10)
 	x := uint32(2463534242)
 	for i := range seed {
 		x ^= x << 13
