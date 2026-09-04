@@ -141,7 +141,7 @@ UNVERIFIED（未做 profile，只是從請求數推測）。兩者都列在 M3/M
 
 ## M3 驗收數據（GC）
 
-2026-09-05，commit `783a570`（審查修正後），本機目錄後端，同一份資料集，腳本 `tests/acceptance/run_gc.py`，
+2026-09-05，commit `0d0e107`（兩輪審查修正後），本機目錄後端，同一份資料集，腳本 `tests/acceptance/run_gc.py`，
 完整 log `tests/acceptance/m3-acceptance-gc-2026-09-05.log`。流程：backup → 刪掉一成的目錄再 backup →
 forget 舊 snapshot → `prune --grace 0s`（標記 + repack）→ backup → prune（刪）→ 再兩輪 backup + prune 收尾
 → `check --read-data` → restore 與 `diff -r`。
