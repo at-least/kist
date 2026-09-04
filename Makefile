@@ -11,7 +11,7 @@ GOLANGCI := $(shell command -v golangci-lint 2>/dev/null)
 
 FUZZTIME ?= 30s
 
-.PHONY: build test test-s3 test-race vet lint fuzz verify clean
+.PHONY: build test test-s3 test-sftp test-race vet lint fuzz verify clean
 
 ## build: compile the release binary. No cgo, ever — a kist binary must
 ## run on any machine of its GOOS/GOARCH without a libc to match.
@@ -24,11 +24,11 @@ build:
 test:
 	CGO_ENABLED=0 go test ./...
 
-## ## test-sftp: the SFTP backend against OpenSSH in Docker
+## test-sftp: the SFTP backend against OpenSSH in Docker
 test-sftp:
 	KIST_SFTP_TEST=1 CGO_ENABLED=1 go test -race -count=1 ./internal/backend/ -run 'SFTP'
 
-test-s3: the S3 backend and the multi-client tests against a MinIO the
+## test-s3: the S3 backend and the multi-client tests against a MinIO the
 ## tests start in Docker. Offline by default; this is the one command
 ## both CI and a developer run for it.
 test-s3:
