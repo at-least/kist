@@ -9,12 +9,12 @@
 //! Two "compressor versions" are simulated with zstd level 3 and 19: the
 //! same plaintext compresses to different bytes. Evidence produced:
 //! - A: nonce(body-derived) differs (no reuse — safe), but the NAME differs
-//!      too → identity coupled to compressor version.
+//!   too → identity coupled to compressor version.
 //! - B: name is over plaintext → identical under both versions.
 
 use blake3::Hasher;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 fn tree_plaintext() -> Vec<u8> {
     // Stand-in for a mid-size tree CBOR: repeated-ish structure that
@@ -26,12 +26,17 @@ fn tree_plaintext() -> Vec<u8> {
     buf
 }
 
-fn scheme_a_name(nonce_key: &[u8; 32], object_key: &[u8; 32], body: &[u8], aad: &[u8; 32]) -> [u8; 32] {
+fn scheme_a_name(
+    nonce_key: &[u8; 32],
+    object_key: &[u8; 32],
+    body: &[u8],
+    aad: &[u8; 32],
+) -> [u8; 32] {
     let mut nonce = [0u8; 24];
     nonce.copy_from_slice(&blake3::keyed_hash(nonce_key, body).as_bytes()[..24]);
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(object_key));
+    let cipher = XChaCha20Poly1305::new(object_key.into());
     let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: body, aad })
+        .encrypt(&XNonce::from(nonce), Payload { msg: body, aad })
         .unwrap();
     let mut full = Vec::with_capacity(32 + ct.len());
     full.extend_from_slice(aad);
@@ -87,7 +92,10 @@ fn poc_tree_naming_stability() {
     let b3 = scheme_b_name(&hash_key, &plaintext);
     let b19 = scheme_b_name(&hash_key, &plaintext);
     println!("POC_SCHEME_B name_same={} name={}", b3 == b19, hex(&b3));
-    assert_eq!(b3, b19, "scheme B name is over plaintext: compressor-independent");
+    assert_eq!(
+        b3, b19,
+        "scheme B name is over plaintext: compressor-independent"
+    );
 
     // And a random nonce (scheme B sealing) does not enter the name at all:
     let _ = Hasher::new(); // blake3 hasher imported for parity checks

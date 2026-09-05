@@ -23,10 +23,22 @@ fn some_pack(t: &TestRepo) -> std::path::PathBuf {
 #[tokio::test]
 async fn clean_repo_passes_both_modes() {
     let (_t, repo) = repo_with_data().await;
-    let quick = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let quick = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(quick.errors.is_empty(), "{:?}", quick.errors);
     assert!(quick.packs > 0 && quick.snapshots == 1 && quick.chunks > 0);
-    let full = repo.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
+    let full = repo
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(full.errors.is_empty(), "{:?}", full.errors);
 }
 
@@ -38,7 +50,13 @@ async fn flipped_byte_in_pack_is_detected_by_read_data() {
     bytes[100] ^= 0x01;
     std::fs::write(&pack, bytes).unwrap();
 
-    let report = repo.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
     let name = pack.file_name().unwrap().to_str().unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains(name)),
@@ -54,7 +72,13 @@ async fn truncated_pack_is_detected_without_reading_data() {
     let bytes = std::fs::read(&pack).unwrap();
     std::fs::write(&pack, &bytes[..bytes.len() - 10]).unwrap();
 
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     let name = pack.file_name().unwrap().to_str().unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains(name)),
@@ -68,7 +92,13 @@ async fn missing_pack_is_detected() {
     let (t, repo) = repo_with_data().await;
     let pack = some_pack(&t);
     std::fs::remove_file(&pack).unwrap();
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     let name = pack.file_name().unwrap().to_str().unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains(name)),
@@ -84,7 +114,13 @@ async fn missing_tree_is_detected() {
     trees.sort();
     let tree = trees.remove(0);
     std::fs::remove_file(&tree).unwrap();
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     let name = tree.file_name().unwrap().to_str().unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains(name)),
@@ -123,7 +159,13 @@ async fn tree_copied_over_another_tree_is_detected() {
     let key = repo.resolve_snapshot("latest").await.unwrap();
     let root = repo.read_snapshot_by_key(&key).await.unwrap().root.to_hex();
     let (_a, b) = swap_objects_excluding(&t.repo_path().join("trees"), &[root]);
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     // v2：tree 以自己的 ID 當 AAD 密封，互拷的檔案在解密（AEAD 驗證）就失敗
     assert!(
         report
@@ -166,7 +208,13 @@ async fn tree_whose_content_does_not_match_its_name_is_detected() {
     let forged = repo.keys().seal_tree(&id_b, &plain_a).unwrap();
     std::fs::write(&b, forged).unwrap();
 
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     let name = b.file_name().unwrap().to_str().unwrap();
     assert!(
         report
@@ -189,7 +237,13 @@ async fn index_copied_over_another_index_is_detected() {
         .unwrap();
     assert_eq!(t.count("indexes"), 2);
     let (_a, b) = swap_objects(&t.repo_path().join("indexes"));
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains(&b)),
         "{:?}",
@@ -215,7 +269,13 @@ async fn snapshot_copied_over_another_snapshot_is_detected() {
         .unwrap()
         .path();
     let (_a, b) = swap_objects(&client_dir);
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains(&b)),
         "{:?}",
@@ -288,10 +348,11 @@ async fn damaged_pack_is_repaired_from_parity() {
         .unwrap();
     // restore 在 target 底下重建完整絕對路徑（src 在 /tmp 底下）
     let restored_root = out.join(src.strip_prefix("/").unwrap());
-    for f in walk_files(&src)
-        .into_iter()
-        .filter(|f| std::fs::symlink_metadata(f).map(|m| m.is_file()).unwrap_or(false))
-    {
+    for f in walk_files(&src).into_iter().filter(|f| {
+        std::fs::symlink_metadata(f)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+    }) {
         let rel = f.strip_prefix(&src).unwrap();
         let restored = restored_root.join(rel);
         assert_eq!(
@@ -407,16 +468,17 @@ async fn prune_removes_parity_sidecars() {
         .await
         .unwrap();
     assert!(p1.marked > 0, "{p1:?}");
-    let p2 = repo.prune(PruneOptions {
-        clock_skew: std::time::Duration::ZERO,
-        grace: GRACE,
-        inactive_after: INACTIVE,
-        repack_below_percent: 0,
-        dry_run: false,
-        now: Some(started + GRACE + StdDuration::from_secs(2 * 3600)),
-    })
-    .await
-    .unwrap();
+    let _p2 = repo
+        .prune(PruneOptions {
+            clock_skew: std::time::Duration::ZERO,
+            grace: GRACE,
+            inactive_after: INACTIVE,
+            repack_below_percent: 0,
+            dry_run: false,
+            now: Some(started + GRACE + StdDuration::from_secs(2 * 3600)),
+        })
+        .await
+        .unwrap();
     assert_eq!(t.count("packs"), 0);
     assert_eq!(t.count("parity"), 0, "pack 刪了 parity 也該刪");
 }

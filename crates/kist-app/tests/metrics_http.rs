@@ -70,10 +70,6 @@ fn metrics_render_after_jobs() {
     assert!(text.ends_with("# EOF\n"), "OpenMetrics 結尾:\n{text}");
 }
 
-/// jobs.rs 真實產生的 detail JSON（v2 `BackupSummary` 的 serde 輸出，stats 欄位是
-/// `["stats","bytes_stored"]`）之後把 `#[ignore]` 拿掉。
-#[test]
-
 /// 沒跑過任何工作也要能輸出（註冊過的 metric 全部以 0/預設出現）。
 #[test]
 fn metrics_render_empty() {

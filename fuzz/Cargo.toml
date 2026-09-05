@@ -1,0 +1,48 @@
+[package]
+name = "kist-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# 獨立於主 workspace（主 workspace 的 members = ["crates/*"]），
+# 依賴版本自己鎖，避免 libfuzzer-sys 進主 lockfile。
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hex = "0.4"
+kist-chunker = { path = "../crates/kist-chunker" }
+kist-core = { path = "../crates/kist-core" }
+kist-crypto = { path = "../crates/kist-crypto" }
+kist-format = { path = "../crates/kist-format" }
+
+[[bin]]
+name = "pack"
+path = "fuzz_targets/pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cbor"
+path = "fuzz_targets/cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunker"
+path = "fuzz_targets/chunker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parity"
+path = "fuzz_targets/parity.rs"
+test = false
+doc = false
+bench = false

@@ -5,7 +5,7 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -30,10 +30,22 @@ fn poc_key_derivation_matches_go() {
     );
 
     for (ctx, expected) in [
-        ("kist/v2/hash", "1953dd93ebf5b2e60606cb54e9b5a01debcb64a51c186fcaed7a698e776c8a24"),
-        ("kist/v2/chunk", "cd800501750684a7f2de3982090396759351e2ba153a47c0cabd7a307c844d59"),
-        ("kist/v2/meta", "b9bb8e689db093d3b7969ebd013efbcf04bb0f49c59d8934484fbda5bff91581"),
-        ("kist/v2/index", "7db4ac7f2de7ff9f7ea22282af0bd5963a2a955d773db866210dd3055ecd8d7b"),
+        (
+            "kist/v2/hash",
+            "1953dd93ebf5b2e60606cb54e9b5a01debcb64a51c186fcaed7a698e776c8a24",
+        ),
+        (
+            "kist/v2/chunk",
+            "cd800501750684a7f2de3982090396759351e2ba153a47c0cabd7a307c844d59",
+        ),
+        (
+            "kist/v2/meta",
+            "b9bb8e689db093d3b7969ebd013efbcf04bb0f49c59d8934484fbda5bff91581",
+        ),
+        (
+            "kist/v2/index",
+            "7db4ac7f2de7ff9f7ea22282af0bd5963a2a955d773db866210dd3055ecd8d7b",
+        ),
     ] {
         let sub = blake3::derive_key(ctx, &master);
         println!("POC_SUB_{ctx} {}", hex(&sub));
@@ -55,11 +67,14 @@ fn poc_key_derivation_matches_go() {
 
     // Sealed master with fixed nonce must match Go byte-for-byte.
     let nonce = [0x77u8; 24];
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
+    let cipher = XChaCha20Poly1305::new((&kek).into());
     let sealed = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload { msg: &[0x99u8; 32], aad: &aad },
+            &XNonce::from(nonce),
+            Payload {
+                msg: &[0x99u8; 32],
+                aad: &aad,
+            },
         )
         .unwrap();
     let sealed_full = [nonce.as_slice(), sealed.as_slice()].concat();

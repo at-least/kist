@@ -3,8 +3,6 @@
 
 use kist_chunker::Chunker;
 use kist_format::config::ChunkerParams;
-use kist_format::tree::{content_type, node_type, Entry, Tree};
-use kist_format::TreeId;
 
 /// 共用的測試輸入：xorshift64* 產生的 bytes，與 Go 端同一函式逐 byte
 /// 相同。產生器本身就是 corpus；進 repo 的只有邊界清單。
@@ -35,10 +33,18 @@ fn interop_chunker_boundaries() {
     let cases: &[(&str, ChunkerParams, usize)] = &[
         (
             "chunker-boundaries-small.txt",
-            ChunkerParams { min: 1 << 10, avg: 4 << 10, max: 16 << 10 },
+            ChunkerParams {
+                min: 1 << 10,
+                avg: 4 << 10,
+                max: 16 << 10,
+            },
             4 << 20,
         ),
-        ("chunker-boundaries-default.txt", ChunkerParams::default(), 16 << 20),
+        (
+            "chunker-boundaries-default.txt",
+            ChunkerParams::default(),
+            16 << 20,
+        ),
     ];
     for (name, params, len) in cases {
         let want = load_boundaries(name);
@@ -72,15 +78,30 @@ fn interop_key_derivation() {
     );
 
     for (ctx, want) in [
-        ("kist/v2/hash", "1953dd93ebf5b2e60606cb54e9b5a01debcb64a51c186fcaed7a698e776c8a24"),
-        ("kist/v2/chunk", "cd800501750684a7f2de3982090396759351e2ba153a47c0cabd7a307c844d59"),
-        ("kist/v2/meta", "b9bb8e689db093d3b7969ebd013efbcf04bb0f49c59d8934484fbda5bff91581"),
-        ("kist/v2/index", "7db4ac7f2de7ff9f7ea22282af0bd5963a2a955d773db866210dd3055ecd8d7b"),
+        (
+            "kist/v2/hash",
+            "1953dd93ebf5b2e60606cb54e9b5a01debcb64a51c186fcaed7a698e776c8a24",
+        ),
+        (
+            "kist/v2/chunk",
+            "cd800501750684a7f2de3982090396759351e2ba153a47c0cabd7a307c844d59",
+        ),
+        (
+            "kist/v2/meta",
+            "b9bb8e689db093d3b7969ebd013efbcf04bb0f49c59d8934484fbda5bff91581",
+        ),
+        (
+            "kist/v2/index",
+            "7db4ac7f2de7ff9f7ea22282af0bd5963a2a955d773db866210dd3055ecd8d7b",
+        ),
     ] {
-        assert_eq!(to_hex(&blake3::derive_key(ctx, &master)), want, "subkey {ctx}");
+        assert_eq!(
+            to_hex(&blake3::derive_key(ctx, &master)),
+            want,
+            "subkey {ctx}"
+        );
     }
 }
-
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

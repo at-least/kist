@@ -256,7 +256,9 @@ fn gid_of(_: &std::fs::Metadata) -> u32 {
 /// 鍵與值都是 bytes：xattr 名稱不保證是 UTF-8。讀不到（不支援、無權限）
 /// 一律視為沒有——xattr 記錄是盡力而為，不讓備份因此失敗。
 #[cfg(unix)]
-pub fn read_xattrs(path: &Path) -> Option<std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>> {
+pub fn read_xattrs(
+    path: &Path,
+) -> Option<std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>> {
     use std::collections::BTreeMap;
     use std::os::unix::ffi::OsStrExt;
     let names = xattr::list(path).ok()?;
@@ -276,7 +278,9 @@ pub fn read_xattrs(path: &Path) -> Option<std::collections::BTreeMap<serde_bytes
 }
 
 #[cfg(not(unix))]
-pub fn read_xattrs(_: &Path) -> Option<std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>> {
+pub fn read_xattrs(
+    _: &Path,
+) -> Option<std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>> {
     None
 }
 
@@ -314,6 +318,7 @@ fn apply_mode(_: &Path, _: u32) -> Result<()> {
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod xattr_tests {
     #[test]
     fn user_xattrs_are_captured_and_sorted() {
@@ -333,7 +338,10 @@ mod xattr_tests {
         let got = super::read_xattrs(&path).expect("xattrs present");
         let names: Vec<Vec<u8>> = got.keys().map(|k| k.to_vec()).collect();
         assert_eq!(names, vec![b"user.a".to_vec(), b"user.b".to_vec()]);
-        assert_eq!(&got[&serde_bytes::ByteBuf::from(b"user.a".to_vec())][..], b"1");
+        assert_eq!(
+            &got[&serde_bytes::ByteBuf::from(b"user.a".to_vec())][..],
+            b"1"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

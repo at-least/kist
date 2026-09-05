@@ -170,9 +170,9 @@ pub fn read_trailer(keys: &RepoKeys, pack_bytes: &[u8]) -> Result<PackTrailer> {
     Ok(trailer)
 }
 
-/// trailer 一致性檢查。`max_entry_len` = chunker.max + 1 (algorithm byte)
-/// + 40 (nonce+tag) 的格式上限；這裡用格式允許的最大 chunker.max 推導，
-/// 避免 trailer 檢查反過來依賴每個 repo 的 config。
+/// trailer 一致性檢查。`max_entry_len` 的格式上限 = chunker.max
+/// (最大 64 MiB) + 1 (algorithm byte) + 40 (nonce+tag)；這裡用格式允許
+/// 的最大 chunker.max 推導，避免 trailer 檢查反過來依賴每個 repo 的 config。
 pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
     const MAX_CHUNKER_MAX: u64 = 64 * 1024 * 1024;
     const MAX_ENTRY_LEN: u64 = MAX_CHUNKER_MAX + 1 + (pack::CHUNK_NONCE_LEN + pack::TAG_LEN) as u64;
@@ -194,13 +194,19 @@ pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
         if e.length < pack::MIN_ENTRY_LEN as u64 {
             return Err(CoreError::Corrupt {
                 key: "<pack trailer>".to_owned(),
-                reason: format!("entry {i} is {} bytes, shorter than an empty sealed chunk", e.length),
+                reason: format!(
+                    "entry {i} is {} bytes, shorter than an empty sealed chunk",
+                    e.length
+                ),
             });
         }
         if e.length > MAX_ENTRY_LEN {
             return Err(CoreError::Corrupt {
                 key: "<pack trailer>".to_owned(),
-                reason: format!("entry {i} is {} bytes, over the {MAX_ENTRY_LEN} a sealed chunk can be", e.length),
+                reason: format!(
+                    "entry {i} is {} bytes, over the {MAX_ENTRY_LEN} a sealed chunk can be",
+                    e.length
+                ),
             });
         }
         let end = e.offset + e.length;

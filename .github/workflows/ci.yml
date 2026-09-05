@@ -40,3 +40,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # 短煙霧（每 target 60 秒）：確保 fuzz target 不會腐化到編不過或斷言失效。
+  # 長跑（24h）仍在手動本機跑，見 fuzz/README.md。CI 本身也是手動觸發，
+  # 不 dispatch 就零成本。
+  fuzz-smoke:
+    name: fuzz smoke (60s × 4 targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: smoke each target
+        run: |
+          for t in pack cbor chunker parity; do
+            sh fuzz/smoke.sh "$t" 60
+          done
