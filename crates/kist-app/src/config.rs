@@ -74,6 +74,9 @@ pub struct BackupSection {
     pub schedule: Option<String>,
     #[serde(default, with = "crate::duration::serde_opt")]
     pub gc_grace: Option<std::time::Duration>,
+    /// 每個 pack 旁存幾片 Reed-Solomon 同位（0..=8；0 = 不存，預設）。
+    #[serde(default)]
+    pub parity: u8,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -160,6 +163,11 @@ impl Config {
                 ));
             }
             self.schedule_of(b.schedule.as_deref(), "[backup]")?;
+            if b.parity > 8 {
+                return Err(AppError::Config(
+                    "[backup] parity must be 0..=8".to_owned(),
+                ));
+            }
         }
         if let Some(f) = &self.forget {
             let policy = f.policy();

@@ -533,6 +533,15 @@ impl PrunePlan {
                     self.report.deleted += 1;
                     self.report.deleted_bytes += target.info.size;
                     marks_to_remove.push(target.id);
+                    // pack 的 parity sidecar 一起走（grace 期間 pack 還在，
+                    // sidecar 也留著可修復；這裡是 pack 真的刪掉的時刻）。
+                    if target.kind == Kind::Pack {
+                        let parity_key = kist_format::parity::key(&target.id);
+                        match repo.backend().delete(&parity_key).await {
+                            Ok(()) | Err(BackendError::NotFound(_)) => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("{key}: cannot delete: {e}; keeping its marker");
@@ -556,6 +565,48 @@ impl PrunePlan {
             {
                 Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
                 Err(e) => return Err(e.into()),
+            }
+        }
+
+        // 13. parity sidecar 清掃：pack 已不在的 sidecar 一併刪——本 run 刪掉的
+        //     已在刪除時帶走，這裡清的是之前死掉的 run 或手動刪 pack 留下的。
+        //     m=8 時 sidecar 是 pack 的一半大，孤兒很燒空間。
+        if !self.dry_run {
+            let stored: HashSet<String> = repo
+                .backend()
+                .list(keys::PACKS_PREFIX)
+                .await?
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
+            let sidecars: Vec<String> = repo
+                .backend()
+                .list(kist_format::parity::PREFIX)
+                .await?
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
+            for key in sidecars {
+                let orphan = match keys::object_id_from_key(&key) {
+                    Ok(id) => !stored.contains(&keys::pack(&id)),
+                    Err(_) => true, // 不是 parity 命名：當垃圾清
+                };
+                if orphan {
+                    // 名單是剛才列的：並發 backup 可能「pack 已 Put、parity 尚未
+                    // 列進我們的名單但已存在」。刪之前再看一眼 pack 還在不在，
+                    // pack 在就不動它的 sidecar。
+                    let pack_gone = match keys::object_id_from_key(&key) {
+                        Ok(id) => repo.backend().head(&keys::pack(&id)).await.is_err(),
+                        Err(_) => true,
+                    };
+                    if !pack_gone {
+                        continue;
+                    }
+                    match repo.backend().delete(&key).await {
+                        Ok(()) | Err(BackendError::NotFound(_)) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             }
         }
         Ok(self.report)

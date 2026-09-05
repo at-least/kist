@@ -43,6 +43,7 @@ proptest = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rand = "0.10"
+reed-solomon-erasure = "6"
 rpassword = "7"
 rust-embed = { version = "8", features = ["debug-embed"] }
 serde = { version = "1", features = ["derive"] }

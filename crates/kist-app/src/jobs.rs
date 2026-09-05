@@ -129,6 +129,7 @@ async fn run_job_inner(
                 username: client_id::username(),
                 now: None,
                 gc_grace: b.gc_grace.unwrap_or(kist_core::DEFAULT_GC_GRACE),
+                parity: b.parity,
                 progress,
             };
             let paths: Vec<PathBuf> = b.paths.clone();

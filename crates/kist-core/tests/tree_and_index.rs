@@ -25,7 +25,7 @@ async fn corrupt_tree_is_healed_by_the_next_backup() {
             std::fs::write(&tree, bytes).unwrap();
         }
     }
-    let before = repo.check(CheckOptions { read_data: false }).await.unwrap();
+    let before = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
     assert!(!before.errors.is_empty(), "破壞要先被看見");
 
     let s = repo
@@ -37,7 +37,7 @@ async fn corrupt_tree_is_healed_by_the_next_backup() {
         "資料沒變，不該有新 chunk：{:?}",
         s.stats
     );
-    let after = repo.check(CheckOptions { read_data: false }).await.unwrap();
+    let after = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
     // 舊 snapshot 仍指向壞掉的…不，tree 名稱相同，重寫後兩個 snapshot 都好了
     assert!(after.errors.is_empty(), "{:?}", after.errors);
 }

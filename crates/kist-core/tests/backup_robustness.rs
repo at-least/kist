@@ -47,7 +47,7 @@ async fn unreadable_file_is_skipped_and_counted() {
     assert!(restored.join("small.txt").is_file());
     assert!(!restored.join("secret.txt").exists());
     assert!(restored.join("locked").is_dir(), "讀不到的目錄以空目錄記錄");
-    let report = repo.check(CheckOptions { read_data: false }).await.unwrap();
+    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 
@@ -80,7 +80,7 @@ async fn file_whose_size_changes_while_reading_restores_correctly() {
         .unwrap();
     let restored = std::fs::read(target.join("proc/version")).unwrap();
     assert_eq!(restored.len() as u64, s.stats.bytes);
-    let report = repo.check(CheckOptions { read_data: false }).await.unwrap();
+    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 

@@ -19,6 +19,7 @@ fn client(id: u8) -> BackupOptions {
         username: "tester".to_owned(),
         now: None,
         gc_grace: std::time::Duration::from_secs(72 * 3600),
+        parity: 0,
         progress: None,
     }
 }
@@ -156,7 +157,7 @@ async fn commit_finds_moved_chunks_after_reloading_the_index() {
     assert_eq!(t.count("snapshots"), 3);
     // 新 snapshot 的資料全部讀得到
     let fresh = t.open().await;
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let out = t.dir.path().join("out");
     let r = fresh
@@ -356,7 +357,7 @@ async fn commit_after_a_repack_keeps_its_chunks_reachable() {
     let s = prepared.commit().await.unwrap();
     assert_eq!(t.count("snapshots"), 2);
     let fresh = t.open().await;
-    let r = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let r = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     let out = t.dir.path().join("out");
     let rs = fresh

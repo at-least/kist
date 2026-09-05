@@ -25,6 +25,7 @@ pub mod ids;
 pub mod index;
 pub mod keys;
 pub mod pack;
+pub mod parity;
 pub mod snapshot;
 pub mod tree;
 
@@ -96,6 +97,10 @@ pub enum FormatError {
     BadTimestamp(String),
     #[error("invalid repository parameters: {0}")]
     InvalidParams(String),
+    #[error("parity object is corrupt: {0}")]
+    ParityCorrupt(String),
+    #[error("pack cannot be repaired: {0}")]
+    Unrepairable(String),
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;

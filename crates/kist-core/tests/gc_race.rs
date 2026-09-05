@@ -109,6 +109,7 @@ fn opts(client: u8, now: OffsetDateTime) -> BackupOptions {
         username: "tester".to_owned(),
         now: Some(now),
         gc_grace: 72 * H,
+        parity: 0,
         progress: None,
     }
 }
@@ -310,7 +311,7 @@ impl World {
     /// 每一步之後的不變量。
     async fn check_invariants(&self) {
         let fresh = self.t.open().await;
-        let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+        let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
         assert!(
             report.errors.is_empty(),
             "repo inconsistent: {:?}\nlog:\n{}",

@@ -26,6 +26,7 @@ fn client(id: u8, now: OffsetDateTime) -> BackupOptions {
         username: "tester".to_owned(),
         now: Some(now),
         gc_grace: 72 * H,
+        parity: 0,
         progress: None,
     }
 }
@@ -121,7 +122,7 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
     let report = t
         .open()
         .await
-        .check(CheckOptions { read_data: true })
+        .check(CheckOptions { read_data: true, repair: false })
         .await
         .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -157,7 +158,7 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
     // 這一輪會新標記在 p1 變成垃圾的東西（被 repack 的舊 pack、被取代的舊 index blob）
     assert!(p2.marked > 0, "{p2:?}");
     let fresh = t.open().await;
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     // （被 repack 的舊 pack 這時還是孤兒、剛被標記，check 會警告它；最後收斂時再驗沒有警告）
     restore_matches(&fresh, &b2.snapshot_key, &src, &out).await;
@@ -176,7 +177,7 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
         let report = t
             .open()
             .await
-            .check(CheckOptions { read_data: true })
+            .check(CheckOptions { read_data: true, repair: false })
             .await
             .unwrap();
         assert!(report.errors.is_empty(), "day {day}: {:?}", report.errors);
@@ -189,7 +190,7 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
     let report = t
         .open()
         .await
-        .check(CheckOptions { read_data: true })
+        .check(CheckOptions { read_data: true, repair: false })
         .await
         .unwrap();
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
@@ -306,7 +307,7 @@ async fn marked_objects_referenced_by_a_new_snapshot_are_revived() {
         );
     }
     let fresh = t.open().await;
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let out = t.dir.path().join("out");
     restore_matches(&fresh, &b2.snapshot_key, &src, &out).await;
@@ -363,7 +364,7 @@ async fn active_client_without_a_newer_snapshot_blocks_deletion_but_inactive_doe
     let report = t
         .open()
         .await
-        .check(CheckOptions { read_data: true })
+        .check(CheckOptions { read_data: true, repair: false })
         .await
         .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -448,7 +449,7 @@ async fn snapshot_committed_inside_a_prune_keeps_its_chunks() {
     assert!(p1.marked >= 1, "{p1:?}");
     let out = t.dir.path().join("out");
     let fresh = t.open().await;
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     restore_matches(&fresh, &s.snapshot_key, &src_a, &out).await;
 
@@ -467,7 +468,7 @@ async fn snapshot_committed_inside_a_prune_keeps_its_chunks() {
             .unwrap();
         assert!(p.skipped.is_empty(), "{p:?}");
         let fresh = t.open().await;
-        let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+        let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
         assert!(report.errors.is_empty(), "day {day}: {:?}", report.errors);
         restore_matches(&fresh, &s.snapshot_key, &src_a, &out).await;
     }
@@ -532,7 +533,7 @@ async fn duplicate_copies_are_reclaimed() {
     let p2 = repo.prune(prune_opts(r + Duration::days(8))).await.unwrap();
     assert_eq!(p2.deleted as usize, marked.len(), "{p2:?}");
     let fresh = t.open().await;
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let out = t.dir.path().join("out");
     restore_matches(&fresh, &s2.snapshot_key, &src, &out).await;
@@ -594,7 +595,7 @@ async fn phantom_packs_do_not_steal_canonical_from_real_holders() {
             "幽靈 {id} 還在 index 裡"
         );
     }
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let out = t.dir.path().join("out");
     restore_matches(&fresh, &s2.snapshot_key, &src, &out).await;
@@ -612,7 +613,7 @@ async fn phantom_packs_do_not_steal_canonical_from_real_holders() {
     let report = t
         .open()
         .await
-        .check(CheckOptions { read_data: true })
+        .check(CheckOptions { read_data: true, repair: false })
         .await
         .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);

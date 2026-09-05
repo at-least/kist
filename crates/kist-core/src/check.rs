@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use kist_backend::BackendError;
 use kist_format::{keys, ChunkId, ObjectId};
 
 use crate::index::ChunkLocation;
@@ -22,6 +23,10 @@ use crate::{blocking, Result};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CheckOptions {
     pub read_data: bool,
+    /// 用 parity sidecar 就地修復損壞的 pack（隱含 `read_data`：片內的損壞
+    /// 只有讀了才看得到）。修復的重寫是 check 唯一覆寫既有物件的動作，
+    /// 需要 Put 權限；S3 Object Lock 下的物件修不了，會被回報。
+    pub repair: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -32,6 +37,10 @@ pub struct CheckReport {
     pub chunks: u64,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+    /// 已從 parity 修復並重寫的 pack。
+    pub repaired: Vec<String>,
+    /// 損壞但修不了的 pack（沒有 parity、損壞超過 m 片、或修復結果不對）。
+    pub unrepairable: Vec<String>,
 }
 
 impl CheckReport {
@@ -43,6 +52,7 @@ impl CheckReport {
 impl Repository {
     pub async fn check(&self, opts: CheckOptions) -> Result<CheckReport> {
         let mut report = CheckReport::default();
+        let opts = if opts.repair { CheckOptions { read_data: true, repair: true } } else { opts };
 
         // 1. index
         let mut index_errors = Vec::new();
@@ -121,7 +131,7 @@ impl Repository {
             let all_ids = Arc::new(all_ids);
             for (id, _) in index.packs() {
                 let expected = by_pack.remove(id).unwrap_or_default();
-                self.check_pack_data(id, expected, Arc::clone(&all_ids), &mut report)
+                self.check_pack_data(id, expected, Arc::clone(&all_ids), opts.repair, &mut report)
                     .await;
             }
         }
@@ -134,6 +144,7 @@ impl Repository {
         id: &ObjectId,
         expected: HashMap<ChunkId, ChunkLocation>,
         all_ids: Arc<HashSet<ChunkId>>,
+        repair: bool,
         report: &mut CheckReport,
     ) {
         let key = keys::pack(id);
@@ -144,17 +155,43 @@ impl Repository {
                 return;
             }
         };
+        let bytes = match ObjectId::of(&bytes) == *id {
+            true => bytes,
+            false => {
+                if !repair {
+                    report
+                        .errors
+                        .push(format!("{key}: content hash does not match its name"));
+                    return;
+                }
+                // 修復的證明是重算 hash 等於 pack 的名字，所以結果永遠不會
+                // 「修錯」，只會修不成；修復成功就重抓重驗，失敗的原因與
+                // 「沒有 parity」由 repair_pack 回報。
+                if !self.repair_pack(id, &bytes, report).await {
+                    return;
+                }
+                report.repaired.push(key.clone());
+                // 這個 pack 先前記的錯誤（step 2 的大小不符等）是對損壞內容說的：
+                // 修好了就撤掉，report 才不會同時說「修好了」與「有錯」。
+                let prefix = format!("{key}:");
+                report.errors.retain(|e| !e.starts_with(&prefix));
+                // 修復後重抓重驗：驗不過要說出來，不能讓 report 看起來乾淨。
+                match self.backend().get(&key).await {
+                    Ok(b) if ObjectId::of(&b) == *id => b,
+                    _ => {
+                        report.errors.push(format!(
+                            "{key}: repaired pack does not re-verify; the repair did not stick"
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
         let keys = Arc::clone(self.keys());
-        let id = *id;
+        let _id = *id;
         let key_for_task = key.clone();
         let result: Result<Vec<String>> = blocking(move || {
             let mut errs = Vec::new();
-            if ObjectId::of(&bytes) != id {
-                errs.push(format!(
-                    "{key_for_task}: content hash does not match its name"
-                ));
-                return Ok(errs);
-            }
             let trailer = match read_trailer(&keys, &bytes) {
                 Ok(t) => t,
                 Err(e) => {
@@ -210,6 +247,62 @@ impl Repository {
         match result {
             Ok(errs) => report.errors.extend(errs),
             Err(e) => report.errors.push(format!("{key}: {e}")),
+        }
+    }
+
+    /// 從 parity sidecar 重建一個損壞的 pack 並寫回。回傳是否成功；
+    /// 失敗的原因（沒有 parity、修不了、或修好了存不回去）各自回報。
+    async fn repair_pack(&self, id: &ObjectId, damaged: &[u8], report: &mut CheckReport) -> bool {
+        let pack_key = keys::pack(id);
+        let parity_key = kist_format::parity::key(id);
+        let raw = match self.backend().get(&parity_key).await {
+            Ok(r) => r,
+            Err(BackendError::NotFound(_)) => {
+                report.errors.push(format!(
+                    "{pack_key}: content hash does not match its name; no parity to repair it from"
+                ));
+                report.unrepairable.push(pack_key);
+                return false;
+            }
+            Err(e) => {
+                report.errors.push(format!("{pack_key}: parity: {e}"));
+                report.unrepairable.push(pack_key);
+                return false;
+            }
+        };
+        let obj = match kist_format::parity::parse(&raw) {
+            Ok(o) => o,
+            Err(e) => {
+                report.errors.push(format!("{pack_key}: parity: {e}"));
+                report.unrepairable.push(pack_key);
+                return false;
+            }
+        };
+        let repaired = {
+            let id = *id;
+            let damaged = damaged.to_vec();
+            blocking(move || Ok(obj.repair(&id, &damaged))).await
+        };
+        match repaired {
+            Ok(Ok(bytes)) => match self.backend().put(&pack_key, bytes).await {
+                Ok(()) => true,
+                // 修好了但存不回去（例如 S3 Object Lock）：不假裝成功。
+                Err(e) => {
+                    report.errors.push(format!("{pack_key}: repaired but cannot store it: {e}"));
+                    report.unrepairable.push(pack_key);
+                    false
+                }
+            },
+            Ok(Err(e)) => {
+                report.errors.push(format!("{pack_key}: {e}"));
+                report.unrepairable.push(pack_key);
+                false
+            }
+            Err(e) => {
+                report.errors.push(format!("{pack_key}: {e}"));
+                report.unrepairable.push(pack_key);
+                false
+            }
         }
     }
 }

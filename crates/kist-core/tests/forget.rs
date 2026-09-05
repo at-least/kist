@@ -121,6 +121,7 @@ fn client(id: u8) -> BackupOptions {
         username: "tester".to_owned(),
         now: None,
         gc_grace: kist_core::DEFAULT_GC_GRACE,
+        parity: 0,
         progress: None,
     }
 }
@@ -192,7 +193,7 @@ async fn forget_applies_policy_per_client_and_path_group() {
     assert!(remaining.contains(&keys_b[1]));
     assert!(remaining.contains(&other_paths));
     // 資料還在，repo 一致
-    let report = repo.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = repo.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 

@@ -134,6 +134,10 @@ enum Command {
         /// Must match the `--grace` used by `prune`.
         #[arg(long, value_name = "DURATION", default_value = "72h", value_parser = parse_duration)]
         gc_grace: std::time::Duration,
+        /// Reed-Solomon parity shards per pack, out of 16 data shards
+        /// (0 = none; 2 = 12.5% overhead, repairs up to 2 damaged sixteenths).
+        #[arg(long, value_name = "0..=8", default_value = "0")]
+        parity: u8,
     },
     /// List snapshots.
     Snapshots {
@@ -157,6 +161,10 @@ enum Command {
         /// Also download every pack and verify every chunk (slow).
         #[arg(long)]
         read_data: bool,
+        /// Rewrite damaged packs from their parity objects (implies --read-data).
+        /// Needs Put access; objects under S3 Object Lock cannot be repaired.
+        #[arg(long)]
+        repair: bool,
     },
     /// Remove snapshots, by id or by retention policy. Data is reclaimed later by `prune`.
     Forget {
@@ -401,7 +409,11 @@ async fn run(cli: Cli) -> Result<()> {
             paths,
             client_id_file,
             gc_grace,
+            parity,
         } => {
+            if parity > 8 {
+                anyhow::bail!("--parity must be 0..=8");
+            }
             let r = open_repo(&repo).await?;
             let client_id = client_id::load_or_create(client_id_file.as_deref())?;
             let _lock = client_id::lock(client_id_file.as_deref())?;
@@ -411,6 +423,7 @@ async fn run(cli: Cli) -> Result<()> {
                 username: username(),
                 now: None,
                 gc_grace,
+                parity,
                 progress: None,
             };
             let summary = r.backup(&paths, opts).await?;
@@ -626,9 +639,16 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Check { repo, read_data } => {
+        Command::Check {
+            repo,
+            read_data,
+            repair,
+        } => {
             let r = open_repo(&repo).await?;
-            let report = r.check(CheckOptions { read_data }).await?;
+            let report = r.check(CheckOptions { read_data, repair }).await?;
+            for id in &report.repaired {
+                println!("repaired pack {id} from parity");
+            }
             if json {
                 print_json(&report)?;
             } else {

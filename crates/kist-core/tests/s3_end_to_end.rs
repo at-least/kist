@@ -58,7 +58,7 @@ async fn backup_restore_check_on_s3() {
     assert!(summary.errors.is_empty(), "{summary:?}");
     assert_same_tree(&src, &target.join(src.strip_prefix("/").unwrap_or(&src)));
 
-    let report = repo.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = repo.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.snapshots, 2);
 
@@ -110,7 +110,7 @@ async fn put_only_user_completes_a_backup() {
         .unwrap();
     assert_eq!(s2.stats.chunks_new, 0);
     // 受限帳號也能 check（只需 Get / List）
-    let report = repo.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = repo.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     // 但刪不掉任何東西
     assert!(limited.delete("config").await.is_err());
@@ -171,7 +171,7 @@ async fn forget_and_prune_on_s3() {
     let fresh = Repository::open(backend.clone(), PASSWORD.as_bytes())
         .await
         .unwrap();
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let target = dir.path().join("out");
     let r = fresh

@@ -29,6 +29,7 @@ fn client(id: u8) -> BackupOptions {
         username: "tester".to_owned(),
         now: None,
         gc_grace: kist_core::DEFAULT_GC_GRACE,
+        parity: 0,
         progress: None,
     }
 }
@@ -59,7 +60,7 @@ async fn concurrent_scenario(backend: Backend, work: &Path) {
     let fresh = Repository::open(backend.clone(), PASSWORD.as_bytes())
         .await
         .unwrap();
-    let report = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.snapshots, 2);
 

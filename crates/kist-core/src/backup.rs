@@ -27,6 +27,7 @@ use kist_backend::{Backend, BackendError};
 use kist_chunker::Chunker;
 use kist_crypto::RepoKeys;
 use kist_format::index::{IndexBlob, IndexPack};
+use kist_format::parity;
 use kist_format::snapshot::{format_key_timestamp, Snapshot, SnapshotStats};
 use kist_format::tree::{
     content_type, node_type, ChunkList, Entry, Tree, MAX_INLINE_CHUNKS, MAX_NODES_PER_TREE,
@@ -55,6 +56,9 @@ pub struct BackupOptions {
     pub now: Option<time::OffsetDateTime>,
     /// 標記超過這麼久的 pack 視同已刪（commit 前的驗證）。必須與 prune 用的一致。
     pub gc_grace: std::time::Duration,
+    /// 每個 pack 旁要存幾片 Reed-Solomon 同位（0..=8；0 = 不存，預設）。
+    /// 同位寫失敗只警告、不讓 backup 失敗：資料已安全，缺的只是冗餘。
+    pub parity: u8,
     /// 進度回報（給 UI 顯示）；`None` = 不回報。
     pub progress: Option<ProgressCallback>,
 }
@@ -132,6 +136,8 @@ struct Backup {
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
     /// 進度回報（見 `BackupOptions::progress`）。
     progress: Option<ProgressCallback>,
+    /// 每個 pack 旁存幾片 Reed-Solomon 同位（0 = 不存）。
+    parity: u8,
     /// 這次 backup 已看過的硬連結：(dev, inode) → 第一個名字的 chunk 清單與大小。
     /// 後續名字直接沿用，不必重讀資料。
     hardlinks: HashMap<(u64, u64), (u64, Vec<ChunkId>, u8)>,
@@ -426,6 +432,7 @@ impl Repository {
             marks_at_start,
             referenced: HashMap::new(),
             progress: opts.progress.clone(),
+            parity: opts.parity,
         };
 
         // 根 tree：每個來源路徑一個節點，名稱是絕對路徑。
@@ -1013,10 +1020,42 @@ impl Backup {
             });
             self.stats.packs_new += 1;
             let backend: Backend = self.repo.backend().clone();
-            let key = keys::pack(&p.id);
+            let id = p.id;
+            let key = keys::pack(&id);
+            let parity_m = usize::from(self.parity);
             let bytes = p.bytes;
-            self.uploads
-                .spawn(async move { backend.put(&key, bytes).await.map_err(Into::into) });
+            self.uploads.spawn(async move {
+                // 同位是 sidecar：算不出來或上不去只警告——pack 本身已安全，
+                // 缺的只是冗餘（與 Go pack.Writer.writeParity 相同語意）。
+                // RS 對整個 pack（可到 64 MiB+）做線性組合是重 CPU，丟 blocking；
+                // 閉式把 bytes 帶回來上傳，不為了算同位多抄一份。
+                let (bytes, parity_bytes) = if parity_m > 0 {
+                    blocking(move || {
+                        let pb = match parity::encode(&id, &bytes, parity_m) {
+                            Ok(b) => Some(b),
+                            Err(e) => {
+                                tracing::warn!("pack {id} is stored but its parity is not: {e}");
+                                None
+                            }
+                        };
+                        Ok((bytes, pb))
+                    })
+                    .await?
+                } else {
+                    (bytes, None)
+                };
+                backend.put(&key, bytes).await.map_err(CoreError::from)?;
+                if let Some(parity_bytes) = parity_bytes {
+                    let parity_key = keys::parity(&id);
+                    match backend.put_if_absent(&parity_key, parity_bytes).await {
+                        Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+                        Err(e) => {
+                            tracing::warn!("pack {id} is stored but its parity is not: {e}");
+                        }
+                    }
+                }
+                Ok(())
+            });
         }
         Ok(())
     }

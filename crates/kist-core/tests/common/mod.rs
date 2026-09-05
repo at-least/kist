@@ -37,6 +37,7 @@ pub fn backup_options() -> BackupOptions {
         username: "tester".to_owned(),
         now: None,
         gc_grace: kist_core::DEFAULT_GC_GRACE,
+        parity: 0,
         progress: None,
     }
 }

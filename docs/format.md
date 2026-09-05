@@ -364,7 +364,16 @@ versioning bucket 刪的只是現行版本，清空間要 lifecycle；Object Loc
 `parity/<pack hex>`：明文 CBOR `{v:2, k:16, m:1..8, pack_size, shard_len,
 hashes:[16+m 個 BLAKE3], parity:[m 個 shard]}`——Reed-Solomon 對**整個
 sealed pack** 切 16 資料片。寫入端可選；讀取端**忽略**。修復僅在重算
-BLAKE3 == pack 名稱時接受。（v1 Go 設計，照搬。）
+BLAKE3 == pack 名稱時接受。
+
+明文是有意的：RS 對密文做線性組合不洩漏資訊、shard hash 是密文的 hash、
+偽造或損壞的 parity 最多讓修復**失敗**、不可能修**錯**（證明 = pack 的
+名字），因此 scrub/repair 不需要 repo 密碼。兩邊實作（Go
+klauspost/reedsolomon、Rust reed-solomon-erasure）已用固定向量雙向驗證
+矩陣逐 byte 相容：任一邊寫的 parity 另一邊都能修。prune 刪 pack 時
+sidecar 一起刪；`check --repair` 的重寫是唯一覆寫既有物件的動作，
+Object Lock 下的物件修不了、會回報。（2026-09-06：Rust 端補齊寫入與
+repair；parity 物件的 `v` 由實作誤標的 1 對齊為規格的 2。）
 
 ## 15. 後端契約
 
