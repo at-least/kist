@@ -10,7 +10,12 @@ import (
 )
 
 func newInitCommand() *cobra.Command {
-	var flags repoFlags
+	var (
+		flags      repoFlags
+		chunkerMin uint32
+		chunkerAvg uint32
+		chunkerMax uint32
+	)
 
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -29,6 +34,7 @@ func newInitCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			opts.Chunker = &repo.ChunkerParams{MinSize: chunkerMin, AvgSize: chunkerAvg, MaxSize: chunkerMax}
 
 			b, err := openBackend(cmd.Context(), location, true)
 			if err != nil {
@@ -58,6 +64,9 @@ func newInitCommand() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().Uint32Var(&chunkerMin, "chunker-min", 512<<10, "FastCDC minimum chunk size in bytes")
+	cmd.Flags().Uint32Var(&chunkerAvg, "chunker-avg", 2<<20, "FastCDC average chunk size in bytes")
+	cmd.Flags().Uint32Var(&chunkerMax, "chunker-max", 8<<20, "FastCDC maximum chunk size in bytes")
 	flags.register(cmd)
 	return cmd
 }

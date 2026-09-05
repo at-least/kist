@@ -74,3 +74,30 @@ v2 的權威規格是兩邊各放一份、內容相同的 `docs/format.md`；每
 - tree 的根節點命名從 basename 改為完整絕對路徑 bytes（restore 重建完整
   路徑，與 Rust 一致）；clients/ 註冊表移除；backup 不再刪 gc 標記
   （Put-only）；xattr 改 byte-string key 的自訂 marshaler。
+
+## 修訂（2026-09-05，產品定位確定後）：欄位順序取代排序
+
+kist-rs 確定為交付產品、Go 退居參考實作後重新審視了每個決定。唯一為
+遷就 Go 而選的次級設計是 CBOR 的「map keys 依編碼 bytes 排序」：
+fxamacker 的 CoreDet 模式免費做到，Rust 卻要 serialize→Value→sort→
+serialize，**實測 encode 慢 20 倍**（10k 節點 tree 18.6ms vs 0.96ms），
+而 backup 途中每個目錄都要 encode tree。
+
+修訂：規格 §4 改為**欄位表釘死輸出順序**（spec 的欄位表 = 規範順序，
+解碼端不得假設順序）。Rust 刪掉正規化層（encode 回到單次序列化），
+Go 換掉 CoreDet 模式、struct 欄位順序對齊規格表（KeySlot、Stats 等），
+xattrs map 的排序保留（Rust BTreeMap 天然、Go 自訂 marshaler）。對
+第三方實作也更友善：serde 風格函式庫的預設行為就是宣告順序。bytes
+全部重生成（goldens、共享 tree 向量），重新凍結。
+
+同一輪補上產品缺口（規格本來就要求）：index 合併改為**未標記 pack
+優先、其次名稱最小**（與 prune 正本 rank 一致——smallest-wins 會在
+標記視窗內把 chunk 導向被標記副本，害 backup 重複重傳，測試
+`marked_pack_is_not_used_for_dedup` 抓到）；解碼後的版本欄位檢查
+（tree/snapshot/index/trailer）；trailer 一致性檢查（連續性、重複 ID、
+長度上限，規格 §7）；**backup 記錄 xattr**（`user.*`，Go 端早有；
+產品不能還原自己沒記錄的資料）；兩邊 CLI init 暴露 chunker 參數
+（Go 順帶修掉 AAD 用常數而非 config 值的 latent bug）。
+
+重新驗證：兩邊套件全綠、雙向 E2E 含 0-new-chunk 去重、encode
+benchmark 回到 1.0x。

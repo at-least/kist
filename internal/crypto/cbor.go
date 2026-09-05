@@ -9,11 +9,19 @@ import (
 // Every metadata object in a repository is CBOR, and every one of them
 // carries a version field so the format can evolve without guessing.
 //
-// Encoding is Core Deterministic (RFC 8949 §4.2.1): shortest-form
-// arguments, map keys sorted bytewise. Determinism is not cosmetic here.
-// A tree is named by ContentID over its encoding, so two encoders that
-// disagree by one byte would produce two names for one directory and
-// silently defeat deduplication.
+// Encoding follows the v2 canonical rules (docs/format.md §4): struct
+// fields are emitted in each struct's SPEC-PINNED ORDER (declaration
+// order in these packages -- the field tables in the spec match them
+// field for field), integers in shortest form (CBOR's default), and the
+// one real map type (tree xattrs) is sorted by its custom marshaler.
+// The earlier Core-Deterministic sorted-keys rule was dropped: it made
+// the shipping Rust implementation 20x slower on encode for bytes
+// nothing depends on. Determinism is not cosmetic -- a tree is named by
+// ContentID over its encoding -- but it comes from the spec's field
+// order, not from sorting.
+//
+// NEVER hand a Go map to Marshal: plain EncMode does not sort map keys.
+// The metadata structs contain none; keep it that way.
 var (
 	encMode cbor.EncMode
 	decMode cbor.DecMode
@@ -21,7 +29,7 @@ var (
 
 func init() {
 	var err error
-	if encMode, err = cbor.CoreDetEncOptions().EncMode(); err != nil {
+	if encMode, err = new(cbor.EncOptions).EncMode(); err != nil {
 		panic(fmt.Sprintf("kist/crypto: build canonical CBOR encoder: %v", err))
 	}
 

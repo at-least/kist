@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/at-least/kist/internal/backend"
-	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/index"
 	"github.com/at-least/kist/internal/snapshot"
@@ -60,6 +59,13 @@ type Options struct {
 	// KDF sets the Argon2id cost for Init. The zero value means
 	// crypto.DefaultKDFParams.
 	KDF *crypto.KDFParams
+
+	// Chunker sets the chunk sizes for Init. Nil means
+	// config.DefaultChunkerParams. The values are written to the config
+	// and bound into the master-key AAD: every client of the repository
+	// must agree, and a tampered config fails the unwrap rather than
+	// silently breaking deduplication.
+	Chunker *ChunkerParams
 
 	// NonceSource seeds the nonces of everything this repository writes.
 	// Production leaves it nil, meaning crypto/rand.
@@ -131,13 +137,21 @@ func Init(ctx context.Context, b backend.Backend, opts Options) (*Repository, er
 	if opts.KDF != nil {
 		params = *opts.KDF
 	}
-	aad := crypto.MasterAAD(repoID, chunker.MinSize, chunker.AvgSize, chunker.MaxSize)
+	sizes := DefaultChunkerParams()
+	if opts.Chunker != nil {
+		sizes = *opts.Chunker
+	}
+	if err := sizes.validate(); err != nil {
+		return nil, fmt.Errorf("init repository: %w", err)
+	}
+	aad := crypto.MasterAAD(repoID, sizes.MinSize, sizes.AvgSize, sizes.MaxSize)
 	slot, err := crypto.NewKeySlot(opts.Password, aad, master, params, now, opts.NonceSource)
 	if err != nil {
 		return nil, fmt.Errorf("init repository: %w", err)
 	}
 
 	cfg := newConfig(repoID, slot, now)
+	cfg.Chunker = sizes
 	if err := saveConfig(ctx, b, cfg); err != nil {
 		return nil, fmt.Errorf("init repository: %w", err)
 	}

@@ -129,12 +129,14 @@ func DefaultKDFParams() KDFParams {
 // one password. A repository has one slot in its config object and may
 // have more under keys/<id>, so several passwords can open one repository
 // without any of them being able to reach another's.
+// Field order is the spec table (docs/format.md §4): v, name, created,
+// kdf, wrapped. Reordering changes every byte it feeds.
 type KeySlot struct {
 	Version       uint64    `cbor:"v"`
 	Name          string    `cbor:"name,omitempty"`
+	CreatedUnixNs int64     `cbor:"created"`
 	KDF           KDFParams `cbor:"kdf"`
 	WrappedMaster []byte    `cbor:"wrapped"`
-	CreatedUnixNs int64     `cbor:"created"`
 }
 
 // KeySlotVersion is the schema version written by this implementation.

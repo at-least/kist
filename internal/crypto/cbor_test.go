@@ -32,10 +32,12 @@ func TestMarshalIsCanonical(t *testing.T) {
 		}
 	}
 
-	// Core-deterministic ordering sorts map keys by their encoded bytes:
-	// shortest first, then lexicographic. For these keys that is n, v,
-	// alpha, zebra -- struct declaration order does not appear anywhere.
-	const want = "a4616e2261760165616c7068616161657a65627261617a"
+	// v2 canonical rule: struct fields are emitted in the SPEC-PINNED
+	// order, which is the declaration order of these structs (docs/
+	// format.md §4). Determinism comes from the field tables, not from
+	// sorting -- the sorted form (n, v, alpha, zebra) is exactly what we
+	// must NOT emit anymore.
+	const want = "a4617601657a65627261617a65616c7068616161616e22"
 	if got := hex.EncodeToString(first); got != want {
 		t.Fatalf("encoding = %s, want %s", got, want)
 	}
