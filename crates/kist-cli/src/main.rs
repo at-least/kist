@@ -531,14 +531,22 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
             if prune {
-                let report = r.prune(prune_args.options(dry_run)).await?;
+                let prune_result = r.prune(prune_args.options(dry_run)).await;
                 if json {
-                    // stdout 只能有一個 JSON 值：forget 與 prune 包在一起
+                    // stdout 只能有一個 JSON 值：forget 與 prune 包在一起。
+                    // prune 失敗時 snapshot 已經刪了，仍要把 forget 的結果印出來
+                    //（prune 為 null、結束碼 1、錯誤在 stderr），消費者才知道刪了哪些。
+                    let prune_json = prune_result
+                        .as_ref()
+                        .ok()
+                        .map(|report| PruneJson { dry_run, report });
                     print_json(&serde_json::json!({
                         "forget": ForgetJson::new(dry_run, &summary),
-                        "prune": PruneJson { dry_run, report: &report },
+                        "prune": prune_json,
                     }))?;
-                } else {
+                }
+                let report = prune_result?;
+                if !json {
                     output_prune(&report, dry_run)?;
                 }
                 prune_warnings_and_exit(&report)

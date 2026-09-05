@@ -34,7 +34,8 @@ PLAN 也指定了 Web UI 的技術（axum + htmx + askama），它需要一個�
    位置語意太脆弱；包成 `{snapshot, reasons}`。`forget` / `prune` 的輸出另加 `dry_run`
    欄位——「removed」是已刪還是會刪，消費者光看欄位名分不出來。
 4. **`forget --prune --json`**：stdout 只能有一個 JSON 值，所以包成
-   `{"forget": ..., "prune": ...}`，不輸出兩份文件。
+   `{"forget": ..., "prune": ...}`，不輸出兩份文件。prune 失敗時 snapshot 已經刪了，
+   仍然印出這個物件（`prune` 為 null、結束碼 1、錯誤在 stderr），消費者才知道刪了哪些。
 5. **`--json` 沒有覆蓋 `init` / `version`**：它們的結果沒有機器消費的價值，維持文字。
 
 ### 2. `kist serve` = 排程 daemon + HTTP，與 `kist run` 並存
@@ -70,7 +71,8 @@ backup 卻還在跑，兩邊講的事不一致。
 - 監控的正確用法是對「多久沒看到成功」告警（README 有 PromQL 範例），不是對事件告警；
   事件級的通知是 webhook 的職責。
 - backup / prune 的統計 gauge 是「最後一次」語意，不累加；累加量只有
-  `kist_job_runs_total` 與 `kist_prune_deleted_bytes_total`。
+  `kist_job_runs_total` 與 `kist_prune_deleted_bytes_total`。OpenMetrics 把 `_total` 保留給
+  counter，所以 gauge 一律不帶 `_total`（`kist_backup_bytes` 是最後一次 snapshot 的總 bytes）。
 
 ### 4. `/metrics` 無認證、預設綁 loopback
 

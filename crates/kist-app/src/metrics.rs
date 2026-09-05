@@ -31,7 +31,7 @@ pub struct Metrics {
     last_success_timestamp: Family<JobLabel, Gauge<f64, AtomicU64>>,
     last_duration: Family<JobLabel, Gauge<f64, AtomicU64>>,
     backup_files: Gauge,
-    backup_bytes_total: Gauge,
+    backup_bytes: Gauge,
     backup_bytes_new: Gauge,
     backup_chunks_new: Gauge,
     backup_errors: Gauge,
@@ -88,11 +88,11 @@ impl Metrics {
             "Files in the last snapshot this daemon completed (0 until the first backup finishes)",
             backup_files.clone(),
         );
-        let backup_bytes_total = Gauge::default();
+        let backup_bytes = Gauge::default();
         registry.register(
-            "backup_bytes_total",
+            "backup_bytes",
             "Total file bytes in the last snapshot this daemon completed",
-            backup_bytes_total.clone(),
+            backup_bytes.clone(),
         );
         let backup_bytes_new = Gauge::default();
         registry.register(
@@ -136,7 +136,7 @@ impl Metrics {
             last_success_timestamp,
             last_duration,
             backup_files,
-            backup_bytes_total,
+            backup_bytes,
             backup_bytes_new,
             backup_chunks_new,
             backup_errors,
@@ -177,7 +177,7 @@ impl Metrics {
                     self.backup_files.set(n);
                 }
                 if let Some(n) = get(&["stats", "bytes_total"]) {
-                    self.backup_bytes_total.set(n);
+                    self.backup_bytes.set(n);
                 }
                 if let Some(n) = get(&["stats", "bytes_new"]) {
                     self.backup_bytes_new.set(n);

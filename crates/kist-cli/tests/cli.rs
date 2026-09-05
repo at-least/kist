@@ -559,6 +559,43 @@ fn json_flag_outputs_parseable_results() {
     assert_eq!(v[0]["detail"]["stats"]["files"], 3);
 }
 
+/// `forget --json --prune` 在 prune 失敗時：snapshot 已經刪了，stdout 仍要有
+/// forget 的結果（prune 為 null），結束碼 1、錯誤在 stderr。
+#[cfg(unix)]
+#[test]
+fn forget_prune_json_still_reports_forget_when_prune_fails() {
+    use serde_json::Value;
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    // snapshot key 的時間是秒級，第二個 backup 要換一秒
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    env.ok(&["backup", src.to_str().unwrap()]);
+
+    // trees/ 讀不到 → forget 照常刪 snapshot，接著的 prune 在規劃階段失敗
+    let trees = env.repo().join("trees");
+    std::fs::set_permissions(&trees, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (ok, stdout, stderr) = env.kist(&["forget", "--json", "--keep-last", "1", "--prune"]);
+    std::fs::set_permissions(&trees, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!ok, "prune should have failed\nstdout: {stdout}");
+    assert!(
+        stderr.contains("rror"),
+        "error should go to stderr: {stderr}"
+    );
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["forget"]["dry_run"], false);
+    assert_eq!(v["forget"]["removed"].as_array().unwrap().len(), 1);
+    assert!(v["prune"].is_null(), "{stdout}");
+    // snapshot 真的刪了
+    let v: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+}
+
 /// `kist serve`：起 daemon + HTTP，--http 127.0.0.1:0 時從 stderr 取得實際位址，
 /// /metrics 能抓到 OpenMetrics 文字。
 #[test]

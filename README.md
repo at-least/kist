@@ -100,7 +100,7 @@ kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端�
 | `kist_job_runs_total{job,status}` | 每種工作完成次數（success / incomplete / failure） |
 | `kist_job_last_success_timestamp_seconds{job}` | 上次**完全成功**的 Unix 時間（持久化在 `cache_dir/jobstate-<repo hash>-<job>.json`，重啟後種回；incomplete 不算成功） |
 | `kist_job_last_duration_seconds{job}` | 上次執行時長 |
-| `kist_backup_files` / `kist_backup_bytes_total` | 最後一次 snapshot 的檔案數 / 總 bytes |
+| `kist_backup_files` / `kist_backup_bytes` | 最後一次 snapshot 的檔案數 / 總 bytes |
 | `kist_backup_bytes_new` / `kist_backup_chunks_new` | 最後一次 backup 上傳的量 |
 | `kist_backup_skipped_items` | 最後一次 backup 略過的項目數 |
 | `kist_prune_deleted_bytes_total` | prune 自 daemon 啟動以來刪掉的 bytes |

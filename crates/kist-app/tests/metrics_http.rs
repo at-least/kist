@@ -43,7 +43,7 @@ fn metrics_render_after_jobs() {
         "kist_job_last_duration_seconds{job=\"backup\"} 1.5",
         "kist_job_last_duration_seconds{job=\"prune\"} 1.5",
         "kist_backup_files 3",
-        "kist_backup_bytes_total 100",
+        "kist_backup_bytes 100",
         "kist_backup_bytes_new 50",
         "kist_backup_chunks_new 2",
         "kist_backup_skipped_items 0",
