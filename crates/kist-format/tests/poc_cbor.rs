@@ -1,31 +1,26 @@
-//! TEMPORARY PoC for v2 format unification. Delete after the experiment.
+//! CBOR 編碼行為測試（v2 修訂後：欄位表順序，不做排序）。
 //!
-//! Proves two things:
-//! 1. Plain ciborium output (declaration order) differs from Go's Core
-//!    Deterministic encoding of the same logical struct.
-//! 2. Canonicalising at the Value level (recursively sort map entries by
-//!    encoded key bytes) makes the bytes identical to Go's output.
+//! 歷史：v2 草案曾採「map keys 排序」的 Core Deterministic（P1 驗證過
+//! ciborium Value 層排序可與 Go fxamacker CoreDet 逐 byte 相同），但那是
+//! 「Go 免費、Rust 付 20 倍 encode 成本」的選擇。2026-09-05 修訂為規格釘
+//! 死欄位順序；跨語言一致性由 `tests/interop.rs` 的 tree 向量承擔。
 
 use ciborium::value::Value;
 use serde::{Deserialize, Serialize};
 
-const GO_HEX: &str = "a5616da3636269671b0000010000000000646d6f64651981a4656d74696d651b18d2673ac3468cc3616e65612e7478746176026178a3617a41216c757365722e636f6d6d656e744268697073656375726974792e73656c696e757842780063696473825820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f5820fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0";
-
 #[derive(Serialize, Deserialize)]
 struct Sample {
-    // Declaration order deliberately NOT the canonical sorted order.
-    #[serde(rename = "note", skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
-    #[serde(rename = "ids", skip_serializing_if = "Option::is_none")]
-    ids: Option<Vec<serde_bytes::ByteBuf>>,
-    #[serde(rename = "x", skip_serializing_if = "Option::is_none")]
-    x: Option<std::collections::BTreeMap<String, serde_bytes::ByteBuf>>,
-    #[serde(rename = "m")]
-    m: Meta,
+    // 宣告順序故意不是排序順序：ids < x < m < n < v 才是排序序。
     #[serde(rename = "n")]
     n: String,
     #[serde(rename = "v")]
     v: u64,
+    #[serde(rename = "m")]
+    m: Meta,
+    #[serde(rename = "ids", skip_serializing_if = "Option::is_none")]
+    ids: Option<Vec<serde_bytes::ByteBuf>>,
+    #[serde(rename = "x", skip_serializing_if = "Option::is_none")]
+    x: Option<std::collections::BTreeMap<String, serde_bytes::ByteBuf>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -34,85 +29,47 @@ struct Meta {
     mode: u32,
     #[serde(rename = "mtime")]
     mtime: i64,
-    #[serde(rename = "big")]
-    big: u64,
-}
-
-fn sample() -> Sample {
-    let mut id1 = vec![0u8; 32];
-    for (i, b) in id1.iter_mut().enumerate() {
-        *b = i as u8;
-    }
-    let mut id2 = vec![0u8; 32];
-    for (i, b) in id2.iter_mut().enumerate() {
-        *b = 255 - i as u8;
-    }
-    Sample {
-        note: None,
-        ids: Some(vec![id1, id2].into_iter().map(serde_bytes::ByteBuf::from).collect()),
-        // Order deliberately different from canonical to exercise sorting.
-        x: Some(
-            [
-                ("user.comment", &b"hi"[..]),
-                ("z", &b"!"[..]),
-                ("security.selinux", &b"x\x00"[..]),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), serde_bytes::ByteBuf::from(v.to_vec())))
-            .collect(),
-        ),
-        m: Meta { mode: 0o100644, mtime: 1788605504101452995, big: 1 << 40 },
-        n: "a.txt".to_string(),
-        v: 2,
-    }
-}
-
-/// RFC 8949 §4.2.1 canonicalisation: recursively sort every map's entries
-/// by the bytewise order of the encoded key.
-fn canonical(v: Value) -> Value {
-    match v {
-        Value::Map(entries) => {
-            let mut keyed: Vec<(Vec<u8>, Value, Value)> = entries
-                .into_iter()
-                .map(|(k, val)| {
-                    let mut enc = Vec::new();
-                    ciborium::into_writer(&k, &mut enc).unwrap();
-                    (enc, k, canonical(val))
-                })
-                .collect();
-            keyed.sort_by(|a, b| a.0.cmp(&b.0));
-            Value::Map(keyed.into_iter().map(|(_, k, val)| (k, val)).collect())
-        }
-        Value::Array(items) => Value::Array(items.into_iter().map(canonical).collect()),
-        other => other,
-    }
 }
 
 #[test]
-fn poc_cbor_matches_go_core_deterministic() {
-    let s = sample();
+fn encode_emits_declaration_order_without_sorting() {
+    let s = Sample {
+        n: "a.txt".to_owned(),
+        v: 2,
+        m: Meta { mode: 0o100644, mtime: 1788605504101452995 },
+        ids: None,
+        x: None,
+    };
+    let enc = kist_format::cbor::encode(&s).unwrap();
+    let hex: String = enc.iter().map(|b| format!("{b:02x}")).collect();
+    // n, v, m —— 宣告順序，不是排序序（m < n < v）。
+    assert_eq!(hex, "a3616e65612e74787461760261 6da2646d6f64651981a4656d74696d651b18d2673ac3468cc3".replace(' ', ""));
+}
 
-    let mut plain = Vec::new();
-    ciborium::into_writer(&s, &mut plain).unwrap();
-    let plain_hex = hex::encode(&plain);
-    println!("POC_RUST_PLAIN   {plain_hex}");
-    println!("POC_GO_CANONICAL {GO_HEX}");
-    assert_ne!(plain_hex, GO_HEX, "plain ciborium output already matches Go?!");
+#[test]
+fn decode_rejects_duplicate_map_keys() {
+    // {a: 1, a: 2} —— 重複 key 是偽造或損壞。
+    let dup = [0xa2u8, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02];
+    let v: Result<Value, _> = kist_format::cbor::decode(&dup);
+    assert!(v.is_err(), "duplicate map key must be rejected");
+}
 
-    let mut value_buf = Vec::new();
-    ciborium::into_writer(&s, &mut value_buf).unwrap();
-    let value: Value = ciborium::from_reader(std::io::Cursor::new(&value_buf)).unwrap();
-    let canon = canonical(value);
-    let mut canon_bytes = Vec::new();
-    ciborium::into_writer(&canon, &mut canon_bytes).unwrap();
-    let canon_hex = hex::encode(&canon_bytes);
-    println!("POC_RUST_CANON   {canon_hex}");
+#[test]
+fn decode_rejects_trailing_bytes() {
+    let trailing = [0x01u8, 0x02];
+    let v: Result<u64, _> = kist_format::cbor::decode(&trailing);
+    assert!(v.is_err(), "trailing bytes must be rejected");
+}
 
-    // Round-trip back into the struct to prove decode still works.
-    let back: Sample = ciborium::from_reader(std::io::Cursor::new(&canon_bytes)).unwrap();
-    let mut back_bytes = Vec::new();
-    ciborium::into_writer(&back, &mut back_bytes).unwrap();
-    assert_eq!(hex::encode(&back_bytes), plain_hex, "round-trip not stable");
-
-    assert_eq!(canon_hex, GO_HEX, "canonicalised encoding differs from Go");
+#[test]
+fn decode_ignores_unknown_fields() {
+    // {"known": 1, "future_field": "x"} → 解進只認得 known 的 struct。
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct Known {
+        #[serde(rename = "known")]
+        known: u64,
+    }
+    let bytes = [0xa2u8, 0x45, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x01, 0x4c, 0x66, 0x75, 0x74, 0x75, 0x72, 0x65, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x41, 0x78];
+    let v: Known = kist_format::cbor::decode(&bytes).unwrap();
+    assert_eq!(v.known, 1);
 }

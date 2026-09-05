@@ -147,9 +147,76 @@ pub fn decode_chunk(
     Ok(plaintext)
 }
 
-/// 從整個 pack 的 bytes 讀出 trailer。
+/// 從整個 pack 的 bytes 讀出 trailer，並驗證版本與 trailer 的一致性
+/// （規格 §7：entries 從檔頭 magic 之後連續排列、完整覆蓋資料區、無重複
+/// ID、長度在格式上限內）。trailer 是認證過的，但「認證」不等於「一致」：
+/// 有 bug 的 client 寫出的 pack 一樣有有效 tag。
 pub fn read_trailer(keys: &RepoKeys, pack_bytes: &[u8]) -> Result<PackTrailer> {
     let sealed = pack::trailer_bytes(pack_bytes)?;
     let plain = keys.open_pack_trailer(sealed)?;
-    Ok(cbor::decode(&plain)?)
+    let data_end = pack_bytes.len() - pack::FOOTER_LEN - sealed.len();
+    let trailer: PackTrailer = cbor::decode(&plain)?;
+    if trailer.version != kist_format::FORMAT_VERSION {
+        return Err(CoreError::Corrupt {
+            key: "<pack trailer>".to_owned(),
+            reason: format!(
+                "trailer declares version {}, this build reads {}",
+                trailer.version,
+                kist_format::FORMAT_VERSION
+            ),
+        });
+    }
+    validate_trailer(&trailer, data_end)?;
+    Ok(trailer)
+}
+
+/// trailer 一致性檢查。`max_entry_len` = chunker.max + 1 (algorithm byte)
+/// + 40 (nonce+tag) 的格式上限；這裡用格式允許的最大 chunker.max 推導，
+/// 避免 trailer 檢查反過來依賴每個 repo 的 config。
+pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
+    const MAX_CHUNKER_MAX: u64 = 64 * 1024 * 1024;
+    const MAX_ENTRY_LEN: u64 = MAX_CHUNKER_MAX + 1 + (pack::CHUNK_NONCE_LEN + pack::TAG_LEN) as u64;
+    if trailer.entries.is_empty() {
+        return Err(CoreError::Corrupt {
+            key: "<pack trailer>".to_owned(),
+            reason: "trailer lists no chunks".to_owned(),
+        });
+    }
+    let mut next = pack::HEADER_LEN as u64;
+    let mut seen = std::collections::HashSet::with_capacity(trailer.entries.len());
+    for (i, e) in trailer.entries.iter().enumerate() {
+        if e.offset != next {
+            return Err(CoreError::Corrupt {
+                key: "<pack trailer>".to_owned(),
+                reason: format!("entry {i} starts at {}, expected {next}", e.offset),
+            });
+        }
+        if e.length < pack::MIN_ENTRY_LEN as u64 {
+            return Err(CoreError::Corrupt {
+                key: "<pack trailer>".to_owned(),
+                reason: format!("entry {i} is {} bytes, shorter than an empty sealed chunk", e.length),
+            });
+        }
+        if e.length > MAX_ENTRY_LEN {
+            return Err(CoreError::Corrupt {
+                key: "<pack trailer>".to_owned(),
+                reason: format!("entry {i} is {} bytes, over the {MAX_ENTRY_LEN} a sealed chunk can be", e.length),
+            });
+        }
+        let end = e.offset + e.length;
+        if end > data_end as u64 {
+            return Err(CoreError::Corrupt {
+                key: "<pack trailer>".to_owned(),
+                reason: format!("entry {i} ends at {end}, past the {data_end} bytes of chunk data"),
+            });
+        }
+        if !seen.insert(e.id) {
+            return Err(CoreError::Corrupt {
+                key: "<pack trailer>".to_owned(),
+                reason: format!("chunk {} is listed twice", e.id),
+            });
+        }
+        next = end;
+    }
+    Ok(())
 }

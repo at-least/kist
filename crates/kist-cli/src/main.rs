@@ -109,6 +109,16 @@ enum Command {
     Init {
         #[command(flatten)]
         repo: RepoArgs,
+        /// FastCDC chunk sizes in bytes (min/avg/max). All clients of one
+        /// repository must agree; the values are bound into the master key
+        /// AAD, so a tampered config fails to open instead of silently
+        /// breaking deduplication. Defaults: 524288 / 2097152 / 8388608.
+        #[arg(long, value_name = "BYTES", default_value_t = 512 * 1024)]
+        chunker_min: u32,
+        #[arg(long, value_name = "BYTES", default_value_t = 2 * 1024 * 1024)]
+        chunker_avg: u32,
+        #[arg(long, value_name = "BYTES", default_value_t = 8 * 1024 * 1024)]
+        chunker_max: u32,
     },
     /// Back up one or more paths into a new snapshot.
     Backup {
@@ -358,11 +368,24 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Init { repo } => {
+        Command::Init {
+            repo,
+            chunker_min,
+            chunker_avg,
+            chunker_max,
+        } => {
             let backend = open_backend(&repo)?;
             let password = password::obtain(&repo.password_file, true)?;
             let remote = backend.location().is_remote();
-            Repository::init(backend, password.as_bytes(), InitOptions::default()).await?;
+            let opts = InitOptions {
+                chunker: kist_format::config::ChunkerParams {
+                    min: chunker_min,
+                    avg: chunker_avg,
+                    max: chunker_max,
+                },
+                ..InitOptions::default()
+            };
+            Repository::init(backend, password.as_bytes(), opts).await?;
             println!("repository initialized at {}", repo_display(&repo)?);
             if remote {
                 // config 是唯一可覆寫的物件；被蓋掉就打不開 repo。kist 自己驗不了 bucket 設定，只能提醒。

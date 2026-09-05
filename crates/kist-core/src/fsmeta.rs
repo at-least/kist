@@ -252,6 +252,34 @@ fn gid_of(_: &std::fs::Metadata) -> u32 {
     0
 }
 
+/// 擷取 `user.*` 擴充屬性（與 Go 端同一個 namespace 約定）。
+/// 鍵與值都是 bytes：xattr 名稱不保證是 UTF-8。讀不到（不支援、無權限）
+/// 一律視為沒有——xattr 記錄是盡力而為，不讓備份因此失敗。
+#[cfg(unix)]
+pub fn read_xattrs(path: &Path) -> Option<std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>> {
+    use std::collections::BTreeMap;
+    use std::os::unix::ffi::OsStrExt;
+    let names = xattr::list(path).ok()?;
+    let mut out = BTreeMap::new();
+    for name in names {
+        if !name.as_bytes().starts_with(b"user.") {
+            continue;
+        }
+        if let Ok(Some(value)) = xattr::get(path, &name) {
+            out.insert(
+                serde_bytes::ByteBuf::from(name.as_bytes().to_vec()),
+                serde_bytes::ByteBuf::from(value),
+            );
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+#[cfg(not(unix))]
+pub fn read_xattrs(_: &Path) -> Option<std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>> {
+    None
+}
+
 /// 還原 mode（Unix）與 mtime。symlink 只還原 mtime（且不跟隨連結）。
 pub fn apply(path: &Path, meta: &FsMeta, is_symlink: bool) -> Result<()> {
     let mtime = filetime::FileTime::from_unix_time(
@@ -283,4 +311,29 @@ fn apply_mode(path: &Path, mode: u32) -> Result<()> {
 #[cfg(not(unix))]
 fn apply_mode(_: &Path, _: u32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod xattr_tests {
+    #[test]
+    fn user_xattrs_are_captured_and_sorted() {
+        let dir = std::env::temp_dir().join("kist-fsmeta-xattr-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        // 環境不支援 user.* xattr（某些掛載）就退回：記錄 None 是合法行為。
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        if xattr::set(&path, OsStr::from_bytes(b"user.b"), b"2").is_err() {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("skipping: user.* xattrs not supported here");
+            return;
+        }
+        xattr::set(&path, OsStr::from_bytes(b"user.a"), b"1").unwrap();
+        let got = super::read_xattrs(&path).expect("xattrs present");
+        let names: Vec<Vec<u8>> = got.keys().map(|k| k.to_vec()).collect();
+        assert_eq!(names, vec![b"user.a".to_vec(), b"user.b".to_vec()]);
+        assert_eq!(&got[&serde_bytes::ByteBuf::from(b"user.a".to_vec())][..], b"1");
+        let _ = std::fs::remove_file(&path);
+    }
 }

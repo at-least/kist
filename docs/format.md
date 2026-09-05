@@ -71,23 +71,44 @@ master ─BLAKE3 DeriveKey─▶
 
 ## 4. CBOR 慣例（規範編碼）
 
-所有 metadata 都是 **RFC 8949 Core Deterministic CBOR**：
+所有 metadata 都是 CBOR（RFC 8949）：
 
-- 整數最短編碼；長度 definite；**map 的 key 依「編碼後的 key bytes」字典序
-  排序**。Go 用 fxamacker 的 CoreDetEncOptions；Rust 用 ciborium 編碼後在
-  `Value` 層遞迴排序（實作於 kist-format 的 cbor 模組）。兩者輸出已驗證
-  逐 byte 相同（證據 P1）。
-- struct 一律編成 map，key 是**短標籤**（各結構的欄位表見後文）；
-  欄位在 map 裡永遠排序，所以兩語言的欄位宣告順序不影響 bytes。
-- 禁止把 struct 編成位置陣列（v1 Go 的 `cbor:",toarray"` 不再使用）。
+- 整數最短編碼；長度 definite。
+- **struct 依規格中各結構的欄位表順序輸出——欄位表就是規範順序**。
+  解碼端**不得假設順序**：按欄位名稱取值、忽略未知欄位。這讓任何
+  serde 風格的實作用宣告順序就能編出規範 bytes，不需要排序（v2 草案
+  曾要求 map keys 排序，實測讓 Rust 編碼慢 20 倍；2026-09-05 修訂，
+  兩個實作都零成本）。
+- 一般 map（目前只有 tree 的 `xattrs`）的 key 依 bytes 字典序排序
+  （Rust 的 `BTreeMap` 天然如此；Go 的 xattrs 用自訂 marshaler）。
+- 禁止把 struct 編成位置陣列。
 - 位元組資料（名稱、ID、xattr）一律 byte string（major 2），不是整數陣列、
-  不是 text string（Rust 需 `serde_bytes`/`ByteBuf`；P1 抓到過差異）。
+  不是 text string（Rust 需 `serde_bytes`/`ByteBuf`）。
 - **解碼**：忽略未知欄位（向前相容的基礎）；拒絕重複 map key、indefinite
   length、尾端多餘 bytes。
 - **絕不回寫（never round-trip）**：讀出的物件永遠不重新編碼後寫回。
   寫入端一律從事實來源（檔案系統走訪、pack 寫入器）重新構造。這條規則
   讓「忽略未知欄位」不可能造成靜默資料丟失。
-- 新增欄位：一律有可省略語意（零值省略），舊版照樣能讀。
+- 新增欄位：一律有可省略語意（零值省略），插入位置依欄位表更新並同步
+  兩個實作；舊版照樣能讀。
+
+各結構的欄位表（= 輸出順序）：
+
+| 結構 | 欄位順序 |
+| --- | --- |
+| `Tree` | v, entries, prev |
+| `Entry` | n, t, mode, uid, gid, mtime, ctime, size, target, chunks, ct, tree, dev, ino, nlink, xattrs |
+| `ChunkList` | v, chunks |
+| `PackTrailer` | v, entries |
+| `PackEntry` | i, o, l, r |
+| `IndexBlob` | v, packs, supersedes |
+| `IndexPack` | id, size, entries |
+| `RepoConfig` | v, repo_id, created, chunker, pack_target, slot |
+| `KeySlot` | v, name, created, kdf, wrapped |
+| `KdfParams` | alg, t, m, p, salt |
+| `ChunkerParams` | min, avg, max |
+| `Snapshot` | v, root, time, host, user, paths, client, parent, stats |
+| `SnapshotStats` | files, dirs, symlinks, bytes, chunks_new, chunks_read, packs_new, packs_revived, bytes_stored, errors, files_reused |
 
 ## 5. Sealed 物件（沒有 envelope header）
 
@@ -235,8 +256,11 @@ Pack      { id: 名稱, size: u64（pack 檔總長）, entries:[Entry（§7 同�
   整個忽略（v1 Rust 設計）——兩個 prune 重疊、或 prune 途中 rebuild-index
   都安全；被忽略 blob 獨有的 pack 是「幽靈」，不參加正本選擇，下次
   index 重寫時丟掉。
-- 合併規則：同一 chunk 出現在多個 pack → **pack 名稱最小者贏**（純函數，
-  與載入順序無關；v1 Go 設計）。
+- 合併規則：同一 chunk 出現在多個 pack → **未標記 pack 優先，其次名稱
+  最小者贏**——與 prune 的正本選擇（§13.1）同一個 rank。持有標記集合的
+  讀取端（backup 開始時列出 `gc/`）用完整規則；沒有標記資訊的讀取端
+  （restore、check）用「名稱最小」即可，任一副本都讀得到資料。純函數：
+  給定 pack 集合與標記集合，結果與載入順序無關。
 - `size` 讓 `check` 不讀資料就能抓出被截斷/換掉的 pack（HEAD 比對）。
 - index 只是 pack trailer 的快取，可由所有 pack 重建（`rebuild-index`）。
 
@@ -366,7 +390,7 @@ snapshot 是唯一 commit point：它出現之前的新物件都是可回收垃�
 
 | # | 決定 | 取自 | 證據 |
 | --- | --- | --- | --- |
-| 1 | CBOR Core Deterministic + 短標籤 map + 忽略未知欄位 + never-round-trip | 兩邊折衷 | P1：raw ciborium ≠ fxamacker；Value 層排序後逐 byte 相同 |
+| 1 | CBOR：規格釘死欄位順序（map keys 排序僅 xattrs）+ 忽略未知欄位 + never-round-trip | 產品優先修訂 | 實測排序正規化讓 Rust encode 慢 20 倍（10k 節點 tree 18.6ms vs 0.96ms）；排序是「Go 免費、Rust 付費」的選擇，2026-09-05 修訂為欄位表順序 |
 | 2 | tree 以明文 keyed hash 命名；隨機 nonce；AAD=自 ID；metadata 不壓縮 | Go v1 | P3：zstd 版本改變 → 密文命名改名（e4679e→858150）、明文命名不變；v1 Rust 有實際 bug 記錄 |
 | 3 | 無 envelope header；per-role AAD | Go v1 | 決策 review：AAD 常數/路徑綁 kind，安全性等價、bytes 更少 |
 | 4 | chunk 壓縮位元在明文首 byte；trailer entry 留 {i,o,l,r} 含 raw_len | Go v1 + Rust v1 | Go ADR 009 明言 v2 要 raw_len；advisor：map 優於位置陣列（可演化） |

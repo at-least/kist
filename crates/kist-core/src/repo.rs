@@ -211,10 +211,21 @@ impl Repository {
                 key: key_owned.clone(),
                 reason: e.to_string(),
             })?;
-            decode_index_blob(&payload).map_err(|e| CoreError::Corrupt {
-                key: key_owned,
+            let blob = decode_index_blob(&payload).map_err(|e| CoreError::Corrupt {
+                key: key_owned.clone(),
                 reason: e.to_string(),
-            })
+            })?;
+            if blob.version != kist_format::FORMAT_VERSION {
+                return Err(CoreError::Corrupt {
+                    key: key_owned,
+                    reason: format!(
+                        "index blob declares version {}, this build reads {}",
+                        blob.version,
+                        kist_format::FORMAT_VERSION
+                    ),
+                });
+            }
+            Ok(blob)
         })
         .await
     }
@@ -241,10 +252,21 @@ impl Repository {
                     reason: format!("content hash {actual} does not match its name"),
                 });
             }
-            cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
+            let tree: Tree = cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
                 key: key_owned.clone(),
                 reason: e.to_string(),
-            })
+            })?;
+            if tree.version != kist_format::FORMAT_VERSION {
+                return Err(CoreError::Corrupt {
+                    key: key_owned,
+                    reason: format!(
+                        "tree declares version {}, this build reads {}",
+                        tree.version,
+                        kist_format::FORMAT_VERSION
+                    ),
+                });
+            }
+            Ok(tree)
         })
         .await
     }
@@ -368,6 +390,32 @@ impl Repository {
         Ok(index)
     }
 
+    /// backup 專用的 index：讀進所有有效 index blob，合併規則是
+    /// **未標記 pack 優先、其次名稱最小**——與 prune 的正本選擇同一個
+    /// rank（規格 §10、§13.1）。沒有這條規則，smallest-wins 會把 chunk
+    /// 導向被標記的舊副本，backup 在 prune 收掉它之前每次都重傳。
+    /// 不走本地快取：快取的位置是歷史選擇，不知道標記集合。
+    pub(crate) async fn load_index_for_backup(
+        &self,
+        marks: &std::collections::HashSet<ObjectId>,
+    ) -> Result<ChunkIndex> {
+        let mut errors = Vec::new();
+        let blobs = self.load_index_blobs(&mut errors).await?;
+        if let Some(first) = errors.into_iter().next() {
+            return Err(CoreError::Corrupt {
+                key: "index".to_owned(),
+                reason: format!("{first}; run `kist rebuild-index`"),
+            });
+        }
+        let mut index = ChunkIndex::new();
+        for (_, blob) in &blobs.effective {
+            for pack in &blob.packs {
+                index.add_pack_ranked(pack, |id| marks.contains(id));
+            }
+        }
+        Ok(index)
+    }
+
     pub(crate) async fn write_snapshot(&self, key: &str, snapshot: Snapshot) -> Result<()> {
         let keys = Arc::clone(&self.keys);
         let key_owned = key.to_owned();
@@ -396,10 +444,21 @@ impl Repository {
                     key: key_owned.clone(),
                     reason: e.to_string(),
                 })?;
-            cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
-                key: key_owned,
+            let snap: Snapshot = cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
+                key: key_owned.clone(),
                 reason: e.to_string(),
-            })
+            })?;
+            if snap.version != kist_format::FORMAT_VERSION {
+                return Err(CoreError::Corrupt {
+                    key: key_owned,
+                    reason: format!(
+                        "snapshot declares version {}, this build reads {}",
+                        snap.version,
+                        kist_format::FORMAT_VERSION
+                    ),
+                });
+            }
+            Ok(snap)
         })
         .await?;
         // snapshot 不是以內容命名：用內容裡的 client 與時間反算 key，必須一致。

@@ -33,6 +33,7 @@ gethostname = "1"
 getrandom = "0.4"
 hex = "0.4"
 sha2 = "0.10"
+xattr = "1"
 maud = { version = "0.27", features = ["axum"] }
 object_store = { version = "0.14", default-features = false, features = ["fs", "aws-base", "reqwest", "ring"] }
 prometheus-client = "0.25"

@@ -387,15 +387,17 @@ impl Repository {
         }
         let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = kept.into_iter().unzip();
 
-        let index = self.load_index().await?;
+        // 標記先於 index（與 Go 版同一個 load-bearing 順序）：backup 的
+        // index 合併需要標記集合（未標記 pack 優先，規格 §10）。
         let marks_at_start = self.list_gc_marks().await?;
         let marked: HashSet<ObjectId> = marks_at_start.keys().copied().collect();
         if !marked.is_empty() {
             tracing::info!(
-                "{} pack(s) are marked for deletion and will not be used for deduplication",
+                "{} object(s) are marked for deletion; their packs will not be used for deduplication",
                 marked.len()
             );
         }
+        let index = self.load_index_for_backup(&marked).await?;
 
         let parent = self.find_parent(&opts.client_id, &path_bytes).await?;
         let parent_entries = match &parent {
@@ -638,6 +640,7 @@ impl Backup {
             tracing::warn!("{}: unsupported file type, skipped", path.display());
             return Ok(None);
         }
+        entry.xattrs = fsmeta::read_xattrs(path);
         Ok(Some(entry))
     }
 

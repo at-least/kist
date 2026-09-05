@@ -296,11 +296,39 @@ impl ChunkIndex {
         self.packs.len()
     }
 
-    /// 把一個 index blob 裡的 pack 加進來。同一個 chunk 出現在多個 pack 時保留先加入的。
+    /// 把一個 index blob 裡的 pack 加進來。同一個 chunk 出現在多個 pack
+    /// 時，保留**名稱最小**的 pack（規格 §10）：讓「chunk → pack」的對應
+    /// 是 pack 集合的純函數，與 blob 的載入順序無關——prune 的正本判定
+    /// 依賴這一點，rebuild 之間不能移動正本。
     pub fn add_pack(&mut self, pack: &IndexPack) {
         self.packs.insert(pack.pack, pack.size);
         for e in &pack.entries {
-            self.overlay.entry(e.id).or_insert(location(pack.pack, e));
+            match self.overlay.get_mut(&e.id) {
+                Some(existing) if existing.pack <= pack.pack => {}
+                Some(existing) => {
+                    *existing = location(pack.pack, e);
+                }
+                None => {
+                    self.overlay.insert(e.id, location(pack.pack, e));
+                }
+            }
+        }
+    }
+
+    /// 同 [`Self::add_pack`]，但合併規則帶 rank（例如「未標記優先，
+    /// 其次名稱最小」）：`rank` 對 pack 名稱回傳排序鍵的前半，越小越
+    /// 優先。同一 chunk 出現在多個 blob 時，保留 rank 最小的位置——
+    /// 與 prune 的正本選擇同一個排序。
+    pub fn add_pack_ranked(&mut self, pack: &IndexPack, rank: impl Fn(&ObjectId) -> bool) {
+        self.packs.insert(pack.pack, pack.size);
+        let new_rank = (rank(&pack.pack), pack.pack);
+        for e in &pack.entries {
+            match self.overlay.get(&e.id) {
+                Some(existing) if (false, existing.pack) <= new_rank => {}
+                Some(_) | None => {
+                    self.overlay.insert(e.id, location(pack.pack, e));
+                }
+            }
         }
     }
 
