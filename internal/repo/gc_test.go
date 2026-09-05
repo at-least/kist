@@ -1,11 +1,13 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -25,8 +27,11 @@ type clock struct {
 	at time.Time
 }
 
+// newClock starts at the real wall clock: a v2 mark's age is the mark
+// object's mtime as reported by the backend, so the scenario's time and
+// the filesystem's have to agree at the start.
 func newClock() *clock {
-	return &clock{at: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	return &clock{at: time.Now()}
 }
 
 func (c *clock) now() time.Time {
@@ -161,7 +166,9 @@ func (s *scenario) healthy() {
 		if _, err := r.Restore(ctx, h.Key, target, RestoreOptions{}); err != nil {
 			s.t.Fatalf("restore %s: %v", h.Key, err)
 		}
-		compareTrees(s.t, source, filepath.Join(target, filepath.Base(source)))
+		// The root tree's entries are named by the source's absolute
+		// path, so the restore lands under the target by that full path.
+		compareTrees(s.t, source, filepath.Join(target, source))
 	}
 }
 
@@ -173,7 +180,7 @@ func (s *scenario) packs() int {
 	}
 	defer func() {
 		if err := b.Close(); err != nil {
-			s.t.Errorf("close: %v", err)
+			s.t.Errorf("close backend: %v", err)
 		}
 	}()
 	return countKeys(s.t, b, pack.Prefix)
@@ -186,7 +193,17 @@ func (s *scenario) marks() []crypto.ID {
 	if err != nil {
 		s.t.Fatalf("list marks: %v", err)
 	}
-	return sortedIDs(marks)
+	return sortedMarkIDs(marks)
+}
+
+// sortedMarkIDs returns a mark set's IDs in a stable order.
+func sortedMarkIDs(marks map[crypto.ID]time.Time) []crypto.ID {
+	ids := make([]crypto.ID, 0, len(marks))
+	for id := range marks {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b crypto.ID) int { return bytes.Compare(a[:], b[:]) })
+	return ids
 }
 
 func (s *scenario) source(name string, size int) string {
@@ -202,7 +219,6 @@ func (s *scenario) source(name string, size int) string {
 const (
 	clientA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	clientB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	grace   = 72 * time.Hour
 )
 
 // shortGrace makes the two phases observable in one test without a
@@ -228,39 +244,65 @@ func TestPruneMarksThenSweepsAfterTheGrace(t *testing.T) {
 		t.Fatalf("second run: %+v", second)
 	}
 
-	// After the grace: the only client's last activity is its
-	// registration, which predates the mark, so it still holds.
+	// After the grace the pack goes: the client's only snapshot was
+	// forgotten, and v2 has no client registry -- a client with no
+	// snapshots is not waited for. Its first backup is protected by the
+	// backup-side commit gate instead, not by the sweep.
+	s.clock.advance(2 * time.Hour)
+	third := s.prune(p, shortGrace)
+	if len(third.Deleted) != 1 || third.BytesReclaimed == 0 {
+		t.Fatalf("third run: %+v", third)
+	}
+	if s.packs() != 0 {
+		t.Errorf("%d packs stored, want 0", s.packs())
+	}
+	// The mark of a deleted pack outlives the deletion by one run: a
+	// client listing the marks in the instant after the delete must still
+	// see it.
+	if len(s.marks()) != 1 {
+		t.Fatal("mark removed with the pack; it must outlive it")
+	}
+	if len(p.Index().Packs()) != 0 {
+		t.Errorf("index names %d packs, want 0", len(p.Index().Packs()))
+	}
+
+	fourth := s.prune(p, shortGrace)
+	if len(fourth.Unmarked) != 1 || len(s.marks()) != 0 {
+		t.Fatalf("fourth run did not clear the orphaned mark: %+v", fourth)
+	}
+	s.healthy()
+}
+
+// A client whose newest snapshot predates the mark holds the pack: a
+// backup it started before the mark could still be counting on the pack.
+// That is the whole of the hold rule in v2 -- there is no registry.
+func TestPruneHoldsForAClientWithNoSnapshotNewerThanTheMark(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+	a := s.open(clientA)
+	s.forget(a, s.backup(a, src))        // one's pack becomes dead
+	s.backup(a, s.source("two", 10<<10)) // client active, but before the mark
+	p := s.pruner()
+	first := s.prune(p, shortGrace)
+	if len(first.Marked) != 1 {
+		t.Fatalf("first run: %+v", first)
+	}
+
 	s.clock.advance(2 * time.Hour)
 	third := s.prune(p, shortGrace)
 	if len(third.Held) != 1 || len(third.Deleted) != 0 {
-		t.Fatalf("third run: %+v", third)
+		t.Fatalf("after the grace: %+v", third)
 	}
-	if third.Held[0].Reason != "client "+clientA+" has not been active since the mark" {
-		t.Errorf("hold reason = %q", third.Held[0].Reason)
+	want := "client " + clientA + " has no snapshot newer than the mark"
+	if third.Held[0].Reason != want {
+		t.Errorf("hold reason = %q, want %q", third.Held[0].Reason, want)
 	}
 
-	// The client backs up something else, so it has been active since
-	// the mark. Now the pack goes, the mark stays for the next run, and
-	// the index no longer names the pack.
-	other := s.source("two", 100<<10)
-	s.backup(a, other)
+	// A snapshot newer than the mark releases the hold.
+	s.backup(a, s.source("three", 10<<10))
 	fourth := s.prune(p, shortGrace)
-	if len(fourth.Deleted) != 1 || fourth.BytesReclaimed == 0 {
-		t.Fatalf("fourth run: %+v", fourth)
-	}
-	if s.packs() != 1 {
-		t.Errorf("%d packs stored, want 1", s.packs())
-	}
-	if len(s.marks()) != 1 {
-		t.Errorf("mark removed with the pack; it must outlive it")
-	}
-	if len(p.Index().Packs()) != 1 {
-		t.Errorf("index names %d packs, want 1", len(p.Index().Packs()))
-	}
-
-	fifth := s.prune(p, shortGrace)
-	if len(fifth.Unmarked) != 1 || len(s.marks()) != 0 {
-		t.Fatalf("fifth run did not clear the orphaned mark: %+v", fifth)
+	if len(fourth.Deleted) != 1 {
+		t.Fatalf("after the client became active: %+v", fourth)
 	}
 	s.healthy()
 }
@@ -280,6 +322,9 @@ func TestPruneDryRunChangesNothing(t *testing.T) {
 	}
 }
 
+// A mark's age is the backend's mtime for the mark object, and a mark is
+// written with PutIfAbsent: refreshing it on every run would mean the
+// grace period never ends.
 func TestPruneDoesNotRefreshAnExistingMark(t *testing.T) {
 	s := newScenario(t)
 	a := s.open(clientA)
@@ -287,15 +332,29 @@ func TestPruneDoesNotRefreshAnExistingMark(t *testing.T) {
 	p := s.pruner()
 	s.prune(p, shortGrace)
 	before := s.marks()
-	s.clock.advance(30 * time.Minute)
-	s.prune(p, shortGrace)
 
-	marks, _, err := p.listMarks(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	markMtime := func() time.Time {
+		fi, err := p.Backend().Stat(context.Background(), gcKey(before[0]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Modified
 	}
-	if got := marks[before[0]]; time.Unix(0, got.MarkedNs).After(s.clock.at.Add(-30 * time.Minute)) {
-		t.Errorf("mark was refreshed to %s", time.Unix(0, got.MarkedNs))
+	at := markMtime()
+
+	// The pack is still held by age, so the run neither removed the mark
+	// nor re-wrote it: mark() goes through PutIfAbsent and leaves an
+	// existing mark's bytes -- and therefore its mtime -- alone. (The
+	// backend reports mtime at whole seconds, so a rewrite inside the
+	// same second would go unnoticed here; the PutIfAbsent rule itself is
+	// pinned by the backend conformance suite.)
+	s.clock.advance(30 * time.Minute)
+	again := s.prune(p, shortGrace)
+	if len(again.Held) != 1 || len(again.Marked) != 0 || len(again.Unmarked) != 0 {
+		t.Fatalf("second run: %+v", again)
+	}
+	if got := markMtime(); !got.Equal(at) {
+		t.Errorf("mark was rewritten: mtime %s -> %s", at, got)
 	}
 }
 
@@ -318,38 +377,52 @@ func TestPruneRefusesAnUnhealthyRepository(t *testing.T) {
 	}
 }
 
+// A client nobody has heard from within --forget-clients-after is not
+// waited for, even though it has snapshots predating the mark.
 func TestPruneForgetsAClientNotHeardFromInLong(t *testing.T) {
 	s := newScenario(t)
 	a := s.open(clientA)
 	s.forget(a, s.backup(a, s.source("one", 100<<10)))
+	s.backup(a, s.source("two", 10<<10)) // the client's newest snapshot
 	p := s.pruner()
-	s.prune(p, shortGrace)
+	opts := PruneOptions{Grace: time.Hour, ForgetClientsAfter: 10 * time.Hour}
+	s.prune(p, opts)
 
 	s.clock.advance(2 * time.Hour)
-	if r := s.prune(p, shortGrace); len(r.Held) != 1 {
+	if r := s.prune(p, opts); len(r.Held) != 1 {
 		t.Fatalf("client still within its window: %+v", r)
 	}
-	s.clock.advance(10 * time.Hour) // past 10x grace since the client's last activity
-	if r := s.prune(p, shortGrace); len(r.Deleted) != 1 {
+	s.clock.advance(10 * time.Hour) // past forget-clients-after since the client's last snapshot
+	if r := s.prune(p, opts); len(r.Deleted) != 1 {
 		t.Fatalf("client forgotten: %+v", r)
 	}
+	s.healthy()
 }
 
+// A key under gc/ that parses as a content address is a mark whatever
+// its bytes say (v2 marks are content-free); one whose pack is gone is
+// an orphan and is removed, as is any key that is not a mark at all.
 func TestPruneCleansJunkAndOrphanedMarks(t *testing.T) {
 	s := newScenario(t)
 	p := s.pruner()
 	ctx := context.Background()
-	for _, key := range []string{GCPrefix + "not-a-pack", gcKey(crypto.ID{1})} {
-		if err := backend.PutBytesIfAbsent(ctx, p.Backend(), key, []byte("junk")); err != nil {
-			t.Fatal(err)
-		}
+	if err := backend.PutBytesIfAbsent(ctx, p.Backend(), GCPrefix+"not-a-pack", []byte("junk")); err != nil {
+		t.Fatal(err)
 	}
-	if err := p.mark(ctx, crypto.ID{2}, s.clock.now()); err != nil {
+	if err := p.mark(ctx, crypto.ID{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.mark(ctx, crypto.ID{2}); err != nil {
 		t.Fatal(err)
 	}
 	report := s.prune(p, shortGrace)
-	if len(report.Unmarked) != 1 || report.Unmarked[0] != (crypto.ID{2}) {
-		t.Errorf("unmarked = %v, want the orphan", report.Unmarked)
+	if len(report.Unmarked) != 2 {
+		t.Fatalf("unmarked = %v, want both orphans", report.Unmarked)
+	}
+	for _, id := range []crypto.ID{{1}, {2}} {
+		if !slices.Contains(report.Unmarked, id) {
+			t.Errorf("unmarked = %v, want %s among them", report.Unmarked, id)
+		}
 	}
 	if n := countKeys(t, p.Backend(), GCPrefix); n != 0 {
 		t.Errorf("%d keys left under gc/, want 0", n)
@@ -357,7 +430,9 @@ func TestPruneCleansJunkAndOrphanedMarks(t *testing.T) {
 }
 
 // Scenario A. A backup starts before the mark and its snapshot lands
-// after it. The next run must find the pack live and keep it.
+// after it. The mark is young at commit time, so the backup commits; it
+// is Put-only and leaves the mark, and the next prune -- finding the
+// pack live again -- removes it.
 func TestPruneRaceSnapshotLandsAfterMark(t *testing.T) {
 	s := newScenario(t)
 	src := s.source("one", 300<<10)
@@ -379,14 +454,14 @@ func TestPruneRaceSnapshotLandsAfterMark(t *testing.T) {
 	if s.packs() != 1 {
 		t.Fatalf("the client uploaded again although it saw no mark: %d packs", s.packs())
 	}
-	// The backup noticed the mark at commit and removed it itself.
-	if len(s.marks()) != 0 {
-		t.Errorf("mark survived the commit of a backup that references the pack")
+	// The backup is Put-only: the mark survives the commit.
+	if len(s.marks()) != 1 {
+		t.Fatal("the backup removed a gc mark; v2 backups never remove marks")
 	}
 
 	s.clock.advance(2 * time.Hour)
 	second := s.prune(p, shortGrace)
-	if len(second.Deleted) != 0 || len(second.Marked) != 0 || second.Live != 1 {
+	if len(second.Deleted) != 0 || len(second.Marked) != 0 || len(second.Unmarked) != 1 || second.Live != 1 {
 		t.Fatalf("second run: %+v", second)
 	}
 	if s.packs() != 1 {
@@ -395,10 +470,12 @@ func TestPruneRaceSnapshotLandsAfterMark(t *testing.T) {
 	s.healthy()
 }
 
-// Scenario B. A backup is still in flight when the grace runs out. The
-// sweep must hold the pack because the client has not been active since
-// the mark.
-func TestPruneRaceBackupInFlightAtSweep(t *testing.T) {
+// Scenario B, v2. A backup is in flight when the grace runs out, and the
+// client has no snapshots, so nothing holds the pack: the sweep deletes
+// it. The backup's commit gate re-resolves every referenced chunk, finds
+// the pack missing, and refuses -- no snapshot is written pointing at
+// data that is gone. A re-run re-uploads and commits.
+func TestPruneRaceBackupInFlightAtSweepRefusesToCommit(t *testing.T) {
 	s := newScenario(t)
 	src := s.source("one", 300<<10)
 	a := s.open(clientA)
@@ -414,25 +491,36 @@ func TestPruneRaceBackupInFlightAtSweep(t *testing.T) {
 		sweep = s.prune(p, shortGrace)
 	}
 	defer func() { backupHooks.afterMarks = nil }()
-	s.backup(client, src)
-
-	if len(sweep.Deleted) != 0 || len(sweep.Held) != 1 {
+	_, _, err := client.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	if err == nil {
+		t.Fatal("the backup committed although the pack it referenced was swept")
+	}
+	if len(sweep.Deleted) != 1 {
 		t.Fatalf("sweep during the backup: %+v", sweep)
 	}
-	if s.packs() != 1 {
-		t.Fatalf("%d packs, want the one the in-flight backup relies on", s.packs())
+	if s.packs() != 0 {
+		t.Fatalf("%d packs, want 0", s.packs())
+	}
+	if handles, err := p.Snapshots(context.Background(), ""); err != nil != (len(handles) != 0) || len(handles) != 0 {
+		t.Fatalf("snapshots after the refused commit: %v %v", handles, err)
+	}
+
+	// Re-running re-uploads everything and commits.
+	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("re-run: %v", err)
+	}
+	s.sources[h.Key] = src
+	if snap.Stats.PacksAdded == 0 {
+		t.Error("the re-run uploaded nothing")
 	}
 	s.healthy()
-
-	// And now that the snapshot has landed, the pack is live and, the
-	// commit having removed the mark, there is nothing left to do.
-	if r := s.prune(p, shortGrace); r.Live != 1 || len(r.Deleted) != 0 || len(r.Marked) != 0 {
-		t.Fatalf("after the backup: %+v", r)
-	}
 }
 
-// Scenario C. A backup that starts after the mark sees it, uploads the
-// pack's chunks again and removes the mark.
+// Scenario C. A backup that starts after the mark sees it, re-uploads
+// the marked pack's chunks into a pack of its own, and leaves the mark
+// in place (backups are Put-only). The next prune finds the duplicate
+// and reclaims it.
 func TestPruneRaceRevival(t *testing.T) {
 	s := newScenario(t)
 	src := s.source("one", 300<<10)
@@ -446,15 +534,19 @@ func TestPruneRaceRevival(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.sources[h.Key] = src
-	if len(s.marks()) != 0 {
-		t.Error("the mark survived a backup that referenced the pack")
+	if len(s.marks()) != 1 {
+		t.Fatal("the mark was removed by a backup; v2 backups never remove marks")
 	}
-	if snap.Stats.PacksRevived != 1 || snap.Stats.PacksAdded != 1 || s.packs() != 2 {
-		t.Errorf("revived %d added %d stored %d, want 1 1 2", snap.Stats.PacksRevived, snap.Stats.PacksAdded, s.packs())
+	// Both of the source's chunks (data.bin and note.txt) live in the
+	// marked pack, so both miss: PacksRevived counts chunk-level
+	// re-uploads out of marked packs.
+	if snap.Stats.PacksRevived != 2 || snap.Stats.PacksAdded != 1 || s.packs() != 2 {
+		t.Errorf("revived %d added %d stored %d, want 2 1 2", snap.Stats.PacksRevived, snap.Stats.PacksAdded, s.packs())
 	}
 	s.healthy()
 
-	// Two packs hold the same chunks now; the duplicate is reclaimed.
+	// Two packs hold the same chunks now; the duplicate is reclaimed
+	// once the mark has aged past the grace and the client is active.
 	s.prune(p, shortGrace)
 	s.clock.advance(2 * time.Hour)
 	s.backup(s.open(clientA), s.source("two", 10<<10))
@@ -521,8 +613,8 @@ func TestPruneRaceDuplicatePacksFromConcurrentBackups(t *testing.T) {
 
 // Scenario E. A backup starts after the mark and runs in the instant
 // between the sweep deciding to delete the pack and doing it. The
-// re-upload is what keeps the data: the mark removal loses this race
-// and must not matter.
+// re-upload is what keeps the data: the mark survives (backups are
+// Put-only) and must not matter.
 func TestPruneRaceRevivalDuringSweep(t *testing.T) {
 	s := newScenario(t)
 	src := s.source("one", 300<<10)
@@ -545,8 +637,33 @@ func TestPruneRaceRevivalDuringSweep(t *testing.T) {
 	s.healthy()
 }
 
-// A backup role that cannot remove marks still backs up safely, because
-// the re-upload does not depend on it.
+// The grace period is also the longest a backup may run: anything past
+// it may have had its objects marked, deleted and unmarked already,
+// beyond any after-the-fact check. (A backup with no snapshots has no
+// sweep-side protection; this gate is what keeps its first commit safe.)
+func TestBackupRefusesToCommitAfterTheGracePeriod(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 100<<10)
+	client := s.open(clientA)
+	backupHooks.afterMarks = func() {
+		backupHooks.afterMarks = nil
+		s.clock.advance(DefaultGrace) // the backup is now older than the grace
+	}
+	defer func() { backupHooks.afterMarks = nil }()
+
+	_, _, err := client.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	if !errors.Is(err, ErrBackupTooLong) {
+		t.Fatalf("backup across the grace: err = %v, want ErrBackupTooLong", err)
+	}
+	if handles, err := client.Snapshots(context.Background(), ""); err != nil || len(handles) != 0 {
+		t.Fatalf("a too-long backup committed: %v %v", handles, err)
+	}
+}
+
+// A backup role holds no Delete permission in v2, so a backup cannot
+// remove a mark even in principle. Make the whole gc/ prefix read-only
+// -- stronger than the real permission boundary -- and the backup must
+// not care: it re-uploads out of marked packs and never writes to gc/.
 func TestBackupSurvivesBeingUnableToUnmark(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("a read-only directory does not prevent deletion on Windows; the mechanism under test is POSIX")
@@ -557,32 +674,27 @@ func TestBackupSurvivesBeingUnableToUnmark(t *testing.T) {
 	s.forget(a, s.backup(a, src))
 	s.prune(s.pruner(), shortGrace)
 
-	// Make the mark undeletable on the local backend.
-	markPath := filepath.Join(s.dir, filepath.FromSlash(gcKey(s.marks()[0])))
-	if err := os.Chmod(filepath.Dir(markPath), 0o555); err != nil {
+	gcDir := filepath.Join(s.dir, "gc")
+	if err := os.Chmod(gcDir, 0o555); err != nil {
 		t.Fatal(err)
 	}
 	restore := func() {
-		if err := os.Chmod(filepath.Dir(markPath), 0o755); err != nil {
+		if err := os.Chmod(gcDir, 0o755); err != nil {
 			t.Errorf("restore permissions: %v", err)
 		}
 	}
 	t.Cleanup(restore)
 
-	var warnings []string
-	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{
-		SpoolDir: t.TempDir(),
-		Warnf:    func(f string, a ...any) { warnings = append(warnings, f) },
-	})
+	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 	s.sources[h.Key] = src
-	if len(warnings) == 0 {
-		t.Error("no warning about the mark that could not be removed")
-	}
 	if snap.Stats.PacksAdded != 1 {
 		t.Errorf("chunks were not re-uploaded: %+v", snap.Stats)
+	}
+	if len(s.marks()) != 1 {
+		t.Fatal("the mark did not survive; it must, backups are Put-only")
 	}
 	restore()
 	s.healthy()
@@ -628,83 +740,6 @@ func TestPruneRewritesTheIndexAfterACrashedSweep(t *testing.T) {
 	s.healthy()
 }
 
-// A mark placed during a backup, on a client that cannot remove marks.
-// The commit-time revival fails; the snapshot lands referencing the
-// pack; prune's own recompute is the last line and must find the pack
-// live.
-func TestPruneRaceMarkDuringBackupWithoutUnmarkPermission(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("a read-only directory does not prevent deletion on Windows; the mechanism under test is POSIX")
-	}
-	s := newScenario(t)
-	src := s.source("one", 300<<10)
-	a := s.open(clientA)
-	s.forget(a, s.backup(a, src))
-	p := s.pruner()
-	gcDir := filepath.Join(s.dir, "gc")
-
-	restore := func() {
-		if err := os.Chmod(gcDir, 0o755); err != nil {
-			t.Errorf("restore permissions: %v", err)
-		}
-	}
-	backupHooks.afterMarks = func() {
-		backupHooks.afterMarks = nil
-		s.prune(p, shortGrace)
-		if err := os.Chmod(gcDir, 0o555); err != nil {
-			t.Fatal(err)
-		}
-	}
-	defer func() { backupHooks.afterMarks = nil }()
-	t.Cleanup(restore)
-
-	var warnings []string
-	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{
-		SpoolDir: t.TempDir(),
-		Warnf:    func(f string, a ...any) { warnings = append(warnings, f) },
-	})
-	restore()
-	if err != nil {
-		t.Fatalf("backup: %v", err)
-	}
-	s.sources[h.Key] = src
-	if len(warnings) == 0 || snap.Stats.PacksAdded != 0 {
-		t.Fatalf("expected a warning and no upload; warnings %v, packs added %d", warnings, snap.Stats.PacksAdded)
-	}
-	if len(s.marks()) != 1 {
-		t.Fatal("the mark should have survived: the client could not remove it")
-	}
-
-	s.clock.advance(2 * time.Hour)
-	report := s.prune(p, shortGrace)
-	if len(report.Deleted) != 0 || len(report.Unmarked) != 1 {
-		t.Fatalf("prune after the backup: %+v", report)
-	}
-	if s.packs() != 1 {
-		t.Errorf("%d packs, want 1", s.packs())
-	}
-	s.healthy()
-}
-
-// Backup credentials can write under clients/. Junk there must not stop
-// prune, and must not be deleted either: an honest client's damaged
-// record is its only protection while its first backup runs.
-func TestPruneToleratesJunkClientRecords(t *testing.T) {
-	s := newScenario(t)
-	p := s.pruner()
-	ctx := context.Background()
-	if err := backend.PutBytesIfAbsent(ctx, p.Backend(), clientKey("cccccccccccccccccccccccccccccccc"), []byte("junk")); err != nil {
-		t.Fatal(err)
-	}
-	report := s.prune(p, shortGrace)
-	if len(report.UnreadableClients) != 1 {
-		t.Errorf("unreadable clients = %v, want the junk record", report.UnreadableClients)
-	}
-	if n := countKeys(t, p.Backend(), ClientsPrefix); n != 1 {
-		t.Errorf("%d keys under clients/, want the junk left in place", n)
-	}
-}
-
 // A client whose clock runs ahead can look active since a mark it never
 // saw. The skew margin holds the pack for it.
 func TestPruneHoldsWithinTheClockSkew(t *testing.T) {
@@ -730,46 +765,4 @@ func TestPruneHoldsWithinTheClockSkew(t *testing.T) {
 		t.Fatalf("with a one-minute skew: %+v", swept)
 	}
 	s.healthy()
-}
-
-// Assumption 4 of format.md §12, violated: a backup that runs longer
-// than --forget-clients-after. The client deduplicated against a pack
-// that was unmarked when it looked; the pack is marked, the client is
-// forgotten, the pack is swept, and the snapshot commits pointing at
-// chunks that are gone. The argument does not hold and the data is
-// lost -- the documented limit. What is promised instead: the loss is
-// visible to check, and the next prune refuses to touch anything.
-func TestPruneRaceBackupLongerThanForgetClientsAfter(t *testing.T) {
-	s := newScenario(t)
-	src := s.source("one", 300<<10)
-	a := s.open(clientA)
-	s.forget(a, s.backup(a, src)) // the pack is dead but not yet marked
-
-	client := s.open(clientA)
-	p := s.pruner()
-	var sweep PruneReport
-	backupHooks.afterMarks = func() {
-		backupHooks.afterMarks = nil
-		s.prune(p, shortGrace) // marks the pack the backup is about to rely on
-		s.clock.advance(11 * time.Hour)
-		sweep = s.prune(p, shortGrace) // grace and 10x grace both passed: the client is forgotten
-	}
-	defer func() { backupHooks.afterMarks = nil }()
-	s.backup(client, src)
-
-	if len(sweep.Deleted) != 1 || len(sweep.Held) != 0 {
-		t.Fatalf("sweep with the client forgotten: %+v", sweep)
-	}
-
-	report, err := p.Check(context.Background(), CheckOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.OK() {
-		t.Fatal("check passed a snapshot whose pack was swept from under it")
-	}
-	t.Logf("check: %v", report.Problems)
-	if _, err := p.Prune(context.Background(), shortGrace); !errors.Is(err, ErrUnhealthy) {
-		t.Fatalf("prune after the loss: %v, want ErrUnhealthy", err)
-	}
 }

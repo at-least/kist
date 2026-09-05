@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -16,6 +17,7 @@ func newBackupCommand() *cobra.Command {
 		host     string
 		spoolDir string
 		parity   int
+		gcGrace  time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -34,6 +36,7 @@ func newBackupCommand() *cobra.Command {
 					Host:     host,
 					SpoolDir: spoolDir,
 					Parity:   parity,
+					GCGrace:  gcGrace,
 					Warnf:    warnInto(cmd, ev),
 				})
 				if err != nil {
@@ -54,6 +57,7 @@ func newBackupCommand() *cobra.Command {
 		},
 	}
 
+	cmd.Flags().DurationVar(&gcGrace, "gc-grace", 0, "grace period prune uses; the backup refuses to commit past it (0: 72h)")
 	flags.register(cmd)
 	cmd.Flags().StringVar(&host, "host", "", "host name to record in the snapshot (default: this machine's)")
 	cmd.Flags().StringVar(&spoolDir, "spool-dir", "", "where to stage packs before upload (default: the system temporary directory)")

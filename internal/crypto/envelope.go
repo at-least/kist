@@ -122,7 +122,7 @@ func NonceStream(source io.Reader) (io.Reader, error) {
 
 	h := blake3.New(IDSize, nil)
 	// hash.Hash forbids Write from returning an error.
-	_, _ = h.Write([]byte("kist/v1/nonces")) //nolint:errcheck // hash.Hash.Write never fails
+	_, _ = h.Write([]byte("kist/v2/nonces")) //nolint:errcheck // hash.Hash.Write never fails
 	_, _ = h.Write(seed[:])                  //nolint:errcheck // hash.Hash.Write never fails
 	return h.XOF(), nil
 }

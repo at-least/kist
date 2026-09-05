@@ -1,393 +1,388 @@
-# kist 儲存格式 v1
+# kist repo 格式（v2 — Go/Rust 統一版）
 
-> **狀態：M1 結束時凍結。** 之後只能透過每個物件的 `version` 欄位演進——加欄位要加版本號，改語意要加版本號。
-> 這份文件描述的是**實作**，每一項都有 `testdata/` 的 golden file 或測試在守著；文末列出對應關係。
+這份文件是 kist 儲存格式的**權威規格**，由 Go（`github.com/at-least/kist`）與
+Rust（`kist-rs`）兩個實作共同遵守，兩邊各放一份**內容相同**的本文件；
+改動格式必須同時改兩邊的程式碼、golden files 與本文件。
 
-## 0. 一句話
+> 狀態：**v2，2026-09-05 定案**。v2 是兩個互不相容的 v1（Go 版與 Rust 版，
+> 各自凍結、皆未發佈、無真實資料）的統一格式，直接取代兩者，不提供 v1
+> 遷移。每個設計決定都以跨語言 PoC 實驗取得證據（見 §18 證據對照表）；
+> 決策過程與 advisor 結論記錄在兩邊的 `docs/decisions/`（統一格式 ADR）。
 
-repo 是一個 key-value 命名空間。除了 `config` 以外，所有物件都是不可變的、以內容 hash 命名的密文。沒有鎖，沒有需要就地更新的東西。
+## 1. 總覽
 
-## 1. 命名空間
+repo 是一個 key → bytes 的命名空間（本機目錄、S3 bucket…）。所有物件除了
+`config` 與 `keys/*` 之外都是**不可變**的；寫入一律用 conditional put
+（`PutIfAbsent`），同名即同內容：
 
-| Key | 內容 | 命名依據 |
-| --- | --- | --- |
-| `config` | repo 參數 + 金鑰封裝 | 固定名稱，**唯一的明文物件** |
-| `keys/<id>` | 額外 key slot（多密碼 / 還原金鑰） | *M1 未實作*，格式已保留 |
-| `packs/<hash>` | pack file | 密文全檔的 **unkeyed** BLAKE3-256 |
-| `indexes/<hash>` | index blob | 密文的 unkeyed BLAKE3-256 |
-| `trees/<hash>` | 目錄物件 | 明文 canonical CBOR 的 **keyed** BLAKE3-256 |
-| `snapshots/<clientID>/<ts>` | 快照 | 固定位置 |
-| `gc/<packID>` | 待刪標記（§12） | 固定位置 |
-| `clients/<clientID>` | client 登記（§12） | 固定位置 |
-| `parity/<packID>` | Reed-Solomon 校驗（§13），**明文** | 固定位置 |
+| key | 內容 | 加密 | 命名 |
+| --- | --- | --- | --- |
+| `config` | `RepoConfig`（明文 CBOR） | 否（不含祕密） | 固定 |
+| `keys/<slot hex>` | `KeySlot`（明文 CBOR），選配 | 否 | 使用者取 |
+| `packs/<hex>` | pack：magic ‖ 加密 chunks ‖ 加密 trailer ‖ tail | 每 chunk 獨立 AEAD | BLAKE3(整檔 bytes)，無 key |
+| `trees/<hex>` | sealed(`Tree`) | 整段 AEAD | **keyed** BLAKE3(明文 CBOR) |
+| `indexes/<hex>` | sealed(`IndexBlob`)（可 zstd） | 整段 AEAD | BLAKE3(整檔 bytes)，無 key |
+| `snapshots/<client hex>/<ts>` | sealed(`Snapshot`) | 整段 AEAD | client id + 時間 |
+| `gc/<object hex>` | 待刪標記：固定 8 bytes `KISTGC2\n` | 否（不含資訊） | 被標記物件的名稱 |
+| `parity/<pack hex>` | Reed-Solomon 同位（選配，明文 CBOR） | 否 | 對應的 pack |
 
-### Key 文法
+「無 key BLAKE3」指對**寫進 repo 的 bytes** 做一般 BLAKE3，小寫 hex。任何人
+不持金鑰都能驗證物件沒被改過；名稱不洩漏明文資訊。**tree 例外**：tree 的
+名稱是對**明文 CBOR** 的 keyed BLAKE3（§2、§18 證據 P3）——目錄沒變，
+名稱就絕對不變，與加密/壓縮的任何偶然無關。
 
-```
-segment = (lowercase-alnum / "-" / "_") *( lowercase-alnum / "-" / "_" / "." )
-key     = segment *( "/" segment )
-```
+**讀取端必須驗證名稱**：tree 讀出後重算 keyed hash 對名稱；pack / index
+讀出後重算無 key hash 對名稱；snapshot 用 AAD（= 完整 key）綁定。
 
-三個限制各有原因，不是美學：
+## 2. 識別碼
 
-- **沒有冒號**——`2026-01-02T03:04:05Z` 這種 RFC 3339 時間戳在 Windows 上不是合法檔名，本機 repo 會直接壞掉。
-- **segment 不能以 `.` 開頭**——local backend 在上傳中途會寫 `.tmp-<random>` 暫存檔，這條規則讓那些檔案永遠不可能被當成物件。
-- 沒有 `..`、沒有空 segment、沒有大寫——路徑穿越與大小寫不敏感檔案系統的問題一次解決。
+- `ChunkId`（32 bytes）＝ keyed BLAKE3(hash key, chunk 明文)。只出現在
+  加密內容裡，**永遠不是** repo 的 key。
+- tree ID ＝ keyed BLAKE3(hash key, tree 明文 CBOR bytes)。與 ChunkId
+  同函式、同金鑰，只是輸入不同；作為 `trees/<hex>` 的名稱與 AEAD 的 AAD。
+- pack / index blob 名稱 ＝ BLAKE3(物件密文 bytes)，無 key。
 
-實作：`internal/backend.ValidateKey`。
+CBOR 內一律是 32-byte 的 byte string（major 2）；路徑裡一律小寫 hex。
 
-三個後端各自怎麼做到「條件寫入」：local 用 `os.Link`（EEXIST）；S3 用 `If-None-Match: *`（412）；SFTP 用 `hardlink@openssh.com`——SFTP v3 沒有「已存在」的狀態碼，OpenSSH 回的是通用的 `SSH_FX_FAILURE`，所以 link 失敗後再 `Stat` 一次：名字存在（而 link 是原子的，存在就是完整的）就是 `ErrExists`，否則回真正的錯誤。三者都由同一份 `runConformance` 驗。
-
-### 不變條件
-
-1. **讀得到的物件就是完整的。** 部分寫入絕不能出現在最終名稱底下，crash 之後也不行。這是「不用鎖也能檢查 repo」的根據。
-2. **物件不就地修改。** 例外只有兩個：`config`（未來的 `key add` 要改寫 key slot），以及 `check --repair` 把損壞的 pack 換成**經 hash 證明與名字相符**的位元組（§13）。其他變更只有 Delete，而且只有維護操作會做。
-3. **`PutIfAbsent` 是條件寫入**，不是最佳化。備份客戶端若能覆寫既有的 pack，光靠自己的憑證就能毀掉整個 repo。
-
-## 2. 金鑰階層
-
-```
-password
-  │  Argon2id（參數存在 config 的 KeySlot，明文）
-  ▼
-KEK ──AEAD 解封──▶ master key（32 B，隨機）
-                     │  HKDF-SHA256，salt = repoID
-                     ├─ "kist/v1/chunk" ─▶ chunk key   （chunk payload）
-                     ├─ "kist/v1/hash"  ─▶ hash key    （內容定址）
-                     ├─ "kist/v1/index" ─▶ index key   （pack trailer、index blob）
-                     └─ "kist/v1/meta"  ─▶ meta key    （tree、snapshot、gc）
-```
-
-- Argon2id 預設 RFC 9106 第二組：t=3、m=64 MiB、p=4。第一組（2 GiB）不是一個「同時在跑備份的機器」可以假設能配置的。
-- salt 是 repoID，所以同一把 master key 用在兩個 repo 也會得到互不相關的 subkey。
-- master key 封裝時的 AAD 是 `"kist/v1/master" || repoID`，所以 key slot 無法搬到另一個 repo 使用。
-
-### AAD 對照表
-
-每個密封物件都宣告自己扮演的角色，讓密文不能從 repo 的一處貼到另一處。
-
-| 物件 | 金鑰 | AAD |
-| --- | --- | --- |
-| chunk payload | chunk | chunk ID（32 B） |
-| pack trailer | index | `"kist/v1/pack-trailer"` |
-| index blob | index | `"kist/v1/index"` |
-| tree | meta | tree ID（32 B） |
-| snapshot | meta | 完整 key path（含 clientID 與時間戳） |
-| gc 標記 | meta | 完整 key path（`gc/<packID>`） |
-| client 登記 | meta | 完整 key path（`clients/<clientID>`） |
-| wrapped master key | KEK | `"kist/v1/master" || repoID` |
-| parity | — | **不密封**（§13 說為什麼） |
-
-pack trailer 與 index blob 用**常數** AAD，因為它們的名字是自己密文的 hash——密封的當下名字還不存在，用名字當 AAD 會循環。代價是 A pack 的 trailer 貼到 B pack 上仍然能通過認證；擋住這件事的是兩層：trailer 的**一致性檢查**（entry 必須恰好鋪滿 chunk 資料區，不能有洞、重疊或重複），以及 pack 以密文 hash 命名——貼過去名字就對不上，`check` 會抓到。
-
-### AEAD 封裝
+## 3. 金鑰階層
 
 ```
-sealed = nonce(24 B) || XChaCha20-Poly1305(plaintext, aad)   // 含 16 B tag
+password ─Argon2id(salt 16B, m=64 MiB, t=3, p=4)─▶ KEK (32B)
+KEK ─XChaCha20-Poly1305 解開 slot 的 wrapped ─▶ master key (32B)
+master ─BLAKE3 DeriveKey─▶
+    "kist/v2/hash"    → ChunkId 與 tree ID 的 keyed hash key
+    "kist/v2/chunk"   → chunk 加密
+    "kist/v2/meta"    → tree 與 snapshot 加密
+    "kist/v2/index"   → pack trailer 與 index blob 加密
 ```
 
-nonce 由 `crypto.NonceStream` 產生：從 32 B 種子展開成 BLAKE3 XOF。這不是為了方便，是為了讓「傳進一個不會前進的亂數來源」這個錯誤**不可能發生**——那會造成同一把金鑰下的 nonce 重用，是這個格式唯一無法倖存的錯誤。
+- 子金鑰推導用 **BLAKE3 DeriveKey**（context 如上），不是 HKDF（§18 決策 5）；
+  兩語言的 DeriveKey 已用固定向量驗證逐 byte 相同（證據 P4）。
+- Argon2id 預設 64 MiB / t=3 / p=4（RFC 9106 第二組建議）；參數存在 config，
+  讀取端有上限檢查（m ≤ 1 GiB、t ≤ 64、p ≤ 64、salt 恰 16 bytes）。
+- `wrapped` 的 AAD ＝ `"kist/v2/master\0"`（15 bytes）‖ `repo_id`（16B）‖
+  `chunker.min` ‖ `chunker.avg` ‖ `chunker.max`（各 u32 little-endian）。
+  chunker 參數綁進 AAD：明文 config 被竄改時 master 解不開，而不是悄悄
+  讓去重失效。`pack_target` 可調，不綁。
+- **沒有 nonce key**：v2 沒有任何決定性 nonce（§5），這類 bug 整個消失
+  （v1 Rust 曾真實發生 ADR 002 記錄的壓縮前後 bug）。
+- 整條鏈（KEK、四把子金鑰、AAD 排版、sealed master 含 Poly1305 tag）
+  已有跨語言測試向量（證據 P4），兩邊測試套件永久保留。
 
-## 3. Chunking
+## 4. CBOR 慣例（規範編碼）
 
-FastCDC，min 512 KiB / avg 2 MiB / max 8 MiB，normalization 2，seed 0。
+所有 metadata 都是 **RFC 8949 Core Deterministic CBOR**：
 
-- mask 由 `bits = round(log2(2 MiB)) = 21` 推出：`maskSmall = 1<<23 - 1`、`maskLarge = 1<<19 - 1`。寫成常數而非執行期 `math.Log2`——不同平台的浮點捨入足以無聲分裂格式。
-- gear hash 每個 chunk 從 0 重新開始，**前 MinSize 位元組不進 hash**。
-- 緩衝區保證游標後永遠有 ≥ MaxSize 位元組（除非輸入用盡），所以邊界只取決於內容，不取決於 reader 一次給多少。
+- 整數最短編碼；長度 definite；**map 的 key 依「編碼後的 key bytes」字典序
+  排序**。Go 用 fxamacker 的 CoreDetEncOptions；Rust 用 ciborium 編碼後在
+  `Value` 層遞迴排序（實作於 kist-format 的 cbor 模組）。兩者輸出已驗證
+  逐 byte 相同（證據 P1）。
+- struct 一律編成 map，key 是**短標籤**（各結構的欄位表見後文）；
+  欄位在 map 裡永遠排序，所以兩語言的欄位宣告順序不影響 bytes。
+- 禁止把 struct 編成位置陣列（v1 Go 的 `cbor:",toarray"` 不再使用）。
+- 位元組資料（名稱、ID、xattr）一律 byte string（major 2），不是整數陣列、
+  不是 text string（Rust 需 `serde_bytes`/`ByteBuf`；P1 抓到過差異）。
+- **解碼**：忽略未知欄位（向前相容的基礎）；拒絕重複 map key、indefinite
+  length、尾端多餘 bytes。
+- **絕不回寫（never round-trip）**：讀出的物件永遠不重新編碼後寫回。
+  寫入端一律從事實來源（檔案系統走訪、pack 寫入器）重新構造。這條規則
+  讓「忽略未知欄位」不可能造成靜默資料丟失。
+- 新增欄位：一律有可省略語意（零值省略），舊版照樣能讀。
 
-自己實作，理由與等價性證明見 [ADR 002](decisions/002-chunking.md)。
+## 5. Sealed 物件（沒有 envelope header）
 
-**chunk ID = keyed BLAKE3-256(hash key, 明文)**，32 B，不截斷。keyed 的意義：能猜到檔案內容的攻擊者，無法用 repo 裡的名字來確認猜測。
-
-## 4. Pack 檔
+tree / snapshot / pack trailer / chunk 的密封形式都是：
 
 ```
-┌─────────────────────────────────────────┐
-│ sealed chunk 0                          │  nonce(24) || AEAD(algo(1) || payload)
-│ sealed chunk 1                          │
-│ ...                                     │
-├─────────────────────────────────────────┤
-│ sealed trailer                          │  AEAD over canonical CBOR
-├─────────────────────────────────────────┤
-│ trailer length          8 B, big endian │
-│ magic "kistpk" + version  6 B + 2 B BE  │
-└─────────────────────────────────────────┘
+nonce(24) ‖ ciphertext ‖ tag(16)        // XChaCha20-Poly1305
 ```
 
-從尾端往回讀：magic → trailer 長度 → trailer。這讓每個 pack 自我描述，index 因此永遠只是快取。
+AAD 依角色：
 
-**Trailer**（明文形式）：
-
-```cbor
-{ "v": 1, "entries": [ [id(32 B), offset(uint), length(uint)], ... ] }
-```
-
-- `offset` 指向 sealed chunk 的第一個位元組（也就是 nonce），`length` 是 sealed 形式的完整長度。`(offset, length)` 就是 reader 要抓的 byte range。
-- 這個三元組跟 index 存的三元組**完全相同**，trailer 與 index 不可能對同一件事有兩種解讀。
-- 讀取時檢查的不只是「能不能解密」，還有一致性：entry 必須依序、無洞、無重疊、無重複地鋪滿 chunk 資料區，長度不得小於一個空信封、不得大於 `chunker.MaxSize + 1 + overhead`。用合法金鑰簽出來的爛 trailer 仍然是爛 trailer。
-
-**Chunk framing**：AEAD 明文的第一個位元組是壓縮演算法（`0` = raw、`1` = zstd），其餘是 payload。放在密文裡面，所以解密後 chunk 自我描述，trailer 維持三欄。
-
-**壓縮決策**：壓下去再比，不抽樣。保留壓縮結果的條件是 `len(z) < len(p) - len(p)/16`——省不到 1/16 就不值得每次還原都付解壓成本。解碼器上限設在 `chunker.MaxSize`：實測一個 1796 B 的 zstd frame 宣稱解出 16 MiB，會被直接拒絕。
-
-**Pack 命名 = 密文全檔的 unkeyed BLAKE3-256**。三個後果：不持有任何金鑰也能驗證完整性；兩個 client 造出相同 pack 會自動去重；**寫入者在寫完最後一個位元組前不知道名字**，所以 pack 一定是先落到本機 spool 檔再上傳，不會在記憶體裡組。
-
-目標大小 64 MiB，寫滿或 backup 結束時 flush。
-
-## 5. Index blob
-
-```cbor
-{ "v": 1, "packs": [ [packID(32 B), [ [id, offset, length], ... ]], ... ] }
-```
-
-- 依 pack 分組，所以 packID 不會在每個 entry 重複。
-- 編碼前依 packID 排序：Go 的 map 迭代順序是隨機的，不排序的話兩個 client 記錄同一批工作會寫出兩個 blob 而不是去重成一個。
-- 一次 backup 一個 blob，在最後一個 pack 上傳之後、snapshot 提交之前寫。
-- **壞掉的 blob 不是致命錯誤。** 打不開的 blob 會被跳過並警告，因為「打開 repo」正是執行 `rebuild-index` 的前提——把它當致命錯誤會變成一個修不了的死結。`rebuild-index` 先寫新 blob 再刪舊的，所以中途 crash 會留下重複（載入時會合併），不會留下空窗。
-- **index 永遠只是快取。** `rebuild-index` 只讀 pack trailer 就能重建出完全相同的答案，測試會把 blob 全刪掉來證明這件事。
-
-## 6. Tree 物件
-
-```cbor
-{ "v": 1, "entries": [ { "n": name, "t": type, "mode": …, … }, ... ] }
-```
-
-Entry 欄位（除 `n`、`t`、`mode` 外皆 `omitempty`）：
-
-| 欄位 | 說明 |
+| 物件 | AAD |
 | --- | --- |
-| `n` | 名稱，不得為空、`.`、`..`，不得含 `/` 或 NUL |
-| `t` | 0 = file、1 = dir、2 = symlink |
-| `mode`, `uid`, `gid`, `mtime`, `ctime` | 中繼資料，`mode` 含 setuid/setgid/sticky |
-| `size` | 檔案長度 |
-| `target` | symlink 目標 |
-| `chunks` | 檔案的 chunk ID 陣列，**inline** |
-| `tree` | 子目錄的 tree ID |
-| `dev`, `ino`, `nlink` | 硬連結識別（僅 `nlink > 1` 時記錄） |
-| `xattrs` | 延伸屬性（M1 記錄，還原是 M4） |
+| chunk | 該 chunk 的 `ChunkId`（32 bytes） |
+| tree | 該 tree 自己的 ID（32 bytes） |
+| snapshot | 完整 key 路徑的 UTF-8 bytes（如 `snapshots/<client>/<ts>`） |
+| pack trailer | 常數 `"kist/v2/pack-trailer"` |
+| index blob | 常數 `"kist/v2/index"` |
 
-**tree 以明文命名，不是密文。** 這一條是承重牆：密文 hash 每次密封都會變（nonce 是隨機的），沒改過的目錄每晚都會換名字，「未變動的子樹整棵重用」就永遠不會發生。
+- **全部用 OS 亂數 24-byte nonce**。v1 Rust 的 tree 決定性 nonce（密文命名
+  的前提）隨密文命名一起淘汰（證據 P3）。
+- 沒有 32-byte header（v1 Rust 的 envelope 淘汰）：kind 由 AAD 常數/路徑綁定，
+  壓縮旗標只在需要的地方出現（index blob 的明文首 byte），版本在明文 CBOR
+  的 `v` 欄位與 pack magic 裡。未認證的 bytes 減到最少（nonce 一種）。
+- tree / snapshot 的明文 = 規範 CBOR，**不壓縮**（P3 的簡化；物件本來就小，
+  且 tree 名稱在明文上，壓縮沒有意義）。
 
-Entry 編碼前依名稱 bytewise 排序，所以一個目錄只有一種編碼、一個名字，跟 client 用什麼順序走它無關。
+## 6. Chunk（資料塊）
 
-還原時的順序是**先 chown 再 chmod**。POSIX 的 chown 會清掉 setuid 與 setgid 位元，反過來做會無聲地把它們吃掉：
+payload = `algorithm byte ‖ 資料`：0 = 原文，1 = zstd。algorithm byte 是
+**AEAD 明文的第一個 byte**（self-describing；v1 Go 設計）。壓縼規則：
+zstd level 3，壓縮後若沒省下 > 1/16（6.25%）就存原文。解壓上限 =
+`chunker.max`（防炸彈）。
 
-```
-after chmod:  ugrwxr-xr-x
-after lchown: -rwxr-xr-x
-```
+讀取端解密後**重算 ChunkId** 對照索引——AEAD 證明 bytes 沒被換，
+重算證明當初的 ID 沒有說謊。
 
-Socket、FIFO、device node 會被跳過並警告：忠實還原它們需要還原程序不該假設有的權限，而且它們的「內容」從來不是使用者想存的東西。
-
-**大檔的 chunk list 內嵌。** 100 GiB 的檔案約 1.6 MiB 的 ID，tree 扛得住。扛不住的是「一個目錄裡放很多超大檔案」——動一個檔就要重寫一個很大的 tree。那是 tree v2 加一層 indirection 的時機，[ADR 004](decisions/004-tree-and-naming.md) 記錄了它，現在**刻意不做**。
-
-## 7. Snapshot
-
-Key：`snapshots/<clientID>/<ts>`，`ts` 格式 `20060102t150405.000000000z`。
-
-固定寬度所以字典序就是時間序；沒有冒號所以在 Windows 上是合法檔名。
-
-```cbor
-{ "v": 1, "root": treeID, "time": int64 ns, "host": str,
-  "paths": [str], "client": str, "stats": {...} }
-```
-
-- **snapshot 是 commit point**：所有 pack、tree、index 都上傳完成後才寫。M1 之後的每個操作都遵守這個順序。中途死掉只會留下沒人引用的物件——浪費空間，不會產生讀不出來的 repo。
-- 寫入用 `PutIfAbsent`。撞到同一奈秒的兩個 client 是兩次備份，不是一次覆蓋另一次；碰撞就往後推一奈秒重試。
-- AAD 是完整 key path，所以 snapshot 被搬到另一個 client 的命名空間就打不開了。
-- 讀取時還會檢查「key 說的」和「物件說的」是否一致：key 只是名字，物件才是紀錄，只信一邊的 reader 可以被一次改名騙過。
-
-`stats` 只是回報，不是結構：沒有任何讀取路徑拿它做決定。欄位：`files dirs symlinks bytes chunks_new chunks_read packs_added packs_revived bytes_stored`，全部 `omitempty`。`packs_revived`（§12）是 M3 加的；因為 decoder 拒絕未知欄位，M1/M2 的 binary 讀不了帶這個欄位的 snapshot——v1 尚未對外發佈，所以直接改，不另開版本。
-
-`clientID` 是本機持久化的 16 B 隨機值（`$XDG_CONFIG_HOME/kist/clients/<repoID>`），不是 hostname。hostname 在一個機群裡會重複、改機器名就會變、而且會把不必要的資訊寫進 repo 列表。hostname 放在 snapshot 內容裡當人看的標籤。
-
-## 8. Config
-
-**唯一的明文物件。**
-
-也是格式上唯一**允許**被覆寫的物件——未來的 `key add`（新增 key slot）需要這個能力。但**目前沒有任何生產程式碼會覆寫它**：`saveConfig` 走的是 `PutIfAbsent`，`Init` 另外還先檢查 config 是否已存在。`Backend.Put`（無條件覆寫）現在沒有生產呼叫者，它存在是為了 M2 之後的 `key add`。
-
-```cbor
-{ "v": 1, "repo_id": 16 B, "created": int64 ns,
-  "chunker": { "min": …, "avg": …, "max": … },
-  "slot": { "v": 1, "kdf": { "alg": "argon2id", "t":…, "m":…, "p":…, "salt": 16 B },
-            "wrapped": …, "created": … } }
-```
-
-明文是必要的：任何金鑰存在之前就必須先讀得到 Argon2id 參數與 salt。其餘欄位對「能列出這個 repo 的人」本來就不是秘密。
-
-chunker 參數會被記錄並在 open 時強制比對。參數不同的 repo 跟這個 build 完全去重不到，寧可拒絕開啟也不要無聲地讓它膨脹一倍。
-
-## 9. CBOR 規則
-
-- 一律 Core Deterministic（RFC 8949 §4.2.1）：最短形式、map key bytewise 排序。**這不是美觀問題**——tree 以編碼的 hash 命名，兩個編碼器差一個 byte 就會讓一個目錄有兩個名字。
-- 時間一律 `int64` 奈秒欄位，不用 CBOR time tag。
-- 解碼嚴格：拒絕重複 map key、拒絕不定長度項目、拒絕未知欄位、拒絕尾端多餘位元組，並限制陣列與 map 大小。
-  - **拒絕未知欄位**是刻意的：不認識的欄位代表這個物件是更新的格式寫的。默默丟掉它會讓 reader 拿半份文件去做決定；`version` 欄位存在的意義就是讓這件事變成一聲響亮的失敗。
-
-## 10. 權限模型
-
-`PLAN.md` 說「backup 只需要 Put 權限」。**實作之後這句話要修正**。下表不是推理出來的，是 `TestS3BackupPolicy` 用一個只持有這張表權限的 MinIO 使用者跑完整個 backup 得到的——少一項就跑不完：
-
-| 操作 | Get | List | Put（條件式） | Delete |
-| --- | --- | --- | --- | --- |
-| `backup` | `config`、`indexes/*` | `indexes/`、`gc/` | `packs/ indexes/ trees/ snapshots/ clients/ parity/` | 僅 `gc/*` |
-| `restore` / `check` | 全部 | 全部 | — | — |
-| `forget` / `prune` / `rebuild-index` | 全部 | 全部 | `gc/*`、`indexes/*` | 全部 |
-| `check --repair` | 全部 | 全部 | **無條件** `packs/*`（只寫回 hash 等於名字的位元組） | — |
-
-backup **不需要**讀 tree：tree 一律用 `PutIfAbsent` 寫，去重靠的是「已存在」的回應，不是先讀再比。
-
-**SFTP（M4）**：OpenSSH 沒有 per-prefix 的權限模型，能做的是 `Match User backup` + `ChrootDirectory` + `ForceCommand internal-sftp -P <黑名單>`。但 kist 的備份帳號**不能**把 `remove` 列進黑名單：每次 `PutIfAbsent` 都以 `Remove(.tmp-*)` 結尾——不只競態時——禁了 `remove` 之後每個物件都會留下第二個硬連結的名字（List 看不到、共用同一個 inode），prune 刪掉 `packs/<id>` 之後位元組仍然被 `.tmp-*` 佔著，什麼都回收不到。實測（`TestSFTPRemoveBlacklistLeavesSpoolFilesBehind`，OpenSSH 開 `-P remove`）：`PutIfAbsent` 照樣成功、目錄裡多出一個 `.tmp-*`，`Delete` 回 access denied。所以老實的說法是：**在 SFTP 上，抗勒索性質沒有任何一半能由伺服器端強制**——備份憑證能刪也能覆寫，性質只對誠實的 client 成立。要一個不需要 `remove` 的備份帳號，路徑是改用 OpenSSH 的 `SSH_FXP_RENAME`（探測證明它在 OpenSSH 上不覆寫），但它的原子性與在其他伺服器上的行為都沒驗過；記下來，不做。`prune` 用的維護帳號不加 `-P`。
-
-### 抗勒索性質，以及它在哪裡成立
-
-真正的性質不是「只有 Put」，是：
-
-> **在資料前綴上沒有 Delete，而且 Put 是條件式的。**
-
-前半由 IAM 保證，兩個服務都成立。後半分兩種情況：
-
-- **AWS S3**：bucket policy 可以用 `s3:if-none-match` 條件鍵**要求** PutObject 必須帶 `If-None-Match`（[AWS 文件](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html)，2024-11 起）：
-  ```json
-  "Action": "s3:PutObject",
-  "Condition": {"Null": {"s3:if-none-match": "false"}}
-  ```
-  這樣一個被入侵的 client 送出無條件的 PutObject 會被儲存端拒絕。性質屬於**儲存端**。**UNVERIFIED**：本機沒有 AWS 帳號，這一條沒有實際跑過。
-- **MinIO（RELEASE.2025-09-07）**：拒絕這個條件鍵（`invalid condition key 's3:if-none-match'`）。政策裡放不進去，所以無條件的 PutObject 會成功並覆寫 pack——`TestS3BackupPolicy` 實測 `err=<nil>, overwrote=true`。在 MinIO 上，覆寫保護只對**誠實的 client** 成立：kist 自己永遠送 `If-None-Match: *`，MinIO 也正確地以 412 拒絕（conformance 測試證明），但政策攔不住一個不送這個 header 的攻擊者。
-
-所以 `PLAN.md` 的「Put 權限-only 的 IAM policy 可完成 backup」驗收條件通過了，但它證明的東西比看起來少：它證明 backup 不需要 Delete，沒有證明 backup 不能覆寫。後者在 AWS 上可以用一行條件補上，在 MinIO 上目前不行。
-
-### Object Lock 與版本控制
-
-`PLAN.md` 說 `prune` 對受鎖物件「直接略過並回報」。實測（`TestS3ObjectLockIsReportedNotFought`，MinIO `mc mb --with-lock` + `retention set --default governance 1d`）之後，行為是這樣定的：
-
-- 在有版本控制的 bucket 上，不帶 version ID 的 `DeleteObject` **成功**——寫一個 delete marker——即使底下的版本被鎖住。之後對那個 key 的 Get 是 404、List 不再列出它，但位元組留著繼續計費。只有指定 version 的刪除才會被拒絕。
-- kist **永遠不刪版本**。要在版本控制底下真的回收空間，是 bucket 擁有者的 lifecycle policy 的事（`NoncurrentVersionExpiration`），不是備份工具該自己動手的。
-- `backend.Delete` 在 `DeleteObject` 之後用 `ListObjectVersions` 看一眼：那個 key 還有版本留著就回 `ErrLocked`。列版本是另一項權限（`s3:ListBucketVersions`），拿不到就當作看不見——刪除本身已經發生了。
-- `prune` 對回 `ErrLocked` 的 pack：計入 `locked`、**不計入回收位元組**，其餘處理跟刪掉的 pack 完全一樣——index 停止指向它、標記留到下一輪。它已經讀不到了，index 再指著它就是謊話。`forget` 對 snapshot 同理。維護用的刪除（舊 index blob、標記、垃圾）把 `ErrLocked` 當成功：要的結果（key 讀不到了）已經成立。
-
-MinIO 上這條全部跑過。AWS S3 的行為文件上相同，**UNVERIFIED**。
-
-## 11. 這些說法各自由什麼守著
-
-| 說法 | 證據 |
-| --- | --- |
-| AEAD 信封、子金鑰、key slot 不變 | `internal/crypto/testdata/{envelope,subkeys,ids,keyslot}.*` |
-| 一個位元組的竄改（金鑰/AAD/nonce/密文/tag）一定失敗 | `TestOpenRejectsTampering`，9 個案例 |
-| nonce 來源不前進也不會重用 nonce | `TestNonceStreamAdvancesEvenWhenItsSourceDoesNot` |
-| chunk 邊界不變 | `internal/chunker/testdata/boundaries.txt`（64 MiB 決定性輸入）+ `TestGearTableDigest` |
-| 邊界與 reader 的讀取大小無關 | `TestBoundariesDoNotDependOnReadSizes`（`iotest.OneByteReader`） |
-| 插入位元組不會重排後面的邊界 | `TestBoundariesSurviveAnInsertionAtTheFront` |
-| pack 位元組不變 | `internal/pack/testdata/pack.txt`（完整的小 pack，逐位元組） |
-| pack 損壞會被拒絕 | `TestReaderRejectsDamagedPacks`（9 種）+ `TestReaderRejectsInconsistentTrailer`（7 種） |
-| 同一個 chunk 不會在一個 pack 裡出現兩次 | `TestDuplicateContentWithinOnePackIsStoredOnce`、`TestWriterRefusesADuplicateChunk` |
-| index blob 壞掉不會讓 repo 打不開，而且修得回來 | `TestADamagedIndexBlobIsRepairable`、`TestRebuildIndexPersists` |
-| restore 不會寫到目標目錄外面 | `TestSafeJoinRefusesEscapes` |
-| setuid/setgid/sticky 位元會被還原 | `TestBackupRestoreIsByteForByte`（模式比對含這三個位元） |
-| 解壓炸彈被擋 | `TestDecompressionBombIsRefused`（1796 B → 宣稱 16 MiB） |
-| index blob 不變、可從 pack 重建 | `internal/index/testdata/index.txt`、`TestRebuildReconstructsTheIndexFromPacksAlone` |
-| tree 不變、順序無關、內容變則名變 | `internal/tree/testdata/tree.txt`、`TestNewSortsEntries`、`TestAChangedEntryChangesTheName`（10 種變動） |
-| snapshot 不變、不覆寫、綁定 key | `internal/snapshot/testdata/snapshot.txt`、`TestSaveNeverOverwrites`、`TestSnapshotIsBoundToItsKey` |
-| backup → restore 逐位元組相同 | `TestBackupRestoreIsByteForByte`、`TestAcceptance` |
-| 第二次備份幾乎不寫東西 | `TestSecondBackupOfUnchangedDataWritesNoPacks` |
-| 只改一個檔只重寫那條路徑 | `TestIncrementalBackupOnlyRewritesTheChangedPath` |
-| `check` 抓得到人為破壞的 pack | `TestCheckDetectsDamage`、`TestOnlyReadDataCatchesAFlippedBitInAChunk` |
-| 同一個 chunk 在多個 pack 裡時，index 指向的那個跟加入順序無關 | `TestDuplicateChunkResolvesToTheSmallestPackID` |
-| retention 規則按 UTC 分桶、跳過空桶、每個 client 各算各的 | `TestRetentionPolicyApply`、`TestRetentionPolicySkipsEmptyBuckets`、`TestForgetAppliesThePolicyPerClient` |
-| 沒給規則也沒指名 → 拒絕 | `TestForgetRefusesToForgetEverything` |
-| prune 兩階段、grace、client 條件、標記不刷新、dry-run 不動手 | `TestPruneMarksThenSweepsAfterTheGrace`、`TestPruneDoesNotRefreshAnExistingMark`、`TestPruneDryRunChangesNothing` |
-| 壞掉的 repo 不能 prune | `TestPruneRefusesAnUnhealthyRepository` |
-| 刻意競態下不會刪到活的 chunk（A–E，§12） | `TestPruneRaceSnapshotLandsAfterMark`、`TestPruneRaceBackupInFlightAtSweep`、`TestPruneRaceRevival`、`TestPruneRaceDuplicatePacksFromConcurrentBackups`、`TestPruneRaceRevivalDuringSweep`、`TestPruneRaceMarkDuringBackupWithoutUnmarkPermission`；D 另在 MinIO 上跑 `TestS3PruneReclaimsDuplicatePacks` |
-| sweep 中途 crash 不會留下「index 指著不存在的 pack 而標記已消失」 | `TestPruneRewritesTheIndexAfterACrashedSweep` |
-| 拿不到 `gc/*` Delete 的 backup 仍然安全 | `TestBackupSurvivesBeingUnableToUnmark` |
-| `clients/` 底下的垃圾擋不住 prune、也不會被刪 | `TestPruneToleratesJunkClientRecords` |
-| 時鐘偏差在容許值內會 hold | `TestPruneHoldsWithinTheClockSkew` |
-| 假設 4 違反（backup 跑超過 `--forget-clients-after`）：資料會丟，但 `check` 看得見、下一次 prune 拒絕動手 | `TestPruneRaceBackupLongerThanForgetClientsAfter` |
-| backup 權限只能刪 `gc/*` | `TestS3BackupPolicy/can_revive_a_marked_pack_and_nothing_more` |
-| Object Lock 底下：回報、不計回收、index 不再指向、repo 仍健康 | `TestS3ObjectLockIsReportedNotFought` |
-| 小檔備份的每檔成本（chunker buffer 重用） | `BenchmarkBackupSmallFiles`、`TestResetChunksLikeAFreshChunker` |
-| SFTP 吞吐量是量過的數字 | `TestSFTPThroughput` |
-| SFTP 的 Put / Get 忽略已取消的 ctx（限制，釘住以便察覺函式庫改變） | `TestSFTPPutAndGetIgnoreACancelledContext` |
-| OpenSSH `-P remove` 黑名單下 `PutIfAbsent` 仍成功但留下 `.tmp-*`、`Delete` 失敗（§10：黑名單不可行） | `TestSFTPRemoveBlacklistLeavesSpoolFilesBehind` |
-| parity 物件不變、edge size 都對 | `internal/parity/testdata/parity.txt`、`TestEncodeAndParseAtAwkwardSizes` |
-| ≤ M 個 shard 損壞（含 trailer、同 shard 兩處）修得回逐位元組相同；> M 不動 pack | `TestRepairsUpToMShards`、`TestRefusesMoreThanMErasures`、`TestCheckRepairsADamagedPackFromParity`、`TestCheckReportsWhatParityCannotRepair` |
-| 偽造的 parity 修不出錯的東西 | `TestForgedParityCannotRepairWrongly`、`TestCheckReportsWhatParityCannotRepair/forged_parity` |
-| parity header 自相矛盾在配置記憶體之前就被拒 | `TestParseRejectsInconsistentHeaders`、`FuzzParse` |
-| prune 連 parity 一起刪、孤兒 parity 會清 | `TestPruneRemovesParityWithThePack` |
-| backup 憑證能寫 parity 不能刪；Object Lock 下 repair 用 Put 成功 | `TestS3BackupPolicy/can_write_parity_and_cannot_delete_it`、`TestS3ObjectLockIsReportedNotFought` |
-
-## 12. 垃圾回收（M3）
-
-沒有鎖，所以 GC 是用**時間**和**兩個小物件**換來的。全部細節與論證在 [ADR 007](decisions/007-garbage-collection.md)；這裡只放格式。
-
-### 物件
-
-```cbor
-gc/<packID>        { "v": 1, "marked": int64 ns, "by": clientID }    // meta key，AAD = key
-clients/<clientID> { "v": 1, "first_seen": int64 ns }                 // meta key，AAD = key
-```
-
-兩者都用 `PutIfAbsent` 寫、**從不更新**：標記越舊 pack 越快能刪，重寫等於 grace 永遠不會到期；登記時間是下界，之後的活動由 snapshot 說。
-
-### 生命週期
+## 7. Pack
 
 ```
-活的 pack：某個 snapshot 的某個 chunk 在 index 裡「解析到」它。
-            解析 = 同一個 chunk 在多個 pack 裡時取 packID 最小的那個（§5），
-            所以兩個 client 同時打包同一份資料，一個活、一個死。
-
-prune 一輪 =
-  1. 列 gc/、indexes/、clients/、snapshots/（順序有意義），讀所有 pack trailer，走遍所有 snapshot。
-     任何 snapshot / tree / chunk 解析不到 → 中止，不動任何東西。
-  2. 標記：死而未標 → 寫 gc/<id>；活而有標 → 刪標記。
-  3. 清掃：有標、標記早於 now − grace、這輪算出來還是死的、
-           而且每個「還在等的 client」的最後活動都晚於 標記 + clock-skew
-           → 刪 pack。標記**留著**。
-  4. index 若指到任何不存在的 pack（這輪刪的，或上一輪刪到一半 crash 的）→ 重寫 index blob。
-  5. 這輪開始時就已經不存在的 pack 的標記 → 刪。步驟 4 一定在 5 之前。
-
-backup 開頭 =
-  登記 clients/<id> → 列 gc/ → 重新載入 index → 才開始讀檔。
-  chunk 已存在但在被標記的 pack 裡 → 當成不存在：重傳，並刪標記（一個 pack 一次）。
-  提交 snapshot 之前再列一次 gc/：這次備份參照到的 pack 若在中途被標記 → 刪標記。
++-------------------+----------------------+------------------+--------------------+-------------------+
+| magic 8B          | chunk entry × N      | trailer (sealed) | trailer len u64 BE | magic 8B          |
++-------------------+----------------------+------------------+--------------------+-------------------+
 ```
 
-「還在等的 client」= 最後活動（登記時間與最新 snapshot 取晚者）距今不超過 `--forget-clients-after`（預設 10 × grace）。預設 grace 72h、clock-skew 1h。
+- magic ＝ `"kistpk"` ‖ 版號 u16 big-endian（v2 = `0x0002`），**檔頭檔尾各一份**，
+  兩處必須一致；trailer 的 `v` 也必須等於 2（三處一致，v1 Go 規則）。
+- chunk entry ＝ `nonce(24) ‖ AEAD(chunk key, nonce, AAD=ChunkId, payload)`，
+  entry 之間無分隔符，位置只記在 trailer。
+- trailer 明文 = CBOR `{v:2, entries:[Entry]}`（不壓縮），以 index key 密封：
 
-### 假設（違反其中之一，論證就不成立）
-
-1. 後端 read-after-write 一致：寫完的物件立刻能被 List 和 Get 看到。S3 自 2020 起如此；M4 的 SFTP 後端也必須如此。
-2. 一個 client 同一時間只跑一個 backup。
-3. client 與 pruner 的時鐘差距在 `--clock-skew` 之內。
-4. 一個 backup 不會跑超過 `--forget-clients-after`。違反的後果（`TestPruneRaceBackupLongerThanForgetClientsAfter` 演給你看）：那次 backup 去重時倚賴的 pack 在它提交前被標記、等它的 client 被遺忘、pack 被掃掉，snapshot 提交後指著不存在的 chunk。資料就是丟了；保證的只剩 `check` 回報「which no pack holds」、下一次 prune 因此拒絕動任何東西。
-
-## 13. Parity（M5，可選）
-
-`backup --parity M`（或設定檔 `[repository] parity = M`，M ∈ 1..8，預設 0 = 不寫）在每個 pack 旁邊寫一個 `parity/<packID>`。這是**寫入端的選擇**，不記在 repo 裡：有的 client 開、有的不開都可以，`check` 回報「N of M packs have parity」，沒有不算問題。
-
-```cbor
-parity/<packID>  { "v": 1, "k": 16, "m": M, "pack_size": u64, "shard_len": u32,
-                   "hashes": [16+M] × BLAKE3-256, "parity": [M] × bstr }
+```
+Entry { i: ChunkId, o: u64 起點(含 nonce), l: u64 長度(nonce+密文+tag), r: u64 明文長度 }
 ```
 
-- 對**整個密封後的 pack**（chunk 密文、trailer、tail）做 Reed-Solomon：切成固定 16 個等長 shard（最後一個補零，`pack_size` 還原），算 M 個 parity shard。M=2 是 12.5% 開銷，能修任意 2/16 的損壞，包括 trailer。
-- `shard_len` 必須恰好是 `ceil(pack_size/16)`；parse 在配置任何依 header 決定大小的記憶體之前先驗完所有界限。
-- **為什麼是明文**：密文上的 RS 是偽隨機位元組的線性組合，不洩漏任何東西；shard hash 是密文的 hash；而修復的正確性證明是 `CiphertextID(結果) == packID`——pack 的**名字就是 checksum**。所以偽造或損壞的 parity 只能讓修復**失敗**，不能讓它錯誤地成功；也因此一個不持密碼的 scrub 工具可以在儲存端修 pack。
-- **修復**（`check --repair`，隱含 `--read-data`）：讀 pack、切 shard、比 hash 找出壞的（截斷或多出來的部分也算壞）、壞的 > M 就回報無法修復；重建；**驗 `CiphertextID == packID`**；才用 `Put` 寫回（三個後端都是原子替換；Object Lock 底下是新版本，鎖允許）；寫完再 `VerifyAll` 一次——AEAD tag 是最後一句話。
-- prune 刪 pack 時一併刪 parity；孤兒 parity 在 index 重寫之後清。復活不碰 parity。
-- 不做的：tree、snapshot、index blob 沒有 parity（小，或可重建）；parity 不是第二個 repo 的替代品。
+  `r`（raw_len）是 v2 新欄位：mount/進度/還原不需要先解密解壓就知道大小
+  （v1 Go ADR 009 明言這是 v2 該補的欄位）。不需要 flags 欄位——壓縮位元
+  在 chunk 明文的 algorithm byte 裡。
+- trailer len 是 big-endian u64。讀取：先 range read 檔尾 16 bytes。
+- pack 名稱 = BLAKE3(整檔 bytes)。目標大小 = `config.pack_target`
+  （預設 64 MiB，寫滿或 backup 結束才 flush）。
+- trailer 一致性檢查（讀取端強制）：entries 從檔頭 magic 之後連續排列、
+  完整覆蓋資料區、無重複 ID、`l` ≤ chunker.max + 1 + 40。
+- 讀取端對整個 pack 重算 BLAKE3 對名稱（`check --read-data` 時）。
 
-## 相關決策
+## 8. Tree
 
-- [001 — 專案骨架、module path 與工具鏈基準](decisions/001-project-skeleton.md)
-- [002 — 內容定義切塊：自己實作 FastCDC](decisions/002-chunking.md)
-- [003 — Pack 格式與壓縮](decisions/003-pack-format.md)
-- [004 — Tree、Snapshot 與命名](decisions/004-tree-and-naming.md)
-- [005 — Backend 原子性與權限模型](decisions/005-backend-atomicity.md)
-- [006 — S3 後端與無鎖並發](decisions/006-s3-backend.md)
-- [007 — 垃圾回收：標記、grace、登記與復活](decisions/007-garbage-collection.md)
-- [008 — SFTP 後端](decisions/008-sftp-backend.md)
-- [009 — mount：唯讀 FUSE](decisions/009-mount.md)
-- [010 — Parity：明文 sidecar 與以名字為證的修復](decisions/010-parity.md)
+```
+Tree  { v:2, entries:[Entry...], prev: tree ID | null }
+Entry {
+  n:  檔名 byte string（Unix = 原 OS bytes；Windows = UTF-8）
+  t:  類型 u8：0 檔案, 1 目錄, 2 符號連結
+  mode: u32（含檔案類型位元；Windows = 0）
+  uid, gid: u32（Windows = 0）          省略若 0
+  mtime: i64 奈秒
+  ctime: i64 奈秒（快速路徑用；0 = 沒有）省略若 0
+  size: u64（僅檔案）                    省略若 0
+  target: bytes（僅符號連結）            省略若空
+  chunks: [ChunkId]（≤256 個，直接內嵌） 省略若空
+  ct:  u8 內容型態：省略/0 = 直接；1 = 間接（chunks 指向 ChunkList 的資料塊）
+  tree: 子目錄 tree ID（目錄分段時 = 最後一段）省略若 0
+  dev, ino, nlink: u64（硬連結；nlink>1 才記）省略若 0
+  xattrs: map<byte string, byte string>（鍵依規範排序）省略若空
+}
+ChunkList { v:2, chunks:[ChunkId] }
+```
+
+- `entries` 依 `n` 的 bytes 升冪排序，同一目錄內名稱不重複（讀取端驗證）。
+- **根 tree 的節點名稱 = 備份來源的絕對路徑 bytes**（可含 `/`，如
+  `/tmp/poc/go2-data`；讀取端驗證「絕對路徑、乾淨元件」）。子目錄的
+  節點一律是單一路徑元件。restore 依此在目標底下重建完整絕對路徑。
+- **tree 名稱 = keyed BLAKE3(明文 CBOR)**（P3）：同名必然同內容，加密、
+  nonce、壓縮版本的偶然都不影響去重。AAD = 自己的 ID，讀取端重算 hash。
+- **大目錄**：每 10 000 個節點切段，後一段的 `prev` 指向前一段；父目錄記
+  **最後一段**；讀取沿 `prev` 收集後從最舊讀起（v1 Rust 設計）。
+- **大檔案**：chunk 清單 > 256 個改間接——清單編成 `ChunkList`、當一般
+  資料切塊入 pack，tree 只留 chunk ID（v1 Rust 設計；v1 Go ADR 004 明言
+  這是 v2 該做的）。
+- **硬連結**：`dev/ino/nlink` 記錄（v1 Go 設計），restore 優先重建連結、
+  失敗降級為複本並警告。
+- **xattr**：記錄；restore 套用失敗會回報而非假裝成功。Go 端以自訂
+  marshaler 產生 byte-string key 的規範 map（Go 原生 map 做不到 byte key）。
+- 空目錄 → `tree` 指向空 entries 的 tree；空檔案 → `chunks` 省略。
+- 寫入端每次 backup 一律重新 put 每個 tree（幂等）；冪等性由明文命名保證。
+
+## 9. Snapshot
+
+key：`snapshots/<client hex>/<ts>`，`ts` = `YYYYMMDDTHHMMSSnnnnnnnnnZ`
+（UTC、奈秒 9 位、無冒號；字典序 = 時間序，Windows 安全）。寫入必須
+conditional put；同 key 已存在就前進 1 奈秒重試（有上限）。
+
+```
+Snapshot {
+  v: 2,
+  root: tree ID（根目錄分段時 = 最後一段）,
+  time: i64 奈秒（= backup 開始時刻，與 key 同一瞬間；讀取端核對一致）,
+  host: text,
+  user: text,                              省略若空
+  paths: [byte string],
+  client: bytes(16)（與 key 的 client hex 必須一致）,
+  parent: text | null（上一個 snapshot 的 key；僅加速，可null）,
+  stats: { files, dirs, symlinks, bytes, chunks_new, chunks_read, packs_new,
+           packs_revived, bytes_stored, errors, files_reused }（全部可省略）
+}
+```
+
+`client` 由每台機器隨機產生存本機（不是 hostname）。AAD = 完整 key。
+快速路徑（v1 Rust 設計）：parent 存在且 `paths` 相同時，size + mtime +
+ctime + inode 都沒變、且 mtime/ctime 早於 parent 開始時間（防 racy clean）
+的檔案直接沿用 chunk 清單。
+
+## 10. Index blob
+
+key：`indexes/<BLAKE3(密文) hex>`。明文 = `algorithm byte ‖ CBOR`：
+
+```
+IndexBlob { v:2, packs:[Pack...], supersedes:[名稱...] }
+Pack      { id: 名稱, size: u64（pack 檔總長）, entries:[Entry（§7 同型）] }
+```
+
+- 以 index key 密封，AAD = `"kist/v2/index"`；algorithm byte 同 chunk
+  （0 原文 / 1 zstd），壓縮用同樣的 1/16 門檻。實測 map 形狀 + zstd
+  比 v1 陣列形狀不壓縮還小（8192 packs：8.8 MB vs 12.1 MB；證據 P5）。
+- 讀取：先讀所有 blob，收集全部 `supersedes`，被任何**有效** blob 列到的
+  整個忽略（v1 Rust 設計）——兩個 prune 重疊、或 prune 途中 rebuild-index
+  都安全；被忽略 blob 獨有的 pack 是「幽靈」，不參加正本選擇，下次
+  index 重寫時丟掉。
+- 合併規則：同一 chunk 出現在多個 pack → **pack 名稱最小者贏**（純函數，
+  與載入順序無關；v1 Go 設計）。
+- `size` 讓 `check` 不讀資料就能抓出被截斷/換掉的 pack（HEAD 比對）。
+- index 只是 pack trailer 的快取，可由所有 pack 重建（`rebuild-index`）。
+
+## 11. Config 與 KeySlot
+
+key `config`，明文規範 CBOR（唯一可覆寫的物件：換密碼、改 pack_target）：
+
+```
+RepoConfig {
+  v: 2,
+  repo_id: bytes(16),
+  created: i64 奈秒,
+  chunker: { min: u32, avg: u32, max: u32 },   預設 512 KiB / 2 MiB / 8 MiB
+  pack_target: u64,                            預設 64 MiB
+  slot: KeySlot                                （slot 0）
+}
+KeySlot {
+  v: 2,
+  name: text,                                  省略若空
+  created: i64 奈秒,
+  kdf: { alg: "argon2id", t: u32, m: u32(KiB), p: u32, salt: bytes(16) },
+  wrapped: bytes = nonce(24) ‖ 密文(32) ‖ tag(16)
+}
+```
+
+參數範圍（讀取端強制）：`min` 64..=1 MiB、`avg` 256..=16 MiB、
+`max` 1 KiB..=64 MiB、min ≤ avg ≤ max；`pack_target` 64 KiB..=4 GiB 且
+≥ `max`。額外 slot 寫 `keys/<slot hex>`（明文 KeySlot，只增不改）。
+
+## 12. 切塊（FastCDC）
+
+兩個實作必須對同 bytes + 同參數產出**完全相同的邊界**（P2 證明 v1 兩家
+不同：Go 3 塊 vs Rust 2 塊）。v2 以 Go 的實作為準：
+
+- FastCDC（Xia et al. 2016）+ normalized level 2；
+- gear 表 = fastcdc-go v0.2.0 的 256×u64 表，**逐 byte 凍結**
+  （LE 串接 SHA-256 = `a98fa4184eb747cd769328307242285f9d4b25afeb28f71ef3fe437a4c278e28`）；
+  兩邊程式碼各自內嵌同一張表並以 digest 測試釘死；
+- 邊界函式：hash 從 `min` 開始算（前 min bytes 不參與）、尚未滿 avg 用
+  `mask_s`、超過 avg 用 `mask_l`、硬邊界 `max`、尾巴不足 min 就整段；
+- mask 由 avg 推導：`bits = round(log2(avg))`、
+  `mask_s = (1<<(bits+2))-1`、`mask_l = (1<<(bits-2))-1`
+  （avg=2 MiB 時 bits=21：`0x00ff_ffff` / `0x0007_ffff`）；
+- 參數來自 config（不是寫死），讀取端驗範圍；
+- 緩衝無關性：讀取器必須保證掃描位置之後 ≥ max bytes（或輸入結束），
+  使邊界與 reader 分塊方式無關；
+- 跨語言 golden：固定輸入的邊界清單存兩邊 testdata，CI 互驗。
+
+## 13. GC
+
+- 標記 `gc/<名稱>`，內容固定 8 bytes `KISTGC2\n`（**不帶任何資訊**：
+  什麼時候標記看後端修改時間，標記什麼看名稱）。conditional put 寫入，
+  已存在不重寫（時間不重設）。pack / tree / index 共用一個命名空間。
+- 沒有 `clients/` 註冊表：活躍與否由 snapshot 推得（§13.2）。
+- 時間一律**取整到秒**（S3 list/head 精度不同；本機 mtime 截秒）：
+  同秒內「重寫過」與「標記」分不出先後時，prune 當重寫過（不刪）、
+  backup 當沒重寫（不 commit）——都取安全側。
+
+### 13.1 活的定義（每次 prune 從 snapshot 重算）
+
+- tree：任一 snapshot 走得到（含 `prev` 鏈）。
+- pack：某被引用 chunk 的**正本**。正本 = 在有效 index 持有該 chunk 的
+  pack 中，未標記者優先、其次名稱最小者；幽靈 pack 不參加。
+- index blob：未被任何有效 blob `supersedes`。
+- 引用不完整（任何 snapshot/tree/index 讀不出、或被引用 chunk 無法解析）
+  → prune 整個拒絕：不標、不刪。
+
+### 13.2 兩階段
+
+1. 不活且修改時間距今超過 grace（預設 72 h）→ 寫標記。活的 → 撤銷標記。
+2. 標記超過 grace，且每個**活躍 client**（`inactive_after` 預設 30 天內
+   有 snapshot）在標記（+`clock_skew`，預設 1 h）之後都有新 snapshot
+   （比較 backup 開始時間，保守方向）→ 刪。刪有效 index 裡的 pack 之前
+   必須先寫一個不含它的新 index blob（`supersedes` 全部既有 blob）。
+   刪前再 HEAD 一次：物件在標記後被重寫過 → 撤銷。
+3. repack（選配）：活的、比 grace 老、正本 bytes 比例低於門檻的 pack，
+   把正本 chunk（解密驗證後）搬進新 pack；新 blob 列出新 pack 與全部
+   既有 pack（新在前、被 repack 者在最後）；舊 pack 留在 index 並標記，
+   走 1–2。
+
+### 13.3 backup 的義務（嚴格 Put-only）
+
+- 開始時列出 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。
+  backup **絕不刪標記**（維持 Put+Get+List 最小權限）。
+- 從開始到寫 snapshot 之前若已過 grace（減 1 h 安全邊界）→ 一律不寫
+  snapshot、以錯誤結束（`BackupTooLong`；重跑會沿用已上傳資料）。
+- 寫 snapshot 前重新載入 index：這次引用的每個 chunk 都要解析得到、
+  其 pack 要存在且標記未超過 grace；這次 put 過的 tree 若有超過 grace
+  的標記，修改時間必須比標記新。任一不成立 → 不 commit、以錯誤結束。
+- restore 端 chunk 的 pack 不見就重載 index 再試（repack 搬走了）。
+
+### 13.4 安全性假設
+
+grace 長於最長 backup；同一 client 一次一個 backup（本機檔案鎖）；
+建議一個 repo 只排程一個 prune（重疊也安全，代價是多一輪 index 重寫）；
+versioning bucket 刪的只是現行版本，清空間要 lifecycle；Object Lock
+保護中的物件刪不掉，prune 回報並保留標記；後端必須支援條件寫入。
+
+## 14. Parity（選配 sidecar）
+
+`parity/<pack hex>`：明文 CBOR `{v:2, k:16, m:1..8, pack_size, shard_len,
+hashes:[16+m 個 BLAKE3], parity:[m 個 shard]}`——Reed-Solomon 對**整個
+sealed pack** 切 16 資料片。寫入端可選；讀取端**忽略**。修復僅在重算
+BLAKE3 == pack 名稱時接受。（v1 Go 設計，照搬。）
+
+## 15. 後端契約
+
+`Put`（僅 config）、`PutIfAbsent`（條件寫；完成前不可見）、`Get`（含
+range read，強制能力）、`List`、`Stat`、`Delete`（維護角色專用）。
+本機 PutIfAbsent 用 `link(2)`；S3 用 `If-None-Match: *`。key 字法：
+`[a-z0-9._-]` 區段、無前導點、無冒號、≤ 1024 bytes。
+
+## 16. 版本與演進
+
+- `config.v`、各明文 `v`、pack magic 版號全部 = **2**；讀取端遇到 ≠2 拒絕。
+- 加新欄位：一律「零值省略 + `#[serde(default)]` / Go 指標或自訂解碼」，
+  配合 §4 的忽略未知欄位與 never-round-trip 規則，兩方向新舊互讀。
+- 需要動到金鑰推導、AAD、magic 的改動 → v3，靠 config 版號談判。
+
+## 17. 寫入順序（commit point）
+
+backup：(packs、trees，走訪途中交錯) → index blob → snapshot。
+snapshot 是唯一 commit point：它出現之前的新物件都是可回收垃圾；
+它出現之後，它引用的東西都已在 repo。
+
+## 18. 設計決定 × 證據對照
+
+| # | 決定 | 取自 | 證據 |
+| --- | --- | --- | --- |
+| 1 | CBOR Core Deterministic + 短標籤 map + 忽略未知欄位 + never-round-trip | 兩邊折衷 | P1：raw ciborium ≠ fxamacker；Value 層排序後逐 byte 相同 |
+| 2 | tree 以明文 keyed hash 命名；隨機 nonce；AAD=自 ID；metadata 不壓縮 | Go v1 | P3：zstd 版本改變 → 密文命名改名（e4679e→858150）、明文命名不變；v1 Rust 有實際 bug 記錄 |
+| 3 | 無 envelope header；per-role AAD | Go v1 | 決策 review：AAD 常數/路徑綁 kind，安全性等價、bytes 更少 |
+| 4 | chunk 壓縮位元在明文首 byte；trailer entry 留 {i,o,l,r} 含 raw_len | Go v1 + Rust v1 | Go ADR 009 明言 v2 要 raw_len；advisor：map 優於位置陣列（可演化） |
+| 5 | 子金鑰 BLAKE3 DeriveKey；Argon2id 64MiB/t3/p4；AAD 綁 repo_id+chunker | 兩邊折衷 | P4：KEK/子金鑰/AAD/sealed master 跨語言逐 byte 相同 |
+| 6 | FastCDC 以 Go 實作為準（表+mask+邊界函式），參數進 config | Go v1 | P2：兩家 v1 同輸入 3 塊 vs 2 塊，零互通 |
+| 7 | tree：分段 + 間接清單 + ctime/inode 快速路徑 + 硬連結 + xattr + bytes 檔名 | 兩邊合併 | Go ADR 004/009（v2 該做間接與長度）；Rust ADR 002 |
+| 8 | snapshot：parent、client bytes16、ns int、AAD=key、T/Z 時間格式、+1ns 重試 | 兩邊合併 | 決策 review |
+| 9 | index：supersedes + per-pack size + 最小名稱贏 + 明文首 byte zstd | 兩邊合併 | P5：8192 packs map+zstd 8.8MB < v1 陣列 12.1MB；Rust ADR 004/005（supersedes 安全性） |
+| 10 | GC：無資訊標記、無 clients/、Put-only backup、repack、clock_skew | Rust v1 + Go knob | 決策 review（權限模型：backup 不該有 Delete） |
+| 11 | parity 為選配 sidecar，他端忽略 | Go v1 | 決策 review |
+| 12 | 兩個 v1 直接淘汰，無遷移 | — | 兩邊 format.md 皆記錄「未發佈、無真實 repo」 |
+
+永久 conformance 測試（跨語言共用向量）：
+- 切塊邊界＋金鑰推導＋tree 規範 CBOR：Rust `kist-chunker/tests/interop.rs` 與
+  `kist-format/tests/interop.rs` ↔ Go `internal/interop/`（同一份
+  testdata 向量，兩邊各自斷言）。
+- AEAD 密封 master（固定 nonce 向量）：`kist-crypto/tests/poc_keys.rs`。
+- 命名方案對照（明文 vs 密文）：`kist-crypto/tests/poc_tree_naming.rs`。
+- CBOR 正規化：`kist-format/tests/poc_cbor.rs`（釘 Go 產生的 hex）。

@@ -152,10 +152,10 @@ func TestLocalPutCreatesNestedDirectories(t *testing.T) {
 	ctx := context.Background()
 	b := newTestLocal(t)
 
-	if err := PutBytesIfAbsent(ctx, b, "snapshots/deadbeef/20260102t030405.000000000z", []byte("snap")); err != nil {
+	if err := PutBytesIfAbsent(ctx, b, "snapshots/deadbeef/20260102T030405123456789Z", []byte("snap")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if ok, err := Exists(ctx, b, "snapshots/deadbeef/20260102t030405.000000000z"); err != nil || !ok {
+	if ok, err := Exists(ctx, b, "snapshots/deadbeef/20260102T030405123456789Z"); err != nil || !ok {
 		t.Errorf("exists = %v, %v; want true, nil", ok, err)
 	}
 }

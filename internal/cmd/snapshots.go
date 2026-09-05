@@ -36,7 +36,7 @@ func newSnapshotsCommand() *cobra.Command {
 						if snap, err := r.LoadSnapshot(ctx, handle.Key); err != nil {
 							row.Error = err.Error()
 						} else {
-							row.Host, row.Paths, row.Files, row.Bytes = snap.Host, snap.Paths, snap.Stats.Files, snap.Stats.Bytes
+							row.Host, row.Paths, row.Files, row.Bytes = snap.Host, pathsOf(snap.Paths), snap.Stats.Files, snap.Stats.Bytes
 						}
 						rows = append(rows, row)
 					}
@@ -61,7 +61,7 @@ func newSnapshotsCommand() *cobra.Command {
 						snap.Host,
 						snap.Stats.Files,
 						humanBytes(snap.Stats.Bytes),
-						strings.Join(snap.Paths, ","),
+						strings.Join(pathsOf(snap.Paths), ","),
 						handle.Key)
 				}
 				return w.Flush()
@@ -72,4 +72,12 @@ func newSnapshotsCommand() *cobra.Command {
 	flags.register(cmd)
 	cmd.Flags().StringVar(&client, "client", "", "list only this client's snapshots")
 	return cmd
+}
+
+func pathsOf(raw [][]byte) []string {
+	out := make([]string, len(raw))
+	for i, p := range raw {
+		out[i] = string(p)
+	}
+	return out
 }

@@ -21,27 +21,17 @@ import (
 
 var update = flag.Bool("update", false, "rewrite testdata golden files")
 
-var (
-	goldenMaster = crypto.Key{
-		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-	}
-	goldenRepoID = crypto.RepoID{
-		0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
-		0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
-	}
-)
+var goldenMaster = crypto.Key{
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+	0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+}
 
 func testKeys(t *testing.T) *crypto.Keys {
 	t.Helper()
 
-	keys, err := crypto.DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive keys: %v", err)
-	}
-	return keys
+	return crypto.DeriveKeys(goldenMaster)
 }
 
 func testBackend(t *testing.T) backend.Backend {
@@ -65,8 +55,17 @@ func id(b byte) crypto.ID {
 	return out
 }
 
-func entry(chunk byte, offset uint64, length uint32) pack.Entry {
+func entry(chunk byte, offset uint64, length uint64) pack.Entry {
 	return pack.Entry{ID: id(chunk), Offset: offset, Length: length}
+}
+
+// packInfos wraps per-pack entries as the Save/Rebuild argument form.
+func packInfos(entries map[crypto.ID][]pack.Entry) map[crypto.ID]PackInfo {
+	out := make(map[crypto.ID]PackInfo, len(entries))
+	for packID, es := range entries {
+		out[packID] = PackInfo{Size: uint64(len(es)), Entries: es}
+	}
+	return out
 }
 
 func TestLookupAndHas(t *testing.T) {
@@ -165,7 +164,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		id(0xaa): {entry(1, 0, 100), entry(2, 100, 250)},
 		id(0xbb): {entry(3, 0, 77)},
 	}
-	blobID, err := Save(ctx, b, keys, packs, crypto.DeterministicReader("save"))
+	blobID, err := Save(ctx, b, keys, packInfos(packs), nil, crypto.DeterministicReader("save"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -215,7 +214,7 @@ func TestSaveIsIndependentOfMapOrder(t *testing.T) {
 
 	var first crypto.ID
 	for run := range 8 {
-		got, err := Save(ctx, testBackend(t), keys, packs, crypto.DeterministicReader("order"))
+		got, err := Save(ctx, testBackend(t), keys, packInfos(packs), nil, crypto.DeterministicReader("order"))
 		if err != nil {
 			t.Fatalf("save: %v", err)
 		}
@@ -230,7 +229,7 @@ func TestSaveIsIndependentOfMapOrder(t *testing.T) {
 }
 
 func TestSaveRefusesAnEmptyIndex(t *testing.T) {
-	if _, err := Save(context.Background(), testBackend(t), testKeys(t), nil, crypto.DeterministicReader("empty")); err == nil {
+	if _, err := Save(context.Background(), testBackend(t), testKeys(t), nil, nil, crypto.DeterministicReader("empty")); err == nil {
 		t.Fatal("save with no packs: got nil error")
 	}
 }
@@ -252,7 +251,7 @@ func TestLoadRejectsDamagedBlobs(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	blobID, err := Save(ctx, b, keys, map[crypto.ID][]pack.Entry{id(0xaa): {entry(1, 0, 100)}}, crypto.DeterministicReader("damage"))
+	blobID, err := Save(ctx, b, keys, packInfos(map[crypto.ID][]pack.Entry{id(0xaa): {entry(1, 0, 100)}}), nil, crypto.DeterministicReader("damage"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -296,17 +295,14 @@ func TestLoadRejectsTheWrongKeys(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	blobID, err := Save(ctx, b, keys, map[crypto.ID][]pack.Entry{id(0xaa): {entry(1, 0, 100)}}, crypto.DeterministicReader("keys"))
+	blobID, err := Save(ctx, b, keys, packInfos(map[crypto.ID][]pack.Entry{id(0xaa): {entry(1, 0, 100)}}), nil, crypto.DeterministicReader("keys"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
 	otherMaster := goldenMaster
 	otherMaster[0] ^= 0xff
-	other, err := crypto.DeriveKeys(otherMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	other := crypto.DeriveKeys(otherMaster)
 	if err := Load(ctx, b, other, blobID, New()); !errors.Is(err, crypto.ErrDecrypt) {
 		t.Fatalf("load with the wrong keys: err = %v, want ErrDecrypt", err)
 	}
@@ -340,7 +336,7 @@ func TestLoadAllSkipsUnreadableBlobs(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	good, err := Save(ctx, b, keys, map[crypto.ID][]pack.Entry{id(0xaa): {entry(1, 0, 100)}}, crypto.DeterministicReader("good"))
+	good, err := Save(ctx, b, keys, packInfos(map[crypto.ID][]pack.Entry{id(0xaa): {entry(1, 0, 100)}}), nil, crypto.DeterministicReader("good"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -371,7 +367,7 @@ func TestRebuildReconstructsTheIndexFromPacksAlone(t *testing.T) {
 	keys, b := testKeys(t), testBackend(t)
 
 	payloads := [][]byte{[]byte("alpha"), []byte("beta"), bytes.Repeat([]byte("gamma "), 1000)}
-	written := map[crypto.ID][]pack.Entry{}
+	written := map[crypto.ID]PackInfo{}
 	for i, payload := range payloads {
 		w, err := pack.NewWriter(keys, t.TempDir(), crypto.DeterministicReader(fmt.Sprintf("rebuild-%d", i)))
 		if err != nil {
@@ -381,14 +377,14 @@ func TestRebuildReconstructsTheIndexFromPacksAlone(t *testing.T) {
 		if err := w.Add(chunkID, payload); err != nil {
 			t.Fatalf("add: %v", err)
 		}
-		packID, entries, err := w.Finish(ctx, b)
+		packID, entries, total, err := w.Finish(ctx, b)
 		if err != nil {
 			t.Fatalf("finish: %v", err)
 		}
-		written[packID] = entries
+		written[packID] = PackInfo{Size: total, Entries: entries}
 	}
 
-	saved, err := Save(ctx, b, keys, written, crypto.DeterministicReader("rebuild-index"))
+	saved, err := Save(ctx, b, keys, written, nil, crypto.DeterministicReader("rebuild-index"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -407,6 +403,20 @@ func TestRebuildReconstructsTheIndexFromPacksAlone(t *testing.T) {
 	}
 	if len(rebuiltPacks) != len(payloads) {
 		t.Errorf("rebuild reported %d packs, want %d", len(rebuiltPacks), len(payloads))
+	}
+	// The rebuilt PackInfo sizes must be what `check` will HEAD for: the
+	// stored packs' actual lengths.
+	for packID, info := range rebuiltPacks {
+		fi, err := b.Stat(ctx, pack.Key(packID))
+		if err != nil {
+			t.Fatalf("stat pack %s: %v", packID, err)
+		}
+		if info.Size != uint64(fi.Size) {
+			t.Errorf("pack %s: rebuilt size %d, stored %d", packID, info.Size, fi.Size)
+		}
+		if len(info.Entries) != 1 {
+			t.Errorf("pack %s: rebuilt %d entries, want 1", packID, len(info.Entries))
+		}
 	}
 
 	if rebuilt.Len() != fromBlob.Len() {
@@ -428,6 +438,62 @@ func TestRebuildReconstructsTheIndexFromPacksAlone(t *testing.T) {
 	}
 }
 
+// LoadAll ignores any blob named in a surviving blob's supersedes. That is
+// what makes a prune's index rewrite safe: a reader that still sees the old
+// and new blobs together takes the new one's word for what exists.
+func TestLoadAllIgnoresSupersededBlobs(t *testing.T) {
+	ctx := context.Background()
+	keys, b := testKeys(t), testBackend(t)
+
+	old, err := Save(ctx, b, keys, packInfos(map[crypto.ID][]pack.Entry{
+		id(0xaa): {entry(1, 0, 100)},
+	}), nil, crypto.DeterministicReader("old"))
+	if err != nil {
+		t.Fatalf("save old: %v", err)
+	}
+
+	// A replacement that names a different pack for the same chunk and
+	// supersedes the first blob.
+	fresh, err := Save(ctx, b, keys, packInfos(map[crypto.ID][]pack.Entry{
+		id(0xbb): {entry(1, 0, 50)},
+	}), []crypto.ID{old}, crypto.DeterministicReader("new"))
+	if err != nil {
+		t.Fatalf("save fresh: %v", err)
+	}
+	if fresh == old {
+		t.Fatal("the replacement blob collided with the one it replaces")
+	}
+
+	ix, skipped, err := LoadAll(ctx, b, keys)
+	if err != nil {
+		t.Fatalf("load all: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %v, want none", skipped)
+	}
+	loc, ok := ix.Lookup(id(1))
+	if !ok {
+		t.Fatal("chunk 1 is missing")
+	}
+	if loc.Pack != id(0xbb) {
+		t.Errorf("chunk 1 resolves to pack %s (the superseded blob's), want %s", loc.Pack, id(0xbb))
+	}
+	if packs := ix.Packs(); len(packs) != 1 || packs[0] != id(0xbb) {
+		t.Errorf("Packs = %v, want only the replacement's pack", packs)
+	}
+
+	// Load (single blob) still reads a superseded blob when asked directly:
+	// supersession is a LoadAll-level view, not a mark on the object.
+	ix2 := New()
+	if err := Load(ctx, b, keys, old, ix2); err != nil {
+		t.Fatalf("load superseded blob directly: %v", err)
+	}
+	loc2, ok := ix2.Lookup(id(1))
+	if !ok || loc2.Pack != id(0xaa) {
+		t.Error("direct load of the superseded blob lost its own entry")
+	}
+}
+
 func TestGoldenIndexBlob(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
@@ -436,7 +502,7 @@ func TestGoldenIndexBlob(t *testing.T) {
 		id(0xbb): {entry(3, 0, 77)},
 		id(0xaa): {entry(1, 0, 100), entry(2, 100, 250)},
 	}
-	blobID, err := Save(ctx, b, keys, packs, crypto.DeterministicReader("golden-index"))
+	blobID, err := Save(ctx, b, keys, packInfos(packs), nil, crypto.DeterministicReader("golden-index"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}

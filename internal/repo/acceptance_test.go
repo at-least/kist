@@ -119,7 +119,7 @@ func TestAcceptance(t *testing.T) {
 	t.Logf("restore: %d files, %s, in %v", stats.Files, human(int64(stats.Bytes)), time.Since(start).Round(time.Second))
 
 	start = time.Now()
-	compareTreesByHash(t, source, filepath.Join(target, filepath.Base(source)))
+	compareTreesByHash(t, source, filepath.Join(target, source))
 	t.Logf("byte-for-byte comparison in %v", time.Since(start).Round(time.Second))
 
 	// --- check --------------------------------------------------------

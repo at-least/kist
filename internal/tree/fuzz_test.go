@@ -35,7 +35,7 @@ func FuzzDecode(f *testing.F) {
 		if err := crypto.Unmarshal(data, &tr); err != nil {
 			return
 		}
-		if err := tr.validate(); err != nil {
+		if err := tr.Validate(); err != nil {
 			return
 		}
 		id, encoded, err := tr.Encode(&hashKey)

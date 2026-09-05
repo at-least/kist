@@ -37,13 +37,42 @@ const (
 //	maskSmall = 1<<(bits+2) - 1      = 1<<23 - 1
 //	maskLarge = 1<<(bits-2) - 1      = 1<<19 - 1
 //
-// Computed once here rather than with math.Log2 at run time, because a
+// bits is derived with integer arithmetic (see roundLog2): a
 // floating-point rounding difference between platforms would silently
 // fork the format.
-const (
-	maskSmall uint64 = 1<<23 - 1
-	maskLarge uint64 = 1<<19 - 1
-)
+
+// Params are the chunk sizes one repository was created with. They are
+// format, not tuning: clients of the same repository must agree, which
+// the config and the master-key AAD both enforce.
+type Params struct {
+	Min uint32
+	Avg uint32
+	Max uint32
+}
+
+// DefaultParams is what repositories created by this build use.
+func DefaultParams() Params {
+	return Params{Min: MinSize, Avg: AvgSize, Max: MaxSize}
+}
+
+func (p Params) maskSmall() uint64 { return 1<<(roundLog2(p.Avg)+2) - 1 }
+func (p Params) maskLarge() uint64 { return 1<<(roundLog2(p.Avg)-2) - 1 }
+
+// roundLog2 is round(log2(v)) in exact integer arithmetic: v is rounded
+// up to the next power of two when v >= 2^b*sqrt(2), tested as
+// v*v >= 2^(2b+1). The Rust implementation derives its masks from the
+// same expression; changing either one forks the format.
+func roundLog2(v uint32) uint {
+	b := uint(0)
+	for 1<<(b+1) <= v {
+		b++
+	}
+	vv := uint64(v) * uint64(v)
+	if vv >= 1<<(2*b+1) {
+		return b + 1
+	}
+	return b
+}
 
 // A Chunk is one content-defined span of the input.
 type Chunk struct {
@@ -71,33 +100,49 @@ type Chunk struct {
 // A Chunker is not safe for concurrent use; chunking many files at once
 // means one Chunker per file, which share nothing.
 type Chunker struct {
-	r      io.Reader
+	r io.Reader
+
+	params Params
+
+	smallMask uint64
+	largeMask uint64
+
 	buf    []byte
 	cursor int
 	offset int64
 	eof    bool
 }
 
-// New returns a Chunker reading from r.
+// New returns a Chunker reading from r with the default sizes.
 func New(r io.Reader) (*Chunker, error) {
+	return NewParams(r, DefaultParams())
+}
+
+// NewParams returns a Chunker reading from r with a repository's sizes.
+// The buffer is sized from the parameters' maximum.
+func NewParams(r io.Reader, params Params) (*Chunker, error) {
 	if r == nil {
 		return nil, errors.New("create chunker: nil reader")
 	}
+	bufCap := 2 * int64(params.Max)
 	return &Chunker{
-		r:      r,
-		buf:    make([]byte, bufSize),
-		cursor: bufSize, // empty: fill on the first Next
+		r:         r,
+		params:    params,
+		smallMask: params.maskSmall(),
+		largeMask: params.maskLarge(),
+		buf:       make([]byte, bufCap),
+		cursor:    int(bufCap), // empty: fill on the first Next
 	}, nil
 }
 
 // Reset makes the chunker read from r, keeping its buffer.
 //
-// The buffer is 16 MiB, and allocating and zeroing one per file is
-// what dominated a backup of a million small files: 16 GB of allocation
-// for a thousand one-kilobyte files, 1.8 ms each. A backup keeps one
-// chunker and resets it per file. Chunks handed out before the reset
-// point into the buffer and are invalid after it, as they already are
-// after the next call to Next.
+// The buffer is 16 MiB at the default sizes, and allocating and zeroing
+// one per file is what dominated a backup of a million small files:
+// 16 GB of allocation for a thousand one-kilobyte files, 1.8 ms each.
+// A backup keeps one chunker and resets it per file. Chunks handed out
+// before the reset point into the buffer and are invalid after it, as
+// they already are after the next call to Next.
 func (c *Chunker) Reset(r io.Reader) error {
 	if r == nil {
 		return errors.New("reset chunker: nil reader")
@@ -122,7 +167,7 @@ func (c *Chunker) Next() (Chunk, error) {
 		return Chunk{}, io.EOF
 	}
 
-	length := boundary(c.buf[c.cursor:])
+	length := c.boundary(c.buf[c.cursor:])
 	chunk := Chunk{Offset: c.offset, Data: c.buf[c.cursor : c.cursor+length]}
 
 	c.cursor += length
@@ -135,8 +180,9 @@ func (c *Chunker) Next() (Chunk, error) {
 // boundary could be decided on a short window and would then depend on
 // the size of the reader's writes rather than on the content.
 func (c *Chunker) fill() error {
+	max := int(c.params.Max)
 	remaining := len(c.buf) - c.cursor
-	if remaining >= MaxSize {
+	if remaining >= max {
 		return nil
 	}
 
@@ -162,26 +208,27 @@ func (c *Chunker) fill() error {
 
 // boundary returns the length of the next chunk starting at data[0].
 //
-// The gear hash restarts at zero for every chunk and the first MinSize
+// The gear hash restarts at zero for every chunk and the first Min
 // bytes are not hashed at all: a boundary can only be declared once the
 // minimum has been passed, so hashing before that would be wasted work
 // and, more importantly, would change where the boundaries fall.
-func boundary(data []byte) int {
-	if len(data) <= MinSize {
+func (c *Chunker) boundary(data []byte) int {
+	minSize := int(c.params.Min)
+	if len(data) <= minSize {
 		return len(data)
 	}
 
-	limit := min(len(data), MaxSize)
-	normal := min(limit, AvgSize)
+	limit := min(len(data), int(c.params.Max))
+	normal := min(limit, int(c.params.Avg))
 
 	var fp uint64
-	i := MinSize
+	i := minSize
 
 	// Below the average size, the stricter mask makes a cut less likely,
 	// which suppresses very short chunks.
 	for ; i < normal; i++ {
 		fp = (fp << 1) + gearTable[data[i]]
-		if fp&maskSmall == 0 {
+		if fp&c.smallMask == 0 {
 			return i + 1
 		}
 	}
@@ -189,7 +236,7 @@ func boundary(data []byte) int {
 	// very long ones.
 	for ; i < limit; i++ {
 		fp = (fp << 1) + gearTable[data[i]]
-		if fp&maskLarge == 0 {
+		if fp&c.largeMask == 0 {
 			return i + 1
 		}
 	}

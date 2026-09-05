@@ -6,13 +6,13 @@ import (
 	"github.com/at-least/kist/internal/crypto"
 )
 
-// FuzzDecodeRecords: the two small GC objects and the config, which is
-// the one plaintext object and so the one an attacker can hand the
-// decoder without a key.
+// FuzzDecodeRecords: the config and the key slot, the two plaintext
+// objects and so the ones an attacker can hand the decoder without a key.
+// (A v2 gc mark carries no structure at all: 8 constant bytes.)
 func FuzzDecodeRecords(f *testing.F) {
 	for _, v := range []any{
-		gcMark{Version: gcVersion, MarkedNs: 1, By: "x"},
-		clientRecord{Version: gcVersion, FirstSeenNs: 1},
+		crypto.KeySlot{Version: crypto.KeySlotVersion},
+		Config{Version: ConfigVersion},
 	} {
 		seed, err := crypto.Marshal(v)
 		if err != nil {
@@ -25,16 +25,10 @@ func FuzzDecodeRecords(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Decoding may fail; it may not panic, and what it accepts must
 		// re-encode.
-		var m gcMark
-		if err := crypto.Unmarshal(data, &m); err == nil {
-			if _, err := crypto.Marshal(m); err != nil {
-				t.Fatalf("a decoded mark failed to encode: %v", err)
-			}
-		}
-		var c clientRecord
-		if err := crypto.Unmarshal(data, &c); err == nil {
-			if _, err := crypto.Marshal(c); err != nil {
-				t.Fatalf("a decoded client record failed to encode: %v", err)
+		var slot crypto.KeySlot
+		if err := crypto.Unmarshal(data, &slot); err == nil {
+			if _, err := crypto.Marshal(slot); err != nil {
+				t.Fatalf("a decoded key slot failed to encode: %v", err)
 			}
 		}
 		var cfg Config

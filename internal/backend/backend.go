@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // Sentinel errors every implementation must return, so callers can branch
@@ -32,9 +33,14 @@ var (
 const ReadToEnd int64 = -1
 
 // FileInfo is what Stat and List report about one object.
+//
+// Modified is the backend's own clock, truncated to whole seconds: S3
+// reports seconds and its list/head precisions differ, and the gc mark
+// protocol depends on times never appearing finer than they are.
 type FileInfo struct {
-	Key  string
-	Size int64
+	Key      string
+	Size     int64
+	Modified time.Time
 }
 
 // A Backend is a flat namespace of immutable objects.
@@ -99,9 +105,10 @@ var ErrInvalidKey = errors.New("invalid key")
 //
 // The rules are the intersection of what a filesystem, an S3 bucket and
 // an SFTP server all accept, and they are deliberately narrow: keys are
-// built from hex content addresses and fixed prefixes, so nothing
-// legitimate needs a character outside this set. In particular there are
-// no colons, which are illegal in Windows filenames, and no traversal.
+// built from hex content addresses, fixed prefixes and the snapshot
+// timestamp's uppercase ISO 8601 digits, so nothing legitimate needs a
+// character outside this set. In particular there are no colons, which
+// are illegal in Windows filenames, and no traversal.
 //
 // A segment may not begin with a dot, which keeps the whole namespace
 // clear of the dot-prefixed scratch names the local backend writes while
@@ -110,30 +117,35 @@ var ErrInvalidKey = errors.New("invalid key")
 //	segment  = (lowercase-alnum / "-" / "_") *( lowercase-alnum / "-" / "_" / "." )
 //	key      = segment *( "/" segment )
 func ValidateKey(key string) error {
+	// Uppercase is allowed for one reason: the snapshot key's timestamp
+	// is uppercase ISO 8601 basic format (YYYYMMDDTHHMMSSnnnnnnnnnZ), the
+	// unified v2 form. Everything else kist writes is lowercase hex.
+	const allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+	segment := func(seg string) bool {
+		if seg == "" || seg[0] == '.' {
+			return false
+		}
+		for i := 0; i < len(seg); i++ {
+			if !strings.ContainsRune(allowed, rune(seg[i])) {
+				return false
+			}
+		}
+		return true
+	}
 	if key == "" {
 		return fmt.Errorf("%w: key is empty", ErrInvalidKey)
 	}
 	if len(key) > 1024 {
 		return fmt.Errorf("%w: key is %d bytes, over the 1024 limit", ErrInvalidKey, len(key))
 	}
-
-	for _, segment := range strings.Split(key, "/") {
-		if segment == "" {
-			return fmt.Errorf("%w: %q has an empty path segment", ErrInvalidKey, key)
-		}
-		if segment[0] == '.' {
-			return fmt.Errorf("%w: %q has a path segment starting with a dot", ErrInvalidKey, key)
-		}
-		for _, r := range segment {
-			switch {
-			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			case r == '-', r == '_', r == '.':
-			default:
-				return fmt.Errorf("%w: %q contains %q, which is outside [a-z0-9._-/]", ErrInvalidKey, key, r)
-			}
+	if strings.Contains(key, "//") {
+		return fmt.Errorf("%w: %q has an empty path segment", ErrInvalidKey, key)
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if !segment(seg) {
+			return fmt.Errorf("%w: %q", ErrInvalidKey, key)
 		}
 	}
-
 	return nil
 }
 
@@ -161,6 +173,11 @@ func GetAll(ctx context.Context, b Backend, key string) ([]byte, error) {
 		return nil, fmt.Errorf("read %s from %s: %w", key, b.Location(), err)
 	}
 	return data, nil
+}
+
+// PutBytes stores a byte slice unconditionally.
+func PutBytes(ctx context.Context, b Backend, key string, data []byte) error {
+	return b.Put(ctx, key, bytes.NewReader(data), int64(len(data)))
 }
 
 // PutBytesIfAbsent is PutIfAbsent for an object already in memory: trees,

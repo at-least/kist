@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"strings"
 	"testing"
@@ -9,10 +10,7 @@ import (
 )
 
 func TestDeriveKeysSubkeysAreDistinct(t *testing.T) {
-	keys, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	keys := DeriveKeys(goldenMaster)
 
 	named := map[string]Key{
 		"master": keys.Master,
@@ -34,36 +32,74 @@ func TestDeriveKeysSubkeysAreDistinct(t *testing.T) {
 }
 
 func TestDeriveKeysIsDeterministic(t *testing.T) {
-	first, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
-	second, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	first := DeriveKeys(goldenMaster)
+	second := DeriveKeys(goldenMaster)
 	if *first != *second {
 		t.Fatal("two derivations of one master key differ")
 	}
 }
 
-// The repository ID salts derivation, so one master key reused in two
-// repositories still yields unrelated subkeys.
-func TestDeriveKeysIsSaltedByRepoID(t *testing.T) {
-	other := goldenRepoID
+// Derivation is a pure function of the master key in v2: the repository
+// binding moved into the master-key AAD. Two master keys must therefore
+// yield unrelated subkeys.
+func TestDeriveKeysDependsOnTheMasterKey(t *testing.T) {
+	other := goldenMaster
 	other[0] ^= 0xff
 
-	a, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
-	b, err := DeriveKeys(goldenMaster, other)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	a := DeriveKeys(goldenMaster)
+	b := DeriveKeys(other)
 	if a.Chunk == b.Chunk || a.Hash == b.Hash || a.Index == b.Index || a.Meta == b.Meta {
-		t.Fatal("subkeys do not depend on the repository ID")
+		t.Fatal("subkeys do not depend on the master key")
 	}
+}
+
+// The master-key AAD is what binds a slot to its repository in v2: it
+// carries the repository ID and the chunker parameters, each as a distinct
+// byte range, so tampering with the plaintext config fails the unwrap
+// instead of silently breaking deduplication.
+func TestMasterAADEncodesRepoIDAndChunkerParams(t *testing.T) {
+	const min, avg, max = 512 << 10, 2 << 20, 8 << 20
+
+	aad := MasterAAD(goldenRepoID, min, avg, max)
+	if got, want := len(aad), len(AADMasterKey)+RepoIDSize+12; got != want {
+		t.Fatalf("aad length = %d, want %d", got, want)
+	}
+	if !bytes.HasPrefix(aad, []byte(AADMasterKey)) {
+		t.Errorf("aad does not start with the domain: %x", aad)
+	}
+	rest := aad[len(AADMasterKey):]
+	if !bytes.Equal(rest[:RepoIDSize], goldenRepoID[:]) {
+		t.Errorf("repository ID is not carried verbatim: %x", rest[:RepoIDSize])
+	}
+	fields := []uint32{min, avg, max}
+	for i, want := range fields {
+		off := RepoIDSize + 4*i
+		if got := binary.LittleEndian.Uint32(rest[off:]); got != want {
+			t.Errorf("field %d = %d, want %d (little endian)", i, got, want)
+		}
+	}
+}
+
+// One master key, two repositories: the AADs differ, so a slot wrapped
+// under one cannot open under the other (exercised end to end below).
+func TestMasterAADDiffersPerRepositoryAndParams(t *testing.T) {
+	base := MasterAAD(goldenRepoID, 1, 2, 3)
+
+	otherRepo := goldenRepoID
+	otherRepo[0] ^= 0xff
+	if bytes.Equal(base, MasterAAD(otherRepo, 1, 2, 3)) {
+		t.Error("the AAD ignores the repository ID")
+	}
+	if bytes.Equal(base, MasterAAD(goldenRepoID, 1, 2, 4)) {
+		t.Error("the AAD ignores the chunker max size")
+	}
+	if bytes.Equal(MasterAAD(goldenRepoID, 1, 2, 3), MasterAAD(goldenRepoID, 3, 2, 1)) {
+		t.Error("the chunker parameters are not in fixed order")
+	}
+}
+
+func goldenAAD() []byte {
+	return MasterAAD(goldenRepoID, 512<<10, 2<<20, 8<<20)
 }
 
 func cheapParams() KDFParams {
@@ -75,7 +111,7 @@ func cheapParams() KDFParams {
 func TestKeySlotRoundTrip(t *testing.T) {
 	password := []byte("hunter2")
 
-	slot, err := NewKeySlot(password, goldenRepoID, goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
+	slot, err := NewKeySlot(password, goldenAAD(), goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
 	if err != nil {
 		t.Fatalf("new key slot: %v", err)
 	}
@@ -89,7 +125,7 @@ func TestKeySlotRoundTrip(t *testing.T) {
 		t.Errorf("created = %d, want %d", slot.CreatedUnixNs, goldenTime.UnixNano())
 	}
 
-	master, err := slot.Unwrap(password, goldenRepoID)
+	master, err := slot.Unwrap(password, goldenAAD())
 	if err != nil {
 		t.Fatalf("unwrap: %v", err)
 	}
@@ -99,12 +135,12 @@ func TestKeySlotRoundTrip(t *testing.T) {
 }
 
 func TestKeySlotRejectsWrongPassword(t *testing.T) {
-	slot, err := NewKeySlot([]byte("hunter2"), goldenRepoID, goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
+	slot, err := NewKeySlot([]byte("hunter2"), goldenAAD(), goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
 	if err != nil {
 		t.Fatalf("new key slot: %v", err)
 	}
 
-	if _, err := slot.Unwrap([]byte("hunter3"), goldenRepoID); !errors.Is(err, ErrWrongPassword) {
+	if _, err := slot.Unwrap([]byte("hunter3"), goldenAAD()); !errors.Is(err, ErrWrongPassword) {
 		t.Fatalf("unwrap with a wrong password: err = %v, want ErrWrongPassword", err)
 	} else if !errors.Is(err, ErrDecrypt) {
 		t.Error("ErrWrongPassword should also satisfy errors.Is(err, ErrDecrypt)")
@@ -112,18 +148,25 @@ func TestKeySlotRejectsWrongPassword(t *testing.T) {
 }
 
 // A slot copied out of one repository must not open in another, even with
-// the right password: the repository ID is in the wrapping AAD.
+// the right password: the repository ID and chunker parameters are in the
+// wrapping AAD.
 func TestKeySlotCannotBeTransplanted(t *testing.T) {
 	password := []byte("hunter2")
-	slot, err := NewKeySlot(password, goldenRepoID, goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
+	slot, err := NewKeySlot(password, goldenAAD(), goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
 	if err != nil {
 		t.Fatalf("new key slot: %v", err)
 	}
 
-	other := goldenRepoID
-	other[15] ^= 0x01
-	if _, err := slot.Unwrap(password, other); !errors.Is(err, ErrWrongPassword) {
+	otherRepo := goldenRepoID
+	otherRepo[15] ^= 0x01
+	if _, err := slot.Unwrap(password, MasterAAD(otherRepo, 512<<10, 2<<20, 8<<20)); !errors.Is(err, ErrWrongPassword) {
 		t.Fatalf("unwrap in another repository: err = %v, want failure", err)
+	}
+	// A repository whose plaintext config lies about its chunker
+	// parameters is the more interesting transplant: the unwrap must fail,
+	// not silently return a key that deduplicates against nothing.
+	if _, err := slot.Unwrap(password, MasterAAD(goldenRepoID, 512<<10, 2<<20, 4<<20)); !errors.Is(err, ErrWrongPassword) {
+		t.Fatalf("unwrap with tampered chunker params: err = %v, want failure", err)
 	}
 }
 
@@ -136,21 +179,21 @@ func TestKeySlotRejectsBadParameters(t *testing.T) {
 		want  string
 	}{
 		{"unknown algorithm", func(p *KDFParams) { p.Alg = "scrypt" }, "unsupported kdf"},
-		{"zero time cost", func(p *KDFParams) { p.Time = 0 }, "time cost is 0"},
-		{"zero memory cost", func(p *KDFParams) { p.MemoryKiB = 0 }, "memory cost is 0"},
-		{"zero parallelism", func(p *KDFParams) { p.Threads = 0 }, "parallelism is 0"},
+		{"zero time cost", func(p *KDFParams) { p.Time = 0 }, "time cost 0 is outside"},
+		{"zero memory cost", func(p *KDFParams) { p.MemoryKiB = 0 }, "memory cost 0 KiB is outside"},
+		{"zero parallelism", func(p *KDFParams) { p.Threads = 0 }, "parallelism 0 is outside"},
 		{"short salt", func(p *KDFParams) { p.Salt = []byte("short") }, "salt is 5 bytes"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			slot, err := NewKeySlot([]byte("pw"), goldenRepoID, goldenMaster, base, goldenTime, DeterministicReader("slot"))
+			slot, err := NewKeySlot([]byte("pw"), goldenAAD(), goldenMaster, base, goldenTime, DeterministicReader("slot"))
 			if err != nil {
 				t.Fatalf("new key slot: %v", err)
 			}
 			tc.mutte(&slot.KDF)
 
-			_, err = slot.Unwrap([]byte("pw"), goldenRepoID)
+			_, err = slot.Unwrap([]byte("pw"), goldenAAD())
 			if err == nil {
 				t.Fatal("unwrap: got nil error, want failure")
 			}
@@ -162,13 +205,13 @@ func TestKeySlotRejectsBadParameters(t *testing.T) {
 }
 
 func TestKeySlotRejectsUnknownVersion(t *testing.T) {
-	slot, err := NewKeySlot([]byte("pw"), goldenRepoID, goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
+	slot, err := NewKeySlot([]byte("pw"), goldenAAD(), goldenMaster, cheapParams(), goldenTime, DeterministicReader("slot"))
 	if err != nil {
 		t.Fatalf("new key slot: %v", err)
 	}
 	slot.Version = KeySlotVersion + 1
 
-	if _, err := slot.Unwrap([]byte("pw"), goldenRepoID); err == nil || !strings.Contains(err.Error(), "version") {
+	if _, err := slot.Unwrap([]byte("pw"), goldenAAD()); err == nil || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("unwrap of a future version: err = %v, want a version error", err)
 	}
 }
@@ -191,11 +234,11 @@ func TestKeySlotWithProductionParameters(t *testing.T) {
 	}
 	start := time.Now()
 
-	slot, err := NewKeySlot([]byte("pw"), goldenRepoID, goldenMaster, DefaultKDFParams(), goldenTime, nil)
+	slot, err := NewKeySlot([]byte("pw"), goldenAAD(), goldenMaster, DefaultKDFParams(), goldenTime, nil)
 	if err != nil {
 		t.Fatalf("new key slot: %v", err)
 	}
-	master, err := slot.Unwrap([]byte("pw"), goldenRepoID)
+	master, err := slot.Unwrap([]byte("pw"), goldenAAD())
 	if err != nil {
 		t.Fatalf("unwrap: %v", err)
 	}

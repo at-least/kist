@@ -235,9 +235,6 @@ func (r *Runner) maintain(ctx context.Context) error {
 			return err
 		}
 		ev.Prune = report.FromPrune(result, false)
-		for _, key := range result.UnreadableClients {
-			warn("%s is not a readable client record; left in place", key)
-		}
 		r.logf("maintenance: marked %d, unmarked %d, held %d, deleted %d", len(result.Marked), len(result.Unmarked), len(result.Held), len(result.Deleted))
 		return nil
 	}()

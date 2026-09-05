@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Local stores objects as files under a directory, one file per key.
@@ -272,7 +273,7 @@ func (l *Local) List(ctx context.Context, prefix string, fn func(FileInfo) error
 			}
 			return fmt.Errorf("stat %s: %w", key, err)
 		}
-		return fn(FileInfo{Key: key, Size: info.Size()})
+		return fn(FileInfo{Key: key, Size: info.Size(), Modified: info.ModTime().Truncate(time.Second)})
 	})
 	if err != nil {
 		return fmt.Errorf("list %q in %s: %w", prefix, l.root, err)
@@ -294,7 +295,7 @@ func (l *Local) Stat(_ context.Context, key string) (FileInfo, error) {
 	if info.IsDir() {
 		return FileInfo{}, fmt.Errorf("stat %s: %w", key, ErrNotFound)
 	}
-	return FileInfo{Key: key, Size: info.Size()}, nil
+	return FileInfo{Key: key, Size: info.Size(), Modified: info.ModTime().Truncate(time.Second)}, nil
 }
 
 // Delete removes an object, treating an absent object as already deleted.

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 
 	"github.com/at-least/kist/internal/backend"
@@ -26,6 +25,7 @@ import (
 // goroutine, and each produces an independent pack.
 type Writer struct {
 	keys        *crypto.Keys
+	target      uint64
 	nonceSource io.Reader
 
 	spool   *os.File
@@ -52,8 +52,17 @@ func (w *Writer) SetParity(m int, warn func(format string, args ...any)) {
 	w.parityWarn = warn
 }
 
-// NewWriter starts a pack, spooling to a temporary file in dir. Passing
-// an empty dir uses the system temporary directory.
+// NewWriter starts a pack with the default target size; see
+// NewWriterParams.
+func NewWriter(keys *crypto.Keys, dir string, nonceSource io.Reader) (*Writer, error) {
+	return NewWriterParams(keys, dir, TargetSize, nonceSource)
+}
+
+// NewWriterParams starts a pack, spooling to a temporary file in dir and
+// flushing when it reaches target bytes. Passing an empty dir uses the
+// system temporary directory. The target comes from the repository's
+// config, not a constant: two clients of one repository need not agree
+// on batching, but each should honour what its user configured.
 //
 // nonceSource seeds the writer's nonces; production callers pass nil,
 // meaning crypto/rand. The seed is expanded through crypto.NonceStream,
@@ -68,7 +77,7 @@ func (w *Writer) SetParity(m int, warn func(format string, args ...any)) {
 // case, not a reuse.
 //
 // Callers must call Finish or Abort.
-func NewWriter(keys *crypto.Keys, dir string, nonceSource io.Reader) (*Writer, error) {
+func NewWriterParams(keys *crypto.Keys, dir string, target uint64, nonceSource io.Reader) (*Writer, error) {
 	nonces, err := crypto.NonceStream(nonceSource)
 	if err != nil {
 		return nil, fmt.Errorf("create pack writer: %w", err)
@@ -82,14 +91,22 @@ func NewWriter(keys *crypto.Keys, dir string, nonceSource io.Reader) (*Writer, e
 	// unlinking it now would break the reopen-for-upload step.
 
 	hasher := crypto.CiphertextHasher()
-	return &Writer{
+	w := &Writer{
 		keys:        keys,
+		target:      target,
 		nonceSource: nonces,
 		spool:       spool,
 		hasher:      io.MultiWriter(spool, hasher),
 		digest:      hasher,
 		seen:        make(map[crypto.ID]struct{}),
-	}, nil
+	}
+	// v2: the pack opens with the magic (trailer offsets are absolute
+	// file positions, so this must be written before the first chunk).
+	if _, err := w.hasher.Write(magic[:]); err != nil {
+		return nil, fmt.Errorf("create pack writer: write header: %w", err)
+	}
+	w.size = uint64(len(magic))
+	return w, nil
 }
 
 // Add seals plaintext under the chunk key and appends it.
@@ -125,20 +142,12 @@ func (w *Writer) Add(id crypto.ID, plaintext []byte) error {
 		return fmt.Errorf("add chunk %s: %w", id, err)
 	}
 
-	// A chunk is bounded by the chunker's maximum, so this cannot happen
-	// for a chunk that came from the chunker; it is checked because the
-	// length field is uint32 and a silent truncation here would produce a
-	// pack whose trailer disagrees with its own bytes.
-	if len(sealed) > math.MaxUint32 {
-		return fmt.Errorf("add chunk %s: sealed chunk is %d bytes, over the %d format limit", id, len(sealed), uint64(math.MaxUint32))
-	}
-
 	if _, err := w.hasher.Write(sealed); err != nil {
 		return fmt.Errorf("add chunk %s: write spool file: %w", id, err)
 	}
 
 	w.seen[id] = struct{}{}
-	w.entries = append(w.entries, Entry{ID: id, Offset: w.size, Length: uint32(len(sealed))}) //nolint:gosec // bounds-checked against MaxUint32 just above
+	w.entries = append(w.entries, Entry{ID: id, Offset: w.size, Length: uint64(len(sealed)), RawLen: uint64(len(plaintext))})
 	w.size += uint64(len(sealed))
 	return nil
 }
@@ -152,61 +161,63 @@ func (w *Writer) Count() int { return len(w.entries) }
 // Full reports whether the pack has reached its target size and should be
 // flushed. A writer never refuses a chunk for being over the target: a
 // chunk is indivisible, so the target is a threshold, not a limit.
-func (w *Writer) Full() bool { return w.size >= TargetSize }
+func (w *Writer) Full() bool { return w.size >= w.target }
 
-// Finish writes the trailer, uploads the pack and returns its ID and the
-// entries it contains.
+// Finish writes the trailer, uploads the pack and returns its ID, the
+// entries it contains, and its total size (what an index blob records so
+// `check` can catch a truncated pack with a HEAD).
 //
 // The upload is PutIfAbsent, so an identical pack built by another client
 // is not an error: the bytes are already there and the entries returned
 // still describe them. Finish removes the spool file either way.
-func (w *Writer) Finish(ctx context.Context, b backend.Backend) (crypto.ID, []Entry, error) {
+func (w *Writer) Finish(ctx context.Context, b backend.Backend) (crypto.ID, []Entry, uint64, error) {
 	if w.finished {
-		return crypto.ID{}, nil, errors.New("finish pack: writer is already finished")
+		return crypto.ID{}, nil, 0, errors.New("finish pack: writer is already finished")
 	}
 	if len(w.entries) == 0 {
-		return crypto.ID{}, nil, errors.New("finish pack: no chunks were added")
+		return crypto.ID{}, nil, 0, errors.New("finish pack: no chunks were added")
 	}
 	defer w.cleanup()
 	w.finished = true
 
 	encoded, err := crypto.Marshal(trailer{Version: Version, Entries: w.entries})
 	if err != nil {
-		return crypto.ID{}, nil, fmt.Errorf("finish pack: encode trailer: %w", err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack: encode trailer: %w", err)
 	}
 	sealed, err := crypto.Seal(&w.keys.Index, []byte(crypto.AADPackTrailer), encoded, w.nonceSource)
 	if err != nil {
-		return crypto.ID{}, nil, fmt.Errorf("finish pack: seal trailer: %w", err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack: seal trailer: %w", err)
 	}
 	if _, err := w.hasher.Write(sealed); err != nil {
-		return crypto.ID{}, nil, fmt.Errorf("finish pack: write trailer: %w", err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack: write trailer: %w", err)
 	}
 	if _, err := w.hasher.Write(encodeTail(uint64(len(sealed)))); err != nil {
-		return crypto.ID{}, nil, fmt.Errorf("finish pack: write tail: %w", err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack: write tail: %w", err)
 	}
 
-	total, err := offsetOf(w.size + uint64(len(sealed)) + tailSize)
+	totalInt, err := offsetOf(w.size + uint64(len(sealed)) + tailSize)
 	if err != nil {
-		return crypto.ID{}, nil, fmt.Errorf("finish pack: %w", err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack: %w", err)
 	}
+	total := uint64(totalInt) //nolint:gosec // offsetOf bounds it to [0, MaxInt64]
 
 	var id crypto.ID
 	copy(id[:], w.digest.Sum(nil))
 
 	if err := w.spool.Sync(); err != nil {
-		return crypto.ID{}, nil, fmt.Errorf("finish pack %s: sync spool file: %w", id, err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack %s: sync spool file: %w", id, err)
 	}
 	if _, err := w.spool.Seek(0, io.SeekStart); err != nil {
-		return crypto.ID{}, nil, fmt.Errorf("finish pack %s: rewind spool file: %w", id, err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack %s: rewind spool file: %w", id, err)
 	}
 
-	switch err := b.PutIfAbsent(ctx, Key(id), w.spool, total); {
+	switch err := b.PutIfAbsent(ctx, Key(id), w.spool, int64(total)); { //nolint:gosec // bounds-checked above
 	case err == nil, errors.Is(err, backend.ErrExists):
 		// An identical pack already stored is a successful deduplication:
 		// the name is the hash of the bytes, so what is there is what we
 		// were about to write.
 	default:
-		return crypto.ID{}, nil, fmt.Errorf("finish pack %s: %w", id, err)
+		return crypto.ID{}, nil, 0, fmt.Errorf("finish pack %s: %w", id, err)
 	}
 
 	if w.parity > 0 {
@@ -214,7 +225,7 @@ func (w *Writer) Finish(ctx context.Context, b backend.Backend) (crypto.ID, []En
 			w.parityWarn("pack %s is stored but its parity is not: %v", id, err)
 		}
 	}
-	return id, w.entries, nil
+	return id, w.entries, total, nil
 }
 
 // writeParity computes the parity object from the spool file, which is

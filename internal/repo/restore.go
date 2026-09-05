@@ -96,21 +96,32 @@ func (run *restoreRun) restoreTree(ctx context.Context, id crypto.ID, dir string
 	}
 	run.stats.Dirs++
 
+	if t.Prev != nil {
+		// A segmented directory: earlier segments come first on disk, so
+		// they are restored before this one's entries.
+		if err := run.restoreTree(ctx, *t.Prev, dir); err != nil {
+			return err
+		}
+	}
+
 	for _, entry := range t.Entries {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		path, err := safeJoin(dir, entry.Name)
+		path, err := entryPath(dir, entry.Name)
 		if err != nil {
 			return err
 		}
 
-		switch entry.Type {
+		switch tree.NodeType(entry.Type) {
 		case tree.TypeDir:
+			if entry.Subtree == nil {
+				return fmt.Errorf("restore: %w: entry %q has no subtree", tree.ErrCorrupt, entry.Name)
+			}
 			if err := os.MkdirAll(path, 0o700); err != nil {
 				return fmt.Errorf("restore: %w", err)
 			}
-			if err := run.restoreTree(ctx, entry.Subtree, path); err != nil {
+			if err := run.restoreTree(ctx, *entry.Subtree, path); err != nil {
 				return err
 			}
 			// Permissions last: a read-only directory cannot be filled.
@@ -119,7 +130,12 @@ func (run *restoreRun) restoreTree(ctx context.Context, id crypto.ID, dir string
 			}
 
 		case tree.TypeSymlink:
-			if err := os.Symlink(entry.Target, path); err != nil {
+			// A root-level entry's name is an absolute path; its parents
+			// do not exist yet under the target.
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return fmt.Errorf("restore: %w", err)
+			}
+			if err := os.Symlink(string(entry.Target), path); err != nil {
 				return fmt.Errorf("restore: %w", err)
 			}
 			run.stats.Symlinks++
@@ -128,6 +144,9 @@ func (run *restoreRun) restoreTree(ctx context.Context, id crypto.ID, dir string
 			}
 
 		case tree.TypeFile:
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return fmt.Errorf("restore: %w", err)
+			}
 			if err := run.restoreFile(ctx, entry, path); err != nil {
 				return err
 			}
@@ -165,6 +184,26 @@ func safeJoin(dir, name string) (string, error) {
 	return path, nil
 }
 
+// entryPath places one tree entry under dir. Child entries are single
+// components. A root-tree entry's name is the backup source's absolute
+// path -- that is the v2 naming rule -- and lands under dir component by
+// component, each component checked exactly as a child name is.
+func entryPath(dir string, name []byte) (string, error) {
+	if len(name) > 0 && name[0] == '/' {
+		clean := strings.Trim(string(name), "/")
+		path := dir
+		for _, comp := range strings.Split(clean, "/") {
+			var err error
+			path, err = safeJoin(path, comp)
+			if err != nil {
+				return "", err
+			}
+		}
+		return path, nil
+	}
+	return safeJoin(dir, string(name))
+}
+
 func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path string) error {
 	if entry.Links > 1 {
 		key := hardLinkKey{device: entry.Device, inode: entry.Inode}
@@ -186,8 +225,17 @@ func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path s
 	}
 	defer func() { _ = f.Close() }()
 
+	chunkIDs := entry.Chunks
+	if tree.ContentType(entry.ContentType) == tree.ContentIndirect {
+		ids, err := run.resolveChunkList(ctx, entry.Chunks)
+		if err != nil {
+			return fmt.Errorf("restore %s: %w", path, err)
+		}
+		chunkIDs = ids
+	}
+
 	var written uint64
-	for _, chunkID := range entry.Chunks {
+	for _, chunkID := range chunkIDs {
 		data, err := run.chunk(ctx, chunkID)
 		if err != nil {
 			return fmt.Errorf("restore %s: %w", path, err)
@@ -214,6 +262,26 @@ func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path s
 // chunk fetches one chunk, reusing an open pack reader when it can.
 func (run *restoreRun) chunk(ctx context.Context, id crypto.ID) ([]byte, error) {
 	return run.chunks.Chunk(ctx, id)
+}
+
+// resolveChunkList reassembles and decodes an indirect chunk list.
+func (run *restoreRun) resolveChunkList(ctx context.Context, chunks []crypto.ID) ([]crypto.ID, error) {
+	var buf []byte
+	for _, id := range chunks {
+		data, err := run.chunk(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, data...)
+	}
+	var list tree.ChunkList
+	if err := crypto.Unmarshal(buf, &list); err != nil {
+		return nil, fmt.Errorf("%w: chunk list: %v", tree.ErrCorrupt, err)
+	}
+	if list.Version != tree.Version {
+		return nil, fmt.Errorf("%w: chunk list declares version %d, this build reads %d", tree.ErrCorrupt, list.Version, tree.Version)
+	}
+	return list.Chunks, nil
 }
 
 // applyMetadata restores mode, times and ownership, warning about what it

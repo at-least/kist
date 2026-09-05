@@ -64,10 +64,7 @@ func TestGoldenEnvelope(t *testing.T) {
 }
 
 func TestGoldenSubkeys(t *testing.T) {
-	keys, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	keys := DeriveKeys(goldenMaster)
 
 	var b strings.Builder
 	for _, sub := range []struct {
@@ -85,10 +82,7 @@ func TestGoldenSubkeys(t *testing.T) {
 }
 
 func TestGoldenContentID(t *testing.T) {
-	keys, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	keys := DeriveKeys(goldenMaster)
 
 	var b strings.Builder
 	for _, in := range []string{"", "a", "hello world"} {
@@ -105,7 +99,7 @@ func TestGoldenKeySlot(t *testing.T) {
 	// are exercised by TestDefaultKDFParamsMatchRFC9106.
 	params.Time, params.MemoryKiB, params.Threads = 1, 8, 1
 
-	slot, err := NewKeySlot([]byte("correct horse battery staple"), goldenRepoID, goldenMaster, params, goldenTime, DeterministicReader("golden-slot"))
+	slot, err := NewKeySlot([]byte("correct horse battery staple"), goldenAAD(), goldenMaster, params, goldenTime, DeterministicReader("golden-slot"))
 	if err != nil {
 		t.Fatalf("new key slot: %v", err)
 	}
@@ -121,7 +115,7 @@ func TestGoldenKeySlot(t *testing.T) {
 	if err := Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	master, err := decoded.Unwrap([]byte("correct horse battery staple"), goldenRepoID)
+	master, err := decoded.Unwrap([]byte("correct horse battery staple"), goldenAAD())
 	if err != nil {
 		t.Fatalf("unwrap: %v", err)
 	}

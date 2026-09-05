@@ -238,7 +238,7 @@ func TestS3ConcurrentBackups(t *testing.T) {
 				if _, err := third.Restore(ctx, h.Key, target, RestoreOptions{}); err != nil {
 					t.Fatalf("restore %s: %v", h.Key, err)
 				}
-				compareTrees(t, source, filepath.Join(target, filepath.Base(source)))
+				compareTrees(t, source, filepath.Join(target, source))
 			}
 
 			// The sharp assertion: the third client's index merged both
@@ -263,7 +263,9 @@ func TestS3ConcurrentBackups(t *testing.T) {
 
 // backupPolicy is the least a backup client needs, scoped to one prefix.
 // It is what docs/format.md §10 has to match, and the test is what says
-// whether the table there is honest.
+// whether the table there is honest. v2 backups are Put-only: they read
+// the gc marks (to know which packs not to deduplicate against) but hold
+// no Delete permission at all.
 //
 // The PutObject statement carries the s3:if-none-match condition: only a
 // PutObject that sends If-None-Match is allowed at all. On a service that
@@ -297,18 +299,11 @@ func backupPolicy(bucket, prefix string, enforceConditional bool) string {
       "Sid": "ConditionalWriteOnly",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": [%s, %s, %s, %s, %s, %s]%s
-    },
-    {
-      "Sid": "ReviveMarkedPacks",
-      "Effect": "Allow",
-      "Action": ["s3:DeleteObject"],
-      "Resource": [%s]
+      "Resource": [%s, %s, %s, %s, %s]%s
     }
   ]
 }`, res("config"), res("indexes/*"), bucket, prefix, prefix,
-		res("packs/*"), res("indexes/*"), res("trees/*"), res("snapshots/*"), res("clients/*"), res("parity/*"), condition,
-		res("gc/*"))
+		res("packs/*"), res("indexes/*"), res("trees/*"), res("snapshots/*"), res("parity/*"), condition)
 }
 
 // createScopedUser makes a MinIO user holding the backup policy, with
@@ -418,7 +413,7 @@ func TestS3BackupPolicy(t *testing.T) {
 	})
 
 	t.Run("cannot list data prefixes", func(t *testing.T) {
-		for _, prefix := range []string{pack.Prefix, "trees/", "snapshots/", ClientsPrefix, ""} {
+		for _, prefix := range []string{pack.Prefix, "trees/", "snapshots/", ""} {
 			err := limited.List(ctx, prefix, func(backend.FileInfo) error { return nil })
 			if !errors.Is(err, backend.ErrDenied) {
 				t.Errorf("list %q: err = %v, want ErrDenied", prefix, err)
@@ -426,25 +421,24 @@ func TestS3BackupPolicy(t *testing.T) {
 		}
 	})
 
-	// Prune's marks are the one thing a backup client may delete: a
-	// mark is a statement that nobody needs a pack, and a backup that
-	// needs it is entitled to say otherwise. Nothing else under the
-	// backup's credentials may go.
-	t.Run("can revive a marked pack and nothing more", func(t *testing.T) {
+	// v2 backups are Put-only: the marks under gc/ are read (the backup
+	// lists them to know which packs not to deduplicate against) but
+	// never written or deleted, and a backup role holds no Delete at all.
+	t.Run("cannot touch gc marks", func(t *testing.T) {
 		packID, err := crypto.ParseID(strings.TrimPrefix(packKey, pack.Prefix))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := backend.PutBytesIfAbsent(ctx, admin, gcKey(packID), []byte("mark")); err != nil {
+		if err := backend.PutBytesIfAbsent(ctx, admin, gcKey(packID), GCMarkMagic); err != nil {
 			t.Fatalf("mark as admin: %v", err)
 		}
-		if err := limited.Delete(ctx, gcKey(packID)); err != nil {
-			t.Errorf("delete a mark: %v, want success", err)
+		if err := limited.Delete(ctx, gcKey(packID)); !errors.Is(err, backend.ErrDenied) {
+			t.Errorf("delete a mark with backup credentials: err = %v, want ErrDenied", err)
 		}
-		if ok, err := backend.Exists(ctx, admin, gcKey(packID)); err != nil || ok {
-			t.Errorf("mark still there after the backup client removed it: %v, %v", ok, err)
+		if ok, err := backend.Exists(ctx, admin, gcKey(packID)); err != nil || !ok {
+			t.Errorf("mark is gone after a denied delete: %v, %v", ok, err)
 		}
-		for _, key := range []string{packKey, "config", clientKey("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")} {
+		for _, key := range []string{packKey, "config"} {
 			if err := limited.Delete(ctx, key); !errors.Is(err, backend.ErrDenied) {
 				t.Errorf("delete %s: err = %v, want ErrDenied", key, err)
 			}
@@ -627,14 +621,14 @@ func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if snap.Paths[0] != source {
+		if len(snap.Paths) == 0 || string(snap.Paths[0]) != source {
 			continue
 		}
 		target := filepath.Join(t.TempDir(), "out")
 		if _, err := third.Restore(ctx, h.Key, target, RestoreOptions{}); err != nil {
 			t.Fatalf("restore %s: %v", h.Key, err)
 		}
-		compareTrees(t, source, filepath.Join(target, filepath.Base(source)))
+		compareTrees(t, source, filepath.Join(target, source))
 		restored++
 	}
 	if restored != 2 {

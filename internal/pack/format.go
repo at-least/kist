@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
 )
 
@@ -19,7 +18,7 @@ const (
 	// reject a future pack before parsing one, and the trailer's own v
 	// field, so a trailer cannot be lifted from a pack of one version
 	// onto the tail of another.
-	Version = 1
+	Version = 2
 
 	// TargetSize is the size a writer aims for before flushing. Large
 	// enough that per-object overhead on object storage disappears, small
@@ -35,8 +34,11 @@ const (
 	tailSize = lengthSize + magicSize
 
 	// maxSealedChunk is the largest a sealed chunk can legitimately be:
-	// the chunker's maximum, plus the encoding byte, plus the envelope.
-	maxSealedChunk = chunker.MaxSize + 1 + crypto.Overhead
+	// the format's maximum chunk size (chunker.max may be configured up
+	// to this), plus the encoding byte, plus the envelope. The bound is
+	// what keeps a crafted-but-authenticated trailer from asking for
+	// gigabytes at chunk-read time.
+	maxSealedChunk = 64<<20 + 1 + crypto.Overhead
 
 	// maxTrailerSize bounds what a reader will allocate from a length
 	// field it has not yet authenticated. A 64 MiB pack of minimum-size
@@ -45,9 +47,11 @@ const (
 	maxTrailerSize = 16 << 20
 )
 
-// magicPrefix and magic close every pack: "kistpk" followed by the
-// version as a big-endian uint16, so a corrupted or foreign object is
-// rejected by inspection rather than by a confusing parse failure.
+// magicPrefix and magic open and close every pack: "kistpk" followed by
+// the version as a big-endian uint16, so a corrupted or foreign object is
+// rejected by inspection rather than by a confusing parse failure. The
+// header copy at offset 0 is new in v2: entries no longer start at the
+// beginning of the file.
 const magicPrefix = "kistpk"
 
 var magic = func() [magicSize]byte {
@@ -84,7 +88,10 @@ var (
 	ErrCorrupt = errors.New("pack is corrupt")
 )
 
-// An Entry locates one chunk inside its pack.
+// An Entry locates one chunk inside its pack. v2 stores entries as CBOR
+// maps with short keys (evolvable: a v2.1 reader that does not know a new
+// field still understands the ones it knows), and records RawLen so a
+// reader knows the plaintext size without decrypting.
 //
 // Offset points at the first byte of the sealed chunk -- its nonce -- and
 // Length covers the whole sealed form, so (Offset, Length) is exactly the
@@ -92,15 +99,14 @@ var (
 // index stores, so a trailer and an index can never disagree about what
 // an entry means.
 type Entry struct {
-	_ struct{} `cbor:",toarray"`
-
-	ID     crypto.ID
-	Offset uint64
-	Length uint32
+	ID     crypto.ID `cbor:"i"`
+	Offset uint64    `cbor:"o"`
+	Length uint64    `cbor:"l"`
+	RawLen uint64    `cbor:"r"`
 }
 
 // End returns the offset one past the last byte of the chunk.
-func (e Entry) End() uint64 { return e.Offset + uint64(e.Length) }
+func (e Entry) End() uint64 { return e.Offset + e.Length }
 
 // A trailer is the index a pack carries about itself.
 type trailer struct {

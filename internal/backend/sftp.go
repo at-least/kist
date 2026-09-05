@@ -520,7 +520,7 @@ func (s *SFTP) walk(ctx context.Context, dir, prefix string, fn func(FileInfo) e
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if err := fn(FileInfo{Key: key, Size: e.Size()}); err != nil {
+		if err := fn(FileInfo{Key: key, Size: e.Size(), Modified: e.ModTime().Truncate(time.Second)}); err != nil {
 			return err
 		}
 	}

@@ -12,7 +12,7 @@ import (
 func FuzzDecode(f *testing.F) {
 	valid := &Snapshot{
 		Version: Version, Root: crypto.ID{1}, TimeNs: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC).UnixNano(),
-		Host: "h", Paths: []string{"/a"}, ClientID: "00112233445566778899aabbccddeeff",
+		Host: "h", Paths: [][]byte{[]byte("/a")}, ClientID: []byte("0011223344556677"),
 		Stats: Stats{Files: 1, Bytes: 2},
 	}
 	seed, err := crypto.Marshal(valid)

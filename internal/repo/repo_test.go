@@ -90,8 +90,13 @@ func TestInitThenOpen(t *testing.T) {
 	if r.Config().Version != ConfigVersion {
 		t.Errorf("config version = %d, want %d", r.Config().Version, ConfigVersion)
 	}
-	if r.Config().Chunker != currentChunkerParams() {
-		t.Errorf("chunker params = %+v, want %+v", r.Config().Chunker, currentChunkerParams())
+	// v2 reads the chunker parameters as (validated) repository
+	// parameters; Init writes the defaults.
+	if r.Config().Chunker != DefaultChunkerParams() {
+		t.Errorf("chunker params = %+v, want %+v", r.Config().Chunker, DefaultChunkerParams())
+	}
+	if r.Config().PackTargetSize != DefaultPackTargetSize {
+		t.Errorf("pack target = %d, want %d", r.Config().PackTargetSize, DefaultPackTargetSize)
 	}
 
 	// The config is the only plaintext object, and it must be readable
@@ -154,29 +159,58 @@ func TestOpenRejectsTheWrongPassword(t *testing.T) {
 	}
 }
 
-// A repository written with different chunk sizes deduplicates against
-// nothing. Refusing to open it is better than silently doubling it.
-func TestOpenRejectsForeignChunkerParameters(t *testing.T) {
+// v2 binds the chunker parameters into the master-key AAD: a repository
+// whose plaintext config lies about them (they are in the validated range,
+// so validation alone would accept) fails the unwrap rather than silently
+// returning keys that deduplicate against nothing.
+func TestOpenRejectsTamperedChunkerParameters(t *testing.T) {
 	ctx := context.Background()
 	r, dir := initRepo(t, "chunker")
 
-	cfg := *r.Config()
-	cfg.Chunker.AvgSize *= 2
-	encoded, err := crypto.Marshal(&cfg)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if err := r.Backend().Put(ctx, ConfigKey, strings.NewReader(string(encoded)), int64(len(encoded))); err != nil {
-		t.Fatalf("write config: %v", err)
+	rewriteConfig := func(mutate func(*Config)) {
+		cfg := *r.Config()
+		mutate(&cfg)
+		encoded, err := crypto.Marshal(&cfg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := r.Backend().Put(ctx, ConfigKey, strings.NewReader(string(encoded)), int64(len(encoded))); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
 	}
 
-	b, err := backend.OpenLocal(dir)
-	if err != nil {
-		t.Fatalf("open backend: %v", err)
-	}
-	if _, err := Open(ctx, b, testOptions(t, "foreign")); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("open: err = %v, want ErrCorrupt", err)
-	}
+	t.Run("in range but different", func(t *testing.T) {
+		rewriteConfig(func(c *Config) { c.Chunker.AvgSize *= 2 }) // 4 MiB is inside the validated range
+		b, err := backend.OpenLocal(dir)
+		if err != nil {
+			t.Fatalf("open backend: %v", err)
+		}
+		if _, err := Open(ctx, b, testOptions(t, "tampered")); !errors.Is(err, crypto.ErrWrongPassword) {
+			t.Fatalf("open: err = %v, want ErrWrongPassword (the AAD no longer matches)", err)
+		}
+	})
+
+	t.Run("outside the validated range", func(t *testing.T) {
+		rewriteConfig(func(c *Config) { c.Chunker.MaxSize = 1 << 31 })
+		b, err := backend.OpenLocal(dir)
+		if err != nil {
+			t.Fatalf("open backend: %v", err)
+		}
+		if _, err := Open(ctx, b, testOptions(t, "out-of-range")); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("open: err = %v, want ErrCorrupt", err)
+		}
+	})
+
+	t.Run("min above avg", func(t *testing.T) {
+		rewriteConfig(func(c *Config) { c.Chunker.AvgSize = 300 << 10 }) // 300 KiB, in range but under MinSize
+		b, err := backend.OpenLocal(dir)
+		if err != nil {
+			t.Fatalf("open backend: %v", err)
+		}
+		if _, err := Open(ctx, b, testOptions(t, "unordered")); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("open: err = %v, want ErrCorrupt", err)
+		}
+	})
 }
 
 func TestClientIDIsPersistedAndReused(t *testing.T) {

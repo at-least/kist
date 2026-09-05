@@ -44,9 +44,6 @@ func newPruneCommand() *cobra.Command {
 					return err
 				}
 				ev.Prune = report.FromPrune(result, dryRun)
-				for _, key := range result.UnreadableClients {
-					warnInto(cmd, ev)("%s is not a readable client record; left in place", key)
-				}
 				if jsonMode(cmd) {
 					return nil
 				}

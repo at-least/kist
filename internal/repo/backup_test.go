@@ -3,17 +3,20 @@ package repo
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/at-least/kist/internal/backend"
+	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/pack"
 	"github.com/at-least/kist/internal/snapshot"
@@ -213,9 +216,10 @@ func TestBackupRestoreIsByteForByte(t *testing.T) {
 		t.Errorf("restored %d files, backed up %d", stats.Files, snap.Stats.Files)
 	}
 
-	// The snapshot root holds one entry per source path, named by its
-	// base name.
-	compareTrees(t, source, filepath.Join(target, filepath.Base(source)))
+	// The snapshot root holds one entry per source path, named by the
+	// source's own bytes: the v2 rule is the full absolute path, so a
+	// restore rebuilds it under the target component by component.
+	compareTrees(t, source, filepath.Join(target, source))
 }
 
 // The second backup of unchanged data must write no packs: that is the
@@ -295,7 +299,6 @@ func TestIncrementalBackupOnlyRewritesTheChangedPath(t *testing.T) {
 
 func TestBackupSkipsUnsupportedFileTypes(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("no FIFOs on Windows")
 	}
 	ctx := context.Background()
 	r, _ := initRepo(t, "fifo")
@@ -324,7 +327,6 @@ func TestBackupSkipsUnsupportedFileTypes(t *testing.T) {
 
 func TestHardLinksAreStoredOnceAndRestoredAsLinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("hard links are not tracked on Windows")
 	}
 	ctx := context.Background()
 	r, dir := initRepo(t, "hardlink")
@@ -354,7 +356,7 @@ func TestHardLinksAreStoredOnceAndRestoredAsLinks(t *testing.T) {
 		t.Errorf("restored %d hard links, want 1", stats.Links)
 	}
 
-	base := filepath.Join(target, filepath.Base(source))
+	base := filepath.Join(target, source)
 	if !sameInode(t, filepath.Join(base, "original.bin"), filepath.Join(base, "alias.bin")) {
 		t.Error("the restored names are separate files, not one file under two names")
 	}
@@ -396,8 +398,12 @@ func TestBackupOfSeveralPaths(t *testing.T) {
 	if len(snap.Paths) != 2 {
 		t.Errorf("snapshot records %d paths, want 2", len(snap.Paths))
 	}
-	if !sort.StringsAreSorted(snap.Paths) {
-		t.Errorf("snapshot paths are not sorted: %v", snap.Paths)
+	var pathStrings []string
+	for _, p := range snap.Paths {
+		pathStrings = append(pathStrings, string(p))
+	}
+	if !sort.StringsAreSorted(pathStrings) {
+		t.Errorf("snapshot paths are not sorted: %v", pathStrings)
 	}
 
 	target := filepath.Join(t.TempDir(), "out")
@@ -405,8 +411,9 @@ func TestBackupOfSeveralPaths(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	for _, root := range []string{first, second} {
-		if _, err := os.Stat(filepath.Join(target, filepath.Base(root))); err != nil {
-			t.Errorf("restored tree is missing %s: %v", filepath.Base(root), err)
+		// Each source is restored under the target by its full path.
+		if _, err := os.Stat(filepath.Join(target, root)); err != nil {
+			t.Errorf("restored tree is missing %s: %v", root, err)
 		}
 	}
 }
@@ -490,7 +497,222 @@ func TestDuplicateContentWithinOnePackIsStoredOnce(t *testing.T) {
 	if _, err := fresh.Restore(ctx, handle.Key, target, RestoreOptions{}); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	compareTrees(t, source, filepath.Join(target, filepath.Base(source)))
+	compareTrees(t, source, filepath.Join(target, source))
+}
+
+// PRODUCTION GAP (v2): `kist backup <single-file>` writes a root-tree
+// FILE entry named by the file's absolute path, and restore never creates
+// the intermediate directories for such an entry -- it only mkdirs for
+// directory entries -- so the snapshot commits but cannot be restored
+// (repro: kist backup /tmp/x/one.txt; kist restore <key> /tmp/out ->
+// "open .../out/tmp/x/one.txt: no such file or directory"). The fix
+// belongs in restore (create parents for absolute-path file entries) or
+// in backup (another naming for file sources); this test pins the
+// end-to-end OUTCOME -- the file comes back under the target by its full
+// path, per docs/format.md §7 -- not the mechanism. Enable after fixing.
+const singleFileRestoreGap = "PRODUCTION GAP: restore cannot recreate absolute-path file entries at the snapshot root (no parent directories are created)"
+
+func TestBackupOfASingleFileRestores(t *testing.T) {
+	ctx := context.Background()
+	r, _ := initRepo(t, "single-file")
+
+	src := filepath.Join(t.TempDir(), "one.txt")
+	if err := os.WriteFile(src, []byte("single file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, handle, err := r.Backup(ctx, []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	target := filepath.Join(t.TempDir(), "out")
+	if _, err := r.Restore(ctx, handle.Key, target, RestoreOptions{}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(target, src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "single file" {
+		t.Errorf("restored %q, want %q", got, "single file")
+	}
+}
+
+// v2 splits a directory larger than MaxNodesPerTree into a chain of tree
+// segments linked by Prev; the parent records the LAST segment's ID and
+// unchanged earlier segments keep their names.
+func TestBackupSegmentsHugeDirectories(t *testing.T) {
+	ctx := context.Background()
+	r, dir := initRepo(t, "segments")
+
+	source := t.TempDir()
+	total := tree.MaxNodesPerTree + 5
+	specs := make([]fileSpec, 0, total)
+	for i := range total {
+		if i%2500 == 0 {
+			specs = append(specs, fileSpec{path: fmt.Sprintf("f%06d.bin", i), data: randomBytes(t, fmt.Sprintf("seg-%d", i), 1024)})
+		} else {
+			specs = append(specs, fileSpec{path: fmt.Sprintf("f%06d.bin", i)})
+		}
+	}
+	writeTree(t, source, specs)
+
+	snap, handle, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if snap.Stats.Files != uint64(total) {
+		t.Fatalf("backed up %d files, want %d", snap.Stats.Files, total)
+	}
+
+	// The source directory's tree is the chain of both segments.
+	entries, err := r.LoadTreeChain(ctx, snap.Root)
+	if err != nil {
+		t.Fatalf("root chain: %v", err)
+	}
+	if len(entries) != 1 || string(entries[0].Name) != source || entries[0].Subtree == nil {
+		t.Fatalf("root holds %+v, want the one source %q", entries[0], source)
+	}
+	all, err := r.LoadTreeChain(ctx, *entries[0].Subtree)
+	if err != nil {
+		t.Fatalf("dir chain: %v", err)
+	}
+	if len(all) != total {
+		t.Fatalf("chain reassembled %d entries, want %d", len(all), total)
+	}
+	for i, e := range all {
+		if want := fmt.Sprintf("f%06d.bin", i); string(e.Name) != want {
+			t.Fatalf("entry %d = %q, want %q (segments out of order)", i, e.Name, want)
+		}
+	}
+
+	// A second, unchanged backup writes no new segments.
+	treesAfterFirst := countKeys(t, r.Backend(), "trees/")
+	second := reopen(t, dir, "segments-2")
+	if _, _, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+		t.Fatalf("second backup: %v", err)
+	}
+	if got := countKeys(t, second.Backend(), "trees/"); got != treesAfterFirst {
+		t.Errorf("%d trees after the second backup, want the original %d: earlier segments were not reused", got, treesAfterFirst)
+	}
+
+	target := filepath.Join(t.TempDir(), "out")
+	if _, err := second.Restore(ctx, handle.Key, target, RestoreOptions{}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	compareTrees(t, source, filepath.Join(target, source))
+}
+
+// v2 stores a file with more than MaxInlineChunks chunks indirectly: the
+// chunk list itself is encoded as a ChunkList, chunked like data, and the
+// entry points at those chunks with ContentType indirect. A file big
+// enough to trip the limit organically is half a gigabyte, so this test
+// builds the objects directly and exercises the restore side end to end.
+func TestRestoreFollowsIndirectChunkLists(t *testing.T) {
+	ctx := context.Background()
+	r, _ := initRepo(t, "indirect")
+
+	payload := randomBytes(t, "indirect-payload", 3<<20)
+	var ids []crypto.ID
+	var put [][]byte
+	c, err := chunker.New(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		chunk, err := c.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := crypto.ContentID(&r.keys.Hash, chunk.Data)
+		ids = append(ids, id)
+		put = append(put, append([]byte(nil), chunk.Data...))
+	}
+	if len(ids) < 2 {
+		t.Fatalf("payload produced %d chunks, want several", len(ids))
+	}
+
+	// Store the content chunks, then the encoded chunk list, in packs.
+	store := func(chunks map[crypto.ID][]byte) []crypto.ID {
+		w, err := pack.NewWriter(r.keys, t.TempDir(), crypto.DeterministicReader("indirect"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var order []crypto.ID
+		for id, data := range chunks {
+			if err := w.Add(id, data); err != nil {
+				t.Fatal(err)
+			}
+			order = append(order, id)
+		}
+		packID, entries, _, err := w.Finish(ctx, r.Backend())
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.index.AddPack(packID, entries)
+		slices.SortFunc(order, func(a, b crypto.ID) int { return bytes.Compare(a[:], b[:]) })
+		return order
+	}
+	contentChunks := make(map[crypto.ID][]byte, len(ids))
+	for i, id := range ids {
+		contentChunks[id] = put[i]
+	}
+	if _, err := r.RebuildIndex(ctx); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	store(contentChunks)
+
+	encoded, err := crypto.Marshal(tree.NewChunkList(ids))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listID := crypto.ContentID(&r.keys.Hash, encoded)
+	listChunks := store(map[crypto.ID][]byte{listID: encoded})
+
+	// The snapshot root holds one absolute-path directory entry -- the
+	// shape a directory-source backup produces -- with the indirect file
+	// inside it.
+	dirTree := tree.New([]tree.Entry{{
+		Name: []byte("big.bin"), Type: uint8(tree.TypeFile), Mode: 0o644,
+		Size: uint64(len(payload)), MTimeNs: 1767225845000000000,
+		Chunks: listChunks, ContentType: uint8(tree.ContentIndirect),
+	}})
+	dirID, err := dirTree.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := tree.New([]tree.Entry{{
+		Name: []byte("/virtual"), Type: uint8(tree.TypeDir), Mode: 0o755 | uint32(os.ModeDir),
+		MTimeNs: 1767225845000000000, Subtree: &dirID,
+	}})
+	rootID, err := root.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snap := &snapshot.Snapshot{
+		Version: snapshot.Version, Root: rootID, TimeNs: 1767225845000000001,
+		Host: "t", Paths: [][]byte{[]byte("/virtual")}, ClientID: r.clientID,
+	}
+	handle, err := snap.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("snap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(t.TempDir(), "out")
+	if _, err := r.Restore(ctx, handle.Key, target, RestoreOptions{}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(target, "virtual", "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("indirect restore produced %d bytes that differ from the %d-byte payload", len(got), len(payload))
+	}
 }
 
 // logTreeDifferences prints, for the two most recent snapshots, every
@@ -526,10 +748,10 @@ func logTreeDifferences(t *testing.T, r *Repository) {
 		}
 		byName := map[string]tree.Entry{}
 		for _, e := range tb.Entries {
-			byName[e.Name] = e
+			byName[string(e.Name)] = e
 		}
 		for _, ea := range ta.Entries {
-			eb, ok := byName[ea.Name]
+			eb, ok := byName[string(ea.Name)]
 			if !ok {
 				t.Logf("%s/%s: only in the first snapshot", path, ea.Name)
 				continue
@@ -537,8 +759,8 @@ func logTreeDifferences(t *testing.T, r *Repository) {
 			if fmt.Sprintf("%+v", ea) != fmt.Sprintf("%+v", eb) {
 				t.Logf("%s/%s differs:\n  first:  %+v\n  second: %+v", path, ea.Name, ea, eb)
 			}
-			if ea.Type == tree.TypeDir {
-				walk(path+"/"+ea.Name, ea.Subtree, eb.Subtree)
+			if tree.NodeType(ea.Type) == tree.TypeDir && ea.Subtree != nil && eb.Subtree != nil {
+				walk(path+"/"+string(ea.Name), *ea.Subtree, *eb.Subtree)
 			}
 		}
 	}

@@ -331,7 +331,7 @@ func (s *S3) List(ctx context.Context, prefix string, fn func(FileInfo) error) e
 			// Passed through even if it is not a valid kist key, exactly
 			// as the local backend does: check must be able to report
 			// junk under a repository prefix, not have it hidden.
-			if err := fn(FileInfo{Key: key, Size: aws.ToInt64(obj.Size)}); err != nil {
+			if err := fn(FileInfo{Key: key, Size: aws.ToInt64(obj.Size), Modified: aws.ToTime(obj.LastModified).Truncate(time.Second)}); err != nil {
 				return fmt.Errorf("list %q in %s: %w", prefix, s.location, err)
 			}
 		}
@@ -353,7 +353,7 @@ func (s *S3) Stat(ctx context.Context, key string) (FileInfo, error) {
 	if err != nil {
 		return FileInfo{}, s.wrap("stat", key, err)
 	}
-	return FileInfo{Key: key, Size: aws.ToInt64(out.ContentLength)}, nil
+	return FileInfo{Key: key, Size: aws.ToInt64(out.ContentLength), Modified: aws.ToTime(out.LastModified).Truncate(time.Second)}, nil
 }
 
 // Delete removes an object. S3 answers 204 for a missing key, so the

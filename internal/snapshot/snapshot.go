@@ -2,10 +2,12 @@ package snapshot
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,15 +16,69 @@ import (
 )
 
 // Version is the snapshot object schema version.
-const Version = 1
+const Version = 2
 
 // Prefix is the repository prefix snapshots live under.
 const Prefix = "snapshots/"
 
-// TimeFormat is how a snapshot's timestamp appears in its key. Fixed
-// width so that lexical order is chronological order, and without the
-// colons of RFC 3339, which cannot appear in a Windows filename.
-const TimeFormat = "20060102t150405.000000000z"
+// A snapshot's key timestamp is YYYYMMDDTHHMMSSnnnnnnnnnZ: fixed width
+// so that lexical order is chronological order, no colons (Windows), and
+// no dot before the nanoseconds -- Go's reference layouts cannot express
+// nine fixed digits without a decimal point, so the conversion is done
+// by hand below.
+const tsLen = 8 + 1 + 6 + 9 + 1 // 20260905T114202395568091Z
+
+// FormatKeyTime renders t in the key timestamp form (mount uses it for
+// its directory names).
+func FormatKeyTime(t time.Time) string { return formatKeyTime(t) }
+
+func formatKeyTime(t time.Time) string {
+	t = t.UTC()
+	return fmt.Sprintf("%04d%02d%02dT%02d%02d%02d%09dZ",
+		t.Year(), int(t.Month()), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond())
+}
+
+func parseKeyTime(s string) (time.Time, error) {
+	if len(s) != tsLen || s[8] != 'T' || s[24] != 'Z' {
+		return time.Time{}, fmt.Errorf("timestamp %q is not YYYYMMDDTHHMMSSnnnnnnnnnZ", s)
+	}
+	digits := func(run string) (int, error) {
+		v, err := strconv.Atoi(run)
+		if err != nil || v < 0 {
+			return 0, fmt.Errorf("timestamp %q: %q is not a number", s, run)
+		}
+		return v, nil
+	}
+	year, err := digits(s[0:4])
+	if err != nil {
+		return time.Time{}, err
+	}
+	month, err := digits(s[4:6])
+	if err != nil {
+		return time.Time{}, err
+	}
+	day, err := digits(s[6:8])
+	if err != nil {
+		return time.Time{}, err
+	}
+	hour, err := digits(s[9:11])
+	if err != nil {
+		return time.Time{}, err
+	}
+	minute, err := digits(s[11:13])
+	if err != nil {
+		return time.Time{}, err
+	}
+	second, err := digits(s[13:15])
+	if err != nil {
+		return time.Time{}, err
+	}
+	nanos, err := digits(s[15:24])
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Date(year, time.Month(month), day, hour, minute, second, nanos, time.UTC), nil
+}
 
 // ErrCorrupt means a snapshot object is structurally invalid.
 var ErrCorrupt = errors.New("snapshot object is corrupt")
@@ -34,7 +90,8 @@ var ErrCorrupt = errors.New("snapshot object is corrupt")
 const maxTimestampRetries = 1000
 
 // Stats summarise what a backup did. They are reporting, not structure:
-// nothing reads them back to make a decision.
+// nothing reads them back to make a decision. The field set is the union
+// of the two v1 implementations.
 type Stats struct {
 	Files        uint64 `cbor:"files,omitempty"`
 	Dirs         uint64 `cbor:"dirs,omitempty"`
@@ -42,16 +99,19 @@ type Stats struct {
 	Bytes        uint64 `cbor:"bytes,omitempty"`
 	ChunksNew    uint64 `cbor:"chunks_new,omitempty"`
 	ChunksRead   uint64 `cbor:"chunks_read,omitempty"`
-	PacksAdded   uint64 `cbor:"packs_added,omitempty"`
+	PacksAdded   uint64 `cbor:"packs_new,omitempty"`
 	PacksRevived uint64 `cbor:"packs_revived,omitempty"`
 	BytesStored  uint64 `cbor:"bytes_stored,omitempty"`
+	Errors       uint64 `cbor:"errors,omitempty"`
+	FilesReused  uint64 `cbor:"files_reused,omitempty"`
 }
 
 // A Snapshot is one completed backup.
 type Snapshot struct {
 	Version uint64 `cbor:"v"`
 
-	// Root is the tree the backup produced.
+	// Root is the tree the backup produced (its last segment if the root
+	// directory was split).
 	Root crypto.ID `cbor:"root"`
 
 	// TimeNs is when the backup started, in UTC nanoseconds. The key
@@ -59,26 +119,34 @@ type Snapshot struct {
 	// because the key is only a name.
 	TimeNs int64 `cbor:"time"`
 
-	// Host and Paths describe where the data came from, for a human
-	// choosing which snapshot to restore.
+	// Host, User and Paths describe where the data came from, for a human
+	// choosing which snapshot to restore. Paths are byte strings: on Unix
+	// they are the raw OS bytes of the backed-up paths.
 	Host  string   `cbor:"host"`
-	Paths []string `cbor:"paths"`
+	User  string   `cbor:"user,omitempty"`
+	Paths [][]byte `cbor:"paths"`
 
-	// ClientID is the client that wrote this snapshot. It duplicates the
-	// key's namespace so that a snapshot moved to another namespace fails
-	// to agree with itself.
-	ClientID string `cbor:"client"`
+	// ClientID is the 16-byte identity of the client that wrote this
+	// snapshot. It duplicates the key's namespace so that a snapshot
+	// moved to another namespace fails to agree with itself.
+	ClientID []byte `cbor:"client"`
+
+	// Parent is this client's previous snapshot for the same paths. It is
+	// an accelerator only (the Rust implementation uses it for a
+	// metadata-unchanged fast path); readers must not depend on it.
+	Parent *string `cbor:"parent,omitempty"`
 
 	Stats Stats `cbor:"stats"`
 }
 
 // Key returns the repository key a snapshot is stored under.
-func Key(clientID string, at time.Time) string {
-	return Prefix + clientID + "/" + at.UTC().Format(TimeFormat)
+func Key(clientID []byte, at time.Time) string {
+	return Prefix + hex.EncodeToString(clientID) + "/" + formatKeyTime(at)
 }
 
 // A Handle names a stored snapshot without loading it.
 type Handle struct {
+	// ClientID is the hex form, which is what appears in the key.
 	ClientID string
 	Time     time.Time
 	Key      string
@@ -95,7 +163,7 @@ func ParseKey(key string) (Handle, error) {
 		return Handle{}, fmt.Errorf("%w: key %q is not %s<client>/<timestamp>", ErrCorrupt, key, Prefix)
 	}
 
-	at, err := time.ParseInLocation(TimeFormat, stamp, time.UTC)
+	at, err := parseKeyTime(stamp)
 	if err != nil {
 		return Handle{}, fmt.Errorf("%w: key %q has an unparseable timestamp: %w", ErrCorrupt, key, err)
 	}
@@ -132,7 +200,7 @@ func (s *Snapshot) Save(ctx context.Context, b backend.Backend, keys *crypto.Key
 
 		switch err := backend.PutBytesIfAbsent(ctx, b, key, sealed); {
 		case err == nil:
-			return Handle{ClientID: s.ClientID, Time: at, Key: key}, nil
+			return Handle{ClientID: hex.EncodeToString(s.ClientID), Time: at, Key: key}, nil
 		case errors.Is(err, backend.ErrExists):
 			at = at.Add(time.Nanosecond)
 			s.TimeNs = at.UnixNano()
@@ -171,7 +239,7 @@ func Load(ctx context.Context, b backend.Backend, keys *crypto.Keys, key string)
 	}
 
 	// The key is a name; the object is the record. They must agree.
-	if s.ClientID != handle.ClientID {
+	if hex.EncodeToString(s.ClientID) != handle.ClientID {
 		return nil, fmt.Errorf("load snapshot %s: %w: object claims client %q", key, ErrCorrupt, s.ClientID)
 	}
 	if !time.Unix(0, s.TimeNs).UTC().Equal(handle.Time) {
@@ -214,9 +282,9 @@ func (s *Snapshot) validate() error {
 	switch {
 	case s.Root.IsZero():
 		return fmt.Errorf("%w: no root tree", ErrCorrupt)
-	case s.ClientID == "":
-		return fmt.Errorf("%w: no client ID", ErrCorrupt)
-	case strings.ContainsAny(s.ClientID, "/"):
+	case len(s.ClientID) != 16:
+		return fmt.Errorf("%w: client ID is %d bytes, want 16", ErrCorrupt, len(s.ClientID))
+	case strings.ContainsAny(hex.EncodeToString(s.ClientID), "/"):
 		return fmt.Errorf("%w: client ID %q contains a slash", ErrCorrupt, s.ClientID)
 	case s.TimeNs == 0:
 		return fmt.Errorf("%w: no timestamp", ErrCorrupt)

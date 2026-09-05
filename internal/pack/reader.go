@@ -133,11 +133,24 @@ func (r *Reader) VerifyAll(ctx context.Context) error {
 	hasher := crypto.CiphertextHasher()
 	stream := io.TeeReader(body, hasher)
 
+	// v2: the pack opens with the header magic; it passes through the
+	// hasher like everything else and is checked byte for byte.
+	header := make([]byte, magicSize)
+	if _, err := io.ReadFull(stream, header); err != nil {
+		return fail(fmt.Errorf("read header: %w", err))
+	}
+	if string(header) != string(magic[:]) {
+		return fail(fmt.Errorf("%w: header magic mismatch", ErrNotAPack))
+	}
+
 	buf := make([]byte, maxSealedChunk)
-	var read uint64
+	read := uint64(magicSize)
 	for i, entry := range r.entries {
 		if entry.Offset != read {
 			return fail(fmt.Errorf("%w: entry %d starts at %d, but %d bytes have been read", ErrCorrupt, i, entry.Offset, read))
+		}
+		if entry.Length > uint64(len(buf)) {
+			return fail(fmt.Errorf("%w: entry %d is %d bytes, over the %d a sealed chunk can be", ErrCorrupt, i, entry.Length, len(buf)))
 		}
 		if _, err := io.ReadFull(stream, buf[:entry.Length]); err != nil {
 			return fail(fmt.Errorf("read chunk %s: %w", entry.ID, err))
@@ -245,9 +258,10 @@ func readTrailer(ctx context.Context, b backend.Backend, keys *crypto.Keys, id c
 
 	// The trailer is authenticated, but "authentic" is not "consistent":
 	// a pack written by a buggy client is still signed by a valid key.
+	// v2: chunk data starts after the header magic.
 	dataEnd := size - tailSize - trailerLen
 	seen := make(map[crypto.ID]struct{}, len(t.Entries))
-	var next uint64
+	next := uint64(magicSize)
 	for i, e := range t.Entries {
 		switch {
 		case e.Offset != next:

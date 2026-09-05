@@ -83,7 +83,9 @@ func TestEndToEnd(t *testing.T) {
 		t.Errorf("restore printed %q", stdout)
 	}
 
-	restored, err := os.ReadFile(filepath.Join(target, filepath.Base(source), "readme.txt"))
+	// v2 root-tree entries are named by the source's full absolute path,
+	// so the restore lands under the target by that path.
+	restored, err := os.ReadFile(filepath.Join(target, source, "readme.txt"))
 	if err != nil {
 		t.Fatalf("read restored file: %v", err)
 	}
@@ -231,7 +233,7 @@ func TestJSONOutput(t *testing.T) {
 	}
 
 	// A failure is still one object, with ok=false, and a non-zero exit.
-	stdout, stderr, err := run(t, "restore", "--json", "--repo", repoDir, "snapshots/nobody/20260101t000000.000000000z", filepath.Join(t.TempDir(), "x"))
+	stdout, stderr, err := run(t, "restore", "--json", "--repo", repoDir, "snapshots/nobody/20260101T000000000000000Z", filepath.Join(t.TempDir(), "x"))
 	if err == nil {
 		t.Fatal("restore of a missing snapshot succeeded")
 	}

@@ -3,7 +3,6 @@ package crypto
 import (
 	"bytes"
 	"encoding/hex"
-	"strings"
 	"testing"
 )
 
@@ -59,9 +58,12 @@ func TestUnmarshalRoundTrip(t *testing.T) {
 }
 
 // A field this build does not know about means the object was written by
-// a newer format. Silently dropping it would let a reader act on half a
-// document; the version field exists so that this can be a loud failure.
-func TestUnmarshalRejectsUnknownFields(t *testing.T) {
+// a newer format within the same major version. v2's forward-compatibility
+// rule is that unknown FIELDS are ignored (docs/format.md §4): readers
+// never re-encode what they decoded, so a dropped field cannot smuggle two
+// readings of one document past anyone. The version field is what makes a
+// newer MAJOR format a loud failure, and each loader checks it.
+func TestUnmarshalIgnoresUnknownFields(t *testing.T) {
 	type extended struct {
 		Version uint64 `cbor:"v"`
 		Zebra   string `cbor:"zebra"`
@@ -70,18 +72,17 @@ func TestUnmarshalRejectsUnknownFields(t *testing.T) {
 		Future  string `cbor:"future"`
 	}
 
-	encoded, err := Marshal(extended{Version: 2, Future: "surprise"})
+	encoded, err := Marshal(extended{Version: 2, Zebra: "z", Alpha: "a", Num: -3, Future: "surprise"})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 
 	var got goldenDoc
-	err = Unmarshal(encoded, &got)
-	if err == nil {
-		t.Fatal("unmarshal of an unknown field: got nil error")
+	if err := Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("unmarshal of a document with an unknown field: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unknown field") {
-		t.Errorf("error = %q, want it to report an unknown field", err)
+	if got.Version != 2 || got.Zebra != "z" || got.Alpha != "a" || got.Num != -3 {
+		t.Errorf("decoded = %+v, want the known fields populated and nothing else", got)
 	}
 }
 

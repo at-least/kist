@@ -47,6 +47,26 @@ func (c *ChunkSource) Chunk(ctx context.Context, id crypto.ID) ([]byte, error) {
 	return reader.Chunk(ctx, entry)
 }
 
+// ChunkList reassembles and decodes an indirect chunk list.
+func (c *ChunkSource) ChunkList(ctx context.Context, chunks []crypto.ID) ([]crypto.ID, error) {
+	var buf []byte
+	for _, id := range chunks {
+		data, err := c.Chunk(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, data...)
+	}
+	var list tree.ChunkList
+	if err := crypto.Unmarshal(buf, &list); err != nil {
+		return nil, fmt.Errorf("%w: chunk list: %v", tree.ErrCorrupt, err)
+	}
+	if list.Version != tree.Version {
+		return nil, fmt.Errorf("%w: chunk list declares version %d, this build reads %d", tree.ErrCorrupt, list.Version, tree.Version)
+	}
+	return list.Chunks, nil
+}
+
 func (c *ChunkSource) reader(ctx context.Context, packID crypto.ID) (*pack.Reader, error) {
 	c.mu.Lock()
 	reader, ok := c.readers[packID]
@@ -73,6 +93,13 @@ func (c *ChunkSource) reader(ctx context.Context, packID crypto.ID) (*pack.Reade
 // LoadTree reads one directory object.
 func (r *Repository) LoadTree(ctx context.Context, id crypto.ID) (*tree.Tree, error) {
 	return tree.Load(ctx, r.backend, r.keys, id)
+}
+
+// LoadTreeChain reads every segment of a (possibly split) directory and
+// returns the entries in on-disk order: the last segment's ID is what a
+// parent records.
+func (r *Repository) LoadTreeChain(ctx context.Context, last crypto.ID) ([]tree.Entry, error) {
+	return tree.LoadChain(ctx, r.backend, r.keys, last)
 }
 
 // Refresh reloads the index from the stored blobs, so that a long-lived

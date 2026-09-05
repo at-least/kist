@@ -9,12 +9,15 @@
 package mount
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	iofs "io/fs"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -233,7 +236,7 @@ func (n *clientNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 	}
 	entries := make([]fuse.DirEntry, 0, len(handles))
 	for _, h := range handles {
-		entries = append(entries, fuse.DirEntry{Name: h.Time.UTC().Format(snapshot.TimeFormat), Mode: syscall.S_IFDIR})
+		entries = append(entries, fuse.DirEntry{Name: snapshot.FormatKeyTime(h.Time), Mode: syscall.S_IFDIR})
 	}
 	return fs.NewListDirStream(entries), 0
 }
@@ -254,22 +257,89 @@ func (n *clientNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		n.fs.opts.warn("%s: %v", key, err)
 		return nil, errno(err)
 	}
-	// The snapshot's root directory: no entry of its own, so it takes
-	// the snapshot's time and a plain mode.
-	root := tree.Entry{Type: tree.TypeDir, Mode: uint32(iofs.ModeDir | 0o555), MTimeNs: snap.TimeNs, CTimeNs: snap.TimeNs, Subtree: snap.Root}
+	// The snapshot's root: its entries are named by absolute source
+	// paths ("/tmp/x/src"), which are not single directory components.
+	// expandRoots turns them into a virtual hierarchy of intermediate
+	// directories; real subtrees appear at the leaves.
+	rootEntries, err := n.fs.repo.LoadTreeChain(ctx, snap.Root)
+	if err != nil {
+		n.fs.opts.warn("%s: %v", key, err)
+		return nil, errno(err)
+	}
+	top, table := expandRoots(rootEntries, snap.TimeNs)
+	root := tree.Entry{Type: uint8(tree.TypeDir), Mode: uint32(iofs.ModeDir | 0o555), MTimeNs: snap.TimeNs, CTimeNs: snap.TimeNs}
 	setAttr(&out.Attr, root)
 	immutable(out)
-	return n.NewInode(ctx, &dirNode{fs: n.fs, entry: root}, fs.StableAttr{Mode: syscall.S_IFDIR}), 0
+	return n.NewInode(ctx, &dirNode{fs: n.fs, entry: root, synthetic: top, table: table}, fs.StableAttr{Mode: syscall.S_IFDIR}), 0
+}
+
+// expandRoots converts the root tree's absolute-path entries into a
+// one-level entry list plus a table of deeper synthetic levels. A source
+// backed up as "/tmp/x/src" is browsed as tmp -> x -> src; "tmp" and "x"
+// do not exist in the repository, so they are synthesized here. Real
+// entries (which have a subtree or are files) always win over synthetic
+// ones at the same name.
+func expandRoots(entries []tree.Entry, mtimeNs int64) ([]tree.Entry, map[string][]tree.Entry) {
+	table := make(map[string][]tree.Entry)
+	hasName := func(level []tree.Entry, name string) bool {
+		for _, e := range level {
+			if string(e.Name) == name {
+				return true
+			}
+		}
+		return false
+	}
+	for _, e := range entries {
+		name := string(e.Name)
+		if !strings.HasPrefix(name, "/") {
+			// A single-component root name (defensive: writers use
+			// absolute paths) passes straight through.
+			table[""] = append(table[""], e)
+			continue
+		}
+		comps := strings.Split(strings.Trim(name, "/"), "/")
+		parent := ""
+		for _, comp := range comps[:len(comps)-1] {
+			if !hasName(table[parent], comp) {
+				table[parent] = append(table[parent], tree.Entry{
+					Name: []byte(comp), Type: uint8(tree.TypeDir),
+					Mode: uint32(iofs.ModeDir | 0o555), MTimeNs: mtimeNs,
+					// Subtree nil marks the synthetic directories whose
+					// children live in the table, not in the repository.
+				})
+			}
+			parent = parent + "/" + comp
+		}
+		e.Name = []byte(comps[len(comps)-1])
+		table[parent] = append(table[parent], e)
+	}
+	for path, lvl := range table {
+		// Sort each level by name: Lookuper binary-searches.
+		slices.SortFunc(lvl, func(a, b tree.Entry) int { return bytes.Compare(a.Name, b.Name) })
+		table[path] = lvl
+	}
+	return table[""], table
 }
 
 // dirNode is a directory inside a snapshot: immutable, loaded once.
+// A segmented directory keeps only its LAST segment's ID; load() walks
+// the chain and presents the whole directory. Synthetic entries are the
+// intermediate directories of absolute-path root names (see expandRoots).
 type dirNode struct {
 	fs.Inode
 	fs    *filesystem
 	entry tree.Entry
+	// synthetic != nil means load() serves this list instead of reading
+	// a tree from the repository: this is one of the intermediate
+	// directories of an absolute-path root name (see expandRoots).
+	synthetic []tree.Entry
+	// virtualPath is this synthetic directory's path within the virtual
+	// hierarchy ("/tmp", "/tmp/x"); table holds every synthetic level.
+	virtualPath string
+	table       map[string][]tree.Entry
 
 	once    sync.Once
-	loaded  *tree.Tree
+	entries []tree.Entry
 	loadErr error
 }
 
@@ -281,9 +351,19 @@ var (
 	_ fs.NodeListxattrer = (*dirNode)(nil)
 )
 
-func (n *dirNode) load(ctx context.Context) (*tree.Tree, error) {
-	n.once.Do(func() { n.loaded, n.loadErr = n.fs.repo.LoadTree(ctx, n.entry.Subtree) })
-	return n.loaded, n.loadErr
+func (n *dirNode) load(ctx context.Context) ([]tree.Entry, error) {
+	n.once.Do(func() {
+		if n.synthetic != nil {
+			n.entries = n.synthetic
+			return
+		}
+		if n.entry.Subtree == nil {
+			n.loadErr = fmt.Errorf("directory has no subtree")
+			return
+		}
+		n.entries, n.loadErr = n.fs.repo.LoadTreeChain(ctx, *n.entry.Subtree)
+	})
+	return n.entries, n.loadErr
 }
 
 func (n *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -297,9 +377,9 @@ func (n *dirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	if err != nil {
 		return nil, errno(err)
 	}
-	entries := make([]fuse.DirEntry, 0, len(t.Entries))
-	for _, e := range t.Entries {
-		entries = append(entries, fuse.DirEntry{Name: e.Name, Mode: typeBits(e)})
+	entries := make([]fuse.DirEntry, 0, len(t))
+	for _, e := range t {
+		entries = append(entries, fuse.DirEntry{Name: string(e.Name), Mode: typeBits(e)})
 	}
 	return fs.NewListDirStream(entries), 0
 }
@@ -311,17 +391,26 @@ func (n *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 	}
 	// Entries are sorted by name (the tree validates that), so this is
 	// a binary search.
-	i := sort.Search(len(t.Entries), func(i int) bool { return t.Entries[i].Name >= name })
-	if i == len(t.Entries) || t.Entries[i].Name != name {
+	want := []byte(name)
+	i := sort.Search(len(t), func(i int) bool { return bytes.Compare(t[i].Name, want) >= 0 })
+	if i == len(t) || !bytes.Equal(t[i].Name, want) {
 		return nil, syscall.ENOENT
 	}
-	e := t.Entries[i]
+	e := t[i]
 	setAttr(&out.Attr, e)
 	immutable(out)
 	var node fs.InodeEmbedder
-	switch e.Type {
+	switch tree.NodeType(e.Type) {
 	case tree.TypeDir:
-		node = &dirNode{fs: n.fs, entry: e}
+		if e.Subtree == nil && n.table != nil {
+			// A synthetic intermediate directory (part of an absolute
+			// root name): its children live in the table under the
+			// joined virtual path.
+			child := n.virtualPath + "/" + string(e.Name)
+			node = &dirNode{fs: n.fs, entry: e, synthetic: n.table[child], virtualPath: child, table: n.table}
+		} else {
+			node = &dirNode{fs: n.fs, entry: e}
+		}
 	case tree.TypeFile:
 		node = &fileNode{fs: n.fs, entry: e}
 	case tree.TypeSymlink:
@@ -359,20 +448,51 @@ func (n *symlinkNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.Attr
 }
 
 func (n *symlinkNode) Readlink(context.Context) ([]byte, syscall.Errno) {
-	return []byte(n.entry.Target), 0
+	return n.entry.Target, 0
 }
 
-// fileNode is a regular file. Its chunks' plaintext lengths are not in
-// the format, so the offset of chunk i is learnt by decoding chunks 0..i
-// once; ends remembers what has been learnt, shared by every open of
-// the file.
+// fileNode is a regular file. An indirect entry's chunk list is
+// resolved on first read. Chunk plaintext lengths ARE in the format
+// (raw_len, new in v2), but reaching them needs the index, so the
+// offset of chunk i is still learnt by decoding chunks 0..i once; ends
+// remembers what has been learnt, shared by every open of the file.
 type fileNode struct {
 	fs.Inode
 	fs    *filesystem
 	entry tree.Entry
 
+	once       sync.Once
+	chunks     []crypto.ID
+	resolveErr error
+
 	mu   sync.Mutex
 	ends []uint64 // ends[i] = plaintext offset just past chunk i
+}
+
+// resolve produces the data chunk list, following indirect entries.
+func (n *fileNode) resolve(ctx context.Context) ([]crypto.ID, error) {
+	n.once.Do(func() {
+		if tree.ContentType(n.entry.ContentType) == tree.ContentIndirect {
+			var buf []byte
+			for _, id := range n.entry.Chunks {
+				data, err := n.fs.chunk(ctx, id)
+				if err != nil {
+					n.resolveErr = err
+					return
+				}
+				buf = append(buf, data...)
+			}
+			var list tree.ChunkList
+			if err := crypto.Unmarshal(buf, &list); err != nil {
+				n.resolveErr = err
+				return
+			}
+			n.chunks = list.Chunks
+			return
+		}
+		n.chunks = n.entry.Chunks
+	})
+	return n.chunks, n.resolveErr
 }
 
 var (
@@ -400,6 +520,12 @@ func (n *fileNode) Read(ctx context.Context, _ fs.FileHandle, dest []byte, off i
 	if off < 0 {
 		return nil, syscall.EINVAL
 	}
+	chunks, err := n.resolve(ctx)
+	if err != nil {
+		n.fs.opts.warn("read %s: %v", n.entry.Name, err)
+		return nil, errno(err)
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -414,10 +540,10 @@ func (n *fileNode) Read(ctx context.Context, _ fs.FileHandle, dest []byte, off i
 			i++
 			continue
 		}
-		if i >= len(n.entry.Chunks) {
+		if i >= len(chunks) {
 			return fuse.ReadResultData(nil), 0 // past the end
 		}
-		data, err := n.fs.chunk(ctx, n.entry.Chunks[i])
+		data, err := n.fs.chunk(ctx, chunks[i])
 		if err != nil {
 			n.fs.opts.warn("read %s: %v", n.entry.Name, err)
 			return nil, errno(err)
@@ -432,8 +558,8 @@ func (n *fileNode) Read(ctx context.Context, _ fs.FileHandle, dest []byte, off i
 	// Copy from chunk i onwards until dest is full or the file ends.
 	filled := 0
 	pos := start
-	for filled < len(dest) && i < len(n.entry.Chunks) {
-		data, err := n.fs.chunk(ctx, n.entry.Chunks[i])
+	for filled < len(dest) && i < len(chunks) {
+		data, err := n.fs.chunk(ctx, chunks[i])
 		if err != nil {
 			n.fs.opts.warn("read %s: %v", n.entry.Name, err)
 			return nil, errno(err)
@@ -461,20 +587,21 @@ func (n *fileNode) Listxattr(_ context.Context, dest []byte) (uint32, syscall.Er
 }
 
 func getxattr(e tree.Entry, attr string, dest []byte) (uint32, syscall.Errno) {
-	v, ok := e.Xattrs[attr]
-	if !ok {
-		return 0, syscall.ENODATA
+	for _, kv := range e.Xattrs {
+		if string(kv.Name) == attr {
+			if len(dest) < len(kv.Value) {
+				return uint32(len(kv.Value)), syscall.ERANGE //nolint:gosec // an xattr value is far below 4 GiB
+			}
+			return uint32(copy(dest, kv.Value)), 0 //nolint:gosec // bounded by len(dest), a kernel buffer
+		}
 	}
-	if len(dest) < len(v) {
-		return uint32(len(v)), syscall.ERANGE //nolint:gosec // an xattr value is far below 4 GiB
-	}
-	return uint32(copy(dest, v)), 0 //nolint:gosec // bounded by len(dest), a kernel buffer
+	return 0, syscall.ENODATA
 }
 
 func listxattr(e tree.Entry, dest []byte) (uint32, syscall.Errno) {
 	names := make([]string, 0, len(e.Xattrs))
-	for k := range e.Xattrs {
-		names = append(names, k)
+	for _, kv := range e.Xattrs {
+		names = append(names, string(kv.Name))
 	}
 	sort.Strings(names)
 	var need int
@@ -508,7 +635,7 @@ func setAttr(a *fuse.Attr, e tree.Entry) {
 		ctime = time.Unix(0, e.CTimeNs)
 	}
 	a.SetTimes(&mtime, &mtime, &ctime)
-	if e.Type == tree.TypeFile {
+	if tree.NodeType(e.Type) == tree.TypeFile {
 		a.Blocks = (e.Size + 511) / 512
 	}
 }
@@ -516,7 +643,7 @@ func setAttr(a *fuse.Attr, e tree.Entry) {
 // typeBits is the file-type part of a mode, for directory entries and
 // stable attributes.
 func typeBits(e tree.Entry) uint32 {
-	switch e.Type {
+	switch tree.NodeType(e.Type) {
 	case tree.TypeDir:
 		return syscall.S_IFDIR
 	case tree.TypeSymlink:

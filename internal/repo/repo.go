@@ -3,12 +3,14 @@ package repo
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/at-least/kist/internal/backend"
+	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/index"
 	"github.com/at-least/kist/internal/snapshot"
@@ -21,11 +23,14 @@ import (
 // repository open, and the format is what keeps them from harming each
 // other.
 type Repository struct {
-	backend  backend.Backend
-	config   *Config
-	keys     *crypto.Keys
-	index    *index.Index
-	clientID string
+	backend backend.Backend
+	config  *Config
+	keys    *crypto.Keys
+	index   *index.Index
+	// clientID is the 16-byte machine identity; clientIDHex is what the
+	// snapshot keys carry.
+	clientID    []byte
+	clientIDHex string
 
 	// indexSource is where index blobs are read from: the local cache
 	// when there is one, the backend otherwise.
@@ -121,12 +126,13 @@ func Init(ctx context.Context, b backend.Backend, opts Options) (*Repository, er
 		return nil, fmt.Errorf("init repository: generate master key: %w", err)
 	}
 
-	kdf := crypto.DefaultKDFParams()
-	if opts.KDF != nil {
-		kdf = *opts.KDF
-	}
 	now := opts.clock()()
-	slot, err := crypto.NewKeySlot(opts.Password, repoID, master, kdf, now, opts.NonceSource)
+	params := crypto.DefaultKDFParams()
+	if opts.KDF != nil {
+		params = *opts.KDF
+	}
+	aad := crypto.MasterAAD(repoID, chunker.MinSize, chunker.AvgSize, chunker.MaxSize)
+	slot, err := crypto.NewKeySlot(opts.Password, aad, master, params, now, opts.NonceSource)
 	if err != nil {
 		return nil, fmt.Errorf("init repository: %w", err)
 	}
@@ -146,7 +152,8 @@ func Open(ctx context.Context, b backend.Backend, opts Options) (*Repository, er
 		return nil, err
 	}
 
-	master, err := cfg.Slot.Unwrap(opts.Password, cfg.RepoID)
+	aad := crypto.MasterAAD(cfg.RepoID, cfg.Chunker.MinSize, cfg.Chunker.AvgSize, cfg.Chunker.MaxSize)
+	master, err := cfg.Slot.Unwrap(opts.Password, aad)
 	if err != nil {
 		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
 	}
@@ -154,22 +161,23 @@ func Open(ctx context.Context, b backend.Backend, opts Options) (*Repository, er
 }
 
 func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key, opts Options) (*Repository, error) {
-	keys, err := crypto.DeriveKeys(master, cfg.RepoID)
-	if err != nil {
-		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
-	}
+	keys := crypto.DeriveKeys(master)
 
 	clientID := opts.ClientID
 	if clientID == "" {
 		stateDir := opts.StateDir
 		if stateDir == "" {
-			if stateDir, err = DefaultStateDir(); err != nil {
+			dir, err := DefaultStateDir()
+			if err != nil {
 				return nil, err
 			}
+			stateDir = dir
 		}
-		if clientID, err = ClientID(stateDir, hexRepoID(cfg.RepoID)); err != nil {
+		id, err := ClientID(stateDir, hexRepoID(cfg.RepoID))
+		if err != nil {
 			return nil, err
 		}
+		clientID = id
 	}
 	if err := validateClientID(clientID); err != nil {
 		return nil, err
@@ -184,13 +192,17 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 	if !opts.NoCache {
 		root := opts.CacheDir
 		if root == "" {
-			if root, err = DefaultCacheDir(); err != nil {
+			dir, err := DefaultCacheDir()
+			if err != nil {
 				return nil, err
 			}
+			root = dir
 		}
-		if cache, err = newIndexCache(b, root, cfg.RepoID); err != nil {
+		c, err := newIndexCache(b, root, cfg.RepoID)
+		if err != nil {
 			opts.warn("%v; continuing without an index cache", err)
 		} else {
+			cache = c
 			source = cache
 		}
 	}
@@ -217,12 +229,19 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
 	}
 
+	var clientBytes []byte
+	if raw, err := hex.DecodeString(clientID); err == nil && len(raw) == 16 {
+		clientBytes = raw
+	} else {
+		clientBytes = []byte(clientID) // tests may set arbitrary ids
+	}
 	return &Repository{
 		backend:     b,
 		config:      cfg,
 		keys:        keys,
 		index:       ix,
-		clientID:    clientID,
+		clientID:    clientBytes,
+		clientIDHex: clientID,
 		indexSource: source,
 		nonceSource: nonces,
 		now:         opts.clock(),
@@ -252,8 +271,8 @@ func (r *Repository) Backend() backend.Backend { return r.backend }
 // Config returns the repository's parameter block.
 func (r *Repository) Config() *Config { return r.config }
 
-// ClientID is the identifier this client writes snapshots under.
-func (r *Repository) ClientID() string { return r.clientID }
+// ClientID is the identifier this client writes snapshots under (hex).
+func (r *Repository) ClientID() string { return r.clientIDHex }
 
 // Index is the chunk index this repository was opened with.
 func (r *Repository) Index() *index.Index { return r.index }

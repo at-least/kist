@@ -15,110 +15,22 @@ import (
 	"github.com/at-least/kist/internal/pack"
 	"github.com/at-least/kist/internal/parity"
 	"github.com/at-least/kist/internal/snapshot"
+	"github.com/at-least/kist/internal/tree"
 )
 
-// GCPrefix is where prune records the packs it intends to delete.
-//
-// A mark is the only piece of state the two prune phases share, and the
-// only signal a backup client gets that a pack it deduplicates against is
-// on its way out. It is an object like any other -- sealed, with the key
-// as AAD -- so that a mark cannot be forged or moved by anyone without
-// the repository password.
+// GCPrefix is where prune records the objects it intends to delete.
+// Packs, trees and index blobs share the namespace: their names are all
+// 32-byte content addresses and cannot collide.
 const GCPrefix = "gc/"
 
-// gcVersion is the mark object schema version.
-const gcVersion = 1
+// GCMarkMagic is the entire content of a gc mark: 8 fixed bytes that
+// carry no information. "When was this marked" is the backend's
+// modification time for the mark object; "what was marked" is the key.
+// Content-free marks are what keep the backup role Put-only -- there is
+// nothing to encrypt and nothing to forge.
+var GCMarkMagic = []byte("KISTGC2\n")
 
-// DefaultGrace is how long a pack stays marked before it can be deleted.
-//
-// It bounds how stale a running backup's view of the repository may be:
-// a backup that opened before the mark and is still running when the
-// grace runs out is held off by the client condition in prune, not by
-// this number alone. Three days is long enough that a weekend outage of
-// the maintenance job does not turn into a race.
-const DefaultGrace = 72 * time.Hour
-
-// ClientsPrefix is where clients announce themselves.
-//
-// A client writes its record once, before its first backup, and prune
-// uses the record's time as the earliest moment that client could have
-// had a backup in flight. Without it a client's first backup would be
-// invisible to prune until its first snapshot landed, which is exactly
-// the backup most likely to run for longer than the grace period.
-const ClientsPrefix = "clients/"
-
-// clientRecord is what a client's record holds.
-type clientRecord struct {
-	Version     uint64 `cbor:"v"`
-	FirstSeenNs int64  `cbor:"first_seen"`
-}
-
-func clientKey(clientID string) string { return ClientsPrefix + clientID }
-
-// register writes this client's record if it has none. The record is
-// never updated: its time is a lower bound, and the snapshots supply the
-// rest.
-func (r *Repository) register(ctx context.Context, now time.Time) error {
-	key := clientKey(r.clientID)
-	encoded, err := crypto.Marshal(clientRecord{Version: gcVersion, FirstSeenNs: now.UnixNano()})
-	if err != nil {
-		return fmt.Errorf("register client: %w", err)
-	}
-	sealed, err := crypto.Seal(&r.keys.Meta, []byte(key), encoded, r.nonceSource)
-	if err != nil {
-		return fmt.Errorf("register client: %w", err)
-	}
-	if err := backend.PutBytesIfAbsent(ctx, r.backend, key, sealed); err != nil && !errors.Is(err, backend.ErrExists) {
-		return fmt.Errorf("register client: %w", err)
-	}
-	return nil
-}
-
-// listClients returns when each registered client was first seen, and
-// the keys under ClientsPrefix that are not readable records.
-//
-// An unreadable record is reported and skipped, never deleted and never
-// fatal. Backup credentials can write under clients/, so a record that
-// will not open may be an honest client's damaged record -- its only
-// protection while its first backup runs -- or junk written to keep
-// prune from running. Neither is a reason to stop, and the first is a
-// reason not to delete.
-func (r *Repository) listClients(ctx context.Context) (map[string]time.Time, []string, error) {
-	seen := make(map[string]time.Time)
-	var junk []string
-	err := r.backend.List(ctx, ClientsPrefix, func(fi backend.FileInfo) error {
-		clientID := strings.TrimPrefix(fi.Key, ClientsPrefix)
-		sealed, err := backend.GetAll(ctx, r.backend, fi.Key)
-		if err != nil {
-			return err
-		}
-		encoded, err := crypto.Open(&r.keys.Meta, []byte(fi.Key), sealed)
-		if err != nil {
-			junk = append(junk, fi.Key)
-			return nil //nolint:nilerr // reported as junk above
-		}
-		var rec clientRecord
-		if err := crypto.Unmarshal(encoded, &rec); err != nil || rec.Version != gcVersion {
-			junk = append(junk, fi.Key)
-			return nil //nolint:nilerr // reported as junk above
-		}
-		seen[clientID] = time.Unix(0, rec.FirstSeenNs).UTC()
-		return nil
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("list clients: %w", err)
-	}
-	return seen, junk, nil
-}
-
-// gcMark is what a mark object holds.
-type gcMark struct {
-	Version  uint64 `cbor:"v"`
-	MarkedNs int64  `cbor:"marked"`
-	By       string `cbor:"by"`
-}
-
-// gcKey returns the mark key for a pack.
+// gcKey returns the mark key for an object.
 func gcKey(id crypto.ID) string { return GCPrefix + id.String() }
 
 // parseGCKey is the inverse of gcKey.
@@ -130,35 +42,29 @@ func parseGCKey(key string) (crypto.ID, error) {
 	return crypto.ParseID(rest)
 }
 
-// listMarks returns every mark in the repository, oldest first, with any
-// keys under GCPrefix that are not marks.
-func (r *Repository) listMarks(ctx context.Context) (map[crypto.ID]gcMark, []string, error) {
-	marks := make(map[crypto.ID]gcMark)
+// listMarks returns every mark in the repository with the time its mark
+// object was last written (per the backend's clock, truncated to whole
+// seconds), and any keys under GCPrefix that are not marks.
+//
+// Second precision is deliberate and is part of the format: S3 itself
+// only reports whole seconds, its list and head precisions differ, and a
+// local filesystem's mtime has nanoseconds the backend does not carry.
+// Within the same second, "the object was rewritten" and "the mark was
+// written" are indistinguishable; every consumer takes the safe side
+// (prune does not delete, backup does not commit).
+func (r *Repository) listMarks(ctx context.Context) (map[crypto.ID]time.Time, []string, error) {
+	marks := make(map[crypto.ID]time.Time)
 	var junk []string
 	err := r.backend.List(ctx, GCPrefix, func(fi backend.FileInfo) error {
-		// A key under gc/ that is not a readable mark is junk to be
-		// removed, not an error to stop on: it cannot be trusted and
-		// it cannot be anything the format put there.
+		// A key under gc/ that is not a mark is junk to be removed, not an
+		// error to stop on: it cannot be trusted and it cannot be anything
+		// the format put there.
 		id, err := parseGCKey(fi.Key)
 		if err != nil {
 			junk = append(junk, fi.Key)
 			return nil //nolint:nilerr // classified as junk above
 		}
-		sealed, err := backend.GetAll(ctx, r.backend, fi.Key)
-		if err != nil {
-			return err
-		}
-		encoded, err := crypto.Open(&r.keys.Meta, []byte(fi.Key), sealed)
-		if err != nil {
-			junk = append(junk, fi.Key)
-			return nil //nolint:nilerr // classified as junk above
-		}
-		var m gcMark
-		if err := crypto.Unmarshal(encoded, &m); err != nil || m.Version != gcVersion {
-			junk = append(junk, fi.Key)
-			return nil //nolint:nilerr // classified as junk above
-		}
-		marks[id] = m
+		marks[id] = fi.Modified.Truncate(time.Second)
 		return nil
 	})
 	if err != nil {
@@ -167,37 +73,17 @@ func (r *Repository) listMarks(ctx context.Context) (map[crypto.ID]gcMark, []str
 	return marks, junk, nil
 }
 
-// listMarkedPacks is the cheap form of listMarks for a backup client: it
-// needs to know which packs are marked, not when or by whom, so it does
-// not read the objects.
-func (r *Repository) listMarkedPacks(ctx context.Context) (map[crypto.ID]struct{}, error) {
-	marked := make(map[crypto.ID]struct{})
-	err := r.backend.List(ctx, GCPrefix, func(fi backend.FileInfo) error {
-		if id, err := parseGCKey(fi.Key); err == nil {
-			marked[id] = struct{}{}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list gc marks: %w", err)
-	}
-	return marked, nil
+// listMarkedPacks is the cheap form of listMarks for a backup client.
+func (r *Repository) listMarkedPacks(ctx context.Context) (map[crypto.ID]time.Time, error) {
+	marks, _, err := r.listMarks(ctx)
+	return marks, err
 }
 
-// mark writes a mark for a pack. An existing mark is left alone: the
-// older a mark, the sooner its pack may go, and refreshing it on every
+// mark writes a mark for an object. An existing mark is left alone: the
+// older a mark, the sooner its object may go, and refreshing it on every
 // run would mean the grace period never ends.
-func (r *Repository) mark(ctx context.Context, id crypto.ID, now time.Time) error {
-	key := gcKey(id)
-	encoded, err := crypto.Marshal(gcMark{Version: gcVersion, MarkedNs: now.UnixNano(), By: r.clientID})
-	if err != nil {
-		return fmt.Errorf("mark %s: %w", id, err)
-	}
-	sealed, err := crypto.Seal(&r.keys.Meta, []byte(key), encoded, r.nonceSource)
-	if err != nil {
-		return fmt.Errorf("mark %s: %w", id, err)
-	}
-	if err := backend.PutBytesIfAbsent(ctx, r.backend, key, sealed); err != nil && !errors.Is(err, backend.ErrExists) {
+func (r *Repository) mark(ctx context.Context, id crypto.ID) error {
+	if err := backend.PutBytesIfAbsent(ctx, r.backend, gcKey(id), GCMarkMagic); err != nil && !errors.Is(err, backend.ErrExists) {
 		return fmt.Errorf("mark %s: %w", id, err)
 	}
 	return nil
@@ -205,24 +91,22 @@ func (r *Repository) mark(ctx context.Context, id crypto.ID, now time.Time) erro
 
 // PruneOptions configure Prune.
 type PruneOptions struct {
-	// Grace is how long a pack must have been marked before it is
+	// Grace is how long an object must have been marked before it is
 	// deleted. Zero means DefaultGrace.
 	Grace time.Duration
 
 	// ForgetClientsAfter is how long a client may go without a snapshot
-	// before prune stops waiting for it. Zero means ten times Grace.
-	//
-	// A client that has not been heard from in that long is assumed to
-	// have no backup in flight. If it does, that backup opened its view
-	// of the repository more than ForgetClientsAfter ago.
+	// before prune stops waiting for it. Zero means thirty days, matching
+	// the unified format's default.
 	ForgetClientsAfter time.Duration
 
 	// ClockSkew is how far apart the clocks of the pruner and a client
 	// are allowed to be. Zero means DefaultClockSkew.
 	//
 	// The sweep compares a client's activity, stamped by the client's
-	// clock, with a mark, stamped by the pruner's. A client whose clock
-	// runs fast could otherwise look active since a mark it never saw.
+	// clock, with a mark, stamped by the pruner's backend. A client whose
+	// clock runs fast could otherwise look active since a mark it never
+	// saw.
 	ClockSkew time.Duration
 
 	// DryRun reports what would happen and changes nothing.
@@ -234,6 +118,10 @@ type PruneOptions struct {
 
 // DefaultClockSkew is the clock disagreement prune tolerates by default.
 const DefaultClockSkew = time.Hour
+
+// DefaultInactiveAfter is how long a client may go without a snapshot
+// before prune stops holding deletions for it.
+const DefaultInactiveAfter = 30 * 24 * time.Hour
 
 func (o PruneOptions) progress(format string, args ...any) {
 	if o.Progressf != nil {
@@ -259,7 +147,7 @@ func (o PruneOptions) forgetClientsAfter() time.Duration {
 	if o.ForgetClientsAfter > 0 {
 		return o.ForgetClientsAfter
 	}
-	return 10 * o.grace()
+	return DefaultInactiveAfter
 }
 
 // HeldPack is a marked pack prune did not delete, and why.
@@ -282,9 +170,6 @@ type PruneReport struct {
 	// -- they no longer read -- but the storage retains their bytes, so
 	// nothing was reclaimed. See backend.ErrLocked.
 	Locked []crypto.ID
-
-	// UnreadableClients are keys under clients/ that are not records.
-	UnreadableClients []string
 
 	BytesReclaimed uint64
 }
@@ -312,24 +197,21 @@ var pruneHooks struct {
 //
 // Phase 2 sweeps. A pack is deleted only when all of these hold: it is
 // marked; the mark is older than the grace period; this run found it
-// dead; and every client prune still waits for has been active since
-// the mark. The last condition is the one that closes the race. A
-// backup that started before the mark holds an index saying the chunk
-// is stored, skips uploading it, and only later writes the snapshot
-// that would have kept the pack alive. The mark cannot see that backup
-// until its snapshot lands, but its client's last activity -- its most
-// recent snapshot, or its registration if it has none -- is then older
-// than the mark, and that is what holds the pack. A client active
-// since the mark started every backup it has in flight after the mark,
-// and a backup that starts after a mark sees it and treats the pack as
-// absent (see backupRun.has).
+// dead; and every still-active client has a snapshot that started after
+// the mark (plus clock skew). The last condition is the one that closes
+// the race. A backup that started before the mark holds an index saying
+// some chunk is stored, skips uploading it, and only later writes the
+// snapshot that would have kept the pack alive. The mark cannot see that
+// backup until its snapshot lands, but a client with no snapshot newer
+// than the mark might have that backup in flight, and that is what holds
+// the pack. A backup that starts after a mark sees it and treats the
+// marked pack as absent (see backupRun.has); v2 backups never remove
+// marks, so that stays true across the deletion itself.
 //
-// The mark outlives the pack: phase 2 deletes the pack and leaves the
-// mark, and the next run's phase 1 removes marks whose packs are gone.
-// That is what makes "a backup that starts after the mark sees it"
-// true across the deletion itself, when a client could otherwise list
-// the marks in the instant between the pack going and its mark going,
-// and go on trusting an index that still names the pack.
+// The index is rewritten, naming only what survived, BEFORE any deletion
+// is visible, and the replacement blob supersedes every existing blob:
+// a reader that still sees old and new together takes the new one's word
+// for what exists.
 //
 // Both phases run in one call. The pack marked in phase 1 is held by
 // its age in phase 2, so one run marks and the next run, after the
@@ -338,13 +220,13 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	var report PruneReport
 	now := r.now().UTC()
 
-	// The order of the first three listings is load-bearing. Snapshots
-	// are listed before trailers are read and before liveness is
-	// walked, so that everything decided below is decided against one
-	// consistent set of snapshots: a snapshot that lands after the
-	// listing is either from a backup that started after every mark
-	// considered here, or from a client whose most recent listed
-	// snapshot predates the mark, and either way its pack survives.
+	// The order of the first listings is load-bearing. Snapshots are
+	// listed before trailers are read and before liveness is walked, so
+	// that everything decided below is decided against one consistent
+	// set of snapshots: a snapshot that lands after the listing is either
+	// from a backup that started after every mark considered here, or
+	// from a client whose most recent listed snapshot predates the mark,
+	// and either way its pack survives.
 	opts.progress("listing gc marks")
 	marks, junk, err := r.listMarks(ctx)
 	if err != nil {
@@ -354,11 +236,6 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	if err != nil {
 		return report, fmt.Errorf("prune: %w", err)
 	}
-	clients, unreadableClients, err := r.listClients(ctx)
-	if err != nil {
-		return report, fmt.Errorf("prune: %w", err)
-	}
-	report.UnreadableClients = unreadableClients
 	handles, err := snapshot.List(ctx, r.backend, "")
 	if err != nil {
 		return report, fmt.Errorf("prune: %w", err)
@@ -384,6 +261,7 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	opts.progress("walking %d snapshots", len(handles))
 	live := make(map[crypto.ID]struct{})
 	seenTrees := make(map[crypto.ID]struct{})
+	pruneChunks := r.NewChunkSource()
 	var problems []string
 	problem := func(format string, args ...any) {
 		problems = append(problems, fmt.Sprintf(format, args...))
@@ -394,7 +272,7 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 			problem("snapshot %s: %v", h.Key, err)
 			continue
 		}
-		r.walkTree(ctx, snap.Root, h.Key, ix, seenTrees, live, problem)
+		r.walkTree(ctx, snap.Root, h.Key, ix, seenTrees, live, pruneChunks, problem)
 	}
 	if len(problems) > 0 {
 		return report, fmt.Errorf("%w: %s", ErrUnhealthy, strings.Join(problems, "; "))
@@ -407,14 +285,14 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	// Phase 1: mark the dead, unmark the living. Marks whose packs are
 	// gone are dealt with last, after the index has stopped naming them.
 	opts.progress("marking")
-	for _, id := range sortedIDs(packs) {
+	for _, id := range sortedPackInfos(packs) {
 		_, isLive := live[id]
 		_, isMarked := marks[id]
 		switch {
 		case !isLive && !isMarked:
 			report.Marked = append(report.Marked, id)
 			if !opts.DryRun {
-				if err := r.mark(ctx, id, now); err != nil {
+				if err := r.mark(ctx, id); err != nil {
 					return report, fmt.Errorf("prune: %w", err)
 				}
 			}
@@ -432,14 +310,14 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	// Phase 2: sweep what has been dead long enough, if nobody might
 	// still be counting on it.
 	opts.progress("sweeping")
-	activity := lastActivity(clients, handles)
+	activity := lastActivity(handles)
 	deleted := make(map[crypto.ID]struct{})
-	for _, id := range sortedIDs(marks) {
-		if _, stored := packs[id]; !stored {
+	for _, id := range sortedMarkAges(marks) {
+		info, wasStored := packs[id]
+		if !wasStored {
 			continue
 		}
-		m := marks[id]
-		markedAt := time.Unix(0, m.MarkedNs).UTC()
+		markedAt := marks[id]
 		if hold := holdReason(markedAt, now, activity, opts); hold != "" {
 			report.Held = append(report.Held, HeldPack{Pack: id, Reason: hold})
 			continue
@@ -452,7 +330,7 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 		if pruneHooks.beforeDelete != nil {
 			pruneHooks.beforeDelete()
 		}
-		size := packSize(packs[id])
+		size := info.Size
 		switch err := r.backend.Delete(ctx, pack.Key(id)); {
 		case errors.Is(err, backend.ErrLocked):
 			report.Locked = append(report.Locked, id)
@@ -477,7 +355,7 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 		delete(packs, id)
 	}
 	for _, id := range r.index.Packs() {
-		if _, stored := packs[id]; !stored {
+		if _, wasStored := packs[id]; !wasStored {
 			deleted[id] = struct{}{}
 		}
 	}
@@ -491,9 +369,16 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	// A pack this run deleted keeps its mark until the next run: a client
 	// that lists the marks in this very instant must still see it. Only
 	// a mark whose pack was already gone when this run started goes now.
-	opts.progress("removing marks of packs that are gone")
-	for _, id := range sortedIDs(marks) {
+	opts.progress("removing marks of objects that are gone")
+	for _, id := range sortedMarkAges(marks) {
 		if _, wasStored := stored[id]; wasStored {
+			continue
+		}
+		// The mark namespace is shared by packs, trees and index blobs
+		// (docs/format.md §1): a mark whose pack is gone may still point
+		// at a live tree or blob, and only a mark whose object is gone
+		// everywhere may be removed.
+		if r.anyObjectExists(ctx, id) {
 			continue
 		}
 		report.Unmarked = append(report.Unmarked, id)
@@ -538,6 +423,17 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	return report, nil
 }
 
+// anyObjectExists reports whether any object with this name exists, in
+// any of the namespaces a gc mark can point at.
+func (r *Repository) anyObjectExists(ctx context.Context, id crypto.ID) bool {
+	for _, key := range []string{pack.Key(id), tree.Key(id), index.Key(id)} {
+		if _, err := r.backend.Stat(ctx, key); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // holdReason says why a marked pack may not be deleted now, or "" if it
 // may.
 func holdReason(markedAt, now time.Time, activity map[string]time.Time, opts PruneOptions) string {
@@ -555,19 +451,19 @@ func holdReason(markedAt, now time.Time, activity map[string]time.Time, opts Pru
 	}
 	if len(waiting) > 0 {
 		slices.Sort(waiting)
-		return fmt.Sprintf("client %s has not been active since the mark", strings.Join(waiting, ", "))
+		return fmt.Sprintf("client %s has no snapshot newer than the mark", strings.Join(waiting, ", "))
 	}
 	return ""
 }
 
-// lastActivity returns, per client, the later of its registration and
-// its most recent snapshot. Every backup a client has in flight started
-// after that moment.
-func lastActivity(clients map[string]time.Time, handles []snapshot.Handle) map[string]time.Time {
-	activity := make(map[string]time.Time, len(clients))
-	for id, at := range clients {
-		activity[id] = at
-	}
+// lastActivity returns, per client, when its most recent snapshot
+// started. Every backup a client has in flight started after that
+// moment. There is no client registry in v2: a client whose snapshots
+// were all forgotten is inactive by definition, and its first backup is
+// protected by the backup-side commit checks instead (docs/format.md
+// §13.3).
+func lastActivity(handles []snapshot.Handle) map[string]time.Time {
+	activity := make(map[string]time.Time, len(handles))
 	for _, h := range handles {
 		if h.Time.After(activity[h.ClientID]) {
 			activity[h.ClientID] = h.Time
@@ -576,15 +472,16 @@ func lastActivity(clients map[string]time.Time, handles []snapshot.Handle) map[s
 	return activity
 }
 
-func packSize(entries []pack.Entry) uint64 {
-	var n uint64
-	for _, e := range entries {
-		n += uint64(e.Length)
+func sortedPackInfos(m map[crypto.ID]index.PackInfo) []crypto.ID {
+	ids := make([]crypto.ID, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
 	}
-	return n
+	slices.SortFunc(ids, func(a, b crypto.ID) int { return bytes.Compare(a[:], b[:]) })
+	return ids
 }
 
-func sortedIDs[V any](m map[crypto.ID]V) []crypto.ID {
+func sortedMarkAges(m map[crypto.ID]time.Time) []crypto.ID {
 	ids := make([]crypto.ID, 0, len(m))
 	for id := range m {
 		ids = append(ids, id)
@@ -611,14 +508,24 @@ func (r *Repository) remove(ctx context.Context, key string) error {
 // listed in stale and the keys in unusable, and installs the result as
 // this repository's index.
 //
-// The new blob is written before the old ones are deleted. A crash in
-// between leaves two blobs describing overlapping sets -- harmless,
-// because loading merges them -- rather than a window with no index.
-func (r *Repository) replaceIndex(ctx context.Context, stale []crypto.ID, unusable []string, packs map[crypto.ID][]pack.Entry) error {
-	fresh := crypto.ID{}
+// The new blob supersedes every existing blob, so a reader that sees the
+// replacement land mid-listing takes its word for what exists, and a
+// crash between writing it and removing the old ones leaves two blobs --
+// the survivor wins by supersession rather than by merge order.
+func (r *Repository) replaceIndex(ctx context.Context, stale []crypto.ID, unusable []string, packs map[crypto.ID]index.PackInfo) error {
+	var fresh crypto.ID
 	if len(packs) > 0 {
+		// The replacement supersedes every blob that exists now, not only
+		// the ones this run is about to remove: an overlap with a blob
+		// another prune wrote concurrently is resolved in favour of the
+		// newer view either way, and naming all of them is what makes the
+		// phantom entries go away on the next rewrite.
+		supersedes := slices.Clone(stale)
+		if len(supersedes) > 0 {
+			slices.SortFunc(supersedes, func(a, b crypto.ID) int { return bytes.Compare(a[:], b[:]) })
+		}
 		var err error
-		if fresh, err = index.Save(ctx, r.backend, r.keys, packs, r.nonceSource); err != nil {
+		if fresh, err = index.Save(ctx, r.backend, r.keys, packs, supersedes, r.nonceSource); err != nil {
 			return err
 		}
 	}
@@ -637,8 +544,8 @@ func (r *Repository) replaceIndex(ctx context.Context, stale []crypto.ID, unusab
 	}
 
 	ix := index.New()
-	for id, entries := range packs {
-		ix.AddPack(id, entries)
+	for id, info := range packs {
+		ix.AddPack(id, info.Entries)
 	}
 	r.index = ix
 	return nil

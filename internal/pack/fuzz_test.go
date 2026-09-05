@@ -84,11 +84,7 @@ func fuzzKeys() *crypto.Keys {
 	for i := range master {
 		master[i] = byte(i)
 	}
-	keys, err := crypto.DeriveKeys(master, crypto.RepoID{})
-	if err != nil {
-		panic(err)
-	}
-	return keys
+	return crypto.DeriveKeys(master)
 }
 
 // FuzzReadTrailer feeds arbitrary bytes to the trailer reader and, when
@@ -115,7 +111,8 @@ func FuzzReadTrailer(f *testing.F) {
 		if err != nil {
 			return
 		}
-		var next uint64
+		// v2: chunk data begins right after the header magic.
+		var next uint64 = magicSize
 		for i, e := range entries {
 			if e.Offset != next {
 				t.Fatalf("entry %d starts at %d, expected %d", i, e.Offset, next)

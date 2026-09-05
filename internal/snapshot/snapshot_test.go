@@ -25,21 +25,13 @@ var (
 		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
 		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
 	}
-	goldenRepoID = crypto.RepoID{
-		0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
-		0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
-	}
 	goldenTime = time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.UTC)
 )
 
 func testKeys(t *testing.T) *crypto.Keys {
 	t.Helper()
 
-	keys, err := crypto.DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive keys: %v", err)
-	}
-	return keys
+	return crypto.DeriveKeys(goldenMaster)
 }
 
 func testBackend(t *testing.T) backend.Backend {
@@ -57,21 +49,57 @@ func testBackend(t *testing.T) backend.Backend {
 	return b
 }
 
+// clientBytes returns the 16-byte client identity whose hex form is s.
+func clientBytes(t *testing.T, s string) []byte {
+	t.Helper()
+
+	raw, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("decode client id: %v", err)
+	}
+	if len(raw) != 16 {
+		t.Fatalf("client id %s is %d bytes, want 16", s, len(raw))
+	}
+	return raw
+}
+
 func rootID(b byte) crypto.ID {
 	var id crypto.ID
 	id[0] = b
 	return id
 }
 
-func sample(clientID string, at time.Time) *Snapshot {
+// goldenClient is the client the round-trip tests write under.
+const goldenClient = "00112233445566778899aabbccddeeff"
+
+func sample(t *testing.T, clientID string, at time.Time) *Snapshot {
+	t.Helper()
+
 	return &Snapshot{
 		Version:  Version,
 		Root:     rootID(0x42),
 		TimeNs:   at.UnixNano(),
 		Host:     "workstation",
-		Paths:    []string{"/home/newlix", "/etc"},
-		ClientID: clientID,
+		User:     "newlix",
+		Paths:    [][]byte{[]byte("/home/newlix"), []byte("/etc")},
+		ClientID: clientBytes(t, clientID),
 		Stats:    Stats{Files: 12, Dirs: 3, Bytes: 4096, ChunksNew: 5, PacksAdded: 1},
+	}
+}
+
+// The key timestamp is YYYYMMDDTHHMMSSnnnnnnnnnZ: fixed width so lexical
+// order is chronological order, uppercase T and Z, and no dot before the
+// nanoseconds -- Go's reference layouts cannot express nine fixed digits
+// without one.
+func TestFormatKeyTime(t *testing.T) {
+	if got, want := FormatKeyTime(goldenTime), "20260102T030405123456789Z"; got != want {
+		t.Errorf("FormatKeyTime = %q, want %q", got, want)
+	}
+	if got := len(FormatKeyTime(goldenTime)); got != tsLen {
+		t.Errorf("FormatKeyTime length = %d, want %d", got, tsLen)
+	}
+	if strings.ContainsAny(FormatKeyTime(goldenTime), ".:") {
+		t.Errorf("FormatKeyTime = %q contains a dot or colon", FormatKeyTime(goldenTime))
 	}
 }
 
@@ -79,12 +107,12 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	original := sample("client01", goldenTime)
+	original := sample(t, goldenClient, goldenTime)
 	handle, err := original.Save(ctx, b, keys, crypto.DeterministicReader("snap"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if want := "snapshots/client01/20260102t030405.123456789z"; handle.Key != want {
+	if want := "snapshots/" + goldenClient + "/20260102T030405123456789Z"; handle.Key != want {
 		t.Errorf("key = %q, want %q", handle.Key, want)
 	}
 
@@ -92,12 +120,21 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if loaded.Root != original.Root || loaded.Host != original.Host ||
-		loaded.ClientID != original.ClientID || loaded.TimeNs != original.TimeNs ||
-		strings.Join(loaded.Paths, ",") != strings.Join(original.Paths, ",") ||
+	if loaded.Root != original.Root || loaded.Host != original.Host || loaded.User != original.User ||
+		!strings.EqualFold(hex.EncodeToString(loaded.ClientID), goldenClient) ||
+		loaded.TimeNs != original.TimeNs ||
+		pathsJoined(loaded.Paths) != pathsJoined(original.Paths) ||
 		loaded.Stats != original.Stats {
 		t.Errorf("loaded = %+v, want %+v", loaded, original)
 	}
+}
+
+func pathsJoined(paths [][]byte) string {
+	parts := make([]string, len(paths))
+	for i, p := range paths {
+		parts[i] = string(p)
+	}
+	return strings.Join(parts, ",")
 }
 
 // The key format must sort chronologically and must be legal on Windows,
@@ -112,7 +149,7 @@ func TestKeysSortChronologicallyAndAvoidColons(t *testing.T) {
 
 	var previous string
 	for _, at := range times {
-		key := Key("c", at)
+		key := Key([]byte{0x0c}, at)
 		if strings.Contains(key, ":") {
 			t.Errorf("key %q contains a colon, which is illegal in a Windows filename", key)
 		}
@@ -127,7 +164,7 @@ func TestKeysSortChronologicallyAndAvoidColons(t *testing.T) {
 }
 
 func TestParseKeyRoundTrip(t *testing.T) {
-	handle, err := ParseKey(Key("abc123", goldenTime))
+	handle, err := ParseKey(Key([]byte{0xab, 0xc1, 0x23}, goldenTime))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -142,10 +179,14 @@ func TestParseKeyRoundTrip(t *testing.T) {
 func TestParseKeyRejectsMalformed(t *testing.T) {
 	for name, key := range map[string]string{
 		"wrong prefix":  "packs/abc",
-		"no timestamp":  "snapshots/client01",
-		"empty client":  "snapshots//20260102t030405.123456789z",
-		"bad timestamp": "snapshots/client01/yesterday",
-		"rfc3339":       "snapshots/client01/2026-01-02T03:04:05Z",
+		"no timestamp":  "snapshots/" + goldenClient,
+		"empty client":  "snapshots//20260102T030405123456789Z",
+		"bad timestamp": "snapshots/" + goldenClient + "/yesterday",
+		"rfc3339":       "snapshots/" + goldenClient + "/2026-01-02T03:04:05Z",
+		// The v1 form, with a dot before the nanoseconds and lowercase
+		// markers, is not the v2 form.
+		"v1 dotted lowercase": "snapshots/" + goldenClient + "/20260102t030405.123456789z",
+		"dot without nanos":   "snapshots/" + goldenClient + "/20260102T030405.Z",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseKey(key); !errors.Is(err, ErrCorrupt) {
@@ -160,12 +201,12 @@ func TestSaveNeverOverwrites(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	first, err := sample("client01", goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("a"))
+	first, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("a"))
 	if err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
-	other := sample("client01", goldenTime)
+	other := sample(t, goldenClient, goldenTime)
 	other.Root = rootID(0x99)
 	second, err := other.Save(ctx, b, keys, crypto.DeterministicReader("b"))
 	if err != nil {
@@ -194,7 +235,7 @@ func TestSnapshotIsBoundToItsKey(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	handle, err := sample("client01", goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("bind"))
+	handle, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("bind"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -203,7 +244,7 @@ func TestSnapshotIsBoundToItsKey(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 
-	moved := Key("client02", goldenTime)
+	moved := Key(clientBytes(t, "00112233445566778899aabbccddeef1"), goldenTime)
 	if err := backend.PutBytesIfAbsent(ctx, b, moved, sealed); err != nil {
 		t.Fatalf("store: %v", err)
 	}
@@ -216,20 +257,25 @@ func TestListIsOldestFirst(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
+	client0 := "0000000000000000000000000000000a"
+	client1 := "0000000000000000000000000000000b"
 	for i, at := range []time.Time{
 		time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC),
 	} {
-		client := fmt.Sprintf("client%02d", i%2)
-		if _, err := sample(client, at).Save(ctx, b, keys, crypto.DeterministicReader(fmt.Sprintf("list-%d", i))); err != nil {
+		client := client0
+		if i%2 == 0 {
+			client = client1
+		}
+		if _, err := sample(t, client, at).Save(ctx, b, keys, crypto.DeterministicReader(fmt.Sprintf("list-%d", i))); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 	}
 	want := []string{
-		"snapshots/client01/20260101t000000.000000000z",
-		"snapshots/client00/20260201t000000.000000000z",
-		"snapshots/client00/20260301t000000.000000000z",
+		"snapshots/" + client0 + "/20260101T000000000000000Z",
+		"snapshots/" + client1 + "/20260201T000000000000000Z",
+		"snapshots/" + client1 + "/20260301T000000000000000Z",
 	}
 
 	handles, err := List(ctx, b, "")
@@ -245,12 +291,12 @@ func TestListIsOldestFirst(t *testing.T) {
 		}
 	}
 
-	perClient, err := List(ctx, b, "client00")
+	perClient, err := List(ctx, b, client1)
 	if err != nil {
-		t.Fatalf("list client00: %v", err)
+		t.Fatalf("list %s: %v", client1, err)
 	}
 	if len(perClient) != 2 {
-		t.Errorf("client00 has %d snapshots, want 2", len(perClient))
+		t.Errorf("client has %d snapshots, want 2", len(perClient))
 	}
 }
 
@@ -269,14 +315,14 @@ func TestSaveRejectsIncompleteSnapshots(t *testing.T) {
 	keys, b := testKeys(t), testBackend(t)
 
 	for name, mutate := range map[string]func(*Snapshot){
-		"no root":         func(s *Snapshot) { s.Root = crypto.ID{} },
-		"no client":       func(s *Snapshot) { s.ClientID = "" },
-		"slash in client": func(s *Snapshot) { s.ClientID = "a/b" },
-		"no time":         func(s *Snapshot) { s.TimeNs = 0 },
-		"no paths":        func(s *Snapshot) { s.Paths = nil },
+		"no root":      func(s *Snapshot) { s.Root = crypto.ID{} },
+		"no client":    func(s *Snapshot) { s.ClientID = nil },
+		"short client": func(s *Snapshot) { s.ClientID = []byte("short") },
+		"no time":      func(s *Snapshot) { s.TimeNs = 0 },
+		"no paths":     func(s *Snapshot) { s.Paths = nil },
 	} {
 		t.Run(name, func(t *testing.T) {
-			s := sample("client01", goldenTime)
+			s := sample(t, goldenClient, goldenTime)
 			mutate(s)
 			if _, err := s.Save(ctx, b, keys, crypto.DeterministicReader("bad")); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("save: err = %v, want ErrCorrupt", err)
@@ -292,8 +338,8 @@ func TestLoadRejectsAKeyThatContradictsTheObject(t *testing.T) {
 	keys, b := testKeys(t), testBackend(t)
 
 	// Seal a snapshot whose body claims a different time than its key.
-	key := Key("client01", goldenTime)
-	lying := sample("client01", goldenTime.Add(time.Hour))
+	key := Key(clientBytes(t, goldenClient), goldenTime)
+	lying := sample(t, goldenClient, goldenTime.Add(time.Hour))
 	encoded, err := crypto.Marshal(lying)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -315,7 +361,7 @@ func TestGoldenSnapshot(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	handle, err := sample("client01", goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("golden-snapshot"))
+	handle, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("golden-snapshot"))
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}

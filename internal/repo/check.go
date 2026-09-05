@@ -193,6 +193,7 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 
 	seenTrees := make(map[crypto.ID]struct{})
 	usedPacks := make(map[crypto.ID]struct{})
+	checkChunks := r.NewChunkSource()
 	for _, handle := range handles {
 		report.Snapshots++
 
@@ -201,7 +202,7 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 			problem("snapshot %s: %v", handle.Key, err)
 			continue
 		}
-		r.walkTree(ctx, snap.Root, handle.Key, rebuilt, seenTrees, usedPacks, problem)
+		r.walkTree(ctx, snap.Root, handle.Key, rebuilt, seenTrees, usedPacks, checkChunks, problem)
 	}
 	report.Trees = len(seenTrees)
 
@@ -277,6 +278,7 @@ func (r *Repository) walkTree(
 	origin string,
 	ix *index.Index,
 	seenTrees, usedPacks map[crypto.ID]struct{},
+	chunks *ChunkSource,
 	problem func(string, ...any),
 ) {
 	if _, done := seenTrees[id]; done {
@@ -292,12 +294,39 @@ func (r *Repository) walkTree(
 		return
 	}
 
+	if t.Prev != nil {
+		r.walkTree(ctx, *t.Prev, origin, ix, seenTrees, usedPacks, chunks, problem)
+	}
+
 	for _, entry := range t.Entries {
-		switch entry.Type {
+		switch tree.NodeType(entry.Type) {
 		case tree.TypeDir:
-			r.walkTree(ctx, entry.Subtree, origin, ix, seenTrees, usedPacks, problem)
+			if entry.Subtree == nil {
+				problem("%s: tree %s: %q has no subtree", origin, id, entry.Name)
+				continue
+			}
+			r.walkTree(ctx, *entry.Subtree, origin, ix, seenTrees, usedPacks, chunks, problem)
 		case tree.TypeFile:
+			// An indirect entry's Chunks name the encoded ChunkList; the
+			// data chunks it resolves to are what keeps packs live, so
+			// both sets must be walked (docs/format.md §13.1).
+			// The list chunks themselves are referenced too (their pack
+			// holds the encoded ChunkList the snapshot needs).
 			for _, chunkID := range entry.Chunks {
+				if loc, ok := ix.Lookup(chunkID); ok {
+					usedPacks[loc.Pack] = struct{}{}
+				}
+			}
+			chunkIDs := entry.Chunks
+			if tree.ContentType(entry.ContentType) == tree.ContentIndirect {
+				list, err := chunks.ChunkList(ctx, entry.Chunks)
+				if err != nil {
+					problem("%s: tree %s: %q: chunk list: %v", origin, id, entry.Name, err)
+					continue
+				}
+				chunkIDs = list
+			}
+			for _, chunkID := range chunkIDs {
 				loc, ok := ix.Lookup(chunkID)
 				if !ok {
 					problem("%s: tree %s: %q refers to chunk %s, which no pack holds", origin, id, entry.Name, chunkID)

@@ -240,7 +240,7 @@ func TestGoldenBoundaries(t *testing.T) {
 	data := pseudorandom(t, "golden-boundaries", 64<<20)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "# fastcdc min=%d avg=%d max=%d maskS=%#x maskL=%#x\n", MinSize, AvgSize, MaxSize, maskSmall, maskLarge)
+	fmt.Fprintf(&b, "# fastcdc min=%d avg=%d max=%d maskS=%#x maskL=%#x\n", MinSize, AvgSize, MaxSize, DefaultParams().maskSmall(), DefaultParams().maskLarge())
 	fmt.Fprintf(&b, "# input: 64 MiB of crypto.DeterministicReader(\"golden-boundaries\")\n")
 	fmt.Fprintf(&b, "# offset length\n")
 

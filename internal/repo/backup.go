@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
+	"time"
 
 	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
@@ -25,6 +26,10 @@ type BackupOptions struct {
 	// machine's hostname.
 	Host string
 
+	// User is recorded in the snapshot as a human label. Empty means the
+	// name of the user running the backup.
+	User string
+
 	// SpoolDir is where partly built packs are staged. Empty means the
 	// system temporary directory.
 	SpoolDir string
@@ -39,6 +44,12 @@ type BackupOptions struct {
 	// that cannot be represented. A backup that skips something must say
 	// so; silence would be a lie about what was saved.
 	Warnf func(format string, args ...any)
+
+	// GCGrace is the grace period this backup assumes for its commit
+	// gate. It must match what prune uses: the gate's whole argument is
+	// "nothing marked before grace may already be gone". Zero means
+	// DefaultGrace, and the CLI flag forwards prune's setting.
+	GCGrace time.Duration
 }
 
 func (o BackupOptions) warn(format string, args ...any) {
@@ -47,6 +58,30 @@ func (o BackupOptions) warn(format string, args ...any) {
 	}
 }
 
+func (o BackupOptions) gcGrace() time.Duration {
+	if o.GCGrace > 0 {
+		return o.GCGrace
+	}
+	return DefaultGrace
+}
+
+// DefaultGrace is how long a gc mark must age before the marked object
+// may be deleted, and how long a backup may run before it refuses to
+// commit. It must exceed the longest backup anyone will run.
+const DefaultGrace = 72 * time.Hour
+
+// graceSafetyMargin is subtracted from the grace when deciding whether a
+// backup has run too long to commit: the backup and prune hosts' clocks
+// may differ by minutes, and the wrong side of that line is the one where
+// a backup commits over a deletion.
+const graceSafetyMargin = time.Hour
+
+// ErrBackupTooLong means a backup ran for longer than the gc grace
+// period and did not commit: anything it wrote may already have been
+// marked, deleted, and unmarked, and no after-the-fact check could tell.
+// Re-running the backup reuses everything it uploaded.
+var ErrBackupTooLong = errors.New("backup ran longer than the gc grace period; no snapshot was written")
+
 // Backup walks paths and commits a snapshot.
 //
 // The order is forced by the format: chunks go into packs, packs are
@@ -54,6 +89,13 @@ func (o BackupOptions) warn(format string, args ...any) {
 // only then is the snapshot committed. Dying anywhere before that last
 // step leaves objects nothing refers to -- wasted space that prune
 // reclaims, never a repository that cannot be read.
+//
+// v2 GC obligations (docs/format.md §13): this backup is strictly
+// Put-only. Packs that carry a gc mark are not deduplicated against --
+// their chunks are uploaded again -- and no mark is ever removed. Before
+// committing, the index is reloaded and every referenced chunk must
+// resolve to a pack that exists and whose mark, if any, is young; and
+// the whole run must be shorter than the grace period.
 func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOptions) (*snapshot.Snapshot, snapshot.Handle, error) {
 	if len(paths) == 0 {
 		return nil, snapshot.Handle{}, errors.New("backup: no paths given")
@@ -70,25 +112,18 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 		}
 		host = name
 	}
-
-	// Three things happen before any file is read, in this order, and a
-	// backup that cannot do all three does not run. Prune's sweep argues
-	// from them: a client is registered before it deduplicates against
-	// anything, so a sweep that lists clients after this point waits for
-	// this backup; and a backup that started after a pack was marked
-	// read the marks after the mark, so it sees the mark and uploads the
-	// pack's chunks again. A client whose
-	// credentials cannot register or list gc/ is on a data-loss path,
-	// not in a degraded mode.
-	started := r.now().UTC()
-	if err := r.register(ctx, started); err != nil {
-		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
+	user := opts.User
+	if user == "" {
+		if u, err := currentUser(); err == nil {
+			user = u
+		}
 	}
-	// Marks before the index. Prune rewrites the index before it removes
-	// the mark of a pack that is gone, so a backup that misses the mark
-	// is one that lists after the removal, and its index refresh, later
-	// still, cannot name the pack.
-	marked, err := r.listMarkedPacks(ctx)
+
+	started := r.now().UTC()
+	// Marks before the index: a backup that lists gc/ after this point
+	// sees every mark a prune had written, and does not deduplicate
+	// against a marked pack.
+	marksAtStart, err := r.listMarkedPacks(ctx)
 	if err != nil {
 		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
 	}
@@ -100,14 +135,16 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	}
 
 	b := &backupRun{
-		repo:       r,
-		opts:       opts,
-		marked:     marked,
-		uploaded:   make(map[crypto.ID]struct{}),
-		referenced: make(map[crypto.ID]struct{}),
-		revived:    make(map[crypto.ID]struct{}),
-		written:    make(map[crypto.ID][]pack.Entry),
-		hard:       make(map[hardLinkKey][]crypto.ID),
+		repo:         r,
+		opts:         opts,
+		marked:       marksAtStart,
+		uploaded:     make(map[crypto.ID]struct{}),
+		referenced:   make(map[crypto.ID]struct{}),
+		written:      make(map[crypto.ID]index.PackInfo),
+		ownPacks:     make(map[crypto.ID]struct{}),
+		hard:         make(map[hardLinkKey]fileContents),
+		writtenTrees: make(map[crypto.ID]struct{}),
+		started:      started,
 	}
 	defer b.abort()
 
@@ -125,7 +162,7 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 		return nil, snapshot.Handle{}, err
 	}
 
-	rootID, err := tree.New(entries).Save(ctx, r.backend, r.keys, r.nonceSource)
+	rootID, err := b.saveTreeSegments(ctx, entries)
 	if err != nil {
 		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
 	}
@@ -135,16 +172,12 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	// failure to write it is still fatal: a backup that cannot record
 	// where it put things has not finished.
 	if len(b.written) > 0 {
-		if _, err := index.Save(ctx, r.backend, r.keys, b.written, r.nonceSource); err != nil {
+		if _, err := index.Save(ctx, r.backend, r.keys, b.written, nil, r.nonceSource); err != nil {
 			return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
 		}
 	}
 
-	// A pack this backup deduplicated against may have been marked by a
-	// prune that ran meanwhile. It cannot have been deleted -- the mark is
-	// younger than this backup, and this client, registered before the
-	// mark, holds the sweep -- so removing the mark is enough to keep it.
-	if err := b.reviveReferenced(ctx); err != nil {
+	if err := b.verifyBeforeCommit(ctx); err != nil {
 		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
 	}
 
@@ -153,6 +186,7 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 		Root:     rootID,
 		TimeNs:   started.UnixNano(),
 		Host:     host,
+		User:     user,
 		Paths:    roots,
 		ClientID: r.clientID,
 		Stats:    b.stats,
@@ -177,6 +211,13 @@ type hardLinkKey struct {
 	inode  uint64
 }
 
+// fileContents is what a hard link's later names reuse.
+type fileContents struct {
+	size   uint64
+	chunks []crypto.ID
+	ctype  tree.ContentType
+}
+
 type backupRun struct {
 	repo *Repository
 	opts BackupOptions
@@ -188,14 +229,12 @@ type backupRun struct {
 	chunker *chunker.Chunker
 
 	// marked is the set of packs prune has marked for deletion, as of
-	// the start of this backup. See has.
-	marked map[crypto.ID]struct{}
+	// the start of this backup, with the age of each mark. See has.
+	marked map[crypto.ID]time.Time
 
 	// referenced is the set of packs this run deduplicated against: it
-	// refers to their chunks without holding a copy. revived is the set
-	// of marked packs whose mark this run has removed.
+	// refers to their chunks without holding a copy.
 	referenced map[crypto.ID]struct{}
-	revived    map[crypto.ID]struct{}
 
 	// uploaded holds every chunk this run has put into a pack, finished
 	// or not.
@@ -205,22 +244,24 @@ type backupRun struct {
 	// two identical files, a duplicated directory -- would be added
 	// twice. That produces a trailer listing one chunk twice, which fails
 	// the trailer's own consistency check and makes the pack unreadable.
-	// It does not show up in a small test: it needs the repeat to fall
-	// inside a single pack. It is never cleared, because a chunk this run
-	// re-uploaded out of a marked pack still resolves to the marked pack
-	// in the index and would otherwise be re-uploaded on every repeat.
+	// It is never cleared, because a chunk this run re-uploaded out of a
+	// marked pack still resolves to the marked pack in the index and
+	// would otherwise be re-uploaded on every repeat.
 	uploaded map[crypto.ID]struct{}
 
-	written map[crypto.ID][]pack.Entry
-	hard    map[hardLinkKey][]crypto.ID
-	stats   snapshot.Stats
+	written      map[crypto.ID]index.PackInfo
+	ownPacks     map[crypto.ID]struct{}
+	hard         map[hardLinkKey]fileContents
+	writtenTrees map[crypto.ID]struct{}
+	stats        snapshot.Stats
+	started      time.Time
 }
 
 // normalisePaths turns the caller's paths into absolute, deduplicated,
-// sorted roots.
-func normalisePaths(paths []string) ([]string, error) {
+// sorted roots, as byte strings.
+func normalisePaths(paths []string) ([][]byte, error) {
 	seen := make(map[string]struct{}, len(paths))
-	out := make([]string, 0, len(paths))
+	var strs []string
 
 	for _, p := range paths {
 		abs, err := filepath.Abs(p)
@@ -232,30 +273,33 @@ func normalisePaths(paths []string) ([]string, error) {
 			continue
 		}
 		seen[abs] = struct{}{}
-		out = append(out, abs)
+		strs = append(strs, abs)
 	}
-	sort.Strings(out)
+	sort.Strings(strs)
+	out := make([][]byte, len(strs))
+	for i, s := range strs {
+		out[i] = []byte(s)
+	}
 	return out, nil
 }
 
 // backupRoots produces the entries of the synthetic root tree.
 //
-// Several source paths become several entries in one root, named by their
-// base names. Two roots with the same base name would collide, so the
-// second one takes the full path with separators replaced -- ugly, but
-// visible, and better than silently dropping one.
-func (b *backupRun) backupRoots(ctx context.Context, roots []string) ([]tree.Entry, error) {
-	used := make(map[string]struct{}, len(roots))
+// Each source path becomes one entry named by the path's own bytes --
+// the unified v2 rule, so a Rust-written snapshot and a Go-written
+// snapshot of the same directory agree on the root tree's name too, and
+// restore rebuilds the full absolute path under the target.
+func (b *backupRun) backupRoots(ctx context.Context, roots [][]byte) ([]tree.Entry, error) {
 	entries := make([]tree.Entry, 0, len(roots))
 
 	for _, root := range roots {
-		info, err := os.Lstat(root)
+		path := string(root)
+		info, err := os.Lstat(path)
 		if err != nil {
 			return nil, fmt.Errorf("backup: %w", err)
 		}
 
-		name := rootName(root, used)
-		entry, ok, err := b.entryFor(ctx, root, name, info)
+		entry, ok, err := b.entryFor(ctx, path, root, info)
 		if err != nil {
 			return nil, err
 		}
@@ -270,22 +314,10 @@ func (b *backupRun) backupRoots(ctx context.Context, roots []string) ([]tree.Ent
 	return entries, nil
 }
 
-func rootName(root string, used map[string]struct{}) string {
-	name := filepath.Base(root)
-	if name == "" || name == string(filepath.Separator) || name == "." {
-		name = "root"
-	}
-	if _, taken := used[name]; taken {
-		name = strings.ReplaceAll(strings.TrimPrefix(filepath.ToSlash(root), "/"), "/", "_")
-	}
-	used[name] = struct{}{}
-	return name
-}
-
 // entryFor produces the tree entry for one filesystem object, recursing
 // into directories. The bool reports whether the entry should be
 // included; false means it was skipped with a warning.
-func (b *backupRun) entryFor(ctx context.Context, path, name string, info fs.FileInfo) (tree.Entry, bool, error) {
+func (b *backupRun) entryFor(ctx context.Context, path string, name []byte, info fs.FileInfo) (tree.Entry, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return tree.Entry{}, false, err
 	}
@@ -296,6 +328,7 @@ func (b *backupRun) entryFor(ctx context.Context, path, name string, info fs.Fil
 		MTimeNs: info.ModTime().UnixNano(),
 	}
 	fillOwnership(&entry, info)
+	entry.Xattrs = readXattrs(path)
 
 	switch {
 	case info.Mode()&fs.ModeSymlink != 0:
@@ -304,8 +337,8 @@ func (b *backupRun) entryFor(ctx context.Context, path, name string, info fs.Fil
 			b.opts.warn("skipping %s: read link: %v", path, err)
 			return tree.Entry{}, false, nil
 		}
-		entry.Type = tree.TypeSymlink
-		entry.Target = target
+		entry.Type = uint8(tree.TypeSymlink)
+		entry.Target = []byte(target)
 		b.stats.Symlinks++
 		return entry, true, nil
 
@@ -314,8 +347,8 @@ func (b *backupRun) entryFor(ctx context.Context, path, name string, info fs.Fil
 		if err != nil {
 			return tree.Entry{}, false, err
 		}
-		entry.Type = tree.TypeDir
-		entry.Subtree = subtree
+		entry.Type = uint8(tree.TypeDir)
+		entry.Subtree = &subtree
 		b.stats.Dirs++
 		return entry, true, nil
 
@@ -339,12 +372,13 @@ func (b *backupRun) entryFor(ctx context.Context, path, name string, info fs.Fil
 	}
 }
 
+// backupDir returns the tree ID (of the last segment) for one directory.
 func (b *backupRun) backupDir(ctx context.Context, path string) (crypto.ID, error) {
 	names, err := os.ReadDir(path)
 	if err != nil {
 		if isSkippable(err) {
 			b.opts.warn("reading %s: %v; storing it empty", path, err)
-			return tree.New(nil).Save(ctx, b.repo.backend, b.repo.keys, b.repo.nonceSource)
+			return b.saveTreeSegments(ctx, nil)
 		}
 		return crypto.ID{}, fmt.Errorf("backup: read directory %s: %w", path, err)
 	}
@@ -360,7 +394,7 @@ func (b *backupRun) backupDir(ctx context.Context, path string) (crypto.ID, erro
 			return crypto.ID{}, fmt.Errorf("backup: stat %s: %w", filepath.Join(path, child.Name()), err)
 		}
 
-		entry, ok, err := b.entryFor(ctx, filepath.Join(path, child.Name()), child.Name(), info)
+		entry, ok, err := b.entryFor(ctx, filepath.Join(path, child.Name()), []byte(child.Name()), info)
 		if err != nil {
 			return crypto.ID{}, err
 		}
@@ -369,7 +403,35 @@ func (b *backupRun) backupDir(ctx context.Context, path string) (crypto.ID, erro
 		}
 	}
 
-	return tree.New(entries).Save(ctx, b.repo.backend, b.repo.keys, b.repo.nonceSource)
+	return b.saveTreeSegments(ctx, entries)
+}
+
+// saveTreeSegments writes entries as one tree, or as a chain of at most
+// MaxNodesPerTree-entry trees linked by Prev when the directory is huge.
+// The ID of the LAST segment is what the parent records; earlier
+// segments of an unchanged directory keep their names and are reused.
+func (b *backupRun) saveTreeSegments(ctx context.Context, entries []tree.Entry) (crypto.ID, error) {
+	var prev *crypto.ID
+	for len(entries) > tree.MaxNodesPerTree {
+		part := entries[:tree.MaxNodesPerTree]
+		entries = entries[tree.MaxNodesPerTree:]
+		t := tree.New(part)
+		t.Prev = prev
+		id, err := t.Save(ctx, b.repo.backend, b.repo.keys, b.repo.nonceSource)
+		if err != nil {
+			return crypto.ID{}, err
+		}
+		b.writtenTrees[id] = struct{}{}
+		prev = &id
+	}
+	t := tree.New(entries)
+	t.Prev = prev
+	id, err := t.Save(ctx, b.repo.backend, b.repo.keys, b.repo.nonceSource)
+	if err != nil {
+		return crypto.ID{}, err
+	}
+	b.writtenTrees[id] = struct{}{}
+	return id, nil
 }
 
 // childInfo returns a directory entry's metadata. Files take the parent
@@ -395,15 +457,21 @@ func childInfo(parent string, child fs.DirEntry) (fs.FileInfo, error) {
 // A file reachable through several hard links is chunked once: the second
 // name reuses the first's chunk list, which is what the device and inode
 // fields are recorded for.
+//
+// A file with more than MaxInlineChunks chunks switches to indirect
+// storage: the list itself is encoded and chunked like data, and the
+// entry points at those chunks.
 func (b *backupRun) backupFile(ctx context.Context, path string, info fs.FileInfo, entry *tree.Entry) error {
-	entry.Type = tree.TypeFile
+	entry.Type = uint8(tree.TypeFile)
 	entry.Size = uint64(max(info.Size(), 0))
 
 	if key, links, ok := hardLinkOf(info); ok && links > 1 {
 		entry.Device, entry.Inode, entry.Links = key.device, key.inode, links
-		if chunks, seen := b.hard[key]; seen {
-			entry.Chunks = chunks
-			b.stats.Bytes += entry.Size
+		if first, seen := b.hard[key]; seen {
+			entry.Chunks = first.chunks
+			entry.ContentType = uint8(first.ctype)
+			entry.Size = first.size
+			b.stats.Bytes += first.size
 			return nil
 		}
 	}
@@ -418,7 +486,6 @@ func (b *backupRun) backupFile(ctx context.Context, path string, info fs.FileInf
 	if err != nil {
 		return fmt.Errorf("backup %s: %w", path, err)
 	}
-	entry.Chunks = chunks
 	// The size on disk when it was read, not when it was stat'ed: a file
 	// growing during a backup would otherwise be recorded with a length
 	// its chunks do not cover, and restore would produce a short file
@@ -426,8 +493,24 @@ func (b *backupRun) backupFile(ctx context.Context, path string, info fs.FileInf
 	entry.Size = n
 	b.stats.Bytes += n
 
+	ctype := tree.ContentDirect
+	if len(chunks) > tree.MaxInlineChunks {
+		encoded, err := crypto.Marshal(tree.NewChunkList(chunks))
+		if err != nil {
+			return fmt.Errorf("backup %s: encode chunk list: %w", path, err)
+		}
+		listChunks, _, err := b.chunkAll(ctx, bytes.NewReader(encoded))
+		if err != nil {
+			return fmt.Errorf("backup %s: store chunk list: %w", path, err)
+		}
+		chunks = listChunks
+		ctype = tree.ContentIndirect
+	}
+	entry.Chunks = chunks
+	entry.ContentType = uint8(ctype)
+
 	if key, links, ok := hardLinkOf(info); ok && links > 1 {
-		b.hard[key] = chunks
+		b.hard[key] = fileContents{size: n, chunks: entry.Chunks, ctype: ctype}
 	}
 	return nil
 }
@@ -436,7 +519,7 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 	c := b.chunker
 	if c == nil {
 		var err error
-		if c, err = chunker.New(r); err != nil {
+		if c, err = chunker.NewParams(r, b.repo.config.Chunker.chunkerParams()); err != nil {
 			return nil, 0, err
 		}
 		b.chunker = c
@@ -477,14 +560,12 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 // has reports whether a chunk is already stored, by this run or by the
 // repository, in a pack that is going to stay.
 //
-// A chunk whose pack prune has marked counts as absent: it is uploaded
-// again, into a pack of this run's, and the mark is removed. Removing
-// the mark alone would leave a race -- prune reads the mark, this client
-// removes it, prune deletes the pack -- that no ordering of two
-// unconditional operations can close. Uploading the chunk again closes
-// it: whichever way the race goes, a pack holding the chunk survives.
-// The upload costs nothing worth counting, since the data it repeats
-// was about to be deleted.
+// A chunk whose pack prune has marked counts as absent and is uploaded
+// again into a pack of this run's. v2 backups never remove marks (the
+// backup role holds no Delete permission): re-uploading is what keeps
+// the data safe, and the next prune re-evaluates the mark on its own --
+// by then a live snapshot resolves chunks to this run's pack, so the
+// marked pack is genuinely dead and its space is reclaimed.
 func (b *backupRun) has(ctx context.Context, id crypto.ID) bool {
 	if _, ok := b.uploaded[id]; ok {
 		return true
@@ -494,56 +575,90 @@ func (b *backupRun) has(ctx context.Context, id crypto.ID) bool {
 		return false
 	}
 	if _, doomed := b.marked[loc.Pack]; doomed {
-		b.revive(ctx, loc.Pack)
+		b.stats.PacksRevived++
 		return false
 	}
+
 	b.referenced[loc.Pack] = struct{}{}
 	return true
 }
 
-// reviveReferenced removes any mark placed during this backup on a pack
-// it refers to.
-func (b *backupRun) reviveReferenced(ctx context.Context) error {
-	if len(b.referenced) == 0 {
+// verifyBeforeCommit is the v2 commit gate: a backup that ran longer
+// than the grace period never commits (its trees may already have been
+// deleted along with their marks, beyond any after-the-fact check), and
+// every chunk this snapshot refers to must resolve in a freshly loaded
+// index to a pack that exists and whose mark, if any, is young. Trees
+// this run put get their own check: a tree with an expired mark must
+// have been rewritten after the mark (our unconditional Put refreshes
+// its mtime), and a tree already marked when this backup started must
+// still exist with an mtime newer than that mark -- prune may have
+// deleted it after our put and cleaned the mark, invisible afterwards.
+func (b *backupRun) verifyBeforeCommit(ctx context.Context) error {
+	grace := b.opts.gcGrace()
+	elapsed := b.repo.now().UTC().Sub(b.started)
+	margin := graceSafetyMargin
+	if margin > grace/2 {
+		margin = grace / 2
+	}
+	if elapsed+margin >= grace {
+		return fmt.Errorf("%w (elapsed %s, grace %s)", ErrBackupTooLong, elapsed, grace)
+	}
+
+	needMarks := len(b.referenced) > 0 || len(b.writtenTrees) > 0
+	if !needMarks {
 		return nil
 	}
-	marked, err := b.repo.listMarkedPacks(ctx)
+	if err := b.repo.refreshIndex(ctx, b.opts.warn); err != nil {
+		return err
+	}
+	marks, err := b.repo.listMarkedPacks(ctx)
 	if err != nil {
 		return err
 	}
-	for _, id := range sortedIDs(marked) {
-		if _, ok := b.referenced[id]; ok {
-			b.revive(ctx, id)
+	now := b.repo.now().UTC()
+
+	for id := range b.referenced {
+		if _, own := b.ownPacks[id]; own {
+			continue
+		}
+		if markedAt, doomed := marks[id]; doomed && now.Sub(markedAt) >= grace {
+			return fmt.Errorf("pack %s has been marked for deletion longer than the grace period", id)
+		}
+		if _, err := b.repo.backend.Stat(ctx, pack.Key(id)); err != nil {
+			return fmt.Errorf("pack %s, referenced by this backup, is missing: %w", id, err)
+		}
+	}
+
+	// Trees this run put. Times are whole seconds: "rewritten in the
+	// same second as the mark" counts as rewritten, matching prune's
+	// not-older comparison.
+	for id := range b.writtenTrees {
+		if markedAt, doomed := marks[id]; doomed && now.Sub(markedAt) >= grace {
+			info, err := b.repo.backend.Stat(ctx, tree.Key(id))
+			if err != nil {
+				return fmt.Errorf("tree %s, written by this backup, is missing: %w", id, err)
+			}
+			if info.Modified.Before(markedAt) {
+				return fmt.Errorf("tree %s was marked for deletion longer than the grace period and has not been rewritten since", id)
+			}
+		}
+		if markedAt, wasMarked := b.marked[id]; wasMarked {
+			info, err := b.repo.backend.Stat(ctx, tree.Key(id))
+			if err != nil {
+				return fmt.Errorf("tree %s, written by this backup, is missing: %w", id, err)
+			}
+			if info.Modified.Before(markedAt) {
+				return fmt.Errorf("tree %s was marked before this backup started and has not been rewritten since", id)
+			}
 		}
 	}
 	return nil
 }
 
-// revive removes the mark from a pack this backup is about to reference,
-// once per pack. The mark is what tells prune the pack is unreferenced;
-// leaving it would have prune delete a pack that, after this backup
-// commits, a snapshot resolves chunks to.
-//
-// The pack stays in marked: every chunk of a marked pack is uploaded
-// again, not only the first one met. A failure to remove the mark is
-// reported, not fatal: the re-upload in has is what keeps the data
-// safe, and a backup role without Delete on gc/ must still be able to
-// back up.
-func (b *backupRun) revive(ctx context.Context, id crypto.ID) {
-	if _, done := b.revived[id]; done {
-		return
-	}
-	b.revived[id] = struct{}{}
-	if err := b.repo.remove(ctx, gcKey(id)); err != nil {
-		b.opts.warn("could not remove the gc mark on pack %s: %v; the data is re-uploaded, prune will re-evaluate the mark", id, err)
-	}
-	b.stats.PacksRevived++
-}
-
 // add puts one new chunk into the current pack, flushing when full.
 func (b *backupRun) add(ctx context.Context, id crypto.ID, data []byte) error {
 	if b.writer == nil {
-		w, err := pack.NewWriter(b.repo.keys, b.opts.SpoolDir, b.repo.nonceSource)
+		w, err := pack.NewWriterParams(b.repo.keys, b.opts.SpoolDir, b.repo.config.PackTargetSize, b.repo.nonceSource)
 		if err != nil {
 			return err
 		}
@@ -571,17 +686,18 @@ func (b *backupRun) flush(ctx context.Context) error {
 		return nil
 	}
 
-	packID, entries, err := b.writer.Finish(ctx, b.repo.backend)
+	packID, entries, size, err := b.writer.Finish(ctx, b.repo.backend)
 	b.writer = nil
 	if err != nil {
 		return fmt.Errorf("backup: %w", err)
 	}
 
 	b.repo.index.AddPack(packID, entries)
-	b.written[packID] = entries
+	b.written[packID] = index.PackInfo{Size: size, Entries: entries}
+	b.ownPacks[packID] = struct{}{}
 	b.stats.PacksAdded++
 	for _, e := range entries {
-		b.stats.BytesStored += uint64(e.Length)
+		b.stats.BytesStored += e.Length
 	}
 	return nil
 }

@@ -19,24 +19,60 @@ import (
 const ConfigKey = "config"
 
 // ConfigVersion is the schema version of the config object.
-const ConfigVersion = 1
+const ConfigVersion = 2
 
 // ErrCorrupt means a repository's config is unusable.
 var ErrCorrupt = errors.New("repository config is corrupt")
 
 // ChunkerParams records the chunk sizes a repository was created with.
 //
-// They are stored even though this build only supports one set, because
-// a repository whose chunker differs from the reader's deduplicates
-// against nothing and must say so instead of silently doubling in size.
+// v2 reads them as parameters, not constants: a repository's clients must
+// agree on them (they are bound into the master-key AAD, so tampering
+// with the plaintext config fails the unwrap rather than silently
+// breaking deduplication), but different repositories may differ within
+// the validated ranges.
 type ChunkerParams struct {
 	MinSize uint32 `cbor:"min"`
 	AvgSize uint32 `cbor:"avg"`
 	MaxSize uint32 `cbor:"max"`
 }
 
-func currentChunkerParams() ChunkerParams {
+// DefaultChunkerParams is what Init writes.
+func DefaultChunkerParams() ChunkerParams {
 	return ChunkerParams{MinSize: chunker.MinSize, AvgSize: chunker.AvgSize, MaxSize: chunker.MaxSize}
+}
+
+// PackTargetSize bounds how large a pack grows before it is flushed.
+// The default matches the Go v1 constant and the Rust default.
+const DefaultPackTargetSize uint64 = 64 << 20
+
+// chunkerParams converts to the chunker package's type.
+func (c ChunkerParams) chunkerParams() chunker.Params {
+	return chunker.Params{Min: c.MinSize, Avg: c.AvgSize, Max: c.MaxSize}
+}
+
+// validate rejects plaintext parameters that are nonsense before any of
+// them reaches the chunker or an allocation.
+func (c ChunkerParams) validate() error {
+	const (
+		minMin = 64
+		maxMin = 1 << 20
+		minAvg = 256
+		maxAvg = 16 << 20
+		minMax = 1 << 10
+		maxMax = 64 << 20
+	)
+	switch {
+	case c.MinSize < minMin || c.MinSize > maxMin:
+		return fmt.Errorf("%w: chunker.min %d is outside %d..%d", ErrCorrupt, c.MinSize, minMin, maxMin)
+	case c.AvgSize < minAvg || c.AvgSize > maxAvg:
+		return fmt.Errorf("%w: chunker.avg %d is outside %d..%d", ErrCorrupt, c.AvgSize, minAvg, maxAvg)
+	case c.MaxSize < minMax || c.MaxSize > maxMax:
+		return fmt.Errorf("%w: chunker.max %d is outside %d..%d", ErrCorrupt, c.MaxSize, minMax, maxMax)
+	case c.MinSize > c.AvgSize || c.AvgSize > c.MaxSize:
+		return fmt.Errorf("%w: chunk sizes %d/%d/%d do not satisfy min <= avg <= max", ErrCorrupt, c.MinSize, c.AvgSize, c.MaxSize)
+	}
+	return nil
 }
 
 // Config is the repository's public parameter block.
@@ -46,11 +82,20 @@ func currentChunkerParams() ChunkerParams {
 // repository ID, the chunk sizes, the creation time -- is already
 // derivable by anyone who can list the repository.
 type Config struct {
-	Version       uint64         `cbor:"v"`
-	RepoID        crypto.RepoID  `cbor:"repo_id"`
-	CreatedUnixNs int64          `cbor:"created"`
-	Chunker       ChunkerParams  `cbor:"chunker"`
-	Slot          crypto.KeySlot `cbor:"slot"`
+	Version uint64 `cbor:"v"`
+
+	RepoID crypto.RepoID `cbor:"repo_id"`
+
+	CreatedUnixNs int64 `cbor:"created"`
+
+	Chunker ChunkerParams `cbor:"chunker"`
+
+	// PackTargetSize is how large a pack grows before it is flushed. It
+	// is adjustable per repository (not bound into any AAD) because it
+	// changes no content address, only batching.
+	PackTargetSize uint64 `cbor:"pack_target"`
+
+	Slot crypto.KeySlot `cbor:"slot"`
 }
 
 // LoadConfig reads and validates a repository's config.
@@ -67,9 +112,15 @@ func LoadConfig(ctx context.Context, b backend.Backend) (*Config, error) {
 	if cfg.Version != ConfigVersion {
 		return nil, fmt.Errorf("%w: repository declares format version %d, this build reads %d", ErrCorrupt, cfg.Version, ConfigVersion)
 	}
-	if want := currentChunkerParams(); cfg.Chunker != want {
-		return nil, fmt.Errorf("%w: repository was created with chunk sizes min=%d avg=%d max=%d, this build uses min=%d avg=%d max=%d; writing to it would deduplicate against nothing",
-			ErrCorrupt, cfg.Chunker.MinSize, cfg.Chunker.AvgSize, cfg.Chunker.MaxSize, want.MinSize, want.AvgSize, want.MaxSize)
+	if err := cfg.Chunker.validate(); err != nil {
+		return nil, err
+	}
+	const (
+		minPack = 64 << 10
+		maxPack = 4 << 30
+	)
+	if cfg.PackTargetSize < minPack || cfg.PackTargetSize > maxPack || cfg.PackTargetSize < uint64(cfg.Chunker.MaxSize) {
+		return nil, fmt.Errorf("%w: pack_target %d is outside %d..=%d or below chunker.max", ErrCorrupt, cfg.PackTargetSize, minPack, maxPack)
 	}
 	return &cfg, nil
 }
@@ -88,10 +139,11 @@ func saveConfig(ctx context.Context, b backend.Backend, cfg *Config) error {
 
 func newConfig(repoID crypto.RepoID, slot *crypto.KeySlot, now time.Time) *Config {
 	return &Config{
-		Version:       ConfigVersion,
-		RepoID:        repoID,
-		CreatedUnixNs: now.UTC().UnixNano(),
-		Chunker:       currentChunkerParams(),
-		Slot:          *slot,
+		Version:        ConfigVersion,
+		RepoID:         repoID,
+		CreatedUnixNs:  now.UTC().UnixNano(),
+		Chunker:        DefaultChunkerParams(),
+		PackTargetSize: DefaultPackTargetSize,
+		Slot:           *slot,
 	}
 }

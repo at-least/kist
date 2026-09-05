@@ -27,13 +27,15 @@ func init() {
 
 	// Decoding is strict on the things that let an attacker smuggle two
 	// readings of one document past each other, and bounded on the things
-	// that let a small object allocate a large amount of memory.
+	// that let a small object allocate a large amount of memory. Unknown
+	// FIELDS are ignored: that is the forward-compatibility rule of the
+	// v2 format (docs/format.md §4), and it is safe because no reader
+	// ever re-encodes what it decoded ("never round-trip").
 	opts := cbor.DecOptions{
-		DupMapKey:         cbor.DupMapKeyEnforcedAPF,
-		IndefLength:       cbor.IndefLengthForbidden,
-		ExtraReturnErrors: cbor.ExtraDecErrorUnknownField,
-		MaxArrayElements:  8 << 20,
-		MaxMapPairs:       1 << 20,
+		DupMapKey:        cbor.DupMapKeyEnforcedAPF,
+		IndefLength:      cbor.IndefLengthForbidden,
+		MaxArrayElements: 8 << 20,
+		MaxMapPairs:      1 << 20,
 	}
 	if decMode, err = opts.DecMode(); err != nil {
 		panic(fmt.Sprintf("kist/crypto: build CBOR decoder: %v", err))
@@ -49,8 +51,8 @@ func Marshal(v any) ([]byte, error) {
 	return b, nil
 }
 
-// Unmarshal decodes canonical CBOR into v, rejecting duplicate map keys,
-// indefinite-length items and unknown fields.
+// Unmarshal decodes canonical CBOR into v, rejecting duplicate map keys
+// and indefinite-length items; unknown fields are ignored.
 func Unmarshal(data []byte, v any) error {
 	if err := decMode.Unmarshal(data, v); err != nil {
 		return fmt.Errorf("decode cbor: %w", err)

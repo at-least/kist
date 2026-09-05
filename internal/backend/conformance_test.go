@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"testing"
+	"time"
 )
 
 // runConformance exercises the contract in the package documentation
@@ -157,8 +158,9 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 		}
 	})
 
-	t.Run("stat reports size", func(t *testing.T) {
+	t.Run("stat reports size and mtime", func(t *testing.T) {
 		b := newBackend(t)
+		before := time.Now().Add(-time.Minute)
 		if err := PutBytesIfAbsent(ctx, b, "packs/dd", []byte("12345")); err != nil {
 			t.Fatalf("put: %v", err)
 		}
@@ -169,6 +171,17 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 		}
 		if info.Key != "packs/dd" || info.Size != 5 {
 			t.Errorf("stat = %+v, want {packs/dd 5}", info)
+		}
+		// Modified is what the gc mark protocol ages on, so every backend
+		// must report it, truncated to whole seconds.
+		if info.Modified.IsZero() {
+			t.Fatalf("stat = %+v, Modified is zero", info)
+		}
+		if info.Modified.Nanosecond() != 0 {
+			t.Errorf("Modified = %s, want whole-second precision", info.Modified)
+		}
+		if info.Modified.Before(before) || info.Modified.After(time.Now().Add(time.Minute)) {
+			t.Errorf("Modified = %s, want it around now", info.Modified)
 		}
 	})
 
@@ -262,7 +275,7 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 
 	t.Run("invalid keys are rejected", func(t *testing.T) {
 		b := newBackend(t)
-		bad := []string{"", "/leading", "trailing/", "double//slash", "../escape", "packs/../../etc", "UPPER", "has space", "snapshots/a:b", ".hidden", "packs/.tmp-1"}
+		bad := []string{"", "/leading", "trailing/", "double//slash", "../escape", "packs/../../etc", "has space", "snapshots/a:b", ".hidden", "packs/.tmp-1"}
 
 		for _, key := range bad {
 			t.Run(key, func(t *testing.T) {
@@ -279,6 +292,28 @@ func runConformance(t *testing.T, newBackend func(t *testing.T) Backend) {
 					t.Errorf("Delete: err = %v, want ErrInvalidKey", err)
 				}
 			})
+		}
+	})
+
+	// Uppercase became legal in v2 for one reason: the snapshot key's
+	// timestamp is uppercase ISO 8601 basic format
+	// (YYYYMMDDTHHMMSSnnnnnnnnnZ). Everything else kist writes is
+	// lowercase hex, but the charset itself must admit it.
+	t.Run("uppercase timestamp keys are accepted", func(t *testing.T) {
+		b := newBackend(t)
+		key := "snapshots/00112233445566778899aabbccddeeff/20260102T030405123456789Z"
+		if err := ValidateKey(key); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if err := PutBytesIfAbsent(ctx, b, key, []byte("snap")); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		got, err := GetAll(ctx, b, key)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if string(got) != "snap" {
+			t.Errorf("get = %q, want %q", got, "snap")
 		}
 	})
 

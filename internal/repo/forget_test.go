@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -11,7 +12,11 @@ import (
 )
 
 func handleAt(client string, at time.Time) snapshot.Handle {
-	return snapshot.Handle{ClientID: client, Time: at, Key: snapshot.Key(client, at)}
+	id, err := hex.DecodeString(client)
+	if err != nil {
+		panic(err)
+	}
+	return snapshot.Handle{ClientID: client, Time: at, Key: snapshot.Key(id, at)}
 }
 
 // hourly returns n snapshots one hour apart ending at end, oldest first.
@@ -34,7 +39,8 @@ func keys(handles []snapshot.Handle) string {
 func TestRetentionPolicyApply(t *testing.T) {
 	end := time.Date(2026, 3, 10, 23, 0, 0, 0, time.UTC) // a Tuesday
 	// Ten days of hourly snapshots.
-	all := hourly("c", end, 24*10)
+	clientC := "cccccccccccccccccccccccccccccccc"
+	all := hourly(clientC, end, 24*10)
 
 	cases := []struct {
 		name   string
@@ -68,10 +74,11 @@ func TestRetentionPolicyApply(t *testing.T) {
 // periods: a gap in the history does not eat into the count.
 func TestRetentionPolicySkipsEmptyBuckets(t *testing.T) {
 	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	client := "cccccccccccccccccccccccccccccccc"
 	handles := []snapshot.Handle{
-		handleAt("c", base),
-		handleAt("c", base.AddDate(0, 0, 1)),
-		handleAt("c", base.AddDate(0, 0, 10)), // nine-day gap
+		handleAt(client, base),
+		handleAt(client, base.AddDate(0, 0, 1)),
+		handleAt(client, base.AddDate(0, 0, 10)), // nine-day gap
 	}
 	keep, _ := RetentionPolicy{Daily: 3}.Apply(handles, base.AddDate(0, 0, 11))
 	if len(keep) != 3 {
@@ -153,7 +160,7 @@ func TestForgetByExplicitKey(t *testing.T) {
 	ctx := context.Background()
 	r, _, handle := backedUpRepo(t, "forget-key")
 
-	if _, err := r.Forget(ctx, ForgetOptions{Keys: []string{"snapshots/nobody/20260101t000000.000000000z"}}); err == nil {
+	if _, err := r.Forget(ctx, ForgetOptions{Keys: []string{"snapshots/nobody/20260101T000000000000000Z"}}); err == nil {
 		t.Fatal("forget of a missing key: got nil error")
 	}
 
@@ -171,8 +178,10 @@ func TestForgetByExplicitKey(t *testing.T) {
 
 func TestGroupByClientIsSorted(t *testing.T) {
 	now := time.Now()
-	groups := groupByClient([]snapshot.Handle{handleAt("b", now), handleAt("a", now), handleAt("b", now.Add(time.Hour))})
-	if len(groups) != 2 || groups[0][0].ClientID != "a" || len(groups[1]) != 2 {
+	clientA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	clientB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	groups := groupByClient([]snapshot.Handle{handleAt(clientB, now), handleAt(clientA, now), handleAt(clientB, now.Add(time.Hour))})
+	if len(groups) != 2 || groups[0][0].ClientID != clientA || len(groups[1]) != 2 {
 		t.Errorf("groups = %v", groups)
 	}
 }

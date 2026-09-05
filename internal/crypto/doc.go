@@ -4,7 +4,7 @@
 //
 // The hierarchy is password -> Argon2id -> KEK -> master key, with
 // per-purpose subkeys (chunk, hash, index, meta) derived from the master
-// key by HKDF-SHA256 salted with the repository ID. Payloads are sealed
+// key by BLAKE3 DeriveKey salted with the repository ID. Payloads are sealed
 // with XChaCha20-Poly1305 under a 24-byte nonce, with a caller-supplied
 // AAD that binds each object to where it belongs.
 //

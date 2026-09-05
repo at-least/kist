@@ -71,8 +71,12 @@ type BackupResult struct {
 
 // FromBackup builds the result of a backup.
 func FromBackup(snap *snapshot.Snapshot, handle snapshot.Handle) *BackupResult {
+	paths := make([]string, len(snap.Paths))
+	for i, p := range snap.Paths {
+		paths[i] = string(p)
+	}
 	return &BackupResult{
-		Snapshot: handle.Key, Host: snap.Host, Paths: snap.Paths,
+		Snapshot: handle.Key, Host: snap.Host, Paths: paths,
 		Files: snap.Stats.Files, Dirs: snap.Stats.Dirs, Symlinks: snap.Stats.Symlinks,
 		Bytes: snap.Stats.Bytes, BytesStored: snap.Stats.BytesStored, ChunksNew: snap.Stats.ChunksNew,
 		PacksAdded: snap.Stats.PacksAdded, PacksRevived: snap.Stats.PacksRevived,

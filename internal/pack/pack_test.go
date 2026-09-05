@@ -21,27 +21,17 @@ import (
 var update = flag.Bool("update", false, "rewrite testdata golden files")
 
 // The frozen inputs the golden pack is built from.
-var (
-	goldenMaster = crypto.Key{
-		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-	}
-	goldenRepoID = crypto.RepoID{
-		0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
-		0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
-	}
-)
+var goldenMaster = crypto.Key{
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+	0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+}
 
 func testKeys(t *testing.T) *crypto.Keys {
 	t.Helper()
 
-	keys, err := crypto.DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive keys: %v", err)
-	}
-	return keys
+	return crypto.DeriveKeys(goldenMaster)
 }
 
 func testBackend(t *testing.T) backend.Backend {
@@ -80,7 +70,7 @@ func writePack(t *testing.T, b backend.Backend, keys *crypto.Keys, seed string, 
 		}
 	}
 
-	id, entries, err := w.Finish(context.Background(), b)
+	id, entries, _, err := w.Finish(context.Background(), b)
 	if err != nil {
 		t.Fatalf("finish: %v", err)
 	}
@@ -170,12 +160,12 @@ func TestCompressionIsDecidedPerChunk(t *testing.T) {
 
 	id, entries := writePack(t, b, keys, "compression", compressible, random)
 
-	if entries[0].Length >= uint32(len(compressible))/2 {
+	if entries[0].Length >= uint64(len(compressible))/2 {
 		t.Errorf("compressible chunk stored in %d bytes for %d of input; it was not compressed", entries[0].Length, len(compressible))
 	}
 	// An incompressible chunk must not grow by more than the envelope and
 	// the encoding byte: the writer must have kept it raw.
-	if want := uint32(len(random) + crypto.Overhead + 1); entries[1].Length != want {
+	if want := uint64(len(random) + crypto.Overhead + 1); entries[1].Length != want {
 		t.Errorf("incompressible chunk stored in %d bytes, want %d (stored raw)", entries[1].Length, want)
 	}
 
@@ -203,8 +193,10 @@ func TestWriterTracksSizeAndFullness(t *testing.T) {
 	}
 	defer w.Abort()
 
-	if w.Size() != 0 || w.Count() != 0 || w.Full() {
-		t.Errorf("fresh writer: size %d, count %d, full %v", w.Size(), w.Count(), w.Full())
+	// v2 opens the pack with the header magic, so a fresh writer has
+	// already written it: chunk offsets are absolute file positions.
+	if w.Size() != magicSize || w.Count() != 0 || w.Full() {
+		t.Errorf("fresh writer: size %d (want %d), count %d, full %v", w.Size(), magicSize, w.Count(), w.Full())
 	}
 
 	payload := incompressible(t, "fullness", 4<<20)
@@ -232,7 +224,7 @@ func TestFinishRefusesAnEmptyPack(t *testing.T) {
 	}
 	defer w.Abort()
 
-	if _, _, err := w.Finish(context.Background(), b); err == nil {
+	if _, _, _, err := w.Finish(context.Background(), b); err == nil {
 		t.Fatal("finish with no chunks: got nil error")
 	}
 }
@@ -248,14 +240,14 @@ func TestWriterIsSingleUse(t *testing.T) {
 	if err := w.Add(id, payload); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if _, _, err := w.Finish(context.Background(), b); err != nil {
+	if _, _, _, err := w.Finish(context.Background(), b); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 
 	if err := w.Add(id, payload); err == nil {
 		t.Error("add after finish: got nil error")
 	}
-	if _, _, err := w.Finish(context.Background(), b); err == nil {
+	if _, _, _, err := w.Finish(context.Background(), b); err == nil {
 		t.Error("second finish: got nil error")
 	}
 	w.Abort() // must not panic or remove anything twice
@@ -481,7 +473,10 @@ func TestReaderRejectsInconsistentTrailer(t *testing.T) {
 			t.Fatalf("seal: %v", err)
 		}
 
-		raw := append(bytes.Clone(data), sealed...)
+		// v2: the pack opens with the header magic and chunk data starts at
+		// offset magicSize, so every forged entry is placed after it.
+		raw := append(bytes.Clone(magic[:]), data...)
+		raw = append(raw, sealed...)
 		raw = append(raw, encodeTail(uint64(len(sealed)))...)
 
 		id := crypto.CiphertextID(raw)
@@ -492,31 +487,36 @@ func TestReaderRejectsInconsistentTrailer(t *testing.T) {
 		return err
 	}
 
-	sealedLen := uint32(crypto.Overhead + 1)
+	sealedLen := uint64(crypto.Overhead + 1)
 	data := make([]byte, 2*sealedLen)
+	dataStart := uint64(magicSize)
 
 	cases := map[string][]Entry{
 		"gap between chunks": {
-			{ID: crypto.ID{1}, Offset: 0, Length: sealedLen},
-			{ID: crypto.ID{2}, Offset: uint64(sealedLen) + 1, Length: sealedLen - 1},
+			{ID: crypto.ID{1}, Offset: dataStart, Length: sealedLen},
+			{ID: crypto.ID{2}, Offset: dataStart + sealedLen + 1, Length: sealedLen - 1},
 		},
 		"entry past the data": {
-			{ID: crypto.ID{1}, Offset: 0, Length: sealedLen},
-			{ID: crypto.ID{2}, Offset: uint64(sealedLen), Length: sealedLen + 100},
+			{ID: crypto.ID{1}, Offset: dataStart, Length: sealedLen},
+			{ID: crypto.ID{2}, Offset: dataStart + sealedLen, Length: sealedLen + 100},
 		},
 		"entry shorter than an envelope": {
-			{ID: crypto.ID{1}, Offset: 0, Length: crypto.Overhead},
+			{ID: crypto.ID{1}, Offset: dataStart, Length: crypto.Overhead},
+		},
+		"first entry not after the header": {
+			{ID: crypto.ID{1}, Offset: 0, Length: sealedLen},
+			{ID: crypto.ID{2}, Offset: sealedLen, Length: sealedLen},
 		},
 		"duplicate chunk": {
-			{ID: crypto.ID{1}, Offset: 0, Length: sealedLen},
-			{ID: crypto.ID{1}, Offset: uint64(sealedLen), Length: sealedLen},
+			{ID: crypto.ID{1}, Offset: dataStart, Length: sealedLen},
+			{ID: crypto.ID{1}, Offset: dataStart + sealedLen, Length: sealedLen},
 		},
 		"entries do not cover the data": {
-			{ID: crypto.ID{1}, Offset: 0, Length: sealedLen},
+			{ID: crypto.ID{1}, Offset: dataStart, Length: sealedLen},
 		},
 		"no entries": {},
 		"chunk longer than the format allows": {
-			{ID: crypto.ID{1}, Offset: 0, Length: maxSealedChunk + 1},
+			{ID: crypto.ID{1}, Offset: dataStart, Length: maxSealedChunk + 1},
 		},
 	}
 
@@ -537,10 +537,7 @@ func TestTrailerIsBoundToTheRepositoryKeys(t *testing.T) {
 
 	otherMaster := goldenMaster
 	otherMaster[0] ^= 0xff
-	other, err := crypto.DeriveKeys(otherMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive keys: %v", err)
-	}
+	other := crypto.DeriveKeys(otherMaster)
 
 	if _, err := OpenReader(ctx, b, other, id); !errors.Is(err, crypto.ErrDecrypt) {
 		t.Fatalf("open with the wrong keys: err = %v, want ErrDecrypt", err)

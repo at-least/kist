@@ -6,10 +6,7 @@ import (
 )
 
 func TestIDStringParseRoundTrip(t *testing.T) {
-	keys, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	keys := DeriveKeys(goldenMaster)
 	id := ContentID(&keys.Hash, []byte("round trip"))
 
 	parsed, err := ParseID(id.String())
@@ -46,16 +43,10 @@ func TestParseIDRejectsMalformed(t *testing.T) {
 // Keying the hash is what stops an observer confirming a guess about
 // file contents from the names in the repository.
 func TestContentIDDependsOnTheHashKey(t *testing.T) {
-	a, err := DeriveKeys(goldenMaster, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	a := DeriveKeys(goldenMaster)
 	other := goldenMaster
 	other[0] ^= 0xff
-	b, err := DeriveKeys(other, goldenRepoID)
-	if err != nil {
-		t.Fatalf("derive: %v", err)
-	}
+	b := DeriveKeys(other)
 
 	payload := []byte("guessable contents")
 	if ContentID(&a.Hash, payload) == ContentID(&b.Hash, payload) {
