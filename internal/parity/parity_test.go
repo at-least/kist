@@ -202,7 +202,7 @@ func TestParseRejectsInconsistentHeaders(t *testing.T) {
 		return raw
 	}
 	cases := map[string][]byte{
-		"version":          mutate(func(o *Object) { o.Version = 2 }),
+		"version":          mutate(func(o *Object) { o.Version = 3 }),
 		"k":                mutate(func(o *Object) { o.K = 8 }),
 		"m zero":           mutate(func(o *Object) { o.M = 0 }),
 		"m too big":        mutate(func(o *Object) { o.M = 9 }),

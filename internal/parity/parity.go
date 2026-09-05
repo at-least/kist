@@ -30,7 +30,7 @@ import (
 const Prefix = "parity/"
 
 // Version is the parity object schema version.
-const Version = 1
+const Version = 2
 
 // DataShards is the fixed number of data shards a pack is split into.
 // Fixed, so that the overhead of M parity shards is exactly M/16 and a
@@ -86,6 +86,12 @@ func Encode(packID crypto.ID, pack []byte, m int) ([]byte, error) {
 		return nil, fmt.Errorf("encode parity: bytes hash to %s, not %s", got, packID)
 	}
 	shardLen := (len(pack) + DataShards - 1) / DataShards
+	if shardLen > maxShardLen {
+		// Beyond this bound no repair-side reader will parse the object, so
+		// writing it would only waste space: skipping costs redundancy, never
+		// data. Same limit as the Rust implementation.
+		return nil, fmt.Errorf("encode parity: pack of %d bytes needs %d-byte shards, over the %d limit", len(pack), shardLen, maxShardLen)
+	}
 	shards := shard(pack, shardLen, m)
 
 	enc, err := reedsolomon.New(DataShards, m)
