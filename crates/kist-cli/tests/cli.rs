@@ -419,19 +419,19 @@ fn prune_marks_then_deletes() {
     // 修改時間是整秒，標記不能跟物件同一秒：每次 prune 前等一下
     let settle = || std::thread::sleep(std::time::Duration::from_millis(1100));
     settle();
-    let out = env.ok(&["prune", "--grace", "0s"]);
+    let out = env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s"]);
     assert!(out.contains("deleted 0 object"), "{out}");
     assert!(out.contains("repacked 1 pack"), "{out}");
     assert!(original.is_subset(&packs(&env)), "第一階段不能刪 pack");
     // 活躍 client 在標記後要有新 snapshot 才會刪
     settle();
-    let out = env.ok(&["prune", "--grace", "0s"]);
+    let out = env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s"]);
     assert!(out.contains("deleted 0 object"), "{out}");
     assert!(!out.contains(", 0 held back"), "{out}");
     assert!(env.repo().join("gc").is_dir());
     env.ok(&["backup", src.to_str().unwrap()]);
     settle();
-    let out = env.ok(&["prune", "--grace", "0s"]);
+    let out = env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s"]);
     assert!(!out.contains("deleted 0 object"), "{out}");
     assert!(
         original.is_disjoint(&packs(&env)),
@@ -444,7 +444,7 @@ fn prune_marks_then_deletes() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    env.ok(&["prune", "--grace", "0s", "--dry-run"]);
+    env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s", "--dry-run"]);
     let after: Vec<_> = std::fs::read_dir(env.repo().join("indexes"))
         .unwrap()
         .map(|e| e.unwrap().file_name())

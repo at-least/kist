@@ -176,10 +176,10 @@ impl Metrics {
                 if let Some(n) = get(&["stats", "files"]) {
                     self.backup_files.set(n);
                 }
-                if let Some(n) = get(&["stats", "bytes_total"]) {
+                if let Some(n) = get(&["stats", "bytes"]) {
                     self.backup_bytes.set(n);
                 }
-                if let Some(n) = get(&["stats", "bytes_new"]) {
+                if let Some(n) = get(&["stats", "bytes_stored"]) {
                     self.backup_bytes_new.set(n);
                 }
                 if let Some(n) = get(&["stats", "chunks_new"]) {

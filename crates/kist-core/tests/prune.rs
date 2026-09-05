@@ -32,6 +32,8 @@ fn client(id: u8, now: OffsetDateTime) -> BackupOptions {
 
 fn prune_opts(now: OffsetDateTime) -> PruneOptions {
     PruneOptions {
+        // 測試用合成時鐘追趕真實 mtime：沒有時鐘差可言，skew 歸零。
+        clock_skew: std::time::Duration::ZERO,
         grace: 72 * H,
         inactive_after: 30 * 24 * H,
         repack_below_percent: 50,
@@ -114,7 +116,7 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
         "第一階段不能刪 tree"
     );
     // b2 的根 tree 活著、不能被標記
-    assert!(!marked.contains(&b2.root));
+    assert!(!marked.contains(&ObjectId::from_bytes(*b2.root.as_bytes())));
     // repo 一致（index 已重寫，不含被 repack 的 pack）
     let report = t
         .open()
@@ -380,7 +382,7 @@ async fn stale_marker_for_a_missing_object_is_removed() {
     let bogus = ObjectId::from_bytes([0xAB; 32]);
     let path = t.repo_path().join(keys::gc(&bogus));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, b"KISTGC1\n").unwrap();
+    std::fs::write(&path, keys::GC_MARK_MAGIC).unwrap();
     settle().await;
     let p = repo
         .prune(prune_opts(r + Duration::hours(1)))

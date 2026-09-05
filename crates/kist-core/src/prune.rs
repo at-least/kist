@@ -54,6 +54,10 @@ pub struct PruneOptions {
     pub grace: std::time::Duration,
     /// 超過這麼久沒有新 snapshot 的 client 視為 inactive，不阻擋刪除。
     pub inactive_after: std::time::Duration,
+    /// prune 主機與 client 的時鐘容許差。活躍判定比較的是 client 的
+    /// 備份時間與後端的標記時間；client 時鐘偏快會讓它看來「在標記後
+    /// 有新 snapshot」而實際沒有。預設 1 小時（`docs/format.md` §13.2）。
+    pub clock_skew: std::time::Duration,
     /// 正本 bytes 比例低於這個百分比的 pack 會被 repack。0 = 不 repack。
     pub repack_below_percent: u8,
     pub dry_run: bool,
@@ -66,6 +70,7 @@ impl Default for PruneOptions {
         Self {
             grace: crate::backup::DEFAULT_GC_GRACE,
             inactive_after: std::time::Duration::from_secs(30 * 24 * 3600),
+            clock_skew: std::time::Duration::from_secs(3600),
             repack_below_percent: 50,
             dry_run: false,
             now: None,
@@ -112,7 +117,7 @@ impl Kind {
     fn key(self, id: &ObjectId) -> String {
         match self {
             Kind::Pack => keys::pack(id),
-            Kind::Tree => keys::tree(id),
+            Kind::Tree => keys::tree(&kist_format::TreeId::from_bytes(*id.as_bytes())),
             Kind::Index => keys::index(id),
         }
     }
@@ -266,22 +271,22 @@ impl Repository {
         // 5. 活躍 client：每台最新 snapshot 的開始時間
         let mut latest_by_client: HashMap<Vec<u8>, OffsetDateTime> = HashMap::new();
         for (key, snap) in &reach.snapshots {
-            let t = OffsetDateTime::parse(
-                &snap.time,
-                &time::format_description::well_known::Rfc3339,
-            )
-            .map_err(|e| CoreError::Unsafe(format!("{key}: bad time {:?}: {e}", snap.time)))?;
+            let t = OffsetDateTime::from_unix_timestamp_nanos(i128::from(snap.time_ns))
+                .map_err(|e| CoreError::Unsafe(format!("{key}: bad time {}: {e}", snap.time_ns)))?;
             let entry = latest_by_client.entry(snap.client_id.clone()).or_insert(t);
             if t > *entry {
                 *entry = t;
             }
         }
-        // 刪除條件：每個活躍 client 的最新 snapshot 都比標記晚 ⇔ 標記早於「活躍 client 最新 snapshot 的最小值」
+        // 刪除條件：每個活躍 client 的最新 snapshot 都比標記晚 ⇔ 標記早於「活躍 client 最新 snapshot 的最小值」。
+        // snapshot 的時間來自 client 的時鐘、標記來自後端：比較時把 client 時間往前修一個
+        // clock_skew，時鐘偏快的 client 才不會虛報「標記後有新 snapshot」。
+        let skew = to_time_duration(opts.clock_skew, "clock_skew")?;
         let min_active_latest: Option<OffsetDateTime> = latest_by_client
             .values()
             .filter(|t| **t >= now - inactive_after)
-            .min()
-            .copied();
+            .map(|t| *t - skew)
+            .min();
 
         // 6. 逐個標記決定：復活 / 過期 / 可刪 / 等待 / 被擋
         let mut to_delete: Vec<(Target, ObjectInfo)> = Vec::new();
@@ -625,7 +630,7 @@ impl Repository {
                         reason: format!("chunk {} points outside the pack", e.id),
                     });
                     let plain =
-                        slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.flags, e.raw_len));
+                        slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.raw_len));
                     match plain {
                         Ok(p) => plains.push((e.id, p)),
                         Err(err) => return Ok((w, Vec::new(), 0, Some(err))),

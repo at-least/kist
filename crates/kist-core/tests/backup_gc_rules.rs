@@ -38,7 +38,7 @@ fn pack_ids(t: &TestRepo) -> Vec<ObjectId> {
 fn mark(t: &TestRepo, id: &ObjectId, age: std::time::Duration) {
     let path = t.repo_path().join(keys::gc(id));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, b"KISTGC1\n").unwrap();
+    std::fs::write(&path, keys::GC_MARK_MAGIC).unwrap();
     let when = std::time::SystemTime::now() - age;
     filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(when)).unwrap();
 }
@@ -212,7 +212,10 @@ async fn snapshot_time_can_be_injected() {
         s.snapshot_key
     );
     let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
-    assert_eq!(snap.time, "2030-01-02T03:04:05.000000006Z");
+    assert_eq!(
+        time::OffsetDateTime::from_unix_timestamp_nanos(snap.time_ns as i128).unwrap(),
+        time::macros::datetime!(2030-01-02 03:04:05.000000006 UTC)
+    );
 }
 
 /// 開始得早的 restore 手上是舊 index：chunk 被 repack 搬走後，重載 index 就讀得到。
@@ -278,7 +281,7 @@ async fn commit_checks_expired_markers_on_written_trees() {
         .await
         .unwrap();
     // 標記比我們的 put 舊：prune 刪前會看到 tree 被重寫過而撤銷標記 → 允許
-    mark(&t, &first.root, four_days);
+    mark(&t, &tree_object_id(&first.root), four_days);
     prepared.commit().await.unwrap();
     assert_eq!(t.count("snapshots"), 2);
 
@@ -293,6 +296,11 @@ async fn commit_checks_expired_markers_on_written_trees() {
     let err = prepared.commit().await.unwrap_err();
     assert!(matches!(err, CoreError::TreeMarked(_)), "{err}");
     assert_eq!(t.count("snapshots"), 2);
+}
+
+/// tree 的 GC 標記在 gc/ 命名空間以 ObjectId 記（與 pack/index 共用）。
+fn tree_object_id(id: &kist_format::TreeId) -> ObjectId {
+    ObjectId::from_bytes(*id.as_bytes())
 }
 
 fn five_days() -> std::time::Duration {
@@ -370,20 +378,20 @@ async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
         .backup(std::slice::from_ref(&src), client(1))
         .await
         .unwrap();
-    mark(&t, &first.root, std::time::Duration::from_secs(3600));
+    mark(&t, &tree_object_id(&first.root), std::time::Duration::from_secs(3600));
     let prepared = repo
         .backup_prepare(std::slice::from_ref(&src), client(1))
         .await
         .unwrap();
     // prune 刪掉 tree 並清掉標記
     std::fs::remove_file(t.repo_path().join(keys::tree(&first.root))).unwrap();
-    std::fs::remove_file(t.repo_path().join(keys::gc(&first.root))).unwrap();
+    std::fs::remove_file(t.repo_path().join(keys::gc(&tree_object_id(&first.root)))).unwrap();
     let err = prepared.commit().await.unwrap_err();
     assert!(matches!(err, CoreError::TreeMarked(_)), "{err}");
     assert_eq!(t.count("snapshots"), 1);
 
     // 沒被刪（我們的 put 比標記新）：可以 commit
-    mark(&t, &first.root, std::time::Duration::from_secs(3600));
+    mark(&t, &tree_object_id(&first.root), std::time::Duration::from_secs(3600));
     let prepared = repo
         .backup_prepare(std::slice::from_ref(&src), client(1))
         .await

@@ -124,11 +124,12 @@ async fn tree_copied_over_another_tree_is_detected() {
     let root = repo.read_snapshot_by_key(&key).await.unwrap().root.to_hex();
     let (_a, b) = swap_objects_excluding(&t.repo_path().join("trees"), &[root]);
     let report = repo.check(CheckOptions { read_data: false }).await.unwrap();
+    // v2：tree 以自己的 ID 當 AAD 密封，互拷的檔案在解密（AEAD 驗證）就失敗
     assert!(
         report
             .errors
             .iter()
-            .any(|e| e.contains(&b) && e.contains("name")),
+            .any(|e| e.contains(&b) && e.contains("authentication failed")),
         "{:?}",
         report.errors
     );
@@ -142,6 +143,39 @@ async fn tree_copied_over_another_tree_is_detected() {
         .await
         .unwrap();
     assert!(summary.errors.iter().any(|e| e.contains(&b)), "{summary:?}");
+}
+
+/// v2 的 tree 名稱 = 明文的 keyed hash（AAD = 名稱）。AAD 相符、解密成功，
+/// 但內容 hash 不是它名稱的 tree（偽造或寫入端出錯）必須被名稱檢查抓到。
+#[tokio::test]
+async fn tree_whose_content_does_not_match_its_name_is_detected() {
+    let (t, repo) = repo_with_data().await;
+    let key = repo.resolve_snapshot("latest").await.unwrap();
+    let root = repo.read_snapshot_by_key(&key).await.unwrap().root.to_hex();
+    let mut trees = walk_files(&t.repo_path().join("trees"));
+    trees.retain(|p| p.is_file() && p.file_name().unwrap().to_str() != Some(&root));
+    trees.sort();
+    let (a, b) = (trees[0].clone(), trees[1].clone());
+    let id_a = kist_format::TreeId::from_hex(a.file_name().unwrap().to_str().unwrap()).unwrap();
+    let id_b = kist_format::TreeId::from_hex(b.file_name().unwrap().to_str().unwrap()).unwrap();
+    // 把 a 的明文以 b 的名稱（AAD）重新密封、蓋到 b 的檔名上：解密會成功
+    let plain_a = repo
+        .keys()
+        .open_tree(&id_a, &std::fs::read(&a).unwrap())
+        .unwrap();
+    let forged = repo.keys().seal_tree(&id_b, &plain_a).unwrap();
+    std::fs::write(&b, forged).unwrap();
+
+    let report = repo.check(CheckOptions { read_data: false }).await.unwrap();
+    let name = b.file_name().unwrap().to_str().unwrap();
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains(name) && e.contains("name")),
+        "{:?}",
+        report.errors
+    );
 }
 
 #[tokio::test]

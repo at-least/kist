@@ -1,12 +1,15 @@
-//! 兩種 32-byte 識別碼。
+//! 三種 32-byte 識別碼。
 //!
-//! - [`ChunkId`]：chunk 的身分 = keyed BLAKE3(hash key, 明文)。只出現在加密過的
-//!   trailer / index / tree 裡，**絕不**當作 repo 裡的物件名稱。
-//! - [`ObjectId`]：獨立物件（pack / tree / index）的名稱 = 一般 BLAKE3(整個物件的密文 bytes)。
-//!   下載端不需要金鑰就能驗證拿到的 bytes 沒被改過。
+//! - [`ChunkId`]：chunk 的身分 = keyed BLAKE3(hash key, chunk 明文)。
+//!   只出現在加密內容裡，**絕不**當作 repo 裡的物件名稱。
+//! - [`TreeId`]：tree 的名稱 = keyed BLAKE3(hash key, tree 明文 CBOR)。
+//!   與 ChunkId 同函式同金鑰；v2 的 tree 以**明文** hash 命名（v1 以密文，
+//!   已淘汰：壓縮器版本會改變密文、連帶改變名稱，破壞去重）。
+//! - [`ObjectId`]：pack 與 index blob 的名稱 = 一般 BLAKE3(密文 bytes)。
+//!   不持金鑰也能驗證物件完整性。
 //!
-//! 兩者在 CBOR 裡都以 32-byte 的 byte string 存放（不是 32 個整數的陣列），
-//! 在 repo 路徑裡則用小寫 hex。
+//! 三者在 CBOR 裡都是 32-byte 的 byte string（major type 2），
+//! 在 repo 路徑裡都是小寫 hex。
 
 use std::fmt;
 
@@ -17,7 +20,7 @@ use crate::{FormatError, Result};
 macro_rules! id_type {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
         pub struct $name([u8; 32]);
 
         impl $name {
@@ -42,6 +45,8 @@ macro_rules! id_type {
                     .map_err(|_| FormatError::BadName(s.to_owned()))?;
                 Ok(Self(arr))
             }
+
+            pub const ZERO: Self = Self([0u8; 32]);
         }
 
         impl fmt::Debug for $name {
@@ -86,10 +91,11 @@ macro_rules! id_type {
 }
 
 id_type!(ChunkId, "chunk 的身分：keyed BLAKE3(hash key, 明文)。");
-id_type!(ObjectId, "獨立物件的名稱：BLAKE3(物件的完整密文 bytes)。");
+id_type!(TreeId, "tree 的名稱：keyed BLAKE3(hash key, tree 明文 CBOR)。");
+id_type!(ObjectId, "pack / index blob 的名稱：BLAKE3(密文 bytes)，無 key。");
 
 impl ObjectId {
-    /// 依格式規則計算一個物件的名稱：對「要寫進 repo 的完整 bytes」做一般 BLAKE3。
+    /// pack / index 的名稱：對「要寫進 repo 的完整 bytes」做一般 BLAKE3。
     pub fn of(object_bytes: &[u8]) -> Self {
         Self(*blake3::hash(object_bytes).as_bytes())
     }

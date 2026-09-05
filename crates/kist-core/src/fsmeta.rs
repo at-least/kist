@@ -7,7 +7,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use kist_format::tree::NodeMeta;
+use kist_format::tree::Entry;
 
 use crate::{CoreError, Result};
 
@@ -86,31 +86,60 @@ pub fn validate_child_name(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn capture(meta: &std::fs::Metadata) -> NodeMeta {
-    let (secs, nanos) = mtime_of(meta);
-    let (ctime_secs, ctime_nanos) = ctime_of(meta);
-    NodeMeta {
+/// 走訪當下擷取的 metadata（v2：時間是單一 i64 奈秒欄位，另含硬連結識別）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsMeta {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_ns: i64,
+    /// inode 變更時間（奈秒）。0 = 平台沒有，不拿來比對。
+    pub ctime_ns: i64,
+    /// 0 = 平台沒有，不拿來比對。
+    pub inode: u64,
+    /// 硬連結識別（nlink > 1 才有意義）。
+    pub dev: u64,
+    pub nlink: u64,
+}
+
+/// parent tree 裡的檔案 entry → FsMeta（快速路徑的比較用）。
+pub fn meta_of_entry(entry: &Entry) -> FsMeta {
+    FsMeta {
+        mode: entry.mode,
+        uid: entry.uid,
+        gid: entry.gid,
+        mtime_ns: entry.mtime_ns,
+        ctime_ns: entry.ctime_ns,
+        inode: entry.inode,
+        dev: entry.dev,
+        nlink: entry.nlink,
+    }
+}
+
+pub fn capture(meta: &std::fs::Metadata) -> FsMeta {
+    let mtime = mtime_ns_of(meta);
+    let ctime = ctime_ns_of(meta);
+    FsMeta {
         mode: mode_of(meta),
         uid: uid_of(meta),
         gid: gid_of(meta),
-        mtime_secs: secs,
-        mtime_nanos: nanos,
-        ctime_secs,
-        ctime_nanos,
+        mtime_ns: mtime,
+        ctime_ns: ctime,
         inode: inode_of(meta),
+        dev: dev_of(meta),
+        nlink: nlink_of(meta),
     }
 }
 
 /// backup 快速路徑的完整判斷：size 相同，且 [`unchanged`] 成立。
-/// size 要另外傳：`NodeMeta` 不含大小，而沒有 ctime / inode 的平台只剩 size + mtime 可比。
 pub fn file_unchanged(
-    previous: &NodeMeta,
+    previous: &FsMeta,
     previous_size: u64,
-    now: &NodeMeta,
+    now: &FsMeta,
     now_size: u64,
-    parent_start: (i64, u32),
+    parent_start_ns: i64,
 ) -> bool {
-    previous_size == now_size && unchanged(previous, now, parent_start)
+    previous_size == now_size && unchanged(previous, now, parent_start_ns)
 }
 
 /// backup 快速路徑：上一次記錄的 metadata 與現在的是否「看起來沒變」。
@@ -119,38 +148,59 @@ pub fn file_unchanged(
 /// - 另外要求 mtime 與 ctime 都**早於** parent snapshot 的開始時間 `parent_start`（Unix 秒、奈秒）：
 ///   檔案若在上一次 backup 讀它的同一個時間刻度內又被改（"racily clean"），metadata 看起來
 ///   一樣但內容不同；這種檔案永遠重讀，直到它的時間戳明確早於某次 backup 的開始為止。
-pub fn unchanged(previous: &NodeMeta, now: &NodeMeta, parent_start: (i64, u32)) -> bool {
-    if previous.mtime_secs != now.mtime_secs || previous.mtime_nanos != now.mtime_nanos {
+pub fn unchanged(previous: &FsMeta, now: &FsMeta, parent_start_ns: i64) -> bool {
+    if previous.mtime_ns != now.mtime_ns {
         return false;
     }
-    let has_ctime = previous.ctime_secs != 0 || previous.ctime_nanos != 0;
-    if has_ctime
-        && (previous.ctime_secs != now.ctime_secs || previous.ctime_nanos != now.ctime_nanos)
-    {
+    let has_ctime = previous.ctime_ns != 0;
+    if has_ctime && previous.ctime_ns != now.ctime_ns {
         return false;
     }
     if previous.inode != 0 && previous.inode != now.inode {
         return false;
     }
-    let before = |secs: i64, nanos: u32| (secs, nanos) < parent_start;
-    if !before(now.mtime_secs, now.mtime_nanos) {
+    if now.mtime_ns >= parent_start_ns {
         return false;
     }
-    if has_ctime && !before(now.ctime_secs, now.ctime_nanos) {
+    if has_ctime && now.ctime_ns >= parent_start_ns {
         return false;
     }
     true
 }
 
-fn mtime_of(meta: &std::fs::Metadata) -> (i64, u32) {
+fn mtime_ns_of(meta: &std::fs::Metadata) -> i64 {
     let ft = filetime::FileTime::from_last_modification_time(meta);
-    (ft.unix_seconds(), ft.nanoseconds())
+    ft.unix_seconds()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(ft.nanoseconds()))
 }
 
 #[cfg(unix)]
-fn ctime_of(meta: &std::fs::Metadata) -> (i64, u32) {
+fn ctime_ns_of(meta: &std::fs::Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
-    (meta.ctime(), u32::try_from(meta.ctime_nsec()).unwrap_or(0))
+    meta.ctime().saturating_mul(1_000_000_000) + meta.ctime_nsec()
+}
+
+#[cfg(unix)]
+fn dev_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.dev()
+}
+
+#[cfg(unix)]
+fn nlink_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
+}
+
+#[cfg(not(unix))]
+fn dev_of(_: &std::fs::Metadata) -> u64 {
+    0
+}
+
+#[cfg(not(unix))]
+fn nlink_of(_: &std::fs::Metadata) -> u64 {
+    0
 }
 
 #[cfg(unix)]
@@ -160,8 +210,8 @@ fn inode_of(meta: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn ctime_of(_: &std::fs::Metadata) -> (i64, u32) {
-    (0, 0)
+fn ctime_ns_of(_: &std::fs::Metadata) -> i64 {
+    0
 }
 
 #[cfg(not(unix))]
@@ -203,8 +253,11 @@ fn gid_of(_: &std::fs::Metadata) -> u32 {
 }
 
 /// 還原 mode（Unix）與 mtime。symlink 只還原 mtime（且不跟隨連結）。
-pub fn apply(path: &Path, meta: &NodeMeta, is_symlink: bool) -> Result<()> {
-    let mtime = filetime::FileTime::from_unix_time(meta.mtime_secs, meta.mtime_nanos);
+pub fn apply(path: &Path, meta: &FsMeta, is_symlink: bool) -> Result<()> {
+    let mtime = filetime::FileTime::from_unix_time(
+        meta.mtime_ns.div_euclid(1_000_000_000),
+        meta.mtime_ns.rem_euclid(1_000_000_000) as u32,
+    );
     if is_symlink {
         // 有些平台不支援設定 symlink 本身的時間；失敗不算錯。
         let _ = filetime::set_symlink_file_times(path, mtime, mtime);

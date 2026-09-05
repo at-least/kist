@@ -205,7 +205,6 @@ fn push_blob(records: &mut Vec<TableRecord>, packs: &mut Vec<(ObjectId, u64)>, b
                     offset: e.offset,
                     length: e.length,
                     raw_len: e.raw_len,
-                    flags: e.flags,
                 },
             });
         }

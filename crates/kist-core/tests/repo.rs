@@ -28,7 +28,7 @@ async fn init_refuses_existing_repo() {
     let again = Repository::init(t.backend.clone(), b"other", init_options()).await;
     assert!(matches!(again, Err(CoreError::RepoExists)));
     // 原本的 config 沒被動
-    assert!(t.open().await.config().version == 1);
+    assert_eq!(t.open().await.config().version, kist_format::FORMAT_VERSION);
 }
 
 #[tokio::test]

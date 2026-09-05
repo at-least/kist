@@ -27,7 +27,6 @@ pub struct ChunkLocation {
     pub offset: u64,
     pub length: u64,
     pub raw_len: u64,
-    pub flags: u8,
 }
 
 /// 尚未 flush 的 pack 用這個名稱佔位。
@@ -41,7 +40,7 @@ pub struct TableRecord {
 }
 
 const TABLE_MAGIC: &[u8; 8] = b"KISTIDX1";
-const TABLE_VERSION: u32 = 1;
+const TABLE_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 32;
 const RECORD_LEN: u64 = 96;
 
@@ -53,7 +52,6 @@ impl TableRecord {
         b[64..72].copy_from_slice(&self.location.offset.to_le_bytes());
         b[72..80].copy_from_slice(&self.location.length.to_le_bytes());
         b[80..88].copy_from_slice(&self.location.raw_len.to_le_bytes());
-        b[88] = self.location.flags;
         b
     }
 
@@ -74,7 +72,6 @@ impl TableRecord {
                 offset: u(64..72),
                 length: u(72..80),
                 raw_len: u(80..88),
-                flags: b[88],
             },
         }
     }
@@ -339,6 +336,5 @@ fn location(pack: ObjectId, e: &PackEntry) -> ChunkLocation {
         offset: e.offset,
         length: e.length,
         raw_len: e.raw_len,
-        flags: e.flags,
     }
 }

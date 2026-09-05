@@ -59,6 +59,9 @@ struct PruneArgs {
     /// Clients without a snapshot for this long no longer hold back deletion.
     #[arg(long, value_name = "DURATION", default_value = "30d", value_parser = parse_duration)]
     inactive_after: std::time::Duration,
+    /// Tolerated clock difference between clients and the prune host.
+    #[arg(long, value_name = "DURATION", default_value = "1h", value_parser = parse_duration)]
+    clock_skew: std::time::Duration,
     /// Repack packs whose live data is below this percentage (0 disables repacking).
     #[arg(long, value_name = "PERCENT", default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
     repack_below: u8,
@@ -69,6 +72,7 @@ impl PruneArgs {
         PruneOptions {
             grace: self.grace,
             inactive_after: self.inactive_after,
+            clock_skew: self.clock_skew,
             repack_below_percent: self.repack_below,
             dry_run,
             now: None,
@@ -397,11 +401,11 @@ async fn run(cli: Cli) -> Result<()> {
                     s.files,
                     s.dirs,
                     s.symlinks,
-                    human_bytes(s.bytes_total)
+                    human_bytes(s.bytes)
                 );
                 println!(
                     "  new: {} in {} chunks, {} packs written",
-                    human_bytes(s.bytes_new),
+                    human_bytes(s.bytes_stored),
                     s.chunks_new,
                     s.packs_new
                 );
@@ -443,10 +447,10 @@ async fn run(cli: Cli) -> Result<()> {
                     "{:<8} {:<25} {:<19} {:<12} {:>8} {:>10}  {}",
                     &s.client_hex()[..8.min(s.client_hex().len())],
                     s.timestamp(),
-                    display_time(&s.snapshot.time),
-                    s.snapshot.hostname,
+                    display_time_ns(s.snapshot.time_ns),
+                    s.snapshot.host,
                     s.snapshot.stats.files,
-                    human_bytes(s.snapshot.stats.bytes_total),
+                    human_bytes(s.snapshot.stats.bytes),
                     paths.join(", ")
                 );
             }
@@ -742,7 +746,7 @@ struct SnapshotJson {
     hostname: String,
     username: String,
     paths: Vec<String>,
-    root: kist_format::ObjectId,
+    root: kist_format::TreeId,
     stats: kist_format::snapshot::SnapshotStats,
 }
 
@@ -752,9 +756,9 @@ impl SnapshotJson {
             key: s.key.clone(),
             client: s.client_hex().to_owned(),
             timestamp: s.timestamp().to_owned(),
-            time: s.snapshot.time.clone(),
-            hostname: s.snapshot.hostname.clone(),
-            username: s.snapshot.username.clone(),
+            time: display_time_ns(s.snapshot.time_ns),
+            hostname: s.snapshot.host.clone(),
+            username: s.snapshot.user.clone(),
             paths: s
                 .snapshot
                 .paths
@@ -844,6 +848,18 @@ fn short_snapshot_id(key: &str) -> String {
     let ts = parts.next().unwrap_or(key);
     let client = parts.next().unwrap_or("");
     format!("{}/{ts}", &client[..8.min(client.len())])
+}
+
+/// snapshot 的 i64 奈秒 → 列表用的時間字串（顯示到秒）。
+fn display_time_ns(ns: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns))
+        .map(|t| {
+            t.to_offset(time::UtcOffset::UTC)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        })
+        .map(|rfc| display_time(&rfc))
+        .unwrap_or_default()
 }
 
 /// RFC 3339 的奈秒字串太長，列表只顯示到秒：`2026-09-04 15:04:02`。

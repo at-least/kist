@@ -175,8 +175,7 @@ impl Repository {
                     Some(loc)
                         if loc.offset != entry.offset
                             || loc.length != entry.length
-                            || loc.raw_len != entry.raw_len
-                            || loc.flags != entry.flags =>
+                            || loc.raw_len != entry.raw_len =>
                     {
                         errs.push(format!(
                             "{key_for_task}: chunk {} location in index differs from the pack trailer",
@@ -194,7 +193,7 @@ impl Repository {
                     ));
                     continue;
                 };
-                if let Err(e) = decode_chunk(&keys, &entry.id, slice, entry.flags, entry.raw_len) {
+                if let Err(e) = decode_chunk(&keys, &entry.id, slice, entry.raw_len) {
                     errs.push(format!("{key_for_task}: chunk {}: {e}", entry.id));
                 }
             }

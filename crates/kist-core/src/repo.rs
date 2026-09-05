@@ -1,4 +1,4 @@
-//! 打開 / 建立 repo，以及各種物件的讀寫幫手。
+//! 打開 / 建立 repo，以及各種物件的讀寫幫手（v2）。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -7,16 +7,17 @@ use std::sync::Arc;
 use kist_backend::{Backend, BackendError};
 use kist_crypto::{create_key_slot, unlock_key_slot, KdfCost, KeyBinding, RepoKeys};
 use kist_format::config::{ChunkerParams, RepoConfig};
-use kist_format::envelope::{Compression, ObjectKind};
 use kist_format::index::IndexBlob;
-use kist_format::snapshot::{format_key_timestamp, format_rfc3339, Snapshot};
-use kist_format::tree::{Node, Tree};
-use kist_format::{cbor, keys, ObjectId};
-use serde::de::DeserializeOwned;
+use kist_format::snapshot::{parse_key_timestamp, Snapshot};
+use kist_format::tree::{Entry, Tree};
+use kist_format::{cbor, keys, Algorithm, ObjectId, TreeId};
 use zeroize::Zeroizing;
 
 use crate::index::ChunkIndex;
 use crate::{blocking, CoreError, Result};
+
+/// index blob / pack trailer 的壓縮等級（與 chunk 相同）。
+const ZSTD_LEVEL: i32 = 3;
 
 /// repo 裡目前所有 index blob 的原貌：prune 需要看每個 pack 完整的 entries（而不是
 /// `ChunkIndex` 每個 chunk 只記一個位置），才能判斷重複 chunk 所在的每個 pack 都活著。
@@ -60,25 +61,61 @@ impl std::fmt::Debug for Repository {
     }
 }
 
+/// index blob 的明文 = `algorithm byte ‖ (可能 zstd 過的) CBOR`。
+fn encode_index_blob(blob: &IndexBlob) -> Result<Vec<u8>> {
+    let plain = cbor::encode(blob)?;
+    let compressed =
+        zstd::encode_all(plain.as_slice(), ZSTD_LEVEL).map_err(|e| CoreError::Corrupt {
+            key: "index".to_owned(),
+            reason: format!("zstd failed: {e}"),
+        })?;
+    let mut out = Vec::with_capacity(1 + compressed.len());
+    if compressed.len() < plain.len() - plain.len() / 16 {
+        out.push(Algorithm::Zstd as u8);
+        out.extend_from_slice(&compressed);
+    } else {
+        out.push(Algorithm::Raw as u8);
+        out.extend_from_slice(&plain);
+    }
+    Ok(out)
+}
+
+/// 解開 index blob 的明文（見 [`encode_index_blob`]）。
+fn decode_index_blob(payload: &[u8]) -> Result<IndexBlob> {
+    let Some((algorithm, data)) = payload.split_first() else {
+        return Err(CoreError::Corrupt {
+            key: "index".to_owned(),
+            reason: "index blob payload is empty (no algorithm byte)".to_owned(),
+        });
+    };
+    let plain = match Algorithm::from_u8(*algorithm)? {
+        Algorithm::Raw => data.to_vec(),
+        Algorithm::Zstd => zstd::decode_all(data).map_err(|e| CoreError::Corrupt {
+            key: "index".to_owned(),
+            reason: format!("zstd decode failed: {e}"),
+        })?,
+    };
+    Ok(cbor::decode(&plain)?)
+}
+
 impl Repository {
     /// 建立新 repo：產生 master key、用密碼包起來、寫 `config`。已存在則拒絕。
     pub async fn init(backend: Backend, password: &[u8], opts: InitOptions) -> Result<Self> {
-        let now = format_rfc3339(time::OffsetDateTime::now_utc())?;
+        let created_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+            .try_into()
+            .map_err(|_| CoreError::InvalidConfig("clock out of range".to_owned()))?;
         let repo_id = kist_crypto::random_bytes::<16>()?.to_vec();
         let binding = KeyBinding {
             repo_id: repo_id.clone(),
             chunker: opts.chunker,
         };
         let password = Zeroizing::new(password.to_vec());
-        let created = now.clone();
         let cost = opts.kdf_cost;
         let (slot, master) = blocking(move || {
-            Ok(create_key_slot(
-                &password, "default", &created, cost, &binding,
-            )?)
+            Ok(create_key_slot(&password, "default", created_ns, cost, &binding)?)
         })
         .await?;
-        let mut config = RepoConfig::new(repo_id, now, slot);
+        let mut config = RepoConfig::new(repo_id, created_ns, slot);
         config.chunker = opts.chunker;
         config.pack_target_size = opts.pack_target_size;
         config
@@ -116,13 +153,6 @@ impl Repository {
             Err(e) => return Err(e.into()),
         };
         let config: RepoConfig = cbor::decode(&bytes)?;
-        if config.version != kist_format::FORMAT_VERSION {
-            return Err(kist_format::FormatError::UnsupportedVersion {
-                what: "repository config",
-                version: config.version,
-            }
-            .into());
-        }
         // config 是明文：先確認參數合理，再用它們（綁在 AAD 裡）解 master key
         config
             .validate()
@@ -162,41 +192,26 @@ impl Repository {
         &self.keys
     }
 
-    /// 讀一個 envelope 物件並解出 CBOR。
-    ///
-    /// 以內容命名的物件（`trees/*`、`indexes/*`）會先驗證「名稱 = BLAKE3(bytes)」：
-    /// AAD 只綁物件種類，沒綁名稱，若有人把 tree A 的檔案複製到 tree B 的名稱上，
-    /// 解密照樣成功；只有這一步能抓到。
-    pub(crate) async fn read_object<T: DeserializeOwned + Send + 'static>(
-        &self,
-        kind: ObjectKind,
-        key: &str,
-    ) -> Result<T> {
-        let bytes = self.backend.get(key).await?;
+    /// 讀 index blob：名稱 = BLAKE3(密文)，先驗再解。
+    pub(crate) async fn read_index_blob(&self, id: &ObjectId) -> Result<IndexBlob> {
+        let key = keys::index(id);
+        let bytes = self.backend.get(&key).await?;
         let keys = Arc::clone(&self.keys);
-        let key_owned = key.to_owned();
-        let expected_name = if matches!(kind, ObjectKind::Tree | ObjectKind::Index) {
-            Some(keys::object_id_from_key(key)?)
-        } else {
-            None
-        };
+        let key_owned = key.clone();
+        let expected = *id;
         blocking(move || {
-            if let Some(expected) = expected_name {
-                let actual = ObjectId::of(&bytes);
-                if actual != expected {
-                    return Err(CoreError::Corrupt {
-                        key: key_owned,
-                        reason: format!("content hash {actual} does not match its name"),
-                    });
-                }
+            let actual = ObjectId::of(&bytes);
+            if actual != expected {
+                return Err(CoreError::Corrupt {
+                    key: key_owned,
+                    reason: format!("content hash {actual} does not match its name"),
+                });
             }
-            let plain = keys
-                .open_object(kind, &bytes)
-                .map_err(|e| CoreError::Corrupt {
-                    key: key_owned.clone(),
-                    reason: e.to_string(),
-                })?;
-            cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
+            let payload = keys.open_index_blob(&bytes).map_err(|e| CoreError::Corrupt {
+                key: key_owned.clone(),
+                reason: e.to_string(),
+            })?;
+            decode_index_blob(&payload).map_err(|e| CoreError::Corrupt {
                 key: key_owned,
                 reason: e.to_string(),
             })
@@ -204,23 +219,51 @@ impl Repository {
         .await
     }
 
-    /// 把 tree 封裝成 bytes（決定性），回傳名稱與 bytes；不上傳。
-    pub(crate) async fn seal_tree(&self, tree: Tree) -> Result<(ObjectId, Vec<u8>)> {
+    /// 讀 tree：AAD = 自己的 ID，解開後重算 keyed hash 對名稱——
+    /// 名稱是對**明文**的 hash，這一步證明當初寫入時名稱沒有說謊。
+    pub(crate) async fn read_tree(&self, id: &TreeId) -> Result<Tree> {
+        let key = keys::tree(id);
+        let bytes = self.backend.get(&key).await?;
         let keys = Arc::clone(&self.keys);
+        let key_owned = key.clone();
+        let expected = *id;
         blocking(move || {
-            let plain = cbor::encode(&tree)?;
-            let bytes = keys.seal_object(ObjectKind::Tree, Compression::Zstd, &plain)?;
-            Ok((ObjectId::of(&bytes), bytes))
+            let plain = keys
+                .open_tree(&expected, &bytes)
+                .map_err(|e| CoreError::Corrupt {
+                    key: key_owned.clone(),
+                    reason: e.to_string(),
+                })?;
+            let actual = keys.tree_id(&plain);
+            if actual != expected {
+                return Err(CoreError::Corrupt {
+                    key: key_owned,
+                    reason: format!("content hash {actual} does not match its name"),
+                });
+            }
+            cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
+                key: key_owned.clone(),
+                reason: e.to_string(),
+            })
         })
         .await
     }
 
-    pub(crate) async fn read_tree(&self, id: &ObjectId) -> Result<Tree> {
-        self.read_object(ObjectKind::Tree, &keys::tree(id)).await
+    /// 把 tree 編成規範 CBOR、以明文 keyed hash 命名、隨機 nonce 密封。
+    /// 回傳（名稱, bytes)；不上傳。
+    pub(crate) async fn seal_tree(&self, tree: Tree) -> Result<(TreeId, Vec<u8>)> {
+        let keys = Arc::clone(&self.keys);
+        blocking(move || {
+            let plain = cbor::encode(&tree)?;
+            let id = keys.tree_id(&plain);
+            let bytes = keys.seal_tree(&id, &plain)?;
+            Ok((id, bytes))
+        })
+        .await
     }
 
     /// 沿 `prev` 收集一個目錄的所有段，回傳依名稱排序的完整節點清單。
-    pub(crate) async fn read_tree_chain(&self, last: &ObjectId) -> Result<Vec<Node>> {
+    pub(crate) async fn read_tree_chain(&self, last: &TreeId) -> Result<Vec<Entry>> {
         let mut parts = Vec::new();
         let mut next = Some(*last);
         let mut seen = HashSet::new();
@@ -233,7 +276,7 @@ impl Repository {
             }
             let tree = self.read_tree(&id).await?;
             next = tree.prev;
-            parts.push(tree.nodes);
+            parts.push(tree.entries);
         }
         parts.reverse();
         Ok(parts.into_iter().flatten().collect())
@@ -243,8 +286,8 @@ impl Repository {
     pub async fn write_index(&self, blob: IndexBlob) -> Result<ObjectId> {
         let keys = Arc::clone(&self.keys);
         let (id, bytes) = blocking(move || {
-            let plain = cbor::encode(&blob)?;
-            let bytes = keys.seal_object(ObjectKind::Index, Compression::Zstd, &plain)?;
+            let payload = encode_index_blob(&blob)?;
+            let bytes = keys.seal_index_blob(&payload)?;
             Ok((ObjectId::of(&bytes), bytes))
         })
         .await?;
@@ -262,10 +305,7 @@ impl Repository {
             }
             live.sort();
             return cache
-                .load(&live, |id| async move {
-                    self.read_object::<IndexBlob>(ObjectKind::Index, &keys::index(&id))
-                        .await
-                })
+                .load(&live, |id| async move { self.read_index_blob(&id).await })
                 .await
                 .map_err(|e| CoreError::Corrupt {
                     key: "index".to_owned(),
@@ -295,10 +335,7 @@ impl Repository {
                     continue;
                 }
             };
-            match self
-                .read_object::<IndexBlob>(ObjectKind::Index, &o.key)
-                .await
-            {
+            match self.read_index_blob(&id).await {
                 Ok(blob) => all.push((id, blob)),
                 Err(e) => errors.push(e),
             }
@@ -333,39 +370,58 @@ impl Repository {
 
     pub(crate) async fn write_snapshot(&self, key: &str, snapshot: Snapshot) -> Result<()> {
         let keys = Arc::clone(&self.keys);
+        let key_owned = key.to_owned();
         let bytes = blocking(move || {
             let plain = cbor::encode(&snapshot)?;
-            Ok(keys.seal_object(ObjectKind::Snapshot, Compression::Zstd, &plain)?)
+            Ok(keys.seal_snapshot(&key_owned, &plain)?)
         })
         .await?;
         self.backend.put_if_absent(key, bytes).await?;
         Ok(())
     }
 
-    /// 讀 snapshot，並驗證內容與 key 一致（client id、時間戳）：
-    /// snapshot 不是以內容命名，所以用內容裡的欄位反過來對 key。
+    /// 讀 snapshot（AAD = 完整 key），並驗證內容與 key 一致（client id、時間戳）。
     pub(crate) async fn read_snapshot(&self, key: &str) -> Result<Snapshot> {
-        let snapshot: Snapshot = match self.read_object(ObjectKind::Snapshot, key).await {
-            Err(CoreError::Backend(BackendError::NotFound(_))) => {
-                return Err(CoreError::SnapshotNotFound(key.to_owned()))
-            }
-            other => other?,
+        let bytes = match self.backend.get(key).await {
+            Ok(b) => b,
+            Err(BackendError::NotFound(_)) => return Err(CoreError::SnapshotNotFound(key.to_owned())),
+            Err(e) => return Err(e.into()),
         };
-        let expected_key = {
-            let t = time::OffsetDateTime::parse(
-                &snapshot.time,
-                &time::format_description::well_known::Rfc3339,
-            )
-            .map_err(|e| CoreError::Corrupt {
+        let keys = Arc::clone(&self.keys);
+        let key_owned = key.to_owned();
+        let snapshot: Snapshot = blocking(move || {
+            let plain = keys
+                .open_snapshot(&key_owned, &bytes)
+                .map_err(|e| CoreError::Corrupt {
+                    key: key_owned.clone(),
+                    reason: e.to_string(),
+                })?;
+            cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
+                key: key_owned,
+                reason: e.to_string(),
+            })
+        })
+        .await?;
+        // snapshot 不是以內容命名：用內容裡的 client 與時間反算 key，必須一致。
+        let ts = key.rsplit('/').next()
+            .ok_or_else(|| CoreError::Corrupt {
                 key: key.to_owned(),
-                reason: format!("bad time {:?}: {e}", snapshot.time),
+                reason: "not a snapshot key".to_owned(),
             })?;
-            keys::snapshot(&snapshot.client_id, &format_key_timestamp(t)?)
-        };
-        if expected_key != key {
+        let t = parse_key_timestamp(ts)?;
+        let expected_ns: i64 = t.unix_timestamp_nanos().try_into().map_err(|_| {
+            CoreError::Corrupt {
+                key: key.to_owned(),
+                reason: "timestamp out of range".to_owned(),
+            }
+        })?;
+        if snapshot.client_id.len() != 16
+            || keys::snapshot(&snapshot.client_id, ts) != key
+            || snapshot.time_ns != expected_ns
+        {
             return Err(CoreError::Corrupt {
                 key: key.to_owned(),
-                reason: format!("snapshot content belongs to {expected_key}"),
+                reason: "snapshot content does not belong under this key".to_owned(),
             });
         }
         Ok(snapshot)

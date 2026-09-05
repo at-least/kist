@@ -96,12 +96,8 @@ impl Repository {
         let keys_ = Arc::clone(self.keys());
         let key_for_task = key.clone();
         let trailer = blocking(move || {
-            // read_trailer 要整個 pack 的排版；這裡直接解 envelope
             keys_
-                .open_object(
-                    kist_format::envelope::ObjectKind::PackTrailer,
-                    &trailer_bytes,
-                )
+                .open_pack_trailer(&trailer_bytes)
                 .map_err(|e| CoreError::Corrupt {
                     key: key_for_task.clone(),
                     reason: format!("trailer: {e}"),
@@ -109,7 +105,7 @@ impl Repository {
                 .and_then(|plain| {
                     kist_format::cbor::decode::<kist_format::pack::PackTrailer>(&plain).map_err(
                         |e| CoreError::Corrupt {
-                            key: key_for_task,
+                            key: key_for_task.clone(),
                             reason: format!("trailer: {e}"),
                         },
                     )

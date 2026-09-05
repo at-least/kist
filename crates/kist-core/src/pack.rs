@@ -1,32 +1,58 @@
-//! pack 的寫入與讀取。
+//! pack 的寫入與讀取（v2）。
 //!
 //! 寫入端 [`PackWriter`] 把 chunk 一個個加進 buffer（先壓縮、再加密），滿了或 backup 結束時
 //! [`PackWriter::finish`] 封上 trailer 並算出 pack 名稱；上傳由呼叫端負責。
 //! 讀取端只需要 [`decode_chunk`]（單一 entry → 明文並驗證 chunk ID）與
 //! [`read_trailer`]（整個 pack → trailer）。
+//!
+//! 壓縮的演算法 byte 是 AEAD 明文的第一個 byte（self-describing），
+//! trailer entry 不需要 flags。壓縮門檻：zstd-3，沒省下 > 1/16 就存原文。
 
 use std::sync::Arc;
 
 use kist_crypto::RepoKeys;
-use kist_format::envelope::{Compression, ObjectKind};
-use kist_format::pack::{self, PackEntry, PackTrailer, FLAG_ZSTD};
-use kist_format::{cbor, ChunkId, ObjectId};
+use kist_format::pack::{self, PackEntry, PackTrailer};
+use kist_format::{cbor, Algorithm, ChunkId, ObjectId};
 
 use crate::{CoreError, Result};
 
 /// chunk 壓縮等級。
 const ZSTD_LEVEL: i32 = 3;
 
-/// 壓縮後沒有小於原大小的 97% 就視為不可壓縮，存原文。
-pub fn compress_chunk(raw: &[u8]) -> Result<(Vec<u8>, u8)> {
+/// 壓縮 chunk 明文：回傳 `algorithm byte ‖ 資料`。
+pub fn compress_chunk(raw: &[u8]) -> Result<Vec<u8>> {
     let compressed = zstd::encode_all(raw, ZSTD_LEVEL).map_err(|e| CoreError::Corrupt {
         key: "<chunk>".to_owned(),
         reason: format!("zstd failed: {e}"),
     })?;
-    if compressed.len() * 100 < raw.len() * 97 {
-        Ok((compressed, FLAG_ZSTD))
+    // 沒省下 > 1/16（6.25%）就存原文。
+    if compressed.len() < raw.len() - raw.len() / 16 {
+        let mut out = Vec::with_capacity(1 + compressed.len());
+        out.push(Algorithm::Zstd as u8);
+        out.extend_from_slice(&compressed);
+        Ok(out)
     } else {
-        Ok((raw.to_vec(), 0))
+        let mut out = Vec::with_capacity(1 + raw.len());
+        out.push(Algorithm::Raw as u8);
+        out.extend_from_slice(raw);
+        Ok(out)
+    }
+}
+
+/// 解開 `algorithm byte ‖ 資料`。
+fn decompress_chunk(payload: &[u8]) -> Result<Vec<u8>> {
+    let Some((algorithm, data)) = payload.split_first() else {
+        return Err(CoreError::Corrupt {
+            key: "<chunk>".to_owned(),
+            reason: "chunk payload is empty (no algorithm byte)".to_owned(),
+        });
+    };
+    match Algorithm::from_u8(*algorithm)? {
+        Algorithm::Raw => Ok(data.to_vec()),
+        Algorithm::Zstd => zstd::decode_all(data).map_err(|e| CoreError::Corrupt {
+            key: "<chunk>".to_owned(),
+            reason: format!("zstd decode failed: {e}"),
+        }),
     }
 }
 
@@ -65,14 +91,13 @@ impl PackWriter {
 
     /// 壓縮、加密並加入 buffer。回傳這個 chunk 在 pack 裡的位置。
     pub fn add(&mut self, id: ChunkId, plaintext: &[u8]) -> Result<PackEntry> {
-        let (payload, flags) = compress_chunk(plaintext)?;
+        let payload = compress_chunk(plaintext)?;
         let sealed = self.keys.seal_chunk(&id, &payload)?;
         let entry = PackEntry {
             id,
             offset: self.buf.len() as u64,
             length: sealed.len() as u64,
             raw_len: plaintext.len() as u64,
-            flags,
         };
         self.buf.extend_from_slice(&sealed);
         self.entries.push(entry);
@@ -87,10 +112,8 @@ impl PackWriter {
         let entries = std::mem::take(&mut self.entries);
         let buf = std::mem::replace(&mut self.buf, pack::begin());
         let trailer = cbor::encode(&PackTrailer::new(entries.clone()))?;
-        let trailer_env =
-            self.keys
-                .seal_object(ObjectKind::PackTrailer, Compression::Zstd, &trailer)?;
-        let bytes = pack::finish(buf, &trailer_env);
+        let trailer_sealed = self.keys.seal_pack_trailer(&trailer)?;
+        let bytes = pack::finish(buf, &trailer_sealed);
         let id = ObjectId::of(&bytes);
         Ok(Some(FinishedPack { id, bytes, entries }))
     }
@@ -101,18 +124,10 @@ pub fn decode_chunk(
     keys: &RepoKeys,
     id: &ChunkId,
     entry_bytes: &[u8],
-    flags: u8,
     raw_len: u64,
 ) -> Result<Vec<u8>> {
     let payload = keys.open_chunk(id, entry_bytes)?;
-    let plaintext = if flags & FLAG_ZSTD != 0 {
-        zstd::decode_all(payload.as_slice()).map_err(|e| CoreError::Corrupt {
-            key: format!("chunk {id}"),
-            reason: format!("zstd decode failed: {e}"),
-        })?
-    } else {
-        payload
-    };
+    let plaintext = decompress_chunk(&payload)?;
     if plaintext.len() as u64 != raw_len {
         return Err(CoreError::Corrupt {
             key: format!("chunk {id}"),
@@ -134,7 +149,7 @@ pub fn decode_chunk(
 
 /// 從整個 pack 的 bytes 讀出 trailer。
 pub fn read_trailer(keys: &RepoKeys, pack_bytes: &[u8]) -> Result<PackTrailer> {
-    let env = pack::trailer_bytes(pack_bytes)?;
-    let plain = keys.open_object(ObjectKind::PackTrailer, env)?;
+    let sealed = pack::trailer_bytes(pack_bytes)?;
+    let plain = keys.open_pack_trailer(sealed)?;
     Ok(cbor::decode(&plain)?)
 }

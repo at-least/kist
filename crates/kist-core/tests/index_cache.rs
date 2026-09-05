@@ -204,7 +204,6 @@ fn rec(id: u8, pack: u8, offset: u64) -> TableRecord {
             offset,
             length: 100,
             raw_len: 90,
-            flags: 1,
         },
     }
 }

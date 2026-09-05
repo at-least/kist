@@ -65,7 +65,7 @@ async fn second_backup_writes_no_new_packs() {
     );
     assert_eq!(second.stats.chunks_new, 0);
     assert_eq!(second.stats.packs_new, 0);
-    assert_eq!(second.stats.bytes_total, first.stats.bytes_total);
+    assert_eq!(second.stats.bytes, first.stats.bytes);
     assert_eq!(second.parent.as_deref(), Some(first.snapshot_key.as_str()));
     assert_eq!(t.count("snapshots"), 2);
 }
@@ -136,7 +136,7 @@ async fn large_file_uses_indirect_content_and_restores() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert!(s.stats.chunks_total > 256, "{:?}", s.stats);
+    assert!(s.stats.chunks_new > 256, "{:?}", s.stats);
 
     let target = t.dir.path().join("out");
     repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
@@ -237,7 +237,7 @@ async fn list_and_resolve_snapshots() {
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].key, s1.snapshot_key, "依時間排序");
     assert_eq!(list[1].key, s2.snapshot_key);
-    assert_eq!(list[0].snapshot.hostname, "testhost");
+    assert_eq!(list[0].snapshot.host, "testhost");
     assert_eq!(
         list[1].snapshot.parent.as_deref(),
         Some(s1.snapshot_key.as_str())

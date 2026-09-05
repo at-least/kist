@@ -1,13 +1,11 @@
-//! `config` 物件：repo 參數與 master key 的封裝。
+//! `config` 物件（v2）：repo 參數與 master key 的封裝。
 //!
-//! 這是 repo 裡**唯一以明文 CBOR 存放**的物件（打開 repo 前需要它裡面的 KDF 參數），
-//! 也是唯一允許覆寫的物件（換密碼時）。裡面沒有任何祕密：master key 已被 KEK 包住。
+//! repo 裡**唯一以明文 CBOR 存放**的物件（打開 repo 前需要裡面的 KDF 參數），
+//! 也是唯一允許覆寫的物件（換密碼、調 pack_target）。裡面沒有祕密：
+//! master key 已被 KEK 包住，salt 與 KDF 參數本來就是公開的。
 //!
-//! 金鑰階層：
-//! ```text
-//! password ──Argon2id(salt, params)──▶ KEK ──AEAD 解開──▶ master key
-//! master key ──blake3::derive_key(context)──▶ chunk key / hash key / object key / nonce key
-//! ```
+//! `wrapped` 是 `nonce(24) ‖ 密文(32) ‖ tag(16)` 的單一 byte string；
+//! AAD = [`crate::master_aad`]（綁 repo_id 與 chunker 參數）。
 
 use serde::{Deserialize, Serialize};
 
@@ -18,16 +16,21 @@ pub const KDF_ARGON2ID: &str = "argon2id";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
+    #[serde(rename = "v")]
     pub version: u32,
-    /// 隨機 16 bytes，用來區分不同 repo（例如本地快取的命名）。
-    #[serde(with = "serde_bytes")]
+    /// 隨機 16 bytes，用來區分不同 repo。
+    #[serde(rename = "repo_id", with = "serde_bytes")]
     pub repo_id: Vec<u8>,
-    /// RFC 3339 UTC。
-    pub created: String,
+    /// 建立時間（Unix 奈秒，UTC）。
+    #[serde(rename = "created")]
+    pub created_ns: i64,
+    #[serde(rename = "chunker")]
     pub chunker: ChunkerParams,
     /// pack 寫滿多少 bytes 就 flush。
+    #[serde(rename = "pack_target")]
     pub pack_target_size: u64,
-    /// 第 0 個 key slot：由密碼推導的 KEK 包住的 master key。
+    /// 第 0 個 key slot。
+    #[serde(rename = "slot")]
     pub key: KeySlot,
 }
 
@@ -36,11 +39,11 @@ pub const MIN_PACK_TARGET_SIZE: u64 = 64 * 1024;
 pub const MAX_PACK_TARGET_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 impl RepoConfig {
-    pub fn new(repo_id: Vec<u8>, created: String, key: KeySlot) -> Self {
+    pub fn new(repo_id: Vec<u8>, created_ns: i64, key: KeySlot) -> Self {
         Self {
             version: FORMAT_VERSION,
             repo_id,
-            created,
+            created_ns,
             chunker: ChunkerParams::default(),
             pack_target_size: 64 * 1024 * 1024,
             key,
@@ -50,6 +53,12 @@ impl RepoConfig {
     /// config 是明文，讀進來的任何數字都不可信：使用前先確認在合理範圍內，
     /// 否則荒謬的值會讓 chunker 越界或配置巨量記憶體。
     pub fn validate(&self) -> Result<()> {
+        if self.version != FORMAT_VERSION {
+            return Err(FormatError::UnsupportedVersion {
+                what: "repository config",
+                version: self.version,
+            });
+        }
         if self.repo_id.len() != 16 {
             return Err(FormatError::InvalidParams(format!(
                 "repo_id must be 16 bytes, got {}",
@@ -61,15 +70,16 @@ impl RepoConfig {
             || self.pack_target_size > MAX_PACK_TARGET_SIZE
         {
             return Err(FormatError::InvalidParams(format!(
-                "pack_target_size {} is outside {MIN_PACK_TARGET_SIZE}..={MAX_PACK_TARGET_SIZE}",
+                "pack_target {} is outside {MIN_PACK_TARGET_SIZE}..={MAX_PACK_TARGET_SIZE}",
                 self.pack_target_size
             )));
         }
         if u64::from(self.chunker.max) > self.pack_target_size {
             return Err(FormatError::InvalidParams(
-                "chunker.max must not exceed pack_target_size".to_owned(),
+                "chunker.max must not exceed pack_target".to_owned(),
             ));
         }
+        self.key.kdf.validate()?;
         Ok(())
     }
 }
@@ -77,13 +87,16 @@ impl RepoConfig {
 /// FastCDC 參數（bytes）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkerParams {
+    #[serde(rename = "min")]
     pub min: u32,
+    #[serde(rename = "avg")]
     pub avg: u32,
+    #[serde(rename = "max")]
     pub max: u32,
 }
 
 impl ChunkerParams {
-    /// FastCDC 的硬性限制（它在 release build 不檢查，越界會 panic）再加上合理上限。
+    /// 切塊參數的硬性限制：越界值會讓掃描越界或配置巨量記憶體。
     pub fn validate(&self) -> Result<()> {
         let bad = |msg: String| Err(FormatError::InvalidParams(msg));
         if self.min < 64 || self.min > 1024 * 1024 {
@@ -119,36 +132,87 @@ impl Default for ChunkerParams {
 }
 
 /// 一個 key slot：某組密碼可以解開 master key。
-/// slot 0 放在 `config`，其餘放 `keys/<id>`（用 envelope 包、以 master key 加密的話就失去意義，
-/// 所以 `keys/<id>` 也是明文 CBOR）。
+/// slot 0 放在 `config`，其餘放 `keys/<id>`（都是明文 CBOR：以 master key
+/// 加密的話就失去「多組密碼」的意義）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeySlot {
+    #[serde(rename = "v")]
     pub version: u32,
     /// 人看的名稱，例如 "default"、"recovery"。
+    #[serde(rename = "name", default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// RFC 3339 UTC。
-    pub created: String,
+    /// 建立時間（Unix 奈秒，UTC）。
+    #[serde(rename = "created")]
+    pub created_ns: i64,
+    #[serde(rename = "kdf")]
     pub kdf: KdfParams,
-    pub wrapped_master_key: WrappedKey,
+    /// KEK 包住的 master key：`nonce(24) ‖ 密文(32) ‖ tag(16)`。
+    #[serde(rename = "wrapped", with = "serde_bytes")]
+    pub wrapped: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KdfParams {
     /// 目前只有 [`KDF_ARGON2ID`]。
+    #[serde(rename = "alg")]
     pub algorithm: String,
-    pub m_cost_kib: u32,
+    /// 通過次數。
+    #[serde(rename = "t")]
     pub t_cost: u32,
+    /// 記憶體（KiB）。
+    #[serde(rename = "m")]
+    pub m_cost_kib: u32,
+    /// 平行度。
+    #[serde(rename = "p")]
     pub p_cost: u32,
-    #[serde(with = "serde_bytes")]
+    #[serde(rename = "salt", with = "serde_bytes")]
     pub salt: Vec<u8>,
 }
 
-/// 用 KEK 做 XChaCha20-Poly1305 包住的 32-byte master key。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WrappedKey {
-    #[serde(with = "serde_bytes")]
-    pub nonce: Vec<u8>,
-    /// 32-byte key + 16-byte tag。
-    #[serde(with = "serde_bytes")]
-    pub ciphertext: Vec<u8>,
+impl KdfParams {
+    /// 預設：Argon2id 64 MiB / t=3 / p=4（RFC 9106 第二組建議）。
+    pub fn default_params() -> Self {
+        Self {
+            algorithm: KDF_ARGON2ID.to_owned(),
+            t_cost: 3,
+            m_cost_kib: 64 * 1024,
+            p_cost: 4,
+            salt: Vec::new(), // init 時填入
+        }
+    }
+
+    /// 讀取端的 DoS 防護：明文參數不可信，先擋掉荒謬值。
+    pub fn validate(&self) -> Result<()> {
+        if self.algorithm != KDF_ARGON2ID {
+            return Err(FormatError::InvalidParams(format!(
+                "unsupported kdf {}",
+                self.algorithm
+            )));
+        }
+        if self.salt.len() != 16 {
+            return Err(FormatError::InvalidParams(format!(
+                "kdf salt must be 16 bytes, got {}",
+                self.salt.len()
+            )));
+        }
+        if self.m_cost_kib == 0 || self.m_cost_kib > 1024 * 1024 {
+            return Err(FormatError::InvalidParams(format!(
+                "kdf m {} is outside 1..=1 GiB",
+                self.m_cost_kib
+            )));
+        }
+        if self.t_cost == 0 || self.t_cost > 64 {
+            return Err(FormatError::InvalidParams(format!(
+                "kdf t {} is outside 1..=64",
+                self.t_cost
+            )));
+        }
+        if self.p_cost == 0 || self.p_cost > 64 {
+            return Err(FormatError::InvalidParams(format!(
+                "kdf p {} is outside 1..=64",
+                self.p_cost
+            )));
+        }
+        Ok(())
+    }
 }

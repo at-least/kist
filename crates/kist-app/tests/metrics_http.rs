@@ -21,11 +21,13 @@ fn outcome(job: JobKind, status: JobStatus, detail: serde_json::Value) -> JobOut
 
 #[test]
 fn metrics_render_after_jobs() {
+    // jobs.rs 真實跑工作時放進 detail 的是 v2 BackupSummary 的序列化
+    // （stats 欄位名已是 "bytes"/"bytes_stored"），兩邊對不上——見
     let m = Metrics::new();
     m.record(&outcome(
         JobKind::Backup,
         JobStatus::Success,
-        json!({"stats": {"files": 3, "bytes_total": 100, "bytes_new": 50, "chunks_new": 2, "errors": 0}}),
+        json!({"stats": {"files": 3, "bytes": 100, "bytes_stored": 50, "chunks_new": 2, "errors": 0}}),
     ));
     m.record(&outcome(
         JobKind::Prune,
@@ -67,6 +69,10 @@ fn metrics_render_after_jobs() {
     );
     assert!(text.ends_with("# EOF\n"), "OpenMetrics 結尾:\n{text}");
 }
+
+/// jobs.rs 真實產生的 detail JSON（v2 `BackupSummary` 的 serde 輸出，stats 欄位是
+/// `["stats","bytes_stored"]`）之後把 `#[ignore]` 拿掉。
+#[test]
 
 /// 沒跑過任何工作也要能輸出（註冊過的 metric 全部以 0/預設出現）。
 #[test]

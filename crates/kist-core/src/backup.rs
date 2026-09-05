@@ -27,11 +27,11 @@ use kist_backend::{Backend, BackendError};
 use kist_chunker::Chunker;
 use kist_crypto::RepoKeys;
 use kist_format::index::{IndexBlob, IndexPack};
-use kist_format::snapshot::{format_key_timestamp, format_rfc3339, Snapshot, SnapshotStats};
+use kist_format::snapshot::{format_key_timestamp, Snapshot, SnapshotStats};
 use kist_format::tree::{
-    ChunkList, Content, Node, NodeKind, NodeMeta, Tree, MAX_INLINE_CHUNKS, MAX_NODES_PER_TREE,
+    content_type, node_type, ChunkList, Entry, Tree, MAX_INLINE_CHUNKS, MAX_NODES_PER_TREE,
 };
-use kist_format::{cbor, keys, ChunkId, ObjectId};
+use kist_format::{cbor, keys, ChunkId, ObjectId, TreeId};
 use tokio::task::JoinSet;
 
 use crate::fsmeta;
@@ -85,7 +85,7 @@ impl std::fmt::Debug for ProgressCallback {
 pub struct BackupSummary {
     pub snapshot_key: String,
     pub parent: Option<String>,
-    pub root: ObjectId,
+    pub root: TreeId,
     pub stats: SnapshotStats,
 }
 
@@ -105,6 +105,7 @@ struct ChunkState<R: std::io::Read> {
     bytes_total: u64,
     bytes_new: u64,
     chunks_new: u64,
+    reused_count: u64,
     /// 這輪沿用的既有 chunk 與它們所在的 pack。
     reused: Vec<(ChunkId, ObjectId)>,
 }
@@ -117,12 +118,12 @@ struct Backup {
     packer: Option<PackWriter>,
     index: Option<ChunkIndex>,
     /// 這次 backup 已經寫過的 tree（同一次裡同內容的目錄不重寫）。
-    written_trees: HashSet<ObjectId>,
+    written_trees: HashSet<TreeId>,
     new_packs: Vec<IndexPack>,
     uploads: JoinSet<Result<()>>,
     stats: SnapshotStats,
-    /// parent snapshot 的開始時間（Unix 秒、奈秒）；沒有 parent 時快速路徑不會用到。
-    parent_start: (i64, u32),
+    /// parent snapshot 的開始時間（Unix 奈秒）；沒有 parent 時快速路徑不會用到。
+    parent_start_ns: i64,
     /// backup 開始時已被 GC 標記的 pack：不拿來去重。
     marked: Arc<HashSet<ObjectId>>,
     /// backup 開始時所有的標記（含 tree）：commit 時要驗「開始時已被標記、這次又 put 過」的 tree。
@@ -131,6 +132,9 @@ struct Backup {
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
     /// 進度回報（見 `BackupOptions::progress`）。
     progress: Option<ProgressCallback>,
+    /// 這次 backup 已看過的硬連結：(dev, inode) → 第一個名字的 chunk 清單與大小。
+    /// 後續名字直接沿用，不必重讀資料。
+    hardlinks: HashMap<(u64, u64), (u64, Vec<ChunkId>, u8)>,
 }
 
 /// 呼叫進度 callback（有設才做）。stats 是幾個 u64 的 copy，成本可忽略。
@@ -156,13 +160,13 @@ pub struct PreparedBackup {
     opts: BackupOptions,
     started: time::OffsetDateTime,
     paths: Vec<Vec<u8>>,
-    root: ObjectId,
+    root: TreeId,
     parent_key: Option<String>,
     stats: SnapshotStats,
     /// 引用到的 pack → 其中被引用的 chunk（這次新寫的 pack 也在內）。
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
     /// 這次 put 過的 tree。
-    written_trees: HashSet<ObjectId>,
+    written_trees: HashSet<TreeId>,
     marks_at_start: HashMap<ObjectId, time::OffsetDateTime>,
     /// 這次自己寫出的 pack：commit 時不需要再驗（存在與否由 BackupTooLong 保證）。
     own_packs: HashSet<ObjectId>,
@@ -313,17 +317,22 @@ impl Repository {
     ///    事後從標記看不出來，所以直接 HEAD：要存在，而且修改時間比開始時的標記新。
     async fn verify_written_trees(
         &self,
-        written: &HashSet<ObjectId>,
+        written: &HashSet<TreeId>,
         marks_at_start: &HashMap<ObjectId, time::OffsetDateTime>,
         marks: &HashMap<ObjectId, time::OffsetDateTime>,
         grace: std::time::Duration,
         now: time::OffsetDateTime,
     ) -> Result<()> {
-        for (id, marked_at) in marks {
+        let written: HashSet<ObjectId> = written
+            .iter()
+            .map(|t| ObjectId::from_bytes(*t.as_bytes()))
+            .collect();
+        for (id, marked_at) in marks.iter() {
             if *marked_at + grace > now || !written.contains(id) {
                 continue;
             }
-            let info = self.backend().head(&keys::tree(id)).await?;
+            let tree_id = TreeId::from_bytes(*id.as_bytes());
+            let info = self.backend().head(&keys::tree(&tree_id)).await?;
             // 時間是整秒：同一秒算重寫過。prune 刪前的比較也是 >=（同一秒不刪），兩邊一致才安全。
             if info.modified < *marked_at {
                 return Err(CoreError::TreeMarked(*id));
@@ -333,7 +342,8 @@ impl Repository {
             if !written.contains(id) {
                 continue;
             }
-            match self.backend().head(&keys::tree(id)).await {
+            let tree_id = TreeId::from_bytes(*id.as_bytes());
+            match self.backend().head(&keys::tree(&tree_id)).await {
                 Ok(info) if info.modified >= *marked_at => {}
                 Ok(_) | Err(BackendError::NotFound(_)) => return Err(CoreError::TreeMarked(*id)),
                 Err(e) => return Err(e.into()),
@@ -341,6 +351,7 @@ impl Repository {
         }
         Ok(())
     }
+
 
     /// 除了 snapshot 以外全部寫完。
     pub async fn backup_prepare(
@@ -387,15 +398,12 @@ impl Repository {
         }
 
         let parent = self.find_parent(&opts.client_id, &path_bytes).await?;
-        let parent_nodes = match &parent {
+        let parent_entries = match &parent {
             Some((_, snap)) => self.read_tree_chain(&snap.root).await.unwrap_or_default(),
             None => Vec::new(),
         };
-        let parent_map = nodes_by_name(parent_nodes);
-        let parent_start = parent
-            .as_ref()
-            .and_then(|(_, snap)| parse_rfc3339_unix(&snap.time))
-            .unwrap_or((0, 0));
+        let parent_map = entries_by_name(parent_entries);
+        let parent_start_ns = parent.as_ref().map(|(_, snap)| snap.time_ns).unwrap_or(0);
 
         let mut b = Backup {
             repo: self.clone(),
@@ -410,7 +418,8 @@ impl Repository {
             new_packs: Vec::new(),
             uploads: JoinSet::new(),
             stats: SnapshotStats::default(),
-            parent_start,
+            parent_start_ns,
+            hardlinks: HashMap::new(),
             marked: Arc::new(marked),
             marks_at_start,
             referenced: HashMap::new(),
@@ -418,17 +427,17 @@ impl Repository {
         };
 
         // 根 tree：每個來源路徑一個節點，名稱是絕對路徑。
-        let mut root_nodes = Vec::new();
+        let mut root_entries = Vec::new();
         for (path, name) in abs_paths.iter().zip(path_bytes.iter()) {
             let meta = std::fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
-            let node = b
+            let entry = b
                 .process_entry(path, name.clone(), &meta, parent_map.get(name))
                 .await?;
-            if let Some(node) = node {
-                root_nodes.push(node);
+            if let Some(entry) = entry {
+                root_entries.push(entry);
             }
         }
-        let root = b.write_tree_parts(root_nodes).await?;
+        let root = b.write_tree_parts(root_entries).await?;
 
         // flush 最後一個 pack，等所有上傳完成
         b.report("flush", None);
@@ -499,7 +508,7 @@ impl Repository {
         opts: &BackupOptions,
         started: time::OffsetDateTime,
         paths: Vec<Vec<u8>>,
-        root: ObjectId,
+        root: TreeId,
         parent: Option<String>,
         stats: SnapshotStats,
     ) -> Result<String> {
@@ -510,9 +519,14 @@ impl Repository {
             let snapshot = Snapshot {
                 version: Snapshot::VERSION,
                 client_id: opts.client_id.to_vec(),
-                hostname: opts.hostname.clone(),
-                username: opts.username.clone(),
-                time: format_rfc3339(now)?,
+                host: opts.hostname.clone(),
+                user: opts.username.clone(),
+                time_ns: i64::try_from(now.unix_timestamp_nanos()).map_err(|_| {
+                    CoreError::Corrupt {
+                        key: key.clone(),
+                        reason: "timestamp out of range".to_owned(),
+                    }
+                })?,
                 paths: paths
                     .iter()
                     .cloned()
@@ -534,14 +548,8 @@ impl Repository {
     }
 }
 
-/// RFC 3339 → (Unix 秒, 奈秒)。
-fn parse_rfc3339_unix(s: &str) -> Option<(i64, u32)> {
-    let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
-    Some((t.unix_timestamp(), t.nanosecond()))
-}
-
-fn nodes_by_name(nodes: Vec<Node>) -> HashMap<Vec<u8>, Node> {
-    nodes.into_iter().map(|n| (n.name.clone(), n)).collect()
+fn entries_by_name(entries: Vec<Entry>) -> HashMap<Vec<u8>, Entry> {
+    entries.into_iter().map(|e| (e.name.clone(), e)).collect()
 }
 
 impl Backup {
@@ -557,8 +565,8 @@ impl Backup {
         path: &Path,
         name: Vec<u8>,
         meta: &std::fs::Metadata,
-        parent: Option<&Node>,
-    ) -> Result<Option<Node>> {
+        parent: Option<&Entry>,
+    ) -> Result<Option<Entry>> {
         let node = self.process_entry_inner(path, name, meta, parent).await?;
         self.report("files", Some(path));
         Ok(node)
@@ -569,48 +577,68 @@ impl Backup {
         path: &Path,
         name: Vec<u8>,
         meta: &std::fs::Metadata,
-        parent: Option<&Node>,
-    ) -> Result<Option<Node>> {
+        parent: Option<&Entry>,
+    ) -> Result<Option<Entry>> {
         let ft = meta.file_type();
-        let node_meta = fsmeta::capture(meta);
-        let kind = if ft.is_symlink() {
+        let fs = fsmeta::capture(meta);
+        let mut entry = Entry {
+            name,
+            kind: 0,
+            mode: fs.mode,
+            uid: fs.uid,
+            gid: fs.gid,
+            mtime_ns: fs.mtime_ns,
+            ctime_ns: fs.ctime_ns,
+            size: 0,
+            target: Vec::new(),
+            chunks: Vec::new(),
+            content: content_type::DIRECT,
+            subtree: TreeId::ZERO,
+            dev: 0,
+            inode: 0,
+            nlink: 0,
+            xattrs: None,
+        };
+        if ft.is_symlink() {
             let target = match std::fs::read_link(path) {
                 Ok(t) => t,
                 Err(e) => return Ok(self.skip(path, &e.to_string())),
             };
             self.stats.symlinks += 1;
-            NodeKind::Symlink {
-                target: fsmeta::path_to_bytes(&target)?,
-            }
+            entry.kind = node_type::SYMLINK;
+            entry.target = fsmeta::path_to_bytes(&target)?;
         } else if ft.is_dir() {
             let parent_subtree = match parent {
-                Some(Node {
-                    kind: NodeKind::Dir { subtree },
-                    ..
-                }) => Some(*subtree),
+                Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
                 _ => None,
             };
             let subtree = self.process_dir(path, parent_subtree).await?;
             self.stats.dirs += 1;
-            NodeKind::Dir { subtree }
+            entry.kind = node_type::DIR;
+            entry.subtree = subtree;
         } else if ft.is_file() {
-            let Some((size, content)) = self
-                .process_file(path, &node_meta, meta.len(), parent)
+            let Some((size, chunks, content)) = self
+                .process_file(path, &fs, meta.len(), parent)
                 .await?
             else {
                 return Ok(None); // 讀不到，已記錄
             };
             self.stats.files += 1;
-            NodeKind::File { size, content }
+            entry.kind = node_type::FILE;
+            entry.size = size;
+            entry.chunks = chunks;
+            entry.content = content;
+            // 硬連結：記下識別，restore 才能重建連結而不是第二份複本。
+            if fs.nlink > 1 {
+                entry.dev = fs.dev;
+                entry.inode = fs.inode;
+                entry.nlink = fs.nlink;
+            }
         } else {
             tracing::warn!("{}: unsupported file type, skipped", path.display());
             return Ok(None);
-        };
-        Ok(Some(Node {
-            name,
-            meta: node_meta,
-            kind,
-        }))
+        }
+        Ok(Some(entry))
     }
 
     /// 遞迴處理一個目錄，回傳它（最後一段）tree 的名稱。
@@ -618,12 +646,12 @@ impl Backup {
     fn process_dir<'a>(
         &'a mut self,
         path: &'a Path,
-        parent_subtree: Option<ObjectId>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ObjectId>> + Send + 'a>> {
+        parent_subtree: Option<TreeId>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TreeId>> + Send + 'a>> {
         Box::pin(async move {
             let parent_map = match parent_subtree {
                 Some(id) => match self.repo.read_tree_chain(&id).await {
-                    Ok(nodes) => nodes_by_name(nodes),
+                    Ok(entries) => entries_by_name(entries),
                     Err(e) => {
                         tracing::warn!("cannot read parent tree {id}: {e}");
                         HashMap::new()
@@ -658,7 +686,7 @@ impl Backup {
             }
             entries.sort();
 
-            let mut nodes = Vec::new();
+            let mut children: Vec<Entry> = Vec::new();
             let mut prev = None;
             for (name, child_path) in entries {
                 let meta = match std::fs::symlink_metadata(&child_path) {
@@ -669,23 +697,23 @@ impl Backup {
                         continue;
                     }
                 };
-                let node = self
+                let entry = self
                     .process_entry(&child_path, name.clone(), &meta, parent_map.get(&name))
                     .await?;
-                if let Some(node) = node {
-                    nodes.push(node);
+                if let Some(entry) = entry {
+                    children.push(entry);
                 }
-                if nodes.len() >= MAX_NODES_PER_TREE {
-                    let part = std::mem::take(&mut nodes);
+                if children.len() >= MAX_NODES_PER_TREE {
+                    let part = std::mem::take(&mut children);
                     prev = Some(self.write_tree(Tree::new(part, prev)).await?);
                 }
             }
-            self.write_tree(Tree::new(nodes, prev)).await
+            self.write_tree(Tree::new(children, prev)).await
         })
     }
 
     /// 根層級的節點清單也可能很長，同樣分段。
-    async fn write_tree_parts(&mut self, nodes: Vec<Node>) -> Result<ObjectId> {
+    async fn write_tree_parts(&mut self, nodes: Vec<Entry>) -> Result<TreeId> {
         let mut prev = None;
         let mut iter = nodes.into_iter().peekable();
         loop {
@@ -709,7 +737,7 @@ impl Backup {
     /// (2) 不依賴 backup 開始時的列表，M3 GC 在中途刪掉 tree 也不會被漏掉；
     /// (3) 省掉一次可能有數十萬筆的 list。代價是每個目錄一次 put（S3 上要算錢；
     /// M2 有本地快取後可以用 cache_id 記住「這台機器寫過的 tree」再省掉）。
-    async fn write_tree(&mut self, tree: Tree) -> Result<ObjectId> {
+    async fn write_tree(&mut self, tree: Tree) -> Result<TreeId> {
         let (id, bytes) = self.repo.seal_tree(tree).await?;
         if self.written_trees.insert(id) {
             self.repo.backend().put(&keys::tree(&id), bytes).await?;
@@ -718,24 +746,30 @@ impl Backup {
     }
 
     /// 記錄一個讀不到的項目：警告、計數、不寫進 tree。回傳 `None` 方便呼叫端直接 return。
-    fn skip(&mut self, path: &Path, reason: &str) -> Option<Node> {
+    fn skip(&mut self, path: &Path, reason: &str) -> Option<Entry> {
         tracing::warn!("{}: {reason}; skipped", path.display());
         self.stats.errors += 1;
         None
     }
 
-    /// 處理一個檔案：size、mtime、ctime、inode 都與 parent 相同就沿用它的 chunk 清單，否則讀檔切塊。
-    /// 回傳 `None` 表示讀不到、已記錄略過。
+    /// 處理一個檔案：parent 的快速路徑 → 硬連結的重用 → 讀檔切塊。
+    /// 回傳 (size, chunks, content 型態)；`None` 表示讀不到、已記錄略過。
     async fn process_file(
         &mut self,
         path: &Path,
-        node_meta: &NodeMeta,
+        fs: &fsmeta::FsMeta,
         current_size: u64,
-        parent: Option<&Node>,
-    ) -> Result<Option<(u64, Content)>> {
-        if let Some(reused) = self.try_reuse(node_meta, current_size, parent).await? {
+        parent: Option<&Entry>,
+    ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
+        if let Some(reused) = self.try_reuse(fs, current_size, parent).await? {
             self.stats.files_reused += 1;
             return Ok(Some(reused));
+        }
+        // 硬連結：同一個 (dev, inode) 在這次 backup 已經讀過 → 直接沿用 chunk 清單。
+        if fs.nlink > 1 {
+            if let Some((size, chunks, content)) = self.hardlinks.get(&(fs.dev, fs.inode)).cloned() {
+                return Ok(Some((size, chunks, content)));
+            }
         }
 
         let file = match File::open(path) {
@@ -751,72 +785,65 @@ impl Backup {
         };
         // size 用實際讀到的長度，不用讀檔前的 metadata：備份途中被 append 的檔案兩者會不同
         let size = result.bytes_total;
-        self.stats.bytes_total += result.bytes_total;
-        self.stats.bytes_new += result.bytes_new;
-        self.stats.chunks_total += result.chunks.len() as u64;
+        self.stats.bytes += result.bytes_total;
+        self.stats.bytes_stored += result.bytes_new;
         self.stats.chunks_new += result.chunks_new;
 
-        if result.chunks.len() <= MAX_INLINE_CHUNKS {
-            return Ok(Some((
-                size,
-                Content::Direct {
-                    chunks: result.chunks,
-                },
-            )));
+        let out = if result.chunks.len() <= MAX_INLINE_CHUNKS {
+            (size, result.chunks, content_type::DIRECT)
+        } else {
+            // 大檔：chunk 清單本身當資料存
+            let list_bytes = cbor::encode(&ChunkList::new(result.chunks))?;
+            let list_result = self
+                .chunk_reader(
+                    std::io::Cursor::new(list_bytes),
+                    PathBuf::from("<chunk list>"),
+                )
+                .await?
+                .ok_or_else(|| CoreError::Join("chunk list read failed".into()))?;
+            self.stats.chunks_new += list_result.chunks_new;
+            (size, list_result.chunks, content_type::INDIRECT)
+        };
+        if fs.nlink > 1 {
+            self.hardlinks.insert((fs.dev, fs.inode), out.clone());
         }
-        // 大檔：chunk 清單本身當資料存
-        let list_bytes = cbor::encode(&ChunkList::new(result.chunks))?;
-        let list_result = self
-            .chunk_reader(
-                std::io::Cursor::new(list_bytes),
-                PathBuf::from("<chunk list>"),
-            )
-            .await?
-            .ok_or_else(|| CoreError::Join("chunk list read failed".into()))?;
-        self.stats.chunks_new += list_result.chunks_new;
-        Ok(Some((
-            size,
-            Content::Indirect {
-                chunks: list_result.chunks,
-            },
-        )))
+        Ok(Some(out))
     }
 
     /// parent 快速路徑：metadata 沒變、而且它引用的**資料** chunk 全都在 index 裡才沿用。
     async fn try_reuse(
         &mut self,
-        node_meta: &NodeMeta,
+        fs: &fsmeta::FsMeta,
         current_size: u64,
-        parent: Option<&Node>,
-    ) -> Result<Option<(u64, Content)>> {
-        let Some(Node {
-            meta: pmeta,
-            kind: NodeKind::File { size, content },
-            ..
-        }) = parent
-        else {
+        parent: Option<&Entry>,
+    ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
+        let Some(pentry) = parent else {
             return Ok(None);
         };
-        if !fsmeta::file_unchanged(pmeta, *size, node_meta, current_size, self.parent_start) {
+        if pentry.kind != node_type::FILE {
             return Ok(None);
         }
+        let pmeta = fsmeta::meta_of_entry(pentry);
+        if !fsmeta::file_unchanged(&pmeta, pentry.size, fs, current_size, self.parent_start_ns) {
+            return Ok(None);
+        }
+        let content = pentry.content;
         let index = self
             .index
             .as_ref()
             .ok_or_else(|| CoreError::Join("index missing".into()))?;
         // Indirect 的 chunks 只是清單；真正要驗的是清單解開後的資料 chunk
-        let data_ids = match content {
-            Content::Direct { chunks } => chunks.clone(),
-            Content::Indirect { chunks } => {
-                if !chunks.iter().all(|id| index.contains(id)) {
+        let data_ids = if content == content_type::DIRECT {
+            pentry.chunks.clone()
+        } else {
+            if !pentry.chunks.iter().all(|id| index.contains(id)) {
+                return Ok(None);
+            }
+            match self.repo.resolve_chunks(&pentry.chunks, content, index).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!("cannot read previous chunk list: {e}; re-reading file");
                     return Ok(None);
-                }
-                match self.repo.resolve_content(content, index).await {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        tracing::warn!("cannot read previous chunk list: {e}; re-reading file");
-                        return Ok(None);
-                    }
                 }
             }
         };
@@ -827,8 +854,8 @@ impl Backup {
                 _ => return Ok(None),
             }
         }
-        if let Content::Indirect { chunks } = content {
-            for id in chunks {
+        if content == content_type::INDIRECT {
+            for id in &pentry.chunks {
                 match index.get(id) {
                     Some(loc) if !self.marked.contains(&loc.pack) => packs.push((*id, loc.pack)),
                     _ => return Ok(None),
@@ -836,9 +863,9 @@ impl Backup {
             }
         }
         self.record_referenced(packs);
-        self.stats.bytes_total += *size;
-        self.stats.chunks_total += data_ids.len() as u64;
-        Ok(Some((*size, content.clone())))
+        self.stats.bytes += pentry.size;
+        self.stats.chunks_read += data_ids.len() as u64;
+        Ok(Some((pentry.size, pentry.chunks.clone(), content)))
     }
 
     /// 記下沿用的 chunk 在哪個 pack。這次新寫的 pack（佔位或已 flush）另外在最後加。
@@ -864,6 +891,7 @@ impl Backup {
             bytes_total: 0,
             bytes_new: 0,
             chunks_new: 0,
+            reused_count: 0,
             reused: Vec::new(),
         };
         loop {
@@ -903,6 +931,7 @@ impl Backup {
                         if marked.contains(&loc.pack) {
                             in_marked_pack = true;
                         } else {
+                            state.reused_count += 1;
                             state.reused.push((id, loc.pack));
                             continue;
                         }
@@ -938,6 +967,7 @@ impl Backup {
                 return Ok(None);
             }
             if done {
+                self.stats.chunks_read += state.reused_count;
                 return Ok(Some(FileResult {
                     chunks: state.ids,
                     bytes_total: state.bytes_total,

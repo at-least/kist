@@ -1,52 +1,8 @@
 //! 排版解析的邊界測試：截斷、錯 magic、不合法欄位都要回錯，不能 panic。
 
-use kist_format::envelope::{Compression, Envelope, ObjectKind};
 use kist_format::snapshot::{format_key_timestamp, parse_key_timestamp};
 use kist_format::{cbor, keys, pack, ChunkId, FormatError, ObjectId};
 use proptest::prelude::*;
-
-#[test]
-fn envelope_rejects_bad_input() {
-    let good = Envelope {
-        kind: ObjectKind::Index,
-        compression: Compression::None,
-        nonce: [1; 24],
-        ciphertext: vec![2; 16],
-    }
-    .encode();
-
-    assert!(matches!(
-        Envelope::parse(&good[..31]),
-        Err(FormatError::Truncated { .. })
-    ));
-    let mut bad_magic = good.clone();
-    bad_magic[0] = b'X';
-    assert!(matches!(
-        Envelope::parse(&bad_magic),
-        Err(FormatError::BadMagic { .. })
-    ));
-    let mut bad_version = good.clone();
-    bad_version[4] = 2;
-    assert!(matches!(
-        Envelope::parse(&bad_version),
-        Err(FormatError::UnsupportedVersion { .. })
-    ));
-    let mut bad_kind = good.clone();
-    bad_kind[5] = 99;
-    assert!(matches!(
-        Envelope::parse(&bad_kind),
-        Err(FormatError::UnknownKind(99))
-    ));
-    let mut bad_comp = good.clone();
-    bad_comp[6] = 7;
-    assert!(matches!(
-        Envelope::parse(&bad_comp),
-        Err(FormatError::UnknownCompression(7))
-    ));
-    let mut bad_reserved = good;
-    bad_reserved[7] = 1;
-    assert!(Envelope::parse(&bad_reserved).is_err());
-}
 
 #[test]
 fn pack_rejects_bad_input() {
@@ -82,6 +38,81 @@ fn pack_rejects_bad_input() {
     let mut overlap = bytes;
     overlap[len_pos..len_pos + 8].copy_from_slice(&11u64.to_le_bytes());
     assert!(pack::trailer_bytes(&overlap).is_err());
+}
+
+/// v2 沒有 envelope header：magic（含版號）在 pack 的檔頭檔尾各一份。
+/// 錯的 magic 前綴、不支援的版號、被改過的檔尾都必須被拒絕。
+#[test]
+fn pack_rejects_bad_magic_and_unsupported_version() {
+    let good = pack::finish(pack::begin(), &[9; 10]);
+    assert_eq!(pack::trailer_bytes(&good).unwrap(), &[9; 10]);
+
+    // 檔頭 magic 前綴（"kistpk"）被改
+    let mut bad_prefix = good.clone();
+    bad_prefix[0] = b'X';
+    assert!(matches!(
+        pack::trailer_bytes(&bad_prefix),
+        Err(FormatError::BadMagic { what: "pack header" })
+    ));
+    // 檔頭版號不支援（v3）：magic 含版號，整段不符就是 BadMagic
+    let mut bad_version = good.clone();
+    bad_version[6..8].copy_from_slice(&3u16.to_be_bytes());
+    assert!(matches!(
+        pack::trailer_bytes(&bad_version),
+        Err(FormatError::BadMagic { what: "pack header" })
+    ));
+    // 檔尾 magic 被改（前綴與版號各試一次）
+    let mut bad_footer = good.clone();
+    let n = bad_footer.len();
+    bad_footer[n - 1] = b'X';
+    assert!(matches!(
+        pack::trailer_bytes(&bad_footer),
+        Err(FormatError::BadMagic { what: "pack footer" })
+    ));
+    let mut bad_footer_version = good;
+    let n = bad_footer_version.len();
+    bad_footer_version[n - 2..].copy_from_slice(&1u16.to_be_bytes());
+    assert!(matches!(
+        pack::trailer_bytes(&bad_footer_version),
+        Err(FormatError::BadMagic { what: "pack footer" })
+    ));
+    // 檔頭檔尾版號不一致：只有一邊對 → 另一邊擋下
+    let mut mismatch = pack::begin();
+    mismatch.extend_from_slice(&[9; 10]);
+    let mut forged = pack::finish(mismatch, &[9; 10]);
+    let n = forged.len();
+    forged[n - 2..].copy_from_slice(&(kist_format::FORMAT_VERSION as u16).to_be_bytes());
+    forged[6..8].copy_from_slice(&(kist_format::FORMAT_VERSION as u16 + 1).to_be_bytes());
+    assert!(matches!(
+        pack::trailer_bytes(&forged),
+        Err(FormatError::BadMagic { .. })
+    ));
+}
+
+/// footer 本體（u64 BE 長度 + magic）的解析邊界。
+#[test]
+fn pack_footer_parsing() {
+    let good = pack::finish(pack::begin(), &[9; 10]);
+    assert_eq!(pack::parse_footer(&good).unwrap(), 10);
+    assert!(matches!(
+        pack::parse_footer(&good[..15]),
+        Err(FormatError::Truncated { .. })
+    ));
+    // magic（footer 的後 8 bytes）任何一個 bit 被改都必須被拒絕
+    let n = good.len();
+    for pos in n - 8..n {
+        let mut bad = good.clone();
+        bad[pos] ^= 1;
+        assert!(pack::parse_footer(&bad).is_err(), "pos {pos}");
+    }
+    // 長度欄位本身 parse_footer 不判斷（它無從知道對錯），但 trailer_bytes 會擋下
+    let mut huge = good.clone();
+    huge[n - 16] ^= 1; // 長度的最高 byte：瞬間變成天文數字
+    assert!(pack::parse_footer(&huge).is_ok());
+    assert!(matches!(
+        pack::trailer_bytes(&huge),
+        Err(FormatError::Truncated { .. })
+    ));
 }
 
 #[test]
@@ -136,19 +167,21 @@ fn key_timestamp_round_trip_and_ordering() {
 
 proptest! {
     #[test]
-    fn envelope_parse_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..80)) {
-        let _ = Envelope::parse(&bytes);
-    }
-
-    #[test]
     fn pack_trailer_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..80)) {
         let _ = pack::trailer_bytes(&bytes);
     }
 
     #[test]
-    fn envelope_round_trip(ct in proptest::collection::vec(any::<u8>(), 0..200), nonce in any::<[u8; 24]>()) {
-        let env = Envelope { kind: ObjectKind::Snapshot, compression: Compression::None, nonce, ciphertext: ct };
-        prop_assert_eq!(Envelope::parse(&env.encode()).unwrap(), env);
+    fn pack_parse_footer_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..80)) {
+        let _ = pack::parse_footer(&bytes);
+    }
+
+    #[test]
+    fn pack_round_trip(trailer in proptest::collection::vec(any::<u8>(), 0..200)) {
+        let mut buf = pack::begin();
+        buf.extend_from_slice(&[0xAB; 40]);
+        let bytes = pack::finish(buf, &trailer);
+        prop_assert_eq!(pack::trailer_bytes(&bytes).unwrap(), &trailer[..]);
     }
 }
 

@@ -485,14 +485,21 @@ async fn list_snapshots(state: &ServeState) -> std::result::Result<Vec<SnapshotR
     Ok(infos.iter().rev().map(snapshot_row).collect())
 }
 
+/// snapshot 的 i64 奈秒 → 人類可讀的 UTC 時間。
+fn format_ns_time(ns: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns))
+        .map(|t| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default())
+        .unwrap_or_default()
+}
+
 fn snapshot_row(info: &SnapshotInfo) -> SnapshotRow {
     let s = &info.snapshot;
     SnapshotRow {
         client: info.client_hex().chars().take(8).collect(),
-        time: trim_fraction(&s.time),
-        hostname: s.hostname.clone(),
+        time: format_ns_time(s.time_ns),
+        hostname: s.host.clone(),
         files: s.stats.files.to_string(),
-        size: human_bytes(s.stats.bytes_total),
+        size: human_bytes(s.stats.bytes),
         paths: s
             .paths
             .iter()
@@ -533,8 +540,8 @@ fn status_view(state: &ServeState, notice: Option<String>) -> StatusView {
             phase: p.phase.to_owned(),
             files: p.stats.files.to_string(),
             dirs: p.stats.dirs.to_string(),
-            bytes_total: human_bytes(p.stats.bytes_total),
-            bytes_new: human_bytes(p.stats.bytes_new),
+            bytes_total: human_bytes(p.stats.bytes),
+            bytes_new: human_bytes(p.stats.bytes_stored),
             errors: p.stats.errors.to_string(),
             current: p.current.clone(),
         }),

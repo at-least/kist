@@ -152,6 +152,7 @@ async fn forget_and_prune_on_s3() {
     .await
     .unwrap();
     let zero = PruneOptions {
+                    clock_skew: std::time::Duration::ZERO,
         grace: std::time::Duration::ZERO,
         ..PruneOptions::default()
     };

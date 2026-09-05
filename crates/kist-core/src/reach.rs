@@ -8,8 +8,8 @@
 use std::collections::HashSet;
 
 use kist_format::snapshot::Snapshot;
-use kist_format::tree::{Content, Node, NodeKind};
-use kist_format::{keys, ChunkId, ObjectId};
+use kist_format::tree::{content_type, node_type, Entry};
+use kist_format::{keys, ChunkId, ObjectId, TreeId};
 
 use crate::index::ChunkIndex;
 use crate::repo::Repository;
@@ -19,7 +19,7 @@ use crate::Result;
 pub struct Reachability {
     /// 讀得出來的 snapshot（key、內容）。
     pub snapshots: Vec<(String, Snapshot)>,
-    /// 從任一 snapshot 走得到的 tree（含 `prev` 段）。
+    /// 從任一 snapshot 走得到的 tree（含 `prev` 段），以 gc 命名空間的名稱（ObjectId）記錄。
     pub live_trees: HashSet<ObjectId>,
     /// 被引用的 chunk：資料 chunk 與 Indirect 的清單 chunk 都算。
     pub referenced_chunks: HashSet<ChunkId>,
@@ -31,7 +31,7 @@ pub struct Reachability {
 pub struct FileVisit<'a> {
     /// 這個節點所在的 tree 的 key。
     pub tree_key: &'a str,
-    pub node: &'a Node,
+    pub node: &'a Entry,
     pub size: u64,
     /// 解開 Indirect 之後的資料 chunk。
     pub data_chunks: &'a [ChunkId],
@@ -65,14 +65,17 @@ impl Repository {
 
     fn walk_tree<'a>(
         &'a self,
-        id: &'a ObjectId,
+        id: &'a TreeId,
         context: &'a str,
         index: &'a ChunkIndex,
         on_file: &'a mut (dyn FnMut(FileVisit<'_>) + Send),
         reach: &'a mut Reachability,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            if !reach.live_trees.insert(*id) {
+            if !reach
+                .live_trees
+                .insert(ObjectId::from_bytes(*id.as_bytes()))
+            {
                 return;
             }
             let key = keys::tree(id);
@@ -86,29 +89,31 @@ impl Repository {
             if let Some(prev) = tree.prev {
                 self.walk_tree(&prev, context, index, on_file, reach).await;
             }
-            for node in &tree.nodes {
-                match &node.kind {
-                    NodeKind::Dir { subtree } => {
-                        self.walk_tree(subtree, context, index, on_file, reach)
+            for node in &tree.entries {
+                match node.kind {
+                    node_type::DIR if !node.subtree.is_zero() => {
+                        self.walk_tree(&node.subtree, context, index, on_file, reach)
                             .await;
                     }
-                    NodeKind::File { size, content } => {
-                        let data = match content {
-                            Content::Direct { chunks } => chunks.clone(),
-                            Content::Indirect { chunks } => {
-                                reach.referenced_chunks.extend(chunks.iter().copied());
-                                if let Some(missing) = chunks.iter().find(|c| !index.contains(c)) {
-                                    reach.errors.push(format!(
-                                        "{key}: chunk list chunk {missing} is missing from the index"
-                                    ));
+                    node_type::FILE => {
+                        let data = if node.content == content_type::DIRECT {
+                            node.chunks.clone()
+                        } else {
+                            reach.referenced_chunks.extend(node.chunks.iter().copied());
+                            if let Some(missing) = node.chunks.iter().find(|c| !index.contains(c)) {
+                                reach.errors.push(format!(
+                                    "{key}: chunk list chunk {missing} is missing from the index"
+                                ));
+                                continue;
+                            }
+                            match self
+                                .resolve_chunks(&node.chunks, node.content, index)
+                                .await
+                            {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    reach.errors.push(format!("{key}: chunk list: {e}"));
                                     continue;
-                                }
-                                match self.resolve_content(content, index).await {
-                                    Ok(ids) => ids,
-                                    Err(e) => {
-                                        reach.errors.push(format!("{key}: chunk list: {e}"));
-                                        continue;
-                                    }
                                 }
                             }
                         };
@@ -123,11 +128,11 @@ impl Repository {
                         on_file(FileVisit {
                             tree_key: &key,
                             node,
-                            size: *size,
+                            size: node.size,
                             data_chunks: &data,
                         });
                     }
-                    NodeKind::Symlink { .. } => {}
+                    _ => {}
                 }
             }
         })

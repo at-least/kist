@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
-use kist_format::tree::{ChunkList, Content, Node, NodeKind};
-use kist_format::{cbor, keys, ChunkId};
+use kist_format::tree::{content_type, node_type, ChunkList, Entry};
+use kist_format::{cbor, keys, ChunkId, TreeId};
 
 use crate::fsmeta;
 use crate::index::ChunkIndex;
@@ -63,15 +63,19 @@ impl Repository {
         let snapshot = self.read_snapshot(snapshot_key).await?;
         let index = ReloadableIndex::new(self.load_index().await?);
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
-        let nodes = self.read_tree_chain(&snapshot.root).await?;
+        let entries = self.read_tree_chain(&snapshot.root).await?;
         let mut summary = RestoreSummary::default();
-        for node in nodes {
-            let rel = fsmeta::bytes_to_relative_path(&node.name)?;
+        // 硬連結：(dev, inode) → 第一個還原出來的路徑；後續名字 hard_link 過去。
+        let mut hardlinks: std::collections::HashMap<(u64, u64), PathBuf> =
+            std::collections::HashMap::new();
+        for entry in entries {
+            let rel = fsmeta::bytes_to_relative_path(&entry.name)?;
             let path = target.join(rel);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
             }
-            self.restore_node(&node, &path, &index, &mut summary).await;
+            self.restore_node(&entry, &path, &index, &mut summary, &mut hardlinks)
+                .await;
         }
         Ok(summary)
     }
@@ -79,21 +83,57 @@ impl Repository {
     /// 還原一個節點。錯誤記進 summary，不往上拋：一個壞掉的 chunk 不該讓其他 99% 的檔案也拿不回來。
     fn restore_node<'a>(
         &'a self,
-        node: &'a Node,
+        node: &'a Entry,
         path: &'a Path,
         index: &'a ReloadableIndex,
         summary: &'a mut RestoreSummary,
+        hardlinks: &'a mut std::collections::HashMap<(u64, u64), PathBuf>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            let result = match &node.kind {
-                NodeKind::Dir { subtree } => {
-                    self.restore_dir(subtree, node, path, index, summary).await
+            let meta = fsmeta::meta_of_entry(node);
+            if node.xattrs.is_some() {
+                tracing::warn!(
+                    "{}: has {} extended attribute(s); applying them is not implemented",
+                    path.display(),
+                    node.xattrs.as_ref().map_or(0, |x| x.len())
+                );
+            }
+            let result = match node.kind {
+                node_type::DIR if !node.subtree.is_zero() => {
+                    self.restore_dir(&node.subtree, node, path, index, summary, hardlinks)
+                        .await
                 }
-                NodeKind::File { size, content } => {
-                    match self.restore_file(path, *size, content, index).await {
+                node_type::FILE => {
+                    let hardlink_key = (node.nlink > 1)
+                        .then_some((node.dev, node.inode))
+                        .filter(|k| k.1 != 0);
+                    if let Some(k) = hardlink_key {
+                        if let Some(first) = hardlinks.get(&k) {
+                            match std::fs::hard_link(first, path) {
+                                Ok(()) => {
+                                    summary.files += 1;
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "{}: cannot hard-link to {}: {e}; restoring a copy",
+                                        path.display(),
+                                        first.display()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    match self
+                        .restore_file(path, node.size, &node.chunks, node.content, index)
+                        .await
+                    {
                         Ok(()) => {
                             summary.files += 1;
-                            fsmeta::apply(path, &node.meta, false)
+                            if let Some(k) = hardlink_key {
+                                hardlinks.insert(k, path.to_path_buf());
+                            }
+                            fsmeta::apply(path, &meta, false)
                         }
                         Err(e) => {
                             // 別留下寫到一半的檔案：使用者會誤以為它是完整的
@@ -102,16 +142,20 @@ impl Repository {
                         }
                     }
                 }
-                NodeKind::Symlink { target } => match fsmeta::bytes_to_name(target) {
+                node_type::SYMLINK => match fsmeta::bytes_to_name(&node.target) {
                     Ok(name) => match replace_with_symlink(&PathBuf::from(name), path) {
                         Ok(()) => {
                             summary.symlinks += 1;
-                            fsmeta::apply(path, &node.meta, true)
+                            fsmeta::apply(path, &meta, true)
                         }
                         Err(e) => Err(e),
                     },
                     Err(e) => Err(e),
                 },
+                other => Err(CoreError::Corrupt {
+                    key: path.display().to_string(),
+                    reason: format!("unknown node type {other}"),
+                }),
             };
             if let Err(e) = result {
                 tracing::warn!("{}: {e}", path.display());
@@ -122,11 +166,12 @@ impl Repository {
 
     async fn restore_dir(
         &self,
-        subtree: &kist_format::ObjectId,
-        node: &Node,
+        subtree: &TreeId,
+        node: &Entry,
         path: &Path,
         index: &ReloadableIndex,
         summary: &mut RestoreSummary,
+        hardlinks: &mut std::collections::HashMap<(u64, u64), PathBuf>,
     ) -> Result<()> {
         std::fs::create_dir_all(path).map_err(|e| CoreError::io(path, e))?;
         let children = self.read_tree_chain(subtree).await?;
@@ -136,34 +181,45 @@ impl Repository {
                 continue;
             }
             let child_path = path.join(fsmeta::bytes_to_name(&child.name)?);
-            self.restore_node(&child, &child_path, index, summary).await;
+            self.restore_node(&child, &child_path, index, summary, hardlinks)
+                .await;
         }
         summary.dirs += 1;
         // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋
-        fsmeta::apply(path, &node.meta, false)
+        fsmeta::apply(path, &fsmeta::meta_of_entry(node), false)
     }
 
     async fn restore_file(
         &self,
         path: &Path,
         size: u64,
-        content: &Content,
+        chunks: &[ChunkId],
+        content: u8,
         index: &ReloadableIndex,
     ) -> Result<()> {
-        let chunk_ids = match content {
-            Content::Direct { chunks } => chunks.clone(),
-            Content::Indirect { chunks } => {
-                let mut bytes = Vec::new();
-                for id in chunks {
-                    bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
-                }
-                let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
-                    key: "<chunk list>".to_owned(),
-                    reason: e.to_string(),
-                })?;
-                list.chunks
+        let chunk_ids = if content == content_type::DIRECT {
+            chunks.to_vec()
+        } else {
+            let mut bytes = Vec::new();
+            for id in chunks {
+                bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
             }
+            let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+                key: "<chunk list>".to_owned(),
+                reason: e.to_string(),
+            })?;
+            list.chunks
         };
+        // 目標已存在且是 symlink：不跟隨。restore 到含惡意 symlink 的目錄時，
+        // 跟隨會把資料寫到目標之外（與 Go 端同樣的防護）。
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(CoreError::Corrupt {
+                    key: path.display().to_string(),
+                    reason: "a symlink is in the way of a restored file".to_owned(),
+                });
+            }
+        }
         let file = std::fs::File::create(path).map_err(|e| CoreError::io(path, e))?;
         let mut writer = std::io::BufWriter::new(file);
         let mut written = 0u64;
@@ -184,26 +240,25 @@ impl Repository {
         Ok(())
     }
 
-    /// Direct 直接回傳；Indirect 先把清單 chunk 讀出來解成 ChunkList。
-    pub(crate) async fn resolve_content(
+    /// 直接內容回傳原清單；間接內容先把清單 chunk 讀出來解成 ChunkList。
+    pub(crate) async fn resolve_chunks(
         &self,
-        content: &Content,
+        chunks: &[ChunkId],
+        content: u8,
         index: &ChunkIndex,
     ) -> Result<Vec<ChunkId>> {
-        match content {
-            Content::Direct { chunks } => Ok(chunks.clone()),
-            Content::Indirect { chunks } => {
-                let mut bytes = Vec::new();
-                for id in chunks {
-                    bytes.extend_from_slice(&self.read_chunk(id, index).await?);
-                }
-                let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
-                    key: "<chunk list>".to_owned(),
-                    reason: e.to_string(),
-                })?;
-                Ok(list.chunks)
-            }
+        if content == content_type::DIRECT {
+            return Ok(chunks.to_vec());
         }
+        let mut bytes = Vec::new();
+        for id in chunks {
+            bytes.extend_from_slice(&self.read_chunk(id, index).await?);
+        }
+        let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+            key: "<chunk list>".to_owned(),
+            reason: e.to_string(),
+        })?;
+        Ok(list.chunks)
     }
 
     /// 同 `read_chunk`，但 chunk 不在 index 或它的 pack 不見了時重新載入 index 再試一次：
@@ -253,7 +308,8 @@ impl Repository {
         let bytes = self.backend().get_range(&key, loc.offset..end).await?;
         let keys = Arc::clone(self.keys());
         let id = *id;
-        blocking(move || decode_chunk(&keys, &id, &bytes, loc.flags, loc.raw_len)).await
+        let raw_len = loc.raw_len;
+        blocking(move || decode_chunk(&keys, &id, &bytes, raw_len)).await
     }
 }
 

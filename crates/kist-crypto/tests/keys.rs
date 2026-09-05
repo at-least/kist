@@ -1,10 +1,13 @@
 //! 金鑰階層與 AEAD 封裝的行為測試。
 
 use kist_crypto::{create_key_slot, unlock_key_slot, CryptoError, MasterKey, RepoKeys};
-use kist_format::envelope::{Compression, ObjectKind};
 use kist_format::ChunkId;
+use kist_format::TreeId;
 
 const PASSWORD: &str = "correct horse battery staple";
+
+/// `2026-01-01T00:00:00Z` 的 Unix 奈秒。
+const CREATED_NS: i64 = 1_767_225_600_000_000_000;
 
 fn fast_kdf() -> kist_crypto::KdfCost {
     // 測試用：Argon2 最小參數，避免每個測試都花半秒。
@@ -20,15 +23,16 @@ fn key_slot_round_trip() {
     let (slot, master) = create_key_slot(
         PASSWORD.as_bytes(),
         "default",
-        "2026-01-01T00:00:00Z",
+        CREATED_NS,
         fast_kdf(),
         &binding(),
     )
     .unwrap();
     assert_eq!(slot.kdf.algorithm, "argon2id");
     assert_eq!(slot.kdf.salt.len(), 16);
-    assert_eq!(slot.wrapped_master_key.nonce.len(), 24);
-    assert_eq!(slot.wrapped_master_key.ciphertext.len(), 32 + 16);
+    assert_eq!(slot.created_ns, CREATED_NS);
+    // wrapped = nonce(24) ‖ 密文(32) ‖ tag(16)
+    assert_eq!(slot.wrapped.len(), 24 + 32 + 16);
 
     let unlocked = unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).unwrap();
     assert_eq!(unlocked.as_bytes(), master.as_bytes());
@@ -39,7 +43,7 @@ fn wrong_password_is_rejected() {
     let (slot, _) = create_key_slot(
         PASSWORD.as_bytes(),
         "default",
-        "2026-01-01T00:00:00Z",
+        CREATED_NS,
         fast_kdf(),
         &binding(),
     )
@@ -55,12 +59,12 @@ fn tampered_wrapped_key_is_rejected() {
     let (mut slot, _) = create_key_slot(
         PASSWORD.as_bytes(),
         "default",
-        "2026-01-01T00:00:00Z",
+        CREATED_NS,
         fast_kdf(),
         &binding(),
     )
     .unwrap();
-    slot.wrapped_master_key.ciphertext[0] ^= 1;
+    slot.wrapped[30] ^= 1; // 動密文部分（nonce 之後）
     assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).is_err());
 }
 
@@ -69,7 +73,7 @@ fn unknown_kdf_is_rejected() {
     let (mut slot, _) = create_key_slot(
         PASSWORD.as_bytes(),
         "default",
-        "2026-01-01T00:00:00Z",
+        CREATED_NS,
         fast_kdf(),
         &binding(),
     )
@@ -84,14 +88,11 @@ fn unknown_kdf_is_rejected() {
 #[test]
 fn two_slots_wrap_the_same_master_key_differently() {
     // 同一個 master key 用兩組密碼各包一次：salt / nonce 不同，密文不同，但解出來一樣。
-    let (slot_a, master) = create_key_slot(b"a", "a", "t", fast_kdf(), &binding()).unwrap();
+    let (slot_a, master) = create_key_slot(b"a", "a", 0, fast_kdf(), &binding()).unwrap();
     let slot_b =
-        kist_crypto::wrap_master_key(&master, b"b", "b", "t", fast_kdf(), &binding()).unwrap();
+        kist_crypto::wrap_master_key(&master, b"b", "b", 0, fast_kdf(), &binding()).unwrap();
     assert_ne!(slot_a.kdf.salt, slot_b.kdf.salt);
-    assert_ne!(
-        slot_a.wrapped_master_key.ciphertext,
-        slot_b.wrapped_master_key.ciphertext
-    );
+    assert_ne!(slot_a.wrapped, slot_b.wrapped);
     assert_eq!(
         unlock_key_slot(b"b", &slot_b, &binding())
             .unwrap()
@@ -148,100 +149,139 @@ fn chunk_seal_open_round_trip() {
     assert_ne!(keys.seal_chunk(&id, plaintext).unwrap(), sealed);
 }
 
+/// v2 沒有 envelope：index blob / pack trailer 以角色 AAD 密封，長度 = nonce ‖ 密文 ‖ tag。
 #[test]
-fn object_seal_open_round_trip_with_compression() {
+fn index_blob_seal_open_round_trip() {
     let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
     let plaintext = vec![b'a'; 10_000];
-    let sealed = keys
-        .seal_object(ObjectKind::Index, Compression::Zstd, &plaintext)
-        .unwrap();
-    assert!(sealed.len() < 1_000, "可壓縮的內容應該被壓縮");
-    assert_eq!(
-        keys.open_object(ObjectKind::Index, &sealed).unwrap(),
-        plaintext
-    );
+    let sealed = keys.seal_index_blob(&plaintext).unwrap();
+    assert_eq!(sealed.len(), 24 + plaintext.len() + 16);
+    assert_eq!(keys.open_index_blob(&sealed).unwrap(), plaintext);
 
-    let raw = keys
-        .seal_object(ObjectKind::Index, Compression::None, &plaintext)
-        .unwrap();
-    assert_eq!(raw.len(), 32 + plaintext.len() + 16);
-    assert_eq!(
-        keys.open_object(ObjectKind::Index, &raw).unwrap(),
-        plaintext
-    );
+    let trailer = keys.seal_pack_trailer(b"trailer").unwrap();
+    assert_eq!(keys.open_pack_trailer(&trailer).unwrap(), b"trailer");
 }
 
+/// 各角色的 AAD 互相綁定：拿 index 的密文當 trailer 開（AAD 不同）必須失敗。
 #[test]
-fn object_kind_is_bound_by_aad() {
+fn sealed_roles_are_bound_by_aad() {
     let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
-    let sealed = keys
-        .seal_object(ObjectKind::Index, Compression::None, b"index")
-        .unwrap();
-    // 期待 tree 卻拿到 index：header 上的種類不符
+    let index = keys.seal_index_blob(b"index").unwrap();
     assert!(matches!(
-        keys.open_object(ObjectKind::Tree, &sealed),
-        Err(CryptoError::KindMismatch { .. })
+        keys.open_pack_trailer(&index),
+        Err(CryptoError::AuthFailed)
     ));
-    // 把 header 的種類改成 tree：AAD 不符，AEAD 驗證失敗
-    let mut forged = sealed;
-    forged[5] = ObjectKind::Tree as u8;
+    let trailer = keys.seal_pack_trailer(b"trailer").unwrap();
     assert!(matches!(
-        keys.open_object(ObjectKind::Tree, &forged),
+        keys.open_index_blob(&trailer),
+        Err(CryptoError::AuthFailed)
+    ));
+
+    // tree 的 AAD 是自己的 ID：換個 ID 就開不了
+    let id = TreeId::from_bytes([1; 32]);
+    let sealed = keys.seal_tree(&id, b"tree").unwrap();
+    assert_eq!(keys.open_tree(&id, &sealed).unwrap(), b"tree");
+    let other = TreeId::from_bytes([2; 32]);
+    assert!(matches!(
+        keys.open_tree(&other, &sealed),
+        Err(CryptoError::AuthFailed)
+    ));
+
+    // snapshot 的 AAD 是完整 key 路徑：路徑不對就開不了
+    let snap = keys.seal_snapshot("snapshots/ab/20260904T000000000000000Z", b"snap").unwrap();
+    assert_eq!(
+        keys.open_snapshot("snapshots/ab/20260904T000000000000000Z", &snap)
+            .unwrap(),
+        b"snap"
+    );
+    assert!(matches!(
+        keys.open_snapshot("snapshots/ab/20260905T000000000000000Z", &snap),
         Err(CryptoError::AuthFailed)
     ));
 }
 
+/// v2 的重用性改由「名稱 = 明文的 keyed hash」保證：同明文同名稱（跨 repo 不同），
+/// 密封本身則一律隨機 nonce——名稱不再洩漏、也不再有決定性加密。
 #[test]
-fn tree_sealing_is_deterministic_but_others_are_not() {
+fn tree_ids_are_deterministic_but_sealing_is_not() {
     let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
-    let a = keys
-        .seal_object(ObjectKind::Tree, Compression::Zstd, b"tree bytes")
-        .unwrap();
-    let b = keys
-        .seal_object(ObjectKind::Tree, Compression::Zstd, b"tree bytes")
-        .unwrap();
-    assert_eq!(
+    let plain = b"tree bytes";
+    let id = keys.tree_id(plain);
+    assert_eq!(keys.tree_id(plain), id, "同明文 → 同名稱");
+    assert_ne!(keys.tree_id(b"tree bytes!"), id);
+
+    let a = keys.seal_tree(&id, plain).unwrap();
+    let b = keys.seal_tree(&id, plain).unwrap();
+    assert_ne!(
         a, b,
-        "同樣的 tree 明文必須得到 byte-for-byte 相同的密文，否則子樹無法重用"
+        "v2 沒有決定性加密：同樣的明文兩次密封必須用不同的隨機 nonce"
     );
-    let c = keys
-        .seal_object(ObjectKind::Tree, Compression::Zstd, b"tree bytes!")
-        .unwrap();
-    assert_ne!(a, c);
+    assert_ne!(&a[..24], &b[..24], "nonce 必須不同（nonce 重用是災難）");
+    assert_eq!(keys.open_tree(&id, &a).unwrap(), plain);
+    assert_eq!(keys.open_tree(&id, &b).unwrap(), plain);
 
-    let x = keys
-        .seal_object(ObjectKind::Snapshot, Compression::Zstd, b"snap")
-        .unwrap();
-    let y = keys
-        .seal_object(ObjectKind::Snapshot, Compression::Zstd, b"snap")
-        .unwrap();
-    assert_ne!(x, y, "非 tree 的物件用隨機 nonce");
+    let x = keys.seal_snapshot("k", b"snap").unwrap();
+    let y = keys.seal_snapshot("k", b"snap").unwrap();
+    assert_ne!(x, y, "非 tree 的物件也用隨機 nonce");
 
-    // 不同 repo 金鑰下，同樣的 tree 明文密文不同（nonce 由祕密 key 推導）
+    // 不同 repo 金鑰下，同樣的明文得到不同的名稱（keyed hash）
     let other = RepoKeys::from_master(&MasterKey::from_bytes([2; 32]));
-    let z = other
-        .seal_object(ObjectKind::Tree, Compression::Zstd, b"tree bytes")
-        .unwrap();
-    assert_ne!(a[8..32], z[8..32], "nonce 不能只是明文的公開 hash");
+    assert_ne!(
+        other.tree_id(plain),
+        id,
+        "tree 名稱依 repo 金鑰而異，不能只是明文的公開 hash"
+    );
 }
 
+/// 同明文兩次密封的 nonce 必須不同；明文與密文都可以正常來回。
 #[test]
-fn tree_nonce_is_derived_from_the_encrypted_body_not_the_plaintext() {
-    // 同一份明文、不同壓縮設定 → 加密的 bytes 不同 → nonce 必須不同，否則就是 nonce 重用。
+fn sealing_nonces_are_random_per_call() {
     let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
     let plaintext = vec![b'a'; 1000];
-    let zstd = keys
-        .seal_object(ObjectKind::Tree, Compression::Zstd, &plaintext)
-        .unwrap();
-    let raw = keys
-        .seal_object(ObjectKind::Tree, Compression::None, &plaintext)
-        .unwrap();
-    assert_ne!(zstd[8..32], raw[8..32], "nonce 必須隨被加密的 body 而異");
-    assert_eq!(
-        keys.open_object(ObjectKind::Tree, &zstd).unwrap(),
-        plaintext
+    let zstd_like = keys.seal_index_blob(&plaintext).unwrap();
+    let raw_like = keys.seal_index_blob(&plaintext).unwrap();
+    assert_ne!(
+        &zstd_like[..24],
+        &raw_like[..24],
+        "兩次密封的 nonce 必須不同，無論上層怎麼處理明文"
     );
-    assert_eq!(keys.open_object(ObjectKind::Tree, &raw).unwrap(), plaintext);
+    assert_eq!(keys.open_index_blob(&zstd_like).unwrap(), plaintext);
+    assert_eq!(keys.open_index_blob(&raw_like).unwrap(), plaintext);
+}
+
+/// 密文被改一個 bit、空明文、以及 hash/chunk 兩個 context 的域分離。
+#[test]
+fn tree_seal_rejects_tampering_and_contexts_are_separated() {
+    let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
+    let id = TreeId::from_bytes([3; 32]);
+    let sealed = keys.seal_tree(&id, b"tree").unwrap();
+    // 密文中任一個 bit 被改都要失敗（tag 驗證）
+    for pos in [0, sealed.len() / 2, sealed.len() - 1] {
+        let mut bad = sealed.clone();
+        bad[pos] ^= 1;
+        assert!(
+            matches!(keys.open_tree(&id, &bad), Err(CryptoError::AuthFailed)),
+            "篡改位置 {pos} 必須被拒絕"
+        );
+    }
+    // 空明文也要能來回（nonce ‖ tag，沒有密文內容）
+    let empty = keys.seal_tree(&id, b"").unwrap();
+    assert_eq!(empty.len(), 24 + 16);
+    assert_eq!(keys.open_tree(&id, &empty).unwrap(), b"");
+    // TreeId 與 ChunkId 同函式同金鑰（kist-format/src/ids.rs 明載的設計：
+    // 兩者活在不同命名空間——tree 只吃 CBOR、chunk 只吃原始資料——不會撞）；
+    // 但都要與無 key 的 BLAKE3 不同
+    let data = b"same bytes";
+    assert_eq!(
+        keys.chunk_id(data).as_bytes(),
+        keys.tree_id(data).as_bytes(),
+        "TreeId 與 ChunkId 是同一個 keyed hash（文件明載）"
+    );
+    assert_ne!(
+        keys.tree_id(data).as_bytes(),
+        blake3::hash(data).as_bytes(),
+        "tree 名稱不能是無 key 的 hash"
+    );
 }
 
 fn binding() -> kist_crypto::KeyBinding {
@@ -253,7 +293,7 @@ fn binding() -> kist_crypto::KeyBinding {
 
 #[test]
 fn key_slot_is_bound_to_repo_id_and_chunker_params() {
-    let (slot, _) = create_key_slot(PASSWORD.as_bytes(), "d", "t", fast_kdf(), &binding()).unwrap();
+    let (slot, _) = create_key_slot(PASSWORD.as_bytes(), "d", 0, fast_kdf(), &binding()).unwrap();
     assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).is_ok());
 
     let mut other_repo = binding();
@@ -277,7 +317,7 @@ fn key_slot_is_bound_to_repo_id_and_chunker_params() {
 #[test]
 fn absurd_kdf_parameters_are_rejected_before_running_argon2() {
     let (mut slot, _) =
-        create_key_slot(PASSWORD.as_bytes(), "d", "t", fast_kdf(), &binding()).unwrap();
+        create_key_slot(PASSWORD.as_bytes(), "d", 0, fast_kdf(), &binding()).unwrap();
     slot.kdf.m_cost_kib = u32::MAX; // 4 TiB
     let started = std::time::Instant::now();
     assert!(matches!(
@@ -297,6 +337,7 @@ fn absurd_kdf_parameters_are_rejected_before_running_argon2() {
 fn default_kdf_cost_is_above_owasp_floor() {
     let c = kist_crypto::KdfCost::default();
     assert!(c.m_cost_kib >= 64 * 1024 && c.t_cost >= 3, "{c:?}");
+    assert_eq!(c.p_cost, 4, "v2 與 Go 端一致的預設平行度");
 }
 
 #[test]

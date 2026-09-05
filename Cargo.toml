@@ -27,12 +27,12 @@ chacha20poly1305 = "0.11"
 ciborium = "0.2"
 dirs = "6"
 clap = { version = "4", features = ["derive", "env"] }
-fastcdc = "5"
 filetime = "0.2"
 futures = "0.3"
 gethostname = "1"
 getrandom = "0.4"
 hex = "0.4"
+sha2 = "0.10"
 maud = { version = "0.27", features = ["axum"] }
 object_store = { version = "0.14", default-features = false, features = ["fs", "aws-base", "reqwest", "ring"] }
 prometheus-client = "0.25"

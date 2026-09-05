@@ -73,13 +73,13 @@ async fn file_whose_size_changes_while_reading_restores_correctly() {
         .backup(std::slice::from_ref(&path), backup_options())
         .await
         .unwrap();
-    assert!(s.stats.bytes_total > 0, "{:?}", s.stats);
+    assert!(s.stats.bytes > 0, "{:?}", s.stats);
     let target = t.dir.path().join("out");
     repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
         .await
         .unwrap();
     let restored = std::fs::read(target.join("proc/version")).unwrap();
-    assert_eq!(restored.len() as u64, s.stats.bytes_total);
+    assert_eq!(restored.len() as u64, s.stats.bytes);
     let report = repo.check(CheckOptions { read_data: false }).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
@@ -98,7 +98,7 @@ async fn indirect_fast_path_verifies_data_chunks_not_just_the_list() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert!(s1.stats.chunks_total > 256, "要是 Indirect：{:?}", s1.stats);
+    assert!(s1.stats.chunks_new > 256, "要是 Indirect：{:?}", s1.stats);
 
     // append 1 byte：資料 chunk 幾乎全部重用（在 index blob 1），新清單 chunk 在 blob 2
     data.push(7);
@@ -128,7 +128,7 @@ async fn indirect_fast_path_verifies_data_chunks_not_just_the_list() {
     assert_eq!(std::fs::read(restored.join("big.bin")).unwrap(), data);
 }
 
-/// 大檔的 chunks_total 要算資料 chunk，不是清單 chunk。
+/// 大檔的快速路徑要算**資料** chunk 的數量（`chunks_read`），不是只算清單 chunk。
 #[tokio::test]
 async fn indirect_fast_path_counts_data_chunks() {
     let t = TestRepo::new().await;
@@ -140,46 +140,50 @@ async fn indirect_fast_path_counts_data_chunks() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
+    assert!(s1.stats.chunks_new > 256, "要是 Indirect：{:?}", s1.stats);
     let s2 = repo
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert_eq!(
-        s2.stats.chunks_total, s1.stats.chunks_total,
+    // 沿用時 `chunks_read` 數的是解開清單後的資料 chunk（> 256 個），
+    // 不是樹裡那 1-2 個清單 chunk
+    assert!(
+        s2.stats.chunks_read > 256,
         "{:?} vs {:?}",
         s1.stats, s2.stats
     );
+    assert_eq!(s2.stats.chunks_new, 0, "{:?}", s2.stats);
 }
 
 /// 「racily clean」：ctime 不早於上一次 backup 開始時間的檔案不能走快速路徑。
 #[test]
 fn fast_path_rejects_files_changed_at_or_after_parent_start() {
-    use kist_core::fsmeta::unchanged;
-    use kist_format::tree::NodeMeta;
-    let meta = NodeMeta {
-        mtime_secs: 1000,
-        mtime_nanos: 0,
-        ctime_secs: 1000,
-        ctime_nanos: 0,
+    use kist_core::fsmeta::{unchanged, FsMeta};
+    let meta = FsMeta {
+        mode: 0o100644,
+        uid: 0,
+        gid: 0,
+        mtime_ns: 1_000_000_000_000,
+        ctime_ns: 1_000_000_000_000,
         inode: 5,
-        ..NodeMeta::default()
+        dev: 0,
+        nlink: 0,
     };
     assert!(
-        unchanged(&meta, &meta, (2000, 0)),
+        unchanged(&meta, &meta, 2_000_000_000_000),
         "早於 parent 開始時間：可沿用"
     );
-    assert!(!unchanged(&meta, &meta, (1000, 0)), "同一秒：不可沿用");
     assert!(
-        !unchanged(&meta, &meta, (500, 0)),
+        !unchanged(&meta, &meta, 1_000_000_000_000),
+        "同一瞬間：不可沿用"
+    );
+    assert!(
+        !unchanged(&meta, &meta, 500_000_000_000),
         "晚於 parent 開始：不可沿用"
     );
-    let no_ctime = NodeMeta {
-        ctime_secs: 0,
-        ctime_nanos: 0,
-        ..meta
-    };
+    let no_ctime = FsMeta { ctime_ns: 0, ..meta };
     assert!(
-        !unchanged(&no_ctime, &no_ctime, (500, 0)),
+        !unchanged(&no_ctime, &no_ctime, 500_000_000_000),
         "沒有 ctime 就看 mtime，同樣不可沿用"
     );
 }
@@ -204,9 +208,7 @@ async fn fast_path_uses_parent_start_time_and_reports_reused_files() {
     assert_eq!(s2.stats.files_reused, s2.stats.files, "{:?}", s2.stats);
 
     let snap2 = repo.read_snapshot_by_key(&s2.snapshot_key).await.unwrap();
-    let start =
-        time::OffsetDateTime::parse(&snap2.time, &time::format_description::well_known::Rfc3339)
-            .unwrap();
+    let start = time::OffsetDateTime::from_unix_timestamp_nanos(snap2.time_ns as i128).unwrap();
     let at_start = filetime::FileTime::from_unix_time(start.unix_timestamp(), start.nanosecond());
     filetime::set_file_mtime(src.join("random.bin"), at_start).unwrap();
 
@@ -237,9 +239,7 @@ async fn snapshot_time_is_backup_start_and_matches_key() {
         .unwrap();
     let after = time::OffsetDateTime::now_utc();
     let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
-    let time =
-        time::OffsetDateTime::parse(&snap.time, &time::format_description::well_known::Rfc3339)
-            .unwrap();
+    let time = time::OffsetDateTime::from_unix_timestamp_nanos(snap.time_ns as i128).unwrap();
     assert!(before <= time && time <= after);
     let ts = s.snapshot_key.rsplit('/').next().unwrap();
     assert_eq!(
@@ -251,15 +251,20 @@ async fn snapshot_time_is_backup_start_and_matches_key() {
 /// 沒有 ctime / inode 的平台（Windows）只剩 size + mtime：size 不同就不能沿用。
 #[test]
 fn fast_path_compares_size_even_without_ctime() {
-    use kist_core::fsmeta::file_unchanged;
-    use kist_format::tree::NodeMeta;
-    let meta = NodeMeta {
-        mtime_secs: 1000,
-        ..NodeMeta::default()
+    use kist_core::fsmeta::{file_unchanged, FsMeta};
+    let meta = FsMeta {
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        mtime_ns: 1_000_000_000_000,
+        ctime_ns: 0,
+        inode: 0,
+        dev: 0,
+        nlink: 0,
     };
-    assert!(file_unchanged(&meta, 10, &meta, 10, (2000, 0)));
+    assert!(file_unchanged(&meta, 10, &meta, 10, 2_000_000_000_000));
     assert!(
-        !file_unchanged(&meta, 10, &meta, 11, (2000, 0)),
+        !file_unchanged(&meta, 10, &meta, 11, 2_000_000_000_000),
         "size 變了不能沿用"
     );
 }

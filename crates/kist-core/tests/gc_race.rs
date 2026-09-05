@@ -223,6 +223,7 @@ impl World {
                 let r = self
                     .repo
                     .prune(PruneOptions {
+                    clock_skew: std::time::Duration::ZERO,
                         grace: H * (GRACE_HOURS as u32),
                         inactive_after: 30 * 24 * H,
                         repack_below_percent: 50,
@@ -241,6 +242,7 @@ impl World {
                 let plan = self
                     .repo
                     .prune_plan(PruneOptions {
+                    clock_skew: std::time::Duration::ZERO,
                         grace: H * (GRACE_HOURS as u32),
                         inactive_after: 30 * 24 * H,
                         repack_below_percent: 50,

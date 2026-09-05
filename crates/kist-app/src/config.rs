@@ -96,6 +96,8 @@ pub struct ForgetSection {
 pub struct PruneSection {
     #[serde(default, with = "crate::duration::serde_opt")]
     pub grace: Option<std::time::Duration>,
+    /// Tolerated client/prune clock difference; 0 defaults to 1h.
+    pub clock_skew: Option<std::time::Duration>,
     #[serde(default, with = "crate::duration::serde_opt")]
     pub inactive_after: Option<std::time::Duration>,
     pub repack_below: Option<u8>,
@@ -261,6 +263,7 @@ impl PruneSection {
         kist_core::PruneOptions {
             grace: self.grace.unwrap_or(d.grace),
             inactive_after: self.inactive_after.unwrap_or(d.inactive_after),
+            clock_skew: self.clock_skew.unwrap_or(d.clock_skew),
             repack_below_percent: self.repack_below.unwrap_or(d.repack_below_percent),
             dry_run: false,
             now: None,
