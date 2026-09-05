@@ -55,6 +55,30 @@ pub struct BackupOptions {
     pub now: Option<time::OffsetDateTime>,
     /// 標記超過這麼久的 pack 視同已刪（commit 前的驗證）。必須與 prune 用的一致。
     pub gc_grace: std::time::Duration,
+    /// 進度回報（給 UI 顯示）；`None` = 不回報。
+    pub progress: Option<ProgressCallback>,
+}
+
+/// backup 進行中的即時狀態（給 UI 顯示進度）。每處理完一個目錄項目呼叫一次 callback；結尾的
+/// 驗證與 commit 階段也各呼叫一次（phase 不同）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupProgress {
+    /// "files" | "flush" | "verify" | "commit"
+    pub phase: &'static str,
+    pub stats: SnapshotStats,
+    /// 目前處理的路徑（lossy UTF-8）；結尾階段為 None。
+    pub current: Option<String>,
+}
+
+/// 進度 callback：`Arc` 包起來讓 `BackupOptions` 仍可 `Clone`。
+/// 必須 `Send + Sync`，因為 backup 的 future 會被丟到 tokio 的多執行緒 runtime。
+#[derive(Clone)]
+pub struct ProgressCallback(pub Arc<dyn Fn(&BackupProgress) + Send + Sync>);
+
+impl std::fmt::Debug for ProgressCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProgressCallback")
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -105,6 +129,24 @@ struct Backup {
     marks_at_start: HashMap<ObjectId, time::OffsetDateTime>,
     /// 這次沿用的既有 chunk 各自在哪個 pack（commit 前要驗這些 pack 還在）。
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
+    /// 進度回報（見 `BackupOptions::progress`）。
+    progress: Option<ProgressCallback>,
+}
+
+/// 呼叫進度 callback（有設才做）。stats 是幾個 u64 的 copy，成本可忽略。
+fn report_progress(
+    progress: Option<&ProgressCallback>,
+    phase: &'static str,
+    stats: SnapshotStats,
+    current: Option<&Path>,
+) {
+    if let Some(cb) = progress {
+        (cb.0)(&BackupProgress {
+            phase,
+            stats,
+            current: current.map(|p| p.to_string_lossy().into_owned()),
+        });
+    }
 }
 
 /// 除了 snapshot 之外全部寫完的 backup：`commit` 驗證引用的 pack 後寫 snapshot。
@@ -154,6 +196,7 @@ impl PreparedBackup {
             });
         }
         let marks = self.repo.list_gc_marks().await?;
+        report_progress(self.opts.progress.as_ref(), "verify", self.stats, None);
         self.repo
             .verify_referenced_chunks(
                 &self.referenced,
@@ -172,6 +215,7 @@ impl PreparedBackup {
                 now,
             )
             .await?;
+        report_progress(self.opts.progress.as_ref(), "commit", self.stats, None);
         let snapshot_key = self
             .repo
             .commit_snapshot(
@@ -370,6 +414,7 @@ impl Repository {
             marked: Arc::new(marked),
             marks_at_start,
             referenced: HashMap::new(),
+            progress: opts.progress.clone(),
         };
 
         // 根 tree：每個來源路徑一個節點，名稱是絕對路徑。
@@ -386,6 +431,7 @@ impl Repository {
         let root = b.write_tree_parts(root_nodes).await?;
 
         // flush 最後一個 pack，等所有上傳完成
+        b.report("flush", None);
         b.flush_pack().await?;
         b.wait_uploads(0).await?;
 
@@ -499,8 +545,26 @@ fn nodes_by_name(nodes: Vec<Node>) -> HashMap<Vec<u8>, Node> {
 }
 
 impl Backup {
+    /// 回報目前進度（有 callback 才做）。
+    fn report(&self, phase: &'static str, current: Option<&Path>) {
+        report_progress(self.progress.as_ref(), phase, self.stats, current);
+    }
+
     /// 處理一個目錄項目，回傳它的 tree 節點；不支援的類型回 `None`（略過並警告）。
+    /// 不論結果如何（寫進 tree、略過、記成錯誤），做完都回報一次進度。
     async fn process_entry(
+        &mut self,
+        path: &Path,
+        name: Vec<u8>,
+        meta: &std::fs::Metadata,
+        parent: Option<&Node>,
+    ) -> Result<Option<Node>> {
+        let node = self.process_entry_inner(path, name, meta, parent).await?;
+        self.report("files", Some(path));
+        Ok(node)
+    }
+
+    async fn process_entry_inner(
         &mut self,
         path: &Path,
         name: Vec<u8>,
@@ -550,11 +614,12 @@ impl Backup {
     }
 
     /// 遞迴處理一個目錄，回傳它（最後一段）tree 的名稱。
+    /// `Send`：讓整個 backup 的 future 能被 `tokio::spawn`（daemon 在別的 task 上跑工作）。
     fn process_dir<'a>(
         &'a mut self,
         path: &'a Path,
         parent_subtree: Option<ObjectId>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ObjectId>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ObjectId>> + Send + 'a>> {
         Box::pin(async move {
             let parent_map = match parent_subtree {
                 Some(id) => match self.repo.read_tree_chain(&id).await {

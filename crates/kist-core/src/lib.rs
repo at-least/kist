@@ -28,7 +28,10 @@ pub mod repo;
 pub mod restore;
 pub mod snapshots;
 
-pub use backup::{BackupOptions, BackupSummary, PreparedBackup, DEFAULT_GC_GRACE};
+pub use backup::{
+    BackupOptions, BackupProgress, BackupSummary, PreparedBackup, ProgressCallback,
+    DEFAULT_GC_GRACE,
+};
 pub use check::{CheckOptions, CheckReport};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};

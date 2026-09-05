@@ -33,6 +33,7 @@ futures = "0.3"
 gethostname = "1"
 getrandom = "0.4"
 hex = "0.4"
+maud = { version = "0.27", features = ["axum"] }
 object_store = { version = "0.14", default-features = false, features = ["fs", "aws-base", "reqwest", "ring"] }
 prometheus-client = "0.25"
 proptest = "1"
@@ -42,6 +43,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rand = "0.10"
 rpassword = "7"
+rust-embed = { version = "8", features = ["debug-embed"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"

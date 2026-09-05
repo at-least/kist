@@ -16,10 +16,13 @@ gethostname.workspace = true
 hex.workspace = true
 
 axum.workspace = true
+blake3.workspace = true
 chrono.workspace = true
 croner.workspace = true
+maud.workspace = true
 prometheus-client.workspace = true
 reqwest.workspace = true
+rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

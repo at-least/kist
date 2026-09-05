@@ -257,7 +257,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Run { config, once } => {
             let cfg = kist_app::Config::load(&config)?;
-            let daemon = kist_app::Daemon::new(cfg)?;
+            let mut daemon = kist_app::Daemon::new(cfg)?;
             if once {
                 // --json：每件工作的結果已經是 JSON，最後印整個陣列
                 let outcomes = daemon
@@ -286,6 +286,12 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 return Ok(());
             }
+            // 沒有排程的 daemon 只會等 Web UI 的觸發；`run` 沒有 UI，常駐沒意義
+            if !daemon.has_schedules() {
+                bail!(
+                    "no section has a schedule; use `run --once`, add schedule = \"...\", or use `serve`"
+                );
+            }
             print_next_runs(&daemon);
             let (tx, rx) = tokio::sync::watch::channel(false);
             spawn_ctrl_c(tx.clone());
@@ -294,7 +300,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Serve { config, http } => {
             let cfg = kist_app::Config::load(&config)?;
-            let daemon = kist_app::Daemon::new(cfg)?;
+            let mut daemon = kist_app::Daemon::new(cfg)?;
             print_next_runs(&daemon);
             let listener = tokio::net::TcpListener::bind(http)
                 .await
@@ -309,8 +315,13 @@ async fn run(cli: Cli) -> Result<()> {
             eprintln!("listening on http://{local} (/metrics, /healthz)");
             let (tx, rx) = tokio::sync::watch::channel(false);
             spawn_ctrl_c(tx.clone());
-            let metrics = daemon.metrics();
-            let server = tokio::spawn(kist_app::server::serve_http(metrics, listener, rx.clone()));
+            let ui = kist_app::server::ui_config(daemon.config(), local)?;
+            let state = kist_app::server::ServeState {
+                metrics: daemon.metrics(),
+                daemon: daemon.handle(),
+                ui: std::sync::Arc::new(ui),
+            };
+            let server = tokio::spawn(kist_app::server::serve_http(state, listener, rx.clone()));
             // server 半路掛掉時：記下錯誤、發 shutdown 叫醒 daemon（目前工作會做完），
             // 結束後把錯誤帶出去。不能等 daemon 自己結束才檢查——那樣 monitoring 只會
             // 看到 scrape 失敗，backup 卻還在跑。
@@ -373,6 +384,7 @@ async fn run(cli: Cli) -> Result<()> {
                 username: username(),
                 now: None,
                 gc_grace,
+                progress: None,
             };
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;

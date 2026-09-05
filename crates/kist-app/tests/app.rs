@@ -108,6 +108,61 @@ on = ["failure", "success"]
     }
 }
 
+/// `[serve]`：選填的 UI 密碼檔與額外允許的 Host；沒有排程也算合法設定。
+#[test]
+fn serve_section_parses_and_reads_ui_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let ui_pw = dir.path().join("ui-pw");
+    std::fs::write(&ui_pw, "ui secret\r\nsecond line\n").unwrap();
+    let text = format!(
+        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[serve]\npassword_file = {:?}\nallowed_hosts = [\"backup.example.internal:9898\"]\n",
+        ui_pw.display().to_string()
+    );
+    let cfg = Config::parse(&text).unwrap();
+    cfg.validate().unwrap();
+    let serve = cfg.serve.as_ref().unwrap();
+    assert_eq!(serve.password_file.as_deref(), Some(ui_pw.as_path()));
+    assert_eq!(serve.allowed_hosts, ["backup.example.internal:9898"]);
+    // 第一行、去掉 \r
+    let pw = cfg.read_ui_password().unwrap().unwrap();
+    assert_eq!(pw.as_str(), "ui secret");
+
+    // 空的 [serve]：兩個欄位都選填
+    let cfg = Config::parse(
+        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[serve]\n",
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+    let serve = cfg.serve.as_ref().unwrap();
+    assert!(serve.password_file.is_none());
+    assert!(serve.allowed_hosts.is_empty());
+    assert!(cfg.read_ui_password().unwrap().is_none());
+
+    // 沒有 [serve]：沒有 UI 密碼
+    let cfg = Config::parse("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n")
+        .unwrap();
+    assert!(cfg.serve.is_none());
+    assert!(cfg.read_ui_password().unwrap().is_none());
+
+    // 不認識的欄位要擋
+    let err = Config::parse(
+        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[serve]\nport = 1\n",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown field"), "{err}");
+
+    // 空密碼檔是設定錯誤
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, "\n").unwrap();
+    let cfg = Config::parse(&format!(
+        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[serve]\npassword_file = {:?}\n",
+        empty.display().to_string()
+    ))
+    .unwrap();
+    let err = cfg.read_ui_password().unwrap_err();
+    assert!(err.to_string().contains("empty"), "{err}");
+}
+
 #[test]
 fn schedule_next_occurrence() {
     use kist_app::schedule::{Schedule, Timezone};
@@ -224,7 +279,7 @@ async fn scheduled_runs_and_webhook() {
             src.display().to_string()
         ),
     );
-    let daemon = Daemon::new(Config::parse(&text).unwrap()).unwrap();
+    let mut daemon = Daemon::new(Config::parse(&text).unwrap()).unwrap();
     let (tx, rx) = tokio::sync::watch::channel(false);
     let mut n = 0;
     let result = tokio::time::timeout(

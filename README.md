@@ -5,8 +5,8 @@
 > 目前狀態：**M4 進行中** —— M3（GC、無鎖並發）完成：本機與 S3（含 MinIO）repo 的 `init` /
 > `backup` / `snapshots` / `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，
 > 多台機器可同時備份到同一個 repo，GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
-> M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics（`kist serve`）；
-> 還沒有：Web UI、SFTP、`mount`、Windows VSS。
+> M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics 與 Web UI（`kist serve`）；
+> 還沒有：SFTP、`mount`、Windows VSS。
 
 ## 建置
 
@@ -80,7 +80,7 @@ schedule = "0 5 * * *"
 ```sh
 kist run --config /etc/kist/backup.toml          # 常駐，照排程跑（Ctrl-C 等目前工作做完再結束）
 kist run --config /etc/kist/backup.toml --once   # 每件工作各跑一次就結束（給外部 cron / systemd timer）
-kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端口給 /metrics
+kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端口：/metrics 與 Web UI
 ```
 
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
@@ -109,6 +109,35 @@ kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端�
 告警請用「多久沒看到成功」（例如 `time() - kist_job_last_success_timestamp_seconds{job="backup"} > 90000`），
 不要用「有沒有成功過」；incomplete（有項目被略過/刪不掉）不算成功，所以要另外對
 `increase(kist_job_runs_total{status="incomplete"}[24h]) > 0` 告警，或用 webhook 即時通知 failure / incomplete。
+
+### Web UI（`kist serve`）
+
+`kist serve` 同時提供一個網頁：開 `http://127.0.0.1:9898/` 就是目前狀態——
+
+- **Status**：正在跑的工作與即時進度（phase、檔案/目錄數、bytes、目前處理的路徑）、
+  排隊中的工作、各工作的排程與下次執行時間、最近的執行紀錄；每 2 秒自動更新。
+- **Snapshots**：按 Refresh 列出 repo 裡的 snapshot（每次列都要重新開 repo，約一秒）。
+- **Run backup now**：手動觸發一次 backup。UI 唯一的寫入操作——forget / prune 刻意不給按。
+
+是否開放這顆按鈕由 `[serve]` 決定：
+
+```toml
+[serve]
+password_file = "/etc/kist/ui-password"           # UI 密碼（跟 repo 密碼是不同的秘密）
+allowed_hosts = ["backup.example.internal:9898"]  # 額外允許的 Host header
+```
+
+- 沒設 `password_file`：UI 唯讀（不用登入），按鈕換成停用說明。
+- 設了：整個 UI（含靜態檔）要 HTTP Basic auth，帳號任意、只比密碼。
+
+安全規則（細節與理由見 [ADR 007](docs/decisions/007-m4-web-ui.md)）：
+
+- `Host` header 不在白名單 → 421。白名單 = 綁定位址與幾種 loopback 寫法（自動允許）
+  加上 `allowed_hosts`；逐字比對，防 DNS rebinding。
+- 改狀態的請求只接受 htmx 送出的（`HX-Request: true`、非 `cross-site`），否則 403。
+- `/metrics`、`/healthz` 不在這些規則內（見上節；既有的 scrape 設定不受影響）。
+
+UI 密碼走明文 HTTP：預設只綁 loopback，要遠端存取請放在有 TLS 的 reverse proxy 後面。
 
 ### 空間回收（GC）
 

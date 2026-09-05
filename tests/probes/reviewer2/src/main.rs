@@ -19,6 +19,7 @@ fn client(id: u8, now: OffsetDateTime) -> BackupOptions {
         username: "tester".to_owned(),
         now: Some(now),
         gc_grace: 72 * H,
+        progress: None,
     }
 }
 fn prune_opts(now: OffsetDateTime) -> PruneOptions {

@@ -37,7 +37,7 @@ pub fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
     v
 }
 pub fn client(id: u8, now: Option<time::OffsetDateTime>) -> BackupOptions {
-    BackupOptions { client_id: [id; 16], hostname: format!("host{id}"), username: "t".into(), now, gc_grace: 72 * H }
+    BackupOptions { client_id: [id; 16], hostname: format!("host{id}"), username: "t".into(), now, gc_grace: 72 * H, progress: None }
 }
 pub fn ids_under(t: &TestRepo, prefix: &str) -> HashSet<ObjectId> {
     let dir = t.repo_path().join(prefix);

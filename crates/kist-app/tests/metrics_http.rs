@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kist_app::server::serve_http;
+use kist_app::server::{serve_http, ui_config, ServeState};
 use kist_app::{JobKind, JobOutcome, JobStatus, Metrics};
 use serde_json::json;
 use tokio::sync::watch;
@@ -122,11 +122,11 @@ fn daemon_seeds_last_success_from_jobstate() {
 
 /// 非 async 的 client 會把 #[tokio::test] 預設的單執行緒 runtime 擋死（server task 排不到、
 /// read 永遠等不到回應），所以用 tokio 的非同步 TcpStream。
-async fn get(addr: std::net::SocketAddr, path: &str) -> String {
+async fn get(addr: std::net::SocketAddr, path: &str, host: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
     s.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
     )
     .await
     .unwrap();
@@ -143,18 +143,38 @@ async fn serve_http_serves_metrics_and_healthz() {
         JobStatus::Success,
         json!({"stats": {"files": 7}}),
     ));
+    // UI 需要一個 daemon handle；最小設定（沒有 [serve] → 唯讀 UI、不用登入）
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = kist_app::Config::parse(&format!(
+        "repo = \"{}\"\npassword_file = \"{}\"\n\n[backup]\npaths = [\"{}\"]\n",
+        dir.path().join("repo").display(),
+        dir.path().join("pw").display(),
+        dir.path().join("src").display(),
+    ))
+    .unwrap();
+    let daemon = kist_app::Daemon::new(cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let ui = ui_config(daemon.config(), addr).unwrap();
+    let state = ServeState {
+        metrics,
+        daemon: daemon.handle(),
+        ui: Arc::new(ui),
+    };
     let (tx, rx) = watch::channel(false);
-    let server = tokio::spawn(serve_http(metrics, listener, rx));
+    let server = tokio::spawn(serve_http(state, listener, rx));
 
-    let resp = get(addr, "/metrics").await;
+    // /metrics 與 /healthz 不看 Host（scrape 設定裡的 Host 可能是任何東西）
+    let resp = get(addr, "/metrics", "test").await;
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     assert!(resp.contains("application/openmetrics-text"), "{resp}");
     assert!(resp.contains("kist_backup_files 7"), "{resp}");
-    assert!(get(addr, "/healthz").await.contains("200 OK"));
-    let root = get(addr, "/").await;
-    assert!(root.contains("/metrics"), "{root}");
+    assert!(get(addr, "/healthz", "test").await.contains("200 OK"));
+    // 首頁走 UI 規則：Host 要對；沒設密碼就不用登入
+    let root = get(addr, "/", &addr.to_string()).await;
+    assert!(root.starts_with("HTTP/1.1 200 OK"), "{root}");
+    assert!(root.contains("kist"), "{root}");
+    assert!(get(addr, "/", "test").await.contains("421"));
 
     tx.send(true).unwrap();
     server.await.unwrap().unwrap();

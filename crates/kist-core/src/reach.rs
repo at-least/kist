@@ -39,10 +39,11 @@ pub struct FileVisit<'a> {
 
 impl Repository {
     /// 走遍所有 snapshot。`on_file` 對每個檔案節點呼叫一次（同一個 tree 只走一次）。
+    /// `Send`：讓 prune / check 的 future 能被 `tokio::spawn`（daemon 在別的 task 上跑工作）。
     pub(crate) async fn walk_references(
         &self,
         index: &ChunkIndex,
-        on_file: &mut dyn FnMut(FileVisit<'_>),
+        on_file: &mut (dyn FnMut(FileVisit<'_>) + Send),
     ) -> Result<Reachability> {
         let mut reach = Reachability::default();
         let snapshot_keys = self.list_snapshot_keys().await?;
@@ -67,9 +68,9 @@ impl Repository {
         id: &'a ObjectId,
         context: &'a str,
         index: &'a ChunkIndex,
-        on_file: &'a mut dyn FnMut(FileVisit<'_>),
+        on_file: &'a mut (dyn FnMut(FileVisit<'_>) + Send),
         reach: &'a mut Reachability,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             if !reach.live_trees.insert(*id) {
                 return;

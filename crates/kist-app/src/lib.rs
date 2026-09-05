@@ -17,7 +17,7 @@ pub mod schedule;
 pub mod server;
 
 pub use config::Config;
-pub use daemon::Daemon;
+pub use daemon::{Daemon, DaemonHandle, DaemonState, RunningJob, TriggerError};
 pub use jobs::{JobKind, JobOutcome, JobStatus};
 pub use metrics::Metrics;
 

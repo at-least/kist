@@ -109,6 +109,7 @@ fn opts(client: u8, now: OffsetDateTime) -> BackupOptions {
         username: "tester".to_owned(),
         now: Some(now),
         gc_grace: 72 * H,
+        progress: None,
     }
 }
 

@@ -26,6 +26,10 @@
 //! [notify]
 //! webhook_url = "https://example.com/hook"
 //! on = ["failure", "incomplete"]   # 也可以加 "success"
+//!
+//! [serve]                      # 選填；`kist serve` 的 Web UI
+//! password_file = "/etc/kist/ui-password"       # 設了：整個 UI 都要 HTTP Basic auth（帳號任意，只比密碼）
+//! allowed_hosts = ["backup.example.internal:9898"]  # UI 額外接受的 Host header 值（loopback 形式自動允許）
 //! ```
 //!
 //! backup 主機只放 `[backup]`（憑證只要 Put/Get/List）；`[forget]` / `[prune]` 放在另一台
@@ -58,6 +62,8 @@ pub struct Config {
     pub prune: Option<PruneSection>,
     #[serde(default)]
     pub notify: Option<NotifySection>,
+    #[serde(default)]
+    pub serve: Option<ServeSection>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +114,21 @@ pub struct NotifySection {
 
 fn default_notify_on() -> Vec<String> {
     vec!["failure".to_owned(), "incomplete".to_owned()]
+}
+
+/// `kist serve` 的 Web UI 設定。兩個欄位都選填；只有 `[serve]` 而沒有排程的設定也合法
+/// （UI-only 的 serve：手動按「Run backup now」）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeSection {
+    /// UI 密碼檔（跟 repo 密碼是不同的秘密）。設了：整個 UI 都要 HTTP Basic auth，
+    /// 帳號任意、只比密碼。沒設：UI 唯讀，「Run backup now」被停用。
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+    /// UI 額外接受的 `Host` header 值（防 DNS rebinding）；綁定位址與 loopback 形式自動允許。
+    /// 逐字比對，不折疊大小寫、不補預設埠。
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Config {
@@ -189,21 +210,35 @@ impl Config {
         .transpose()
     }
 
-    /// 讀密碼檔（第一行）。
+    /// 讀 repo 密碼檔（第一行）。
     pub fn read_password(&self) -> Result<zeroize::Zeroizing<String>> {
-        let text = std::fs::read_to_string(&self.password_file).map_err(|e| AppError::Io {
-            path: self.password_file.clone(),
-            source: e,
-        })?;
-        let first = text.lines().next().unwrap_or("").trim_end_matches('\r');
-        if first.is_empty() {
-            return Err(AppError::Config(format!(
-                "password file {} is empty",
-                self.password_file.display()
-            )));
-        }
-        Ok(zeroize::Zeroizing::new(first.to_owned()))
+        read_password_file(&self.password_file)
     }
+
+    /// 讀 Web UI 密碼檔（`[serve] password_file`，第一行）。沒設定 → `Ok(None)`。
+    /// 啟動時讀一次，之後留在記憶體裡（`Zeroizing`）。
+    pub fn read_ui_password(&self) -> Result<Option<zeroize::Zeroizing<String>>> {
+        match self.serve.as_ref().and_then(|s| s.password_file.as_deref()) {
+            Some(path) => read_password_file(path).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+/// 密碼檔的規則（repo 密碼與 UI 密碼共用）：取第一行、去掉 `\r`，空的算設定錯誤。
+fn read_password_file(path: &Path) -> Result<zeroize::Zeroizing<String>> {
+    let text = std::fs::read_to_string(path).map_err(|e| AppError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let first = text.lines().next().unwrap_or("").trim_end_matches('\r');
+    if first.is_empty() {
+        return Err(AppError::Config(format!(
+            "password file {} is empty",
+            path.display()
+        )));
+    }
+    Ok(zeroize::Zeroizing::new(first.to_owned()))
 }
 
 impl ForgetSection {
