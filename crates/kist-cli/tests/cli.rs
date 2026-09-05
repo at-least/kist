@@ -460,3 +460,183 @@ fn prune_marks_then_deletes() {
     );
     env.ok(&["check", "--read-data"]);
 }
+
+/// `--json`：每個有結果的命令都輸出可解析的 JSON；錯誤照舊走 stderr。
+#[test]
+fn json_flag_outputs_parseable_results() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+
+    env.ok(&["init"]);
+
+    let v: Value =
+        serde_json::from_str(&env.ok(&["backup", "--json", src.to_str().unwrap()])).unwrap();
+    assert!(v["snapshot_key"]
+        .as_str()
+        .unwrap()
+        .starts_with("snapshots/"));
+    assert_eq!(v["stats"]["files"], 3);
+    assert_eq!(v["root"].as_str().unwrap().len(), 64, "root 是 64 字元 hex");
+    assert!(v["parent"].is_null());
+
+    let v: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["client"].as_str().unwrap().len(), 32);
+    assert_eq!(v[0]["paths"][0], src.to_str().unwrap());
+    assert_eq!(v[0]["stats"]["files"], 3);
+    assert!(v[0]["key"].as_str().unwrap().contains('/'));
+
+    let target = env.dir.path().join("out");
+    let v: Value =
+        serde_json::from_str(&env.ok(&["restore", "--json", "latest", target.to_str().unwrap()]))
+            .unwrap();
+    assert_eq!(v["files"], 3);
+    assert_eq!(v["dirs"], 2);
+    assert_eq!(v["errors"], Value::Array(vec![]));
+
+    let v: Value = serde_json::from_str(&env.ok(&["check", "--json"])).unwrap();
+    assert_eq!(v["errors"], Value::Array(vec![]));
+    assert!(v["snapshots"].as_u64().unwrap() >= 1);
+
+    let v: Value =
+        serde_json::from_str(&env.ok(&["forget", "--json", "--keep-last", "1"])).unwrap();
+    assert_eq!(v["dry_run"], false);
+    assert_eq!(v["removed"], Value::Array(vec![]));
+    assert_eq!(v["kept"].as_array().unwrap().len(), 1);
+    assert!(!v["kept"][0]["reasons"].as_array().unwrap().is_empty());
+
+    // forget --prune --json 必須是「一個」JSON 值，forget 與 prune 包在一起
+    let v: Value =
+        serde_json::from_str(&env.ok(&["forget", "--json", "--keep-last", "1", "--prune"]))
+            .unwrap();
+    assert_eq!(v["forget"]["dry_run"], false);
+    assert_eq!(v["forget"]["kept"].as_array().unwrap().len(), 1);
+    assert_eq!(v["prune"]["dry_run"], false);
+    assert_eq!(v["prune"]["skipped"], Value::Array(vec![]));
+    assert!(v.get("removed").is_none(), "top-level 要是空物件以外的組合");
+
+    let v: Value = serde_json::from_str(&env.ok(&["prune", "--json"])).unwrap();
+    assert_eq!(v["dry_run"], false);
+    assert_eq!(v["skipped"], Value::Array(vec![]));
+
+    let v: Value = serde_json::from_str(&env.ok(&["rebuild-index", "--json"])).unwrap();
+    assert!(v["packs"].as_u64().unwrap() >= 1);
+
+    // run --once --json：JobOutcome 陣列
+    let pw = env.dir.path().join("pw.txt");
+    std::fs::write(&pw, "cli test password\n").unwrap();
+    let cfg = env.dir.path().join("kist.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "repo = \"{}\"\npassword_file = \"{}\"\nclient_id_file = \"{}\"\ncache_dir = \"{}\"\n\n[backup]\npaths = [\"{}\"]\n",
+            env.repo().display(),
+            pw.display(),
+            env.dir.path().join("client-id").display(),
+            env.dir.path().join("cache").display(),
+            src.display(),
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["run", "--json", "--once", "--config", cfg.to_str().unwrap()])
+        .env_remove("KIST_REPO")
+        .env_remove("KIST_PASSWORD")
+        .env_remove("KIST_CLIENT_ID_FILE")
+        .env_remove("KIST_CACHE_DIR")
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "stdout: {stdout}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["job"], "backup");
+    assert_eq!(v[0]["status"], "success");
+    assert_eq!(v[0]["detail"]["stats"]["files"], 3);
+}
+
+/// `kist serve`：起 daemon + HTTP，--http 127.0.0.1:0 時從 stderr 取得實際位址，
+/// /metrics 能抓到 OpenMetrics 文字。
+#[test]
+fn serve_exposes_metrics() {
+    use std::io::{BufRead, Read, Write};
+    use std::net::SocketAddr;
+    use std::process::{Command, Stdio};
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+
+    let pw = env.dir.path().join("pw.txt");
+    std::fs::write(&pw, "cli test password\n").unwrap();
+    let cfg = env.dir.path().join("kist.toml");
+    // 早上三點的排程：測試期間不會真的跑到 backup
+    std::fs::write(
+        &cfg,
+        format!(
+            "repo = \"{}\"\npassword_file = \"{}\"\nclient_id_file = \"{}\"\ncache_dir = \"{}\"\n\n[backup]\npaths = [\"{}\"]\nschedule = \"0 3 * * *\"\n",
+            env.repo().display(),
+            pw.display(),
+            env.dir.path().join("client-id").display(),
+            env.dir.path().join("cache").display(),
+            src.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args([
+            "serve",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--http",
+            "127.0.0.1:0",
+        ])
+        .env_remove("KIST_REPO")
+        .env_remove("KIST_PASSWORD")
+        .env_remove("KIST_CLIENT_ID_FILE")
+        .env_remove("KIST_CACHE_DIR")
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut addr = None;
+    let mut collected = String::new();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break, // process 結束
+            Ok(_) => {
+                if let Some(rest) = line.trim().strip_prefix("listening on http://") {
+                    addr = Some(rest.split(' ').next().unwrap().to_owned());
+                    break;
+                }
+                collected.push_str(&line);
+            }
+        }
+    }
+    let addr: SocketAddr = addr
+        .unwrap_or_else(|| panic!("no listening line; stderr:\n{collected}"))
+        .parse()
+        .unwrap();
+
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.contains("HTTP/1.1 200 OK"), "{resp}");
+    assert!(resp.contains("kist_backup_files 0"), "{resp}");
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}

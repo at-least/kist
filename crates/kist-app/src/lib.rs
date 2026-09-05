@@ -10,12 +10,16 @@ pub mod config;
 pub mod daemon;
 pub mod duration;
 pub mod jobs;
+pub mod jobstate;
+pub mod metrics;
 pub mod notify;
 pub mod schedule;
+pub mod server;
 
 pub use config::Config;
 pub use daemon::Daemon;
 pub use jobs::{JobKind, JobOutcome, JobStatus};
+pub use metrics::Metrics;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {

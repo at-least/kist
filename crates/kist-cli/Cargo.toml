@@ -15,6 +15,7 @@ kist-app.workspace = true
 kist-backend.workspace = true
 kist-core.workspace = true
 kist-crypto.workspace = true
+kist-format.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
@@ -22,6 +23,8 @@ dirs.workspace = true
 gethostname.workspace = true
 hex.workspace = true
 rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true

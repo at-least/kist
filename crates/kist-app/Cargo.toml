@@ -15,8 +15,10 @@ dirs.workspace = true
 gethostname.workspace = true
 hex.workspace = true
 
+axum.workspace = true
 chrono.workspace = true
 croner.workspace = true
+prometheus-client.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,6 +30,4 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
-kist-crypto.workspace = true
 tempfile.workspace = true

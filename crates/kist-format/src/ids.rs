@@ -56,14 +56,24 @@ macro_rules! id_type {
             }
         }
 
+        /// CBOR（repo 格式）是 32 bytes；人類可讀的格式（`--json` 輸出）是 hex 字串。
+        /// ciborium 的 `is_human_readable()` 是 false，所以 repo 裡的 bytes 不受影響（golden 測試守著）。
         impl Serialize for $name {
             fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-                s.serialize_bytes(&self.0)
+                if s.is_human_readable() {
+                    s.serialize_str(&self.to_hex())
+                } else {
+                    s.serialize_bytes(&self.0)
+                }
             }
         }
 
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                if d.is_human_readable() {
+                    let text = String::deserialize(d)?;
+                    return Self::from_hex(&text).map_err(serde::de::Error::custom);
+                }
                 let buf = serde_bytes::ByteBuf::deserialize(d)?;
                 let arr: [u8; 32] = buf
                     .into_vec()

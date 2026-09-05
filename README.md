@@ -2,10 +2,11 @@
 
 去重、加密、可多台機器共用 repo 的備份工具（Rust）。
 
-> 目前狀態：**M3 完成** —— 本機與 S3（含 MinIO）repo 的 `init` / `backup` / `snapshots` /
-> `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，多台機器可同時備份到同一個 repo，
-> GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
-> 依 PLAN，到這裡可以開始自己使用；M4（SFTP、mount、設定檔、排程、Web UI）與 M5（硬化）還沒做。
+> 目前狀態：**M4 進行中** —— M3（GC、無鎖並發）完成：本機與 S3（含 MinIO）repo 的 `init` /
+> `backup` / `snapshots` / `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，
+> 多台機器可同時備份到同一個 repo，GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
+> M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics（`kist serve`）；
+> 還沒有：Web UI、SFTP、`mount`、Windows VSS。
 
 ## 建置
 
@@ -35,6 +36,16 @@ kist forget --keep-last 10 --prune      # 一次做完
 
 結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
 請看警告。
+
+### `--json`
+
+`backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild-index` / `run` 都支援
+`--json`：結果以 JSON 印到 stdout（錯誤照舊在 stderr、結束碼不變），給腳本和監控消費。
+
+- 內容 id（`root` 等）在 JSON 裡是 hex 字串（repo 格式不受影響，仍是 bytes）。
+- snapshot 的 `paths` 原本是 OS bytes，JSON 裡以 UTF-8 呈現，非 UTF-8 的位元組會換成 U+FFFD。
+- `forget` / `prune` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個。
+- `run --once --json` 印出 JobOutcome 陣列；常駐模式下每件工作結束印一行 JSON（NDJSON）。
 
 ### 設定檔與排程
 
@@ -69,9 +80,35 @@ schedule = "0 5 * * *"
 ```sh
 kist run --config /etc/kist/backup.toml          # 常駐，照排程跑（Ctrl-C 等目前工作做完再結束）
 kist run --config /etc/kist/backup.toml --once   # 每件工作各跑一次就結束（給外部 cron / systemd timer）
+kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端口給 /metrics
 ```
 
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
+
+### Prometheus metrics（`kist serve`）
+
+`kist serve` = `kist run`（照排程跑工作）+ 一個 HTTP 端口（`--http`，預設 `127.0.0.1:9898`）：
+
+- `GET /metrics`：OpenMetrics 文字格式，給 Prometheus 抓。
+- `GET /healthz`：活著沒。
+
+`/metrics` **沒有認證**，預設只綁 loopback；內容含 repo 位置、機器名稱與備份排程——
+不要暴露到不受信任的網路。主要指標：
+
+| 指標 | 意義 |
+| --- | --- |
+| `kist_job_runs_total{job,status}` | 每種工作完成次數（success / incomplete / failure） |
+| `kist_job_last_success_timestamp_seconds{job}` | 上次**完全成功**的 Unix 時間（持久化在 `cache_dir/jobstate-<repo hash>-<job>.json`，重啟後種回；incomplete 不算成功） |
+| `kist_job_last_duration_seconds{job}` | 上次執行時長 |
+| `kist_backup_files` / `kist_backup_bytes_total` | 最後一次 snapshot 的檔案數 / 總 bytes |
+| `kist_backup_bytes_new` / `kist_backup_chunks_new` | 最後一次 backup 上傳的量 |
+| `kist_backup_skipped_items` | 最後一次 backup 略過的項目數 |
+| `kist_prune_deleted_bytes_total` | prune 自 daemon 啟動以來刪掉的 bytes |
+| `kist_prune_marked_objects` / `kist_prune_live_packs` | 最後一次 prune 的標記數 / 活 pack 數 |
+
+告警請用「多久沒看到成功」（例如 `time() - kist_job_last_success_timestamp_seconds{job="backup"} > 90000`），
+不要用「有沒有成功過」；incomplete（有項目被略過/刪不掉）不算成功，所以要另外對
+`increase(kist_job_runs_total{status="incomplete"}[24h]) > 0` 告警，或用 webhook 即時通知 failure / incomplete。
 
 ### 空間回收（GC）
 

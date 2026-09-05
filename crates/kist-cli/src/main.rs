@@ -17,8 +17,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use kist_backend::Backend;
 use kist_core::{
-    BackupOptions, CheckOptions, ForgetOptions, InitOptions, PruneOptions, PruneReport, Repository,
-    RestoreOptions, RetentionPolicy,
+    BackupOptions, CheckOptions, ForgetOptions, ForgetSummary, InitOptions, PruneOptions,
+    PruneReport, Repository, RestoreOptions, RetentionPolicy,
 };
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
@@ -41,6 +41,11 @@ impl std::error::Error for Incomplete {}
 #[derive(Debug, Parser)]
 #[command(name = "kist", version, about, long_about = None)]
 struct Cli {
+    /// Output results as JSON on stdout. Errors still go to stderr and exit
+    /// codes are unchanged (0 ok, 1 failure, 3 incomplete).
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -200,6 +205,17 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Run the configured jobs on their schedules and serve `/metrics` over HTTP
+    /// (the long-running daemon; the web UI will live here too).
+    Serve {
+        /// Path to the TOML config file (see README).
+        #[arg(long, short = 'c', env = "KIST_CONFIG")]
+        config: PathBuf,
+        /// Address for the HTTP server. Loopback by default: `/metrics` has no
+        /// authentication and reveals the repo location and job schedule.
+        #[arg(long, env = "KIST_HTTP", default_value = "127.0.0.1:9898")]
+        http: std::net::SocketAddr,
+    },
     /// Print version information.
     Version,
 }
@@ -233,7 +249,8 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let Cli { json, command } = cli;
+    match command {
         Command::Version => {
             println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -241,20 +258,18 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Run { config, once } => {
             let cfg = kist_app::Config::load(&config)?;
             let daemon = kist_app::Daemon::new(cfg)?;
-            let print = |o: &kist_app::JobOutcome| {
-                println!(
-                    "{} {} ({:.1}s){}",
-                    o.job.name(),
-                    o.status.name(),
-                    o.duration_secs,
-                    o.error
-                        .as_ref()
-                        .map(|e| format!(": {e}"))
-                        .unwrap_or_default()
-                );
-            };
             if once {
-                let outcomes = daemon.run_once(print).await;
+                // --json：每件工作的結果已經是 JSON，最後印整個陣列
+                let outcomes = daemon
+                    .run_once(|o| {
+                        if !json {
+                            emit_outcome(o);
+                        }
+                    })
+                    .await;
+                if json {
+                    print_json(&outcomes)?;
+                }
                 let failed = outcomes
                     .iter()
                     .filter(|o| o.status == kist_app::JobStatus::Failure)
@@ -271,22 +286,61 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 return Ok(());
             }
-            for (job, next) in daemon.next_runs(time_now()) {
+            print_next_runs(&daemon);
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            spawn_ctrl_c(tx.clone());
+            daemon.run(rx, emit_outcome_wrap(json)).await?;
+            Ok(())
+        }
+        Command::Serve { config, http } => {
+            let cfg = kist_app::Config::load(&config)?;
+            let daemon = kist_app::Daemon::new(cfg)?;
+            print_next_runs(&daemon);
+            let listener = tokio::net::TcpListener::bind(http)
+                .await
+                .with_context(|| format!("cannot bind {http}"))?;
+            let local = listener.local_addr()?;
+            if !local.ip().is_loopback() {
                 eprintln!(
-                    "{}: next run {}",
-                    job.name(),
-                    next.map(|t| t.to_string())
-                        .unwrap_or_else(|| "never".to_owned())
+                    "warning: /metrics has no authentication and reveals the repo location and \
+                     job schedule; do not expose it to untrusted networks"
                 );
             }
+            eprintln!("listening on http://{local} (/metrics, /healthz)");
             let (tx, rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    eprintln!("shutting down after the current job");
-                    let _ = tx.send(true);
-                }
-            });
-            daemon.run(rx, print).await?;
+            spawn_ctrl_c(tx.clone());
+            let metrics = daemon.metrics();
+            let server = tokio::spawn(kist_app::server::serve_http(metrics, listener, rx.clone()));
+            // server 半路掛掉時：記下錯誤、發 shutdown 叫醒 daemon（目前工作會做完），
+            // 結束後把錯誤帶出去。不能等 daemon 自己結束才檢查——那樣 monitoring 只會
+            // 看到 scrape 失敗，backup 卻還在跑。
+            let server_err = std::sync::Arc::new(std::sync::Mutex::new(None::<anyhow::Error>));
+            {
+                let server_err = std::sync::Arc::clone(&server_err);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let err = match server.await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(anyhow::Error::new(e).context("http server failed")),
+                        Err(j) => Some(j.into()),
+                    };
+                    if let Some(err) = err {
+                        if let Ok(mut slot) = server_err.lock() {
+                            *slot = Some(err);
+                        }
+                        let _ = tx.send(true);
+                    }
+                });
+            }
+            let result = daemon.run(rx, emit_outcome_wrap(json)).await;
+            let server_err = match server_err.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => None,
+            };
+            result.map_err(anyhow::Error::from)?;
+            if let Some(e) = server_err {
+                return Err(e);
+            }
             Ok(())
         }
         Command::Init { repo } => {
@@ -322,20 +376,24 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;
-            println!("snapshot {}", short_snapshot_id(&summary.snapshot_key));
-            println!(
-                "  {} files, {} dirs, {} symlinks, {} total",
-                s.files,
-                s.dirs,
-                s.symlinks,
-                human_bytes(s.bytes_total)
-            );
-            println!(
-                "  new: {} in {} chunks, {} packs written",
-                human_bytes(s.bytes_new),
-                s.chunks_new,
-                s.packs_new
-            );
+            if json {
+                print_json(&summary)?;
+            } else {
+                println!("snapshot {}", short_snapshot_id(&summary.snapshot_key));
+                println!(
+                    "  {} files, {} dirs, {} symlinks, {} total",
+                    s.files,
+                    s.dirs,
+                    s.symlinks,
+                    human_bytes(s.bytes_total)
+                );
+                println!(
+                    "  new: {} in {} chunks, {} packs written",
+                    human_bytes(s.bytes_new),
+                    s.chunks_new,
+                    s.packs_new
+                );
+            }
             if s.errors > 0 {
                 // snapshot 已經寫出（不含那些項目）；結束碼 3 讓排程器知道要看警告
                 return Err(Incomplete(format!(
@@ -349,6 +407,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Snapshots { repo } => {
             let r = open_repo(&repo).await?;
             let snaps = r.list_snapshots().await?;
+            if json {
+                let items: Vec<SnapshotJson> = snaps.iter().map(SnapshotJson::new).collect();
+                print_json(&items)?;
+                return Ok(());
+            }
             if snaps.is_empty() {
                 println!("no snapshots");
                 return Ok(());
@@ -385,14 +448,18 @@ async fn run(cli: Cli) -> Result<()> {
             let r = open_repo(&repo).await?;
             let key = r.resolve_snapshot(&snapshot).await?;
             let summary = r.restore(&key, &target, RestoreOptions::default()).await?;
-            println!(
-                "restored {} to {}: {} files, {} dirs, {} symlinks",
-                short_snapshot_id(&key),
-                target.display(),
-                summary.files,
-                summary.dirs,
-                summary.symlinks
-            );
+            if json {
+                print_json(&summary)?;
+            } else {
+                println!(
+                    "restored {} to {}: {} files, {} dirs, {} symlinks",
+                    short_snapshot_id(&key),
+                    target.display(),
+                    summary.files,
+                    summary.dirs,
+                    summary.symlinks
+                );
+            }
             if !summary.errors.is_empty() {
                 for e in &summary.errors {
                     eprintln!("error: {e}");
@@ -440,29 +507,47 @@ async fn run(cli: Cli) -> Result<()> {
                     dry_run,
                 })
                 .await?;
-            let verb = if dry_run { "would remove" } else { "removed" };
-            for key in &summary.removed {
-                println!("{verb} {}", short_snapshot_id(key));
-            }
-            for (key, reasons) in &summary.kept {
+            if json {
+                // --prune 時 forget 的結果併進下面的合併 JSON，這裡不先印
+                if !prune {
+                    print_json(&ForgetJson::new(dry_run, &summary))?;
+                }
+            } else {
+                let verb = if dry_run { "would remove" } else { "removed" };
+                for key in &summary.removed {
+                    println!("{verb} {}", short_snapshot_id(key));
+                }
+                for (key, reasons) in &summary.kept {
+                    println!(
+                        "keep    {} ({})",
+                        short_snapshot_id(key),
+                        reasons.join(", ")
+                    );
+                }
                 println!(
-                    "keep    {} ({})",
-                    short_snapshot_id(key),
-                    reasons.join(", ")
+                    "{verb} {} snapshot(s), kept {}",
+                    summary.removed.len(),
+                    summary.kept.len()
                 );
             }
-            println!(
-                "{verb} {} snapshot(s), kept {}",
-                summary.removed.len(),
-                summary.kept.len()
-            );
             if prune {
                 let report = r.prune(prune_args.options(dry_run)).await?;
-                print_prune_report(&report, dry_run)?;
-            } else if !dry_run && !summary.removed.is_empty() {
-                println!("run `kist prune` to reclaim the space");
+                if json {
+                    // stdout 只能有一個 JSON 值：forget 與 prune 包在一起
+                    print_json(&serde_json::json!({
+                        "forget": ForgetJson::new(dry_run, &summary),
+                        "prune": PruneJson { dry_run, report: &report },
+                    }))?;
+                } else {
+                    output_prune(&report, dry_run)?;
+                }
+                prune_warnings_and_exit(&report)
+            } else {
+                if !json && !dry_run && !summary.removed.is_empty() {
+                    println!("run `kist prune` to reclaim the space");
+                }
+                Ok(())
             }
-            Ok(())
         }
         Command::Prune {
             repo,
@@ -471,33 +556,51 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let r = open_repo(&repo).await?;
             let report = r.prune(prune.options(dry_run)).await?;
-            print_prune_report(&report, dry_run)
+            if json {
+                print_json(&PruneJson {
+                    dry_run,
+                    report: &report,
+                })?;
+            } else {
+                output_prune(&report, dry_run)?;
+            }
+            prune_warnings_and_exit(&report)
         }
         Command::RebuildIndex { repo } => {
             let r = open_repo(&repo).await?;
             let s = r.rebuild_index().await?;
-            println!(
-                "rebuilt index from {} packs ({} chunks); {} old index object(s) superseded",
-                s.packs, s.chunks, s.superseded
-            );
+            if json {
+                print_json(&s)?;
+            } else {
+                println!(
+                    "rebuilt index from {} packs ({} chunks); {} old index object(s) superseded",
+                    s.packs, s.chunks, s.superseded
+                );
+            }
             Ok(())
         }
         Command::Check { repo, read_data } => {
             let r = open_repo(&repo).await?;
             let report = r.check(CheckOptions { read_data }).await?;
-            println!(
-                "checked {} snapshots, {} trees, {} packs, {} chunks{}",
-                report.snapshots,
-                report.trees,
-                report.packs,
-                report.chunks,
-                if read_data { " (data read)" } else { "" }
-            );
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "checked {} snapshots, {} trees, {} packs, {} chunks{}",
+                    report.snapshots,
+                    report.trees,
+                    report.packs,
+                    report.chunks,
+                    if read_data { " (data read)" } else { "" }
+                );
+            }
             for w in &report.warnings {
                 eprintln!("warning: {w}");
             }
             if report.errors.is_empty() {
-                println!("no errors found");
+                if !json {
+                    println!("no errors found");
+                }
                 Ok(())
             } else {
                 for e in &report.errors {
@@ -509,7 +612,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn print_prune_report(p: &PruneReport, dry_run: bool) -> Result<()> {
+fn output_prune(p: &PruneReport, dry_run: bool) -> Result<()> {
     let would = if dry_run { "would " } else { "" };
     println!(
         "{} snapshots, {} live trees, {} live packs",
@@ -535,10 +638,15 @@ fn print_prune_report(p: &PruneReport, dry_run: bool) -> Result<()> {
         human_bytes(p.repacked_bytes),
         p.new_packs
     );
+    prune_warnings_and_exit(p)
+}
+
+/// 刪不掉的物件走 stderr + 結束碼 3，兩種輸出模式都一樣。
+fn prune_warnings_and_exit(p: &PruneReport) -> Result<()> {
+    for s in &p.skipped {
+        eprintln!("warning: {s}");
+    }
     if !p.skipped.is_empty() {
-        for s in &p.skipped {
-            eprintln!("warning: {s}");
-        }
         return Err(Incomplete(format!(
             "{} object(s) could not be deleted (object lock or permissions); their markers were kept",
             p.skipped.len()
@@ -546,6 +654,137 @@ fn print_prune_report(p: &PruneReport, dry_run: bool) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+/// 結果序列化成 pretty JSON（`--json`）。錯誤照舊走 stderr。
+fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
+    let text = serde_json::to_string_pretty(v).context("cannot encode result as JSON")?;
+    println!("{text}");
+    Ok(())
+}
+
+/// daemon（`run` / `serve`）每件工作結束的輸出：人類可讀一行，或 NDJSON 一行。
+fn emit_outcome_wrap(json: bool) -> impl FnMut(&kist_app::JobOutcome) {
+    move |o: &kist_app::JobOutcome| {
+        if json {
+            match serde_json::to_string(o) {
+                Ok(line) => println!("{line}"),
+                Err(e) => eprintln!("error: cannot encode outcome as JSON: {e}"),
+            }
+        } else {
+            emit_outcome(o);
+        }
+    }
+}
+
+fn emit_outcome(o: &kist_app::JobOutcome) {
+    println!(
+        "{} {} ({:.1}s){}",
+        o.job.name(),
+        o.status.name(),
+        o.duration_secs,
+        o.error
+            .as_ref()
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default()
+    );
+}
+
+fn spawn_ctrl_c(tx: tokio::sync::watch::Sender<bool>) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("shutting down after the current job");
+            let _ = tx.send(true);
+        }
+    });
+}
+
+fn print_next_runs(daemon: &kist_app::Daemon) {
+    for (job, next) in daemon.next_runs(time_now()) {
+        eprintln!(
+            "{}: next run {}",
+            job.name(),
+            next.map(|t| t.to_string())
+                .unwrap_or_else(|| "never".to_owned())
+        );
+    }
+}
+
+/// `snapshots --json` 的輸出形狀：key 拆出 client 與 timestamp，路徑從 OS bytes
+/// 轉成 UTF-8（非法位元組以 U+FFFD 取代）；root 等 id 在 JSON 是 hex 字串。
+#[derive(serde::Serialize)]
+struct SnapshotJson {
+    key: String,
+    client: String,
+    timestamp: String,
+    /// RFC 3339（backup 開始時間）。
+    time: String,
+    hostname: String,
+    username: String,
+    paths: Vec<String>,
+    root: kist_format::ObjectId,
+    stats: kist_format::snapshot::SnapshotStats,
+}
+
+impl SnapshotJson {
+    fn new(s: &kist_core::SnapshotInfo) -> Self {
+        Self {
+            key: s.key.clone(),
+            client: s.client_hex().to_owned(),
+            timestamp: s.timestamp().to_owned(),
+            time: s.snapshot.time.clone(),
+            hostname: s.snapshot.hostname.clone(),
+            username: s.snapshot.username.clone(),
+            paths: s
+                .snapshot
+                .paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect(),
+            root: s.snapshot.root,
+            stats: s.snapshot.stats,
+        }
+    }
+}
+
+/// `forget --json`：dry_run 標示 removed 是「會刪」還是「已刪」；內部的
+/// (key, reasons) tuple 包成有名字的欄位，位置語意太脆弱。
+#[derive(serde::Serialize)]
+struct ForgetJson {
+    dry_run: bool,
+    removed: Vec<String>,
+    kept: Vec<ForgetKept>,
+}
+
+#[derive(serde::Serialize)]
+struct ForgetKept {
+    snapshot: String,
+    reasons: Vec<String>,
+}
+
+impl ForgetJson {
+    fn new(dry_run: bool, s: &ForgetSummary) -> Self {
+        Self {
+            dry_run,
+            removed: s.removed.clone(),
+            kept: s
+                .kept
+                .iter()
+                .map(|(key, reasons)| ForgetKept {
+                    snapshot: key.clone(),
+                    reasons: reasons.iter().map(|r| (*r).to_owned()).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `prune --json`：加上 dry_run（report 本身不帶，但消費者需要知道刪了沒）。
+#[derive(serde::Serialize)]
+struct PruneJson<'a> {
+    dry_run: bool,
+    #[serde(flatten)]
+    report: &'a PruneReport,
 }
 
 fn repo_url(args: &RepoArgs) -> Result<&str> {

@@ -7,7 +7,9 @@ use time::OffsetDateTime;
 use tokio::sync::watch;
 
 use crate::config::Config;
-use crate::jobs::{run_job, JobKind, JobOutcome};
+use crate::jobs::{run_job, JobKind, JobOutcome, JobStatus};
+use crate::jobstate;
+use crate::metrics::unix_now;
 use crate::notify::Notifier;
 use crate::schedule::Schedule;
 use crate::Result;
@@ -16,6 +18,7 @@ pub struct Daemon {
     cfg: Config,
     schedules: HashMap<JobKind, Schedule>,
     notifier: Option<Notifier>,
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
 }
 
 impl Daemon {
@@ -38,15 +41,29 @@ impl Daemon {
             }
         }
         let notifier = cfg.notify.as_ref().map(Notifier::new);
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::new());
+        if let Some(dir) = &cfg.cache_dir {
+            for kind in [JobKind::Backup, JobKind::Forget, JobKind::Prune] {
+                if let Some(at) = jobstate::read(dir, &cfg.repo, kind) {
+                    metrics.seed_last_success(kind, at);
+                }
+            }
+        }
         Ok(Self {
             cfg,
             schedules,
             notifier,
+            metrics,
         })
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// `/metrics` 用。
+    pub fn metrics(&self) -> std::sync::Arc<crate::metrics::Metrics> {
+        std::sync::Arc::clone(&self.metrics)
     }
 
     /// 有排程的工作與各自的下一次時間。
@@ -139,6 +156,14 @@ impl Daemon {
     async fn execute(&self, kind: JobKind) -> JobOutcome {
         tracing::info!("{}: starting", kind.name());
         let o = run_job(&self.cfg, kind).await;
+        self.metrics.record(&o);
+        // 只有 Success 算「成功」：incomplete（有略過/刪不掉）不更新 last_success，
+        // 否則「永遠 incomplete」的 backup 不會觸發「多久沒成功」的告警。
+        if o.status == JobStatus::Success {
+            if let Some(dir) = &self.cfg.cache_dir {
+                jobstate::write_last_success(dir, &self.cfg.repo, o.job, unix_now());
+            }
+        }
         match &o.error {
             Some(e) => tracing::error!("{}: {}: {e}", kind.name(), o.status.name()),
             None => tracing::info!(

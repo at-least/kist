@@ -151,3 +151,18 @@ proptest! {
         prop_assert_eq!(Envelope::parse(&env.encode()).unwrap(), env);
     }
 }
+
+/// `--json` 用：人類可讀的序列化是 hex 字串；CBOR 仍是 bytes（golden 測試另外守）。
+#[test]
+fn ids_serialize_as_hex_in_json_and_bytes_in_cbor() {
+    let id = kist_format::ObjectId::from_bytes([0xab; 32]);
+    let json = serde_json::to_string(&id).unwrap();
+    assert_eq!(json, format!("\"{}\"", "ab".repeat(32)));
+    let back: kist_format::ObjectId = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, id);
+    let cbor = kist_format::cbor::encode(&id).unwrap();
+    assert_eq!(cbor[0], 0x58, "CBOR 應該是 bytes(32)，不是字串"); // 0x58 = bytes, 1-byte length
+    assert_eq!(cbor[1], 32);
+    let back: kist_format::ObjectId = kist_format::cbor::decode(&cbor).unwrap();
+    assert_eq!(back, id);
+}
