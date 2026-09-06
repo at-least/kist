@@ -52,7 +52,14 @@ impl CheckReport {
 impl Repository {
     pub async fn check(&self, opts: CheckOptions) -> Result<CheckReport> {
         let mut report = CheckReport::default();
-        let opts = if opts.repair { CheckOptions { read_data: true, repair: true } } else { opts };
+        let opts = if opts.repair {
+            CheckOptions {
+                read_data: true,
+                repair: true,
+            }
+        } else {
+            opts
+        };
 
         // 1. index
         let mut index_errors = Vec::new();
@@ -288,7 +295,9 @@ impl Repository {
                 Ok(()) => true,
                 // 修好了但存不回去（例如 S3 Object Lock）：不假裝成功。
                 Err(e) => {
-                    report.errors.push(format!("{pack_key}: repaired but cannot store it: {e}"));
+                    report
+                        .errors
+                        .push(format!("{pack_key}: repaired but cannot store it: {e}"));
                     report.unrepairable.push(pack_key);
                     false
                 }

@@ -202,7 +202,8 @@ impl KeyBinding {
 /// 用密碼解開 key slot 裡的 master key。
 pub fn unlock_key_slot(password: &[u8], slot: &KeySlot, binding: &KeyBinding) -> Result<MasterKey> {
     let kek = kdf(password, &slot.kdf)?;
-    let plain = open_meta(&kek, &binding.aad(), &slot.wrapped).map_err(|_| CryptoError::WrongPassword)?;
+    let plain =
+        open_meta(&kek, &binding.aad(), &slot.wrapped).map_err(|_| CryptoError::WrongPassword)?;
     let key: [u8; 32] = plain
         .as_slice()
         .try_into()

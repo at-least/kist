@@ -164,9 +164,7 @@ impl Config {
             }
             self.schedule_of(b.schedule.as_deref(), "[backup]")?;
             if b.parity > 8 {
-                return Err(AppError::Config(
-                    "[backup] parity must be 0..=8".to_owned(),
-                ));
+                return Err(AppError::Config("[backup] parity must be 0..=8".to_owned()));
             }
         }
         if let Some(f) = &self.forget {

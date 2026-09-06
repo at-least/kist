@@ -61,7 +61,8 @@ fn interop_tree_canonical_cbor() {
                 inode: 999,
                 nlink: 3,
                 xattrs: Some(xattrs),
-            },            Entry {
+            },
+            Entry {
                 name: b"dir".to_vec(),
                 kind: node_type::DIR,
                 mode: 0o040755,
@@ -97,7 +98,6 @@ fn interop_tree_canonical_cbor() {
                 nlink: 0,
                 xattrs: None,
             },
-
         ],
         None,
     );

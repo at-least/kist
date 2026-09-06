@@ -201,13 +201,12 @@ impl Repository {
                 if removed.contains(&s.key) {
                     continue;
                 }
-                let time = OffsetDateTime::from_unix_timestamp_nanos(
-                    i128::from(s.snapshot.time_ns),
-                )
-                .map_err(|e| CoreError::Corrupt {
-                    key: s.key.clone(),
-                    reason: format!("bad time {}: {e}", s.snapshot.time_ns),
-                })?;
+                let time =
+                    OffsetDateTime::from_unix_timestamp_nanos(i128::from(s.snapshot.time_ns))
+                        .map_err(|e| CoreError::Corrupt {
+                            key: s.key.clone(),
+                            reason: format!("bad time {}: {e}", s.snapshot.time_ns),
+                        })?;
                 let paths = s.snapshot.paths.iter().map(|p| p.to_vec()).collect();
                 groups
                     .entry((s.snapshot.client_id.clone(), paths))

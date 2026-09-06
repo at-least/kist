@@ -250,8 +250,7 @@ fn tree_without_ctime_fields_still_decodes() {
     use ciborium::value::Value;
 
     let bytes = cbor::encode(&sample_tree()).unwrap();
-    let mut value: Value =
-        ciborium::from_reader(std::io::Cursor::new(&bytes)).unwrap();
+    let mut value: Value = ciborium::from_reader(std::io::Cursor::new(&bytes)).unwrap();
     // 從每個 entry 的 map 裡移除 "ctime"（與其他可選欄位），模擬沒寫它的實作
     let Value::Map(fields) = &mut value else {
         panic!("tree must encode as a map");
@@ -259,23 +258,19 @@ fn tree_without_ctime_fields_still_decodes() {
     let mut stripped: Vec<(Value, Value)> = Vec::new();
     for (k, v) in std::mem::take(fields) {
         let v = match (&k, v) {
-            (Value::Text(key), Value::Array(entries)) if key == "entries" => {
-                Value::Array(
-                    entries
-                        .into_iter()
-                        .map(|e| match e {
-                            Value::Map(map) => Value::Map(
-                                map.into_iter()
-                                    .filter(|(fk, _)| {
-                                        !matches!(fk, Value::Text(f) if f == "ctime")
-                                    })
-                                    .collect(),
-                            ),
-                            other => other,
-                        })
-                        .collect(),
-                )
-            }
+            (Value::Text(key), Value::Array(entries)) if key == "entries" => Value::Array(
+                entries
+                    .into_iter()
+                    .map(|e| match e {
+                        Value::Map(map) => Value::Map(
+                            map.into_iter()
+                                .filter(|(fk, _)| !matches!(fk, Value::Text(f) if f == "ctime"))
+                                .collect(),
+                        ),
+                        other => other,
+                    })
+                    .collect(),
+            ),
             (_, v) => v,
         };
         stripped.push((k, v));

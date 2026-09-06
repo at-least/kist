@@ -47,7 +47,13 @@ async fn unreadable_file_is_skipped_and_counted() {
     assert!(restored.join("small.txt").is_file());
     assert!(!restored.join("secret.txt").exists());
     assert!(restored.join("locked").is_dir(), "讀不到的目錄以空目錄記錄");
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 
@@ -80,7 +86,13 @@ async fn file_whose_size_changes_while_reading_restores_correctly() {
         .unwrap();
     let restored = std::fs::read(target.join("proc/version")).unwrap();
     assert_eq!(restored.len() as u64, s.stats.bytes);
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 
@@ -150,7 +162,8 @@ async fn indirect_fast_path_counts_data_chunks() {
     assert!(
         s2.stats.chunks_read > 256,
         "{:?} vs {:?}",
-        s1.stats, s2.stats
+        s1.stats,
+        s2.stats
     );
     assert_eq!(s2.stats.chunks_new, 0, "{:?}", s2.stats);
 }
@@ -181,7 +194,10 @@ fn fast_path_rejects_files_changed_at_or_after_parent_start() {
         !unchanged(&meta, &meta, 500_000_000_000),
         "晚於 parent 開始：不可沿用"
     );
-    let no_ctime = FsMeta { ctime_ns: 0, ..meta };
+    let no_ctime = FsMeta {
+        ctime_ns: 0,
+        ..meta
+    };
     assert!(
         !unchanged(&no_ctime, &no_ctime, 500_000_000_000),
         "沒有 ctime 就看 mtime，同樣不可沿用"

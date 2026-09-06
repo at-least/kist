@@ -52,14 +52,18 @@ fn pack_rejects_bad_magic_and_unsupported_version() {
     bad_prefix[0] = b'X';
     assert!(matches!(
         pack::trailer_bytes(&bad_prefix),
-        Err(FormatError::BadMagic { what: "pack header" })
+        Err(FormatError::BadMagic {
+            what: "pack header"
+        })
     ));
     // 檔頭版號不支援（v3）：magic 含版號，整段不符就是 BadMagic
     let mut bad_version = good.clone();
     bad_version[6..8].copy_from_slice(&3u16.to_be_bytes());
     assert!(matches!(
         pack::trailer_bytes(&bad_version),
-        Err(FormatError::BadMagic { what: "pack header" })
+        Err(FormatError::BadMagic {
+            what: "pack header"
+        })
     ));
     // 檔尾 magic 被改（前綴與版號各試一次）
     let mut bad_footer = good.clone();
@@ -67,14 +71,18 @@ fn pack_rejects_bad_magic_and_unsupported_version() {
     bad_footer[n - 1] = b'X';
     assert!(matches!(
         pack::trailer_bytes(&bad_footer),
-        Err(FormatError::BadMagic { what: "pack footer" })
+        Err(FormatError::BadMagic {
+            what: "pack footer"
+        })
     ));
     let mut bad_footer_version = good;
     let n = bad_footer_version.len();
     bad_footer_version[n - 2..].copy_from_slice(&1u16.to_be_bytes());
     assert!(matches!(
         pack::trailer_bytes(&bad_footer_version),
-        Err(FormatError::BadMagic { what: "pack footer" })
+        Err(FormatError::BadMagic {
+            what: "pack footer"
+        })
     ));
     // 檔頭檔尾版號不一致：只有一邊對 → 另一邊擋下
     let mut mismatch = pack::begin();

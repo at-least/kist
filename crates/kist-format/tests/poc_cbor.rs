@@ -35,14 +35,21 @@ fn encode_emits_declaration_order_without_sorting() {
     let s = Sample {
         n: "a.txt".to_owned(),
         v: 2,
-        m: Meta { mode: 0o100644, mtime: 1788605504101452995 },
+        m: Meta {
+            mode: 0o100644,
+            mtime: 1788605504101452995,
+        },
         ids: None,
         x: None,
     };
     let enc = kist_format::cbor::encode(&s).unwrap();
     let hex: String = enc.iter().map(|b| format!("{b:02x}")).collect();
     // n, v, m —— 宣告順序，不是排序序（m < n < v）。
-    assert_eq!(hex, "a3616e65612e74787461760261 6da2646d6f64651981a4656d74696d651b18d2673ac3468cc3".replace(' ', ""));
+    assert_eq!(
+        hex,
+        "a3616e65612e74787461760261 6da2646d6f64651981a4656d74696d651b18d2673ac3468cc3"
+            .replace(' ', "")
+    );
 }
 
 #[test]
@@ -74,7 +81,10 @@ fn decode_ignores_unknown_fields() {
         #[serde(rename = "known")]
         known: u64,
     }
-    let bytes = [0xa2u8, 0x45, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x01, 0x4c, 0x66, 0x75, 0x74, 0x75, 0x72, 0x65, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x41, 0x78];
+    let bytes = [
+        0xa2u8, 0x45, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x01, 0x4c, 0x66, 0x75, 0x74, 0x75, 0x72, 0x65,
+        0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x41, 0x78,
+    ];
     let v: Known = kist_format::cbor::decode(&bytes).unwrap();
     assert_eq!(v.known, 1);
 }

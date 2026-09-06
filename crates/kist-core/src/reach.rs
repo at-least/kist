@@ -112,10 +112,7 @@ impl Repository {
                                 ));
                                 continue;
                             }
-                            match self
-                                .resolve_chunks(&node.chunks, node.content, index)
-                                .await
-                            {
+                            match self.resolve_chunks(&node.chunks, node.content, index).await {
                                 Ok(ids) => ids,
                                 Err(e) => {
                                     reach.errors.push(format!("{key}: chunk list: {e}"));

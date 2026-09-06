@@ -193,7 +193,13 @@ async fn forget_applies_policy_per_client_and_path_group() {
     assert!(remaining.contains(&keys_b[1]));
     assert!(remaining.contains(&other_paths));
     // 資料還在，repo 一致
-    let report = repo.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 

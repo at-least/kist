@@ -98,7 +98,10 @@ pub fn encode(pack_id: &ObjectId, pack: &[u8], m: usize) -> Result<Vec<u8>> {
         pack_size: pack.len() as u64,
         shard_len: shard_len as u32,
         hashes: shards.iter().map(|s| ObjectId::of(s)).collect(),
-        parity: shards[DATA_SHARDS..].iter().map(|s| serde_bytes::ByteBuf::from(s.clone())).collect(),
+        parity: shards[DATA_SHARDS..]
+            .iter()
+            .map(|s| serde_bytes::ByteBuf::from(s.clone()))
+            .collect(),
     };
     cbor::encode(&obj)
 }
@@ -218,8 +221,10 @@ impl Object {
             )));
         }
 
-        let mut options: Vec<Option<Vec<u8>>> =
-            shards.into_iter().map(|s| if s.is_empty() { None } else { Some(s) }).collect();
+        let mut options: Vec<Option<Vec<u8>>> = shards
+            .into_iter()
+            .map(|s| if s.is_empty() { None } else { Some(s) })
+            .collect();
         // 空的 shard 也可能是「合法但全 0」嗎？可能——但全 0 shard 的 hash 幾乎
         // 不可能等於 hashes[i]（那些 hash 是密文的 hash），所以全 0 只會出現在
         // 我們標記為 erasure 的位置。保守起見仍以 hash 判定，不用長度。

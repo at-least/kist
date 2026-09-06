@@ -60,7 +60,13 @@ async fn concurrent_scenario(backend: Backend, work: &Path) {
     let fresh = Repository::open(backend.clone(), PASSWORD.as_bytes())
         .await
         .unwrap();
-    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
+    let report = fresh
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.snapshots, 2);
 

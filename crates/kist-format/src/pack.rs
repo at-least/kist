@@ -101,7 +101,9 @@ pub fn parse_footer(footer: &[u8]) -> Result<u64> {
     let footer = &footer[footer.len() - FOOTER_LEN..];
     let m = magic();
     if footer[8..] != m {
-        return Err(FormatError::BadMagic { what: "pack footer" });
+        return Err(FormatError::BadMagic {
+            what: "pack footer",
+        });
     }
     let mut len = [0u8; 8];
     len.copy_from_slice(&footer[..8]);
@@ -119,7 +121,9 @@ pub fn trailer_bytes(pack: &[u8]) -> Result<&[u8]> {
     }
     let m = magic();
     if pack[..HEADER_LEN] != m {
-        return Err(FormatError::BadMagic { what: "pack header" });
+        return Err(FormatError::BadMagic {
+            what: "pack header",
+        });
     }
     let trailer_len = usize::try_from(parse_footer(pack)?).unwrap_or(usize::MAX);
     let end = pack.len() - FOOTER_LEN;

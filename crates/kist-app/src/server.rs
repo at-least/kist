@@ -488,7 +488,10 @@ async fn list_snapshots(state: &ServeState) -> std::result::Result<Vec<SnapshotR
 /// snapshot 的 i64 奈秒 → 人類可讀的 UTC 時間。
 fn format_ns_time(ns: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns))
-        .map(|t| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default())
+        .map(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        })
         .unwrap_or_default()
 }
 

@@ -76,7 +76,9 @@ fn encode_is_deterministic_and_validates_inputs() {
 /// shard_len*15 而不是 ceil(size/16)）。
 #[test]
 fn roundtrip_at_awkward_sizes() {
-    for n in [1, 15, 16, 17, 178, 179, 180, 191, 192, 193, 255, 256, 4095, 4097] {
+    for n in [
+        1, 15, 16, 17, 178, 179, 180, 191, 192, 193, 255, 256, 4095, 4097,
+    ] {
         let pack = fake_pack(&format!("size{n}"), n);
         let (id, raw) = encode(&pack, 2);
         let obj = parity::parse(&raw).unwrap();
@@ -102,7 +104,10 @@ fn repairs_up_to_m_shards() {
     };
     let cases: Vec<(&str, Vec<usize>)> = vec![
         ("one byte in the body", vec![shard_len * 3]),
-        ("two flips in one shard", vec![shard_len * 5 + 1, shard_len * 5 + 40]),
+        (
+            "two flips in one shard",
+            vec![shard_len * 5 + 1, shard_len * 5 + 40],
+        ),
         (
             "two shards, one in the last (trailer)",
             vec![shard_len * 2, pack.len() - 3],
@@ -113,7 +118,11 @@ fn repairs_up_to_m_shards() {
         assert_eq!(obj.repair(&id, &damage(&offsets)).unwrap(), pack, "{name}");
     }
     // 過短/過長的 pack：差異視同損壞 shard。
-    assert_eq!(obj.repair(&id, &pack[..pack.len() - shard_len / 2]).unwrap(), pack);
+    assert_eq!(
+        obj.repair(&id, &pack[..pack.len() - shard_len / 2])
+            .unwrap(),
+        pack
+    );
     let mut overlong = pack.clone();
     overlong.extend_from_slice(&[1, 2, 3]);
     assert_eq!(obj.repair(&id, &overlong).unwrap(), pack);
@@ -192,7 +201,9 @@ fn parse_rejects_inconsistent_headers() {
             m: 1,
             pack_size: pack.len() as u64,
             shard_len,
-            hashes: (0..DATA_SHARDS + 1).map(|i| ObjectId::of(&pack[i % pack.len()..])).collect(),
+            hashes: (0..DATA_SHARDS + 1)
+                .map(|i| ObjectId::of(&pack[i % pack.len()..]))
+                .collect(),
             parity: vec![serde_bytes::ByteBuf::from(vec![0u8; shard_len as usize])],
         };
         f(&mut w);

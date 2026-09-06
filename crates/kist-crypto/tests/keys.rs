@@ -201,7 +201,9 @@ fn sealed_roles_are_bound_by_aad() {
     ));
 
     // snapshot 的 AAD 是完整 key 路徑：路徑不對就開不了
-    let snap = keys.seal_snapshot("snapshots/ab/20260904T000000000000000Z", b"snap").unwrap();
+    let snap = keys
+        .seal_snapshot("snapshots/ab/20260904T000000000000000Z", b"snap")
+        .unwrap();
     assert_eq!(
         keys.open_snapshot("snapshots/ab/20260904T000000000000000Z", &snap)
             .unwrap(),

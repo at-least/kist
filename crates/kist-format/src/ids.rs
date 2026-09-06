@@ -91,8 +91,14 @@ macro_rules! id_type {
 }
 
 id_type!(ChunkId, "chunk 的身分：keyed BLAKE3(hash key, 明文)。");
-id_type!(TreeId, "tree 的名稱：keyed BLAKE3(hash key, tree 明文 CBOR)。");
-id_type!(ObjectId, "pack / index blob 的名稱：BLAKE3(密文 bytes)，無 key。");
+id_type!(
+    TreeId,
+    "tree 的名稱：keyed BLAKE3(hash key, tree 明文 CBOR)。"
+);
+id_type!(
+    ObjectId,
+    "pack / index blob 的名稱：BLAKE3(密文 bytes)，無 key。"
+);
 
 impl ObjectId {
     /// pack / index 的名稱：對「要寫進 repo 的完整 bytes」做一般 BLAKE3。

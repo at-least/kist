@@ -443,7 +443,6 @@ impl Repository {
         Ok(())
     }
 
-
     /// 除了 snapshot 以外全部寫完。
     pub async fn backup_prepare(
         &self,
@@ -497,7 +496,10 @@ impl Repository {
             Some((_, snap)) => match ParentStream::open(self, &snap.root).await {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::warn!("cannot read parent tree {}: {e}; re-reading everything", snap.root);
+                    tracing::warn!(
+                        "cannot read parent tree {}: {e}; re-reading everything",
+                        snap.root
+                    );
                     None
                 }
             },
@@ -723,9 +725,8 @@ impl Backup {
             entry.kind = node_type::DIR;
             entry.subtree = subtree;
         } else if ft.is_file() {
-            let Some((size, chunks, content)) = self
-                .process_file(path, &fs, meta.len(), parent)
-                .await?
+            let Some((size, chunks, content)) =
+                self.process_file(path, &fs, meta.len(), parent).await?
             else {
                 return Ok(None); // 讀不到，已記錄
             };
@@ -760,7 +761,9 @@ impl Backup {
                 Some(id) => match ParentStream::open(&self.repo, &id).await {
                     Ok(s) => Some(s),
                     Err(e) => {
-                        tracing::warn!("cannot read parent tree {id}: {e}; re-reading this directory");
+                        tracing::warn!(
+                            "cannot read parent tree {id}: {e}; re-reading this directory"
+                        );
                         None
                     }
                 },
@@ -883,7 +886,8 @@ impl Backup {
         }
         // 硬連結：同一個 (dev, inode) 在這次 backup 已經讀過 → 直接沿用 chunk 清單。
         if fs.nlink > 1 {
-            if let Some((size, chunks, content)) = self.hardlinks.get(&(fs.dev, fs.inode)).cloned() {
+            if let Some((size, chunks, content)) = self.hardlinks.get(&(fs.dev, fs.inode)).cloned()
+            {
                 return Ok(Some((size, chunks, content)));
             }
         }
@@ -956,7 +960,11 @@ impl Backup {
             if !pentry.chunks.iter().all(|id| index.contains(id)) {
                 return Ok(None);
             }
-            match self.repo.resolve_chunks(&pentry.chunks, content, index).await {
+            match self
+                .repo
+                .resolve_chunks(&pentry.chunks, content, index)
+                .await
+            {
                 Ok(ids) => ids,
                 Err(e) => {
                     tracing::warn!("cannot read previous chunk list: {e}; re-reading file");
@@ -1031,8 +1039,8 @@ impl Backup {
 
             // 錯誤一律帶著 state 出來：chunker 的 2×max 緩衝是整個 backup
             // 共用的，不能在錯誤路徑上把它連同 state 一起丟掉。
-            let (packer, index, state_back, finished, done, read_error, hard_error) = blocking(
-                move || {
+            let (packer, index, state_back, finished, done, read_error, hard_error) =
+                blocking(move || {
                     let mut finished = None;
                     let mut done = false;
                     let mut read_error = None;
@@ -1096,9 +1104,8 @@ impl Backup {
                         }
                     }
                     Ok((packer, index, state, finished, done, read_error, hard_error))
-                },
-            )
-            .await?;
+                })
+                .await?;
             self.packer = Some(packer);
             self.index = Some(index);
             state = state_back;

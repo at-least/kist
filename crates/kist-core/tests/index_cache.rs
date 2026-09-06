@@ -154,7 +154,13 @@ async fn check_never_uses_the_cache() {
             std::fs::write(&blob, bytes).unwrap();
         }
     }
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains("index")),
         "{:?}",

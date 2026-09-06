@@ -22,7 +22,10 @@ async fn rebuild_after_all_index_blobs_are_lost() {
         }
     }
     assert!(!repo
-        .check(CheckOptions { read_data: false, repair: false })
+        .check(CheckOptions {
+            read_data: false,
+            repair: false
+        })
         .await
         .unwrap()
         .errors
@@ -48,7 +51,13 @@ async fn rebuild_after_all_index_blobs_are_lost() {
     for (id, loc) in before.chunks() {
         assert_eq!(after.get(&id), Some(loc), "chunk {id}");
     }
-    let report = repo.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let target = t.dir.path().join("out");
     repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
@@ -83,7 +92,13 @@ async fn rebuild_with_existing_blobs_supersedes_them() {
     let after = repo.load_index().await.unwrap();
     assert_eq!(after.len(), before.len());
     assert_eq!(after.pack_count(), before.pack_count());
-    let report = repo.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert!(
         report.warnings.is_empty(),

@@ -137,7 +137,8 @@ fn decode_index_blob(payload: &[u8]) -> Result<IndexBlob> {
 impl Repository {
     /// 建立新 repo：產生 master key、用密碼包起來、寫 `config`。已存在則拒絕。
     pub async fn init(backend: Backend, password: &[u8], opts: InitOptions) -> Result<Self> {
-        let created_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        let created_ns = time::OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
             .try_into()
             .map_err(|_| CoreError::InvalidConfig("clock out of range".to_owned()))?;
         let repo_id = kist_crypto::random_bytes::<16>()?.to_vec();
@@ -148,7 +149,9 @@ impl Repository {
         let password = Zeroizing::new(password.to_vec());
         let cost = opts.kdf_cost;
         let (slot, master) = blocking(move || {
-            Ok(create_key_slot(&password, "default", created_ns, cost, &binding)?)
+            Ok(create_key_slot(
+                &password, "default", created_ns, cost, &binding,
+            )?)
         })
         .await?;
         let mut config = RepoConfig::new(repo_id, created_ns, slot);
@@ -243,10 +246,12 @@ impl Repository {
                     reason: format!("content hash {actual} does not match its name"),
                 });
             }
-            let payload = keys.open_index_blob(&bytes).map_err(|e| CoreError::Corrupt {
-                key: key_owned.clone(),
-                reason: e.to_string(),
-            })?;
+            let payload = keys
+                .open_index_blob(&bytes)
+                .map_err(|e| CoreError::Corrupt {
+                    key: key_owned.clone(),
+                    reason: e.to_string(),
+                })?;
             let blob = decode_index_blob(&payload).map_err(|e| CoreError::Corrupt {
                 key: key_owned.clone(),
                 reason: e.to_string(),
@@ -470,7 +475,9 @@ impl Repository {
     pub(crate) async fn read_snapshot(&self, key: &str) -> Result<Snapshot> {
         let bytes = match self.backend.get(key).await {
             Ok(b) => b,
-            Err(BackendError::NotFound(_)) => return Err(CoreError::SnapshotNotFound(key.to_owned())),
+            Err(BackendError::NotFound(_)) => {
+                return Err(CoreError::SnapshotNotFound(key.to_owned()))
+            }
             Err(e) => return Err(e.into()),
         };
         let keys = Arc::clone(&self.keys);
@@ -500,18 +507,18 @@ impl Repository {
         })
         .await?;
         // snapshot 不是以內容命名：用內容裡的 client 與時間反算 key，必須一致。
-        let ts = key.rsplit('/').next()
-            .ok_or_else(|| CoreError::Corrupt {
-                key: key.to_owned(),
-                reason: "not a snapshot key".to_owned(),
-            })?;
-        let t = parse_key_timestamp(ts)?;
-        let expected_ns: i64 = t.unix_timestamp_nanos().try_into().map_err(|_| {
-            CoreError::Corrupt {
-                key: key.to_owned(),
-                reason: "timestamp out of range".to_owned(),
-            }
+        let ts = key.rsplit('/').next().ok_or_else(|| CoreError::Corrupt {
+            key: key.to_owned(),
+            reason: "not a snapshot key".to_owned(),
         })?;
+        let t = parse_key_timestamp(ts)?;
+        let expected_ns: i64 =
+            t.unix_timestamp_nanos()
+                .try_into()
+                .map_err(|_| CoreError::Corrupt {
+                    key: key.to_owned(),
+                    reason: "timestamp out of range".to_owned(),
+                })?;
         if snapshot.client_id.len() != 16
             || keys::snapshot(&snapshot.client_id, ts) != key
             || snapshot.time_ns != expected_ns

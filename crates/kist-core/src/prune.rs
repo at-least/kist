@@ -235,7 +235,8 @@ impl PruneIndex {
     /// 這個 chunk 是否有 holder 在 `packs` 裡（repack 的 kept_chunks 語義：
     /// 任一副本在 kept pack 就不用搬，不限正本）。
     fn held_by(&self, id: &ChunkId, packs: &HashSet<ObjectId>) -> bool {
-        self.group(id).any(|i| packs.contains(&self.records[i].location.pack))
+        self.group(id)
+            .any(|i| packs.contains(&self.records[i].location.pack))
     }
 }
 
@@ -310,8 +311,7 @@ impl Repository {
             .map(|(id, _)| *id)
             .chain(superseded_ids.iter().copied())
             .collect();
-        let effective_blobs: HashSet<ObjectId> =
-            blob_list.iter().map(|(id, _)| *id).collect();
+        let effective_blobs: HashSet<ObjectId> = blob_list.iter().map(|(id, _)| *id).collect();
         let mut indexed: HashMap<ObjectId, IndexPack> = HashMap::new();
         let mut records: Vec<TableRecord> = Vec::new();
         // 把 entries 從 blob move 出來：blob 解碼結果整份留著會讓 entries 在
@@ -765,9 +765,7 @@ impl Repository {
                 .entries
                 .iter()
                 .filter(|e| {
-                    idx.is_referenced(&e.id)
-                        && !idx.held_by(&e.id, kept)
-                        && !copied.contains(&e.id)
+                    idx.is_referenced(&e.id) && !idx.held_by(&e.id, kept) && !copied.contains(&e.id)
                 })
                 .cloned()
                 .collect();
@@ -798,8 +796,7 @@ impl Repository {
                         key: key.clone(),
                         reason: format!("chunk {} points outside the pack", e.id),
                     });
-                    let plain =
-                        slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.raw_len));
+                    let plain = slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.raw_len));
                     match plain {
                         Ok(p) => plains.push((e.id, p)),
                         Err(err) => return Ok((w, Vec::new(), 0, Some(err))),
@@ -972,7 +969,8 @@ mod tests {
                 .filter(|_| lcg(&mut state).is_multiple_of(2))
                 .collect();
 
-            let (m_needed, m_live, m_rejects) = model_canonical(&holders, &marks, &phantoms, &referenced);
+            let (m_needed, m_live, m_rejects) =
+                model_canonical(&holders, &marks, &phantoms, &referenced);
             let to_oid = |p: u8| oid(p);
             let m_needed: HashSet<ObjectId> = m_needed.iter().map(|p| to_oid(*p)).collect();
             let m_live: HashMap<ObjectId, u64> =

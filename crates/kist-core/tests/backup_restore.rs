@@ -309,8 +309,7 @@ async fn parent_reuse_across_tree_segments_in_one_dir() {
     std::fs::create_dir_all(&src).unwrap();
     // 10,050 個檔案 → 至少兩段
     for i in 0..10_050u32 {
-        std::fs::write(src.join(format!("f{i:06}.dat")), format!("content {i}\n"))
-            .unwrap();
+        std::fs::write(src.join(format!("f{i:06}.dat")), format!("content {i}\n")).unwrap();
     }
     let repo = t.open().await;
     let first = repo

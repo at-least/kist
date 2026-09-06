@@ -88,7 +88,12 @@ pub struct Entry {
     #[serde(rename = "size", default, skip_serializing_if = "is_zero_u64")]
     pub size: u64,
     /// 符號連結的目標（僅符號連結）。
-    #[serde(rename = "target", default, with = "serde_bytes", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "target",
+        default,
+        with = "serde_bytes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub target: Vec<u8>,
     /// 檔案內容（或間接清單，見 `ct`）的 chunk。
     #[serde(rename = "chunks", default, skip_serializing_if = "Vec::is_empty")]
@@ -118,7 +123,9 @@ pub struct Entry {
 
 /// xattrs 的嚴格解碼：重複的 key 是偽造或損壞（format.md §4），拒絕——
 /// serde 的 `BTreeMap` 訪問器會默默 last-wins，不能依賴。
-fn de_xattrs_strict<'de, D>(d: D) -> Result<Option<std::collections::BTreeMap<ByteBuf, ByteBuf>>, D::Error>
+fn de_xattrs_strict<'de, D>(
+    d: D,
+) -> Result<Option<std::collections::BTreeMap<ByteBuf, ByteBuf>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

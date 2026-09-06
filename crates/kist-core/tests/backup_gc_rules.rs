@@ -157,7 +157,13 @@ async fn commit_finds_moved_chunks_after_reloading_the_index() {
     assert_eq!(t.count("snapshots"), 3);
     // 新 snapshot 的資料全部讀得到
     let fresh = t.open().await;
-    let report = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
+    let report = fresh
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let out = t.dir.path().join("out");
     let r = fresh
@@ -357,7 +363,13 @@ async fn commit_after_a_repack_keeps_its_chunks_reachable() {
     let s = prepared.commit().await.unwrap();
     assert_eq!(t.count("snapshots"), 2);
     let fresh = t.open().await;
-    let r = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
+    let r = fresh
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     let out = t.dir.path().join("out");
     let rs = fresh
@@ -379,7 +391,11 @@ async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
         .backup(std::slice::from_ref(&src), client(1))
         .await
         .unwrap();
-    mark(&t, &tree_object_id(&first.root), std::time::Duration::from_secs(3600));
+    mark(
+        &t,
+        &tree_object_id(&first.root),
+        std::time::Duration::from_secs(3600),
+    );
     let prepared = repo
         .backup_prepare(std::slice::from_ref(&src), client(1))
         .await
@@ -392,7 +408,11 @@ async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
     assert_eq!(t.count("snapshots"), 1);
 
     // 沒被刪（我們的 put 比標記新）：可以 commit
-    mark(&t, &tree_object_id(&first.root), std::time::Duration::from_secs(3600));
+    mark(
+        &t,
+        &tree_object_id(&first.root),
+        std::time::Duration::from_secs(3600),
+    );
     let prepared = repo
         .backup_prepare(std::slice::from_ref(&src), client(1))
         .await

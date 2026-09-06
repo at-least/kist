@@ -127,7 +127,8 @@ impl DiskTable {
                     key: "index cache".to_owned(),
                     reason: e.to_string(),
                 })?;
-                w.write_all(&r.encode()).map_err(|e| CoreError::io(&tmp, e))?;
+                w.write_all(&r.encode())
+                    .map_err(|e| CoreError::io(&tmp, e))?;
                 count += 1;
             }
             // 紀錄數現在才確定：回頭補寫 header（暫存檔，無併發讀者）
