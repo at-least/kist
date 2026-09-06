@@ -941,7 +941,7 @@ mod tests {
             for c in 0..n_chunks {
                 let mut used = HashSet::new();
                 for p in 0..n_packs {
-                    if lcg(&mut state) % 3 == 0 && used.insert(p) {
+                    if lcg(&mut state).is_multiple_of(3) && used.insert(p) {
                         // 每個 holder 各自的 length（同 chunk 在不同 pack 的
                         // 紀錄不必同長——雖然內容相同）
                         let len = 1 + lcg(&mut state) % 1000;
@@ -955,21 +955,21 @@ mod tests {
             for _ in 0..(lcg(&mut state) % 4) {
                 if !records.is_empty() {
                     let i = (lcg(&mut state) % records.len() as u64) as usize;
-                    records.push(records[i].clone());
+                    records.push(records[i]);
                 }
             }
             let mut marks = HashSet::new();
             let mut phantoms = HashSet::new();
             for p in 0..n_packs {
-                if lcg(&mut state) % 3 == 0 {
+                if lcg(&mut state).is_multiple_of(3) {
                     marks.insert(p);
                 }
-                if lcg(&mut state) % 4 == 0 {
+                if lcg(&mut state).is_multiple_of(4) {
                     phantoms.insert(p);
                 }
             }
             let referenced: Vec<u8> = (0..n_chunks)
-                .filter(|_| lcg(&mut state) % 2 == 0)
+                .filter(|_| lcg(&mut state).is_multiple_of(2))
                 .collect();
 
             let (m_needed, m_live, m_rejects) = model_canonical(&holders, &marks, &phantoms, &referenced);
@@ -1044,7 +1044,7 @@ mod tests {
     #[test]
     fn held_by_matches_kept_union() {
         // 舊語義：kept_chunks = kept pack 的所有 entries 聯集，任一 holder 命中即免搬
-        let mut idx = PruneIndex::new(vec![rec(1, 2, 10), rec(1, 5, 10), rec(2, 5, 10)]);
+        let idx = PruneIndex::new(vec![rec(1, 2, 10), rec(1, 5, 10), rec(2, 5, 10)]);
         let kept: HashSet<ObjectId> = [2u8].iter().map(|p| oid(*p)).collect();
         assert!(idx.held_by(&cid(1), &kept)); // holder 在 kept
         assert!(!idx.held_by(&cid(2), &kept)); // 只有 holder 在非 kept
@@ -1076,7 +1076,7 @@ mod tests {
             let mut entries: Vec<(u8, u8)> = Vec::new();
             for c in 0..n_chunks {
                 for p in 0..n_packs {
-                    if lcg(&mut state) % 3 == 0 {
+                    if lcg(&mut state).is_multiple_of(3) {
                         entries.push((c, p));
                     }
                 }

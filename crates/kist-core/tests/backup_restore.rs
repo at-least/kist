@@ -317,7 +317,7 @@ async fn parent_reuse_across_tree_segments_in_one_dir() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    let packs_after_first = t.count("packs");
+    let _packs_after_first = t.count("packs");
 
     // 改掉一批跨段界的檔案（每段的頭、尾、中間都有）；fs::write 會更新
     // mtime，parent 快速路徑因此失效，必須重讀。

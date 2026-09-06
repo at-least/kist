@@ -216,7 +216,7 @@ impl ParentStream {
             }
             let hits = matches!(self.current.peek(), Some(e) if e.name.as_slice() == name);
             if hits {
-                while let Some(e) = self.current.next() {
+                for e in self.current.by_ref() {
                     if e.name.as_slice() == name {
                         return Some(e);
                     }

@@ -50,6 +50,8 @@ fn decode_rejects_duplicate_struct_fields() {
     // {a: 1, a: 2} 解進 struct —— 重複欄位是偽造或損壞，serde visitor 拒絕。
     #[derive(serde::Deserialize, Debug)]
     struct Dup {
+        // 欄位值不被讀——存在只是為了觸發 serde 的重複欄位偵測。
+        #[expect(dead_code)]
         a: u64,
     }
     let dup = [0xa2u8, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02];

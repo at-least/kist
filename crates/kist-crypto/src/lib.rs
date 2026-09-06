@@ -392,7 +392,7 @@ impl RepoKeys {
     /// 就地加密省掉 `encrypt` 的整份密文拷貝。呼叫端先 `reserve(TAG_LEN)`
     /// 就不會在附加 tag 時觸發重配。
     pub fn seal_index_blob_in_place(&self, mut buf: Vec<u8>) -> Result<Vec<u8>> {
-        use chacha20poly1305::aead::AeadInPlace;
+        use chacha20poly1305::aead::AeadInOut;
         let nonce = random_bytes::<NONCE_LEN>()?;
         cipher(&self.index_key)
             .encrypt_in_place(&XNonce::from(nonce), kist_format::AAD_INDEX, &mut buf)

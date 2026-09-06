@@ -135,10 +135,10 @@ impl IndexCache {
                 packs.sort();
                 packs.dedup();
                 // 舊表串流 merge 在 write() 裡進行（t 的所有權移進去）
-                return self.write(new_records, blobs, packs, Some(t));
+                self.write(new_records, blobs, packs, Some(t))
             }
             _ => return self.rebuild(live, fetch).await,
-        };
+        }
     }
 
     async fn rebuild<F, Fut>(&self, live: &[ObjectId], fetch: F) -> Result<ChunkIndex>
@@ -222,9 +222,9 @@ impl IndexCache {
     /// 舊表（增量），同 ID 時新紀錄贏。
     fn write(
         &self,
-        mut new_records: Vec<TableRecord>,
+        new_records: Vec<TableRecord>,
         blobs: Vec<ObjectId>,
-        mut packs: Vec<(ObjectId, u64)>,
+        packs: Vec<(ObjectId, u64)>,
         old: Option<DiskTable>,
     ) -> Result<ChunkIndex> {
         std::fs::create_dir_all(&self.dir).map_err(|e| CoreError::io(&self.dir, e))?;

@@ -156,6 +156,8 @@ mod tests {
     fn duplicate_xattr_keys_are_rejected() {
         #[derive(Deserialize, Debug)]
         struct Probe {
+            // 欄位值不被讀——存在只是為了觸發 de_xattrs_strict 的重複 key 偵測。
+            #[expect(dead_code)]
             #[serde(rename = "x", deserialize_with = "de_xattrs_strict")]
             x: Option<std::collections::BTreeMap<ByteBuf, ByteBuf>>,
         }
