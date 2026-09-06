@@ -85,6 +85,22 @@ russh 可以先讀 known_hosts 再定演算法，一次撥接完成。主機完�
 - 五個發佈 target（`./dist.sh`）全部重建成功——russh 對 windows-gnu/musl/macos
   都編得過（agent 認證 `#[cfg(unix)]` 閘掉後）。
 
+## 實測（2026-09-07，docker 容器 = 遠端，loopback）
+
+- **全量備份 551 MiB**（249 chunks / 9 packs）：7–14 秒 ≈ **40–79 MiB/s**，
+  含 chunk/hash/加密/SFTP 傳輸全程；對照本機後端 page-cache 全熱時約 1 秒。
+  loopback 數字無法代表 WAN（WAN 是延遲主導，管線化的效益在那裡才會放大），
+  但足以證明沒有粗糙的每請求來回瓶頸（Go 版未開 concurrent writes 時
+  loopback 為 61 MiB/s，同一量級）。
+- **二次備份（dedup）**：< 1 秒（0 chunks / 0 packs）。
+- **兩階段 GC 全流程**：backup → forget（keep-last 1）→ prune 標記 →
+  再 backup（抗競態：client 在標記後要有新 snapshot）→ prune 刪除
+  `deleted 2 object(s) (8.9 KiB)`，伺服器端物件數 19 → 15（含 marker 清理），
+  `check` 無錯。預設 `--clock-skew 1h` 會把刪除擋住一小時，是設計行為
+  （時鐘偏快的 client 不得虛報「標記後有新 snapshot」）。
+- **暫存檔殘骸**：全部操作後 `.tmp-*` 為 0。
+- **restore + `diff -r`**：550 MiB 逐 byte 相同。
+
 ## 沒做 / 已知限制
 
 - **斷線不重連**：一個 `Backend` 一條 SSH 連線，斷了之後的操作回錯；CLI 的一次性
