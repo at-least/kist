@@ -284,6 +284,48 @@ pub fn read_xattrs(
     None
 }
 
+/// 還原延伸屬性。只套 `user.` namespace（與記錄端同一道防線：惡意 repo 不能
+/// 指揮我們寫 security./trusted. 之類需要特權的 namespace）。任何一顆失敗
+/// （檔案系統不支援、權限）就整節點回錯——與 times/mode 的 policy 一致：
+/// metadata 丢了就是錯，其他檔案繼續。
+#[cfg(unix)]
+pub fn apply_xattrs(
+    path: &Path,
+    xattrs: Option<&std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>>,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(map) = xattrs else {
+        return Ok(());
+    };
+    for (name, value) in map {
+        if !name.starts_with(b"user.") {
+            tracing::debug!(
+                "skipping non-user xattr {} on {}",
+                String::from_utf8_lossy(name),
+                path.display()
+            );
+            continue;
+        }
+        let name = std::ffi::OsStr::from_bytes(name);
+        xattr::set(path, name, value.as_ref())
+            .map_err(|e| CoreError::io(path, e))
+            .map_err(|e| CoreError::Corrupt {
+                key: path.display().to_string(),
+                reason: format!("setting xattr {}: {e}", name.to_string_lossy()),
+            })?;
+    }
+    Ok(())
+}
+
+/// Windows：xattr 是 Unix 的 user.* namespace，沒有對應物（備份端也不記錄）。
+#[cfg(not(unix))]
+pub fn apply_xattrs(
+    _: &Path,
+    _: Option<&std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>>,
+) -> Result<()> {
+    Ok(())
+}
+
 /// 還原 mode（Unix）與 mtime。symlink 只還原 mtime（且不跟隨連結）。
 pub fn apply(path: &Path, meta: &FsMeta, is_symlink: bool) -> Result<()> {
     let mtime = filetime::FileTime::from_unix_time(

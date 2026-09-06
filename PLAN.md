@@ -201,8 +201,15 @@ kist/
    `mount`【完成 2026-09-07，ADR 015：`crates/kist-mount`（fuser 0.18），
    唯讀 `<client>/<ts>/<樹>`、index `raw_len` 隨機讀、volatile/immutable TTL、
    子程序 E2E 與 CLI 手動驗證全過】。**M4 全數完成。**
-3. xattr 的 restore 套用（目前記錄了但還原只警告）。
-4. 回報上游：openssh-sftp-client 0.15.8 `Sftp::new` 在 multi_thread runtime 上
-   stdout EOF 不喚醒（重現與細節見 ADR 014「上游怪癖」節；繞法已進 kist）。
-5. Windows：VSS、路徑語意驗證。
-6. CI 把跨語言 interop（Go 測試 + 共用向量）納入 pipeline。
+3. xattr 的 restore 套用【完成 2026-09-07：fsmeta::apply_xattrs（只套 user.*，
+   惡意 repo 不能指揮特權 namespace），在 times/mode **之前**套（唯讀 mode 的
+   檔案才設得進 xattr）；symlink 不套（Linux 不能對 symlink 設 user.*，且
+   xattr::set 會跟隨連結）；失敗記節點錯誤，其他檔案繼續。往返測試含
+   0o444 排序案例與 symlink 案例】。
+4. 回報上游【完成 2026-09-07：openssh-rust/openssh-sftp-client#183，
+   https://github.com/openssh-rust/openssh-sftp-client/issues/183 】。
+5. Windows：VSS、路徑語意驗證。【**需要 Windows 機器**才能實作與驗證，本機
+   是 Linux——保持開放，等有 Windows 環境再做；不寫無法驗證的 stub。】
+6. CI 把跨語言 interop（Go 測試 + 共用向量）納入 pipeline。【完成 2026-09-07：
+   workflow 加手動觸發的 interop job（維持「只手動觸發、不吃配額」政策）；
+   Go interop 測試本機跑過。】

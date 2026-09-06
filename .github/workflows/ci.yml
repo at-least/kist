@@ -41,6 +41,29 @@ jobs:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # 跨語言 interop：同一份向量，Go 參考實作與 Rust（cargo test 的 interop 測試）
+  # 必須一致。一樣只手動觸發；本機的快速 gate：
+  #   cd ../kist && go test ./internal/interop/...
+  interop:
+    name: go interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      # at-least/kist 是 private repo：同 repo 的 github.token 看不到它，
+      # 第一次 dispatch 前要先在 repo secrets 放一顆可讀該 repo 的 PAT
+      #（secret 名 GO_REF_TOKEN），並把下面改成 token: ${{ secrets.GO_REF_TOKEN }}。
+      - name: checkout the Go reference implementation
+        uses: actions/checkout@v7
+        with:
+          repository: at-least/kist
+          path: kist-go
+      - name: go test ./internal/interop/...
+        working-directory: kist-go
+        run: go test ./internal/interop/...
+
   # 短煙霧（每 target 60 秒）：確保 fuzz target 不會腐化到編不過或斷言失效。
   # 長跑（24h）仍在手動本機跑，見 fuzz/README.md。CI 本身也是手動觸發，
   # 不 dispatch 就零成本。

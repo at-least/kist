@@ -104,7 +104,9 @@ host key（rclone 每次啟動重生 host key，strict known_hosts 根本無法�
   寬鬆模式本來就不用 hardlink。
 - S3 相容的目標（B2、R2、Wasabi、MinIO…）有 S3 endpoint 時優先用原生 `s3://`
   （完整嚴格語意）；`rclone://` 的價值在**沒有** S3 endpoint 的遠端。
-- **上游怪癖（以 select! 繞過；待回報上游）**：openssh-sftp-client **0.15.8** 的
+- **上游怪癖（以 select! 繞過；已回報上游
+  [openssh-sftp-client#183](https://github.com/openssh-rust/openssh-sftp-client/issues/183)）**：
+  openssh-sftp-client **0.15.8** 的
   `Sftp::new` 在 tokio **multi_thread** runtime 上，對端在版本交換前就退出
   （stdout EOF）**不會**喚醒等待中的版本交換——future 無限懸掛；current_thread
   runtime 不受影響（~25 ms 正常回 EOF 錯誤）。最小重現（與 kist 程式無關）：

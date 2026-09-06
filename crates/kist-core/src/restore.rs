@@ -125,13 +125,6 @@ impl Repository {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
             let meta = fsmeta::meta_of_entry(node);
-            if node.xattrs.is_some() {
-                tracing::warn!(
-                    "{}: has {} extended attribute(s); applying them is not implemented",
-                    path.display(),
-                    node.xattrs.as_ref().map_or(0, |x| x.len())
-                );
-            }
             let result = match node.kind {
                 node_type::DIR if !node.subtree.is_zero() => {
                     self.restore_dir(&node.subtree, node, path, index, summary, hardlinks)
@@ -167,7 +160,10 @@ impl Repository {
                             if let Some(k) = hardlink_key {
                                 hardlinks.insert(k, path.to_path_buf());
                             }
-                            fsmeta::apply(path, &meta, false)
+                            // xattr 在 times/mode **之前**：記錄的 mode 可能是唯讀，
+                            // 之後 user.* 會設不進去（EACCES）。
+                            fsmeta::apply_xattrs(path, node.xattrs.as_ref())
+                                .and_then(|()| fsmeta::apply(path, &meta, false))
                         }
                         Err(e) => {
                             // 別留下寫到一半的檔案：使用者會誤以為它是完整的
@@ -180,6 +176,12 @@ impl Repository {
                     Ok(name) => match replace_with_symlink(&PathBuf::from(name), path) {
                         Ok(()) => {
                             summary.symlinks += 1;
+                            if node.xattrs.is_some() {
+                                tracing::warn!(
+                                    "{}: snapshot has extended attributes for this symlink;                                      Linux cannot set user.* on a symlink and following it would                                      write to the target, so they are not restored",
+                                    path.display()
+                                );
+                            }
                             fsmeta::apply(path, &meta, true)
                         }
                         Err(e) => Err(e),
@@ -219,7 +221,8 @@ impl Repository {
                 .await;
         }
         summary.dirs += 1;
-        // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋
+        // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋；xattr 在 times/mode 之前
+        fsmeta::apply_xattrs(path, node.xattrs.as_ref())?;
         fsmeta::apply(path, &fsmeta::meta_of_entry(node), false)
     }
 

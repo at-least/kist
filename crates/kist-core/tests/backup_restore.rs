@@ -349,3 +349,69 @@ async fn parent_reuse_across_tree_segments_in_one_dir() {
     let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
     assert_same_tree(&src, &restored);
 }
+
+/// xattr 的 backup → restore 往返（unix）。三個案例：
+/// 1. 檔案與目錄的 user.* xattr 原樣回來；
+/// 2. 唯讀 mode（0o444）的檔案也帶 xattr：xattr 必須在 chmod **之前**套用
+///    （套完 0444 之後 user.* 會設不進去——EACCES）；
+/// 3. symlink 條目帶 xattr：不套用（Linux 不能對 symlink 設 user.*，而
+///    xattr::set 會跟隨連結寫到目標去）→ 只警告，不算錯、目標不受影響。
+#[cfg(unix)]
+#[tokio::test]
+async fn xattrs_survive_backup_restore() {
+    use std::ffi::OsStr;
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("plain.txt"), b"plain").unwrap();
+
+    // 1. 一般檔案與目錄
+    xattr::set(src.join("plain.txt"), OsStr::new("user.tag"), b"file-value").unwrap();
+    xattr::set(src.join("sub"), OsStr::new("user.dir-tag"), b"dir-value").unwrap();
+
+    // 2. 唯讀檔 + xattr：先設 xattr 再轉唯讀（模擬使用者機器上的實況）
+    std::fs::write(src.join("ro.txt"), b"read only").unwrap();
+    xattr::set(src.join("ro.txt"), OsStr::new("user.locked"), b"yes").unwrap();
+    let mut perms = std::fs::metadata(src.join("ro.txt")).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o444);
+    std::fs::set_permissions(src.join("ro.txt"), perms).unwrap();
+
+    // 3. symlink 指向帶 xattr 的檔案：backup 的 read_xattrs 會跟隨連結，
+    //    把目標的 xattr 記到 symlink 條目上
+    std::os::unix::fs::symlink("plain.txt", src.join("link")).unwrap();
+
+    let repo = t.open().await;
+    let summary = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let target = t.dir.path().join("out");
+    let restored = repo
+        .restore(&summary.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let root = target.join(src.strip_prefix("/").unwrap_or(&src));
+    let get = |p: &std::path::Path, name: &str| {
+        xattr::get(p, OsStr::new(name))
+            .unwrap()
+            .unwrap_or_else(|| panic!("xattr {name} missing on {}", p.display()))
+    };
+    // 1. 檔案與目錄的 xattr 原樣回來
+    assert_eq!(get(&root.join("plain.txt"), "user.tag"), b"file-value");
+    assert_eq!(get(&root.join("sub"), "user.dir-tag"), b"dir-value");
+    // 2. 唯讀檔：xattr 有回來、mode 也是唯讀（順序正確的證據）
+    let ro = root.join("ro.txt");
+    assert_eq!(get(&ro, "user.locked"), b"yes");
+    let mode = std::fs::metadata(&ro).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o444);
+    // 3. symlink：restore 沒把它算錯誤，xattr 也不會寫到目標上
+    assert!(
+        restored.errors.iter().all(|e| !e.contains("link")),
+        "symlink 的 xattr 警告不該變成錯誤：{:?}",
+        restored.errors
+    );
+    assert_eq!(get(&root.join("plain.txt"), "user.tag"), b"file-value");
+}
