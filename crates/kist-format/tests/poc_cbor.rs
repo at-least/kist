@@ -5,7 +5,6 @@
 //! 「Go 免費、Rust 付 20 倍 encode 成本」的選擇。2026-09-05 修訂為規格釘
 //! 死欄位順序；跨語言一致性由 `tests/interop.rs` 的 tree 向量承擔。
 
-use ciborium::value::Value;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -47,11 +46,15 @@ fn encode_emits_declaration_order_without_sorting() {
 }
 
 #[test]
-fn decode_rejects_duplicate_map_keys() {
-    // {a: 1, a: 2} —— 重複 key 是偽造或損壞。
+fn decode_rejects_duplicate_struct_fields() {
+    // {a: 1, a: 2} 解進 struct —— 重複欄位是偽造或損壞，serde visitor 拒絕。
+    #[derive(serde::Deserialize, Debug)]
+    struct Dup {
+        a: u64,
+    }
     let dup = [0xa2u8, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02];
-    let v: Result<Value, _> = kist_format::cbor::decode(&dup);
-    assert!(v.is_err(), "duplicate map key must be rejected");
+    let v: Result<Dup, _> = kist_format::cbor::decode(&dup);
+    assert!(v.is_err(), "duplicate field must be rejected");
 }
 
 #[test]

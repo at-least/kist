@@ -28,9 +28,16 @@ serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# 診斷用（bench/memory 歸因）：--features dhat 跑完會在 cwd 寫 dhat.json。
+# 暫時加入，歸因完移除。
+dhat = { version = "0.3", optional = true }
 tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
 tempfile.workspace = true
+
+[features]
+dhat = ["dep:dhat"]

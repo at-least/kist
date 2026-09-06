@@ -154,7 +154,7 @@ fn chunk_seal_open_round_trip() {
 fn index_blob_seal_open_round_trip() {
     let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
     let plaintext = vec![b'a'; 10_000];
-    let sealed = keys.seal_index_blob(&plaintext).unwrap();
+    let sealed = keys.seal_index_blob_in_place(plaintext.clone()).unwrap();
     assert_eq!(sealed.len(), 24 + plaintext.len() + 16);
     assert_eq!(keys.open_index_blob(&sealed).unwrap(), plaintext);
 
@@ -162,11 +162,24 @@ fn index_blob_seal_open_round_trip() {
     assert_eq!(keys.open_pack_trailer(&trailer).unwrap(), b"trailer");
 }
 
+/// in-place 版輸出格式相同（nonce ‖ ct ‖ tag）、tag 預留不該改變內容。
+#[test]
+fn index_blob_seal_in_place_round_trip() {
+    let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
+    let plaintext = vec![b'b'; 10_000];
+    let sealed = keys.seal_index_blob_in_place(plaintext.clone()).unwrap();
+    assert_eq!(sealed.len(), 24 + plaintext.len() + 16);
+    assert_eq!(keys.open_index_blob(&sealed).unwrap(), plaintext);
+    // 吃掉明文之後回傳的密文開頭是 24 bytes 的 nonce，與明文無關
+    let again = keys.seal_index_blob_in_place(plaintext.clone()).unwrap();
+    assert_ne!(&sealed[..24], &again[..24], "nonce 必須每次隨機");
+}
+
 /// 各角色的 AAD 互相綁定：拿 index 的密文當 trailer 開（AAD 不同）必須失敗。
 #[test]
 fn sealed_roles_are_bound_by_aad() {
     let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
-    let index = keys.seal_index_blob(b"index").unwrap();
+    let index = keys.seal_index_blob_in_place(b"index".to_vec()).unwrap();
     assert!(matches!(
         keys.open_pack_trailer(&index),
         Err(CryptoError::AuthFailed)
@@ -238,8 +251,8 @@ fn tree_ids_are_deterministic_but_sealing_is_not() {
 fn sealing_nonces_are_random_per_call() {
     let keys = RepoKeys::from_master(&MasterKey::from_bytes([1; 32]));
     let plaintext = vec![b'a'; 1000];
-    let zstd_like = keys.seal_index_blob(&plaintext).unwrap();
-    let raw_like = keys.seal_index_blob(&plaintext).unwrap();
+    let zstd_like = keys.seal_index_blob_in_place(plaintext.clone()).unwrap();
+    let raw_like = keys.seal_index_blob_in_place(plaintext.clone()).unwrap();
     assert_ne!(
         &zstd_like[..24],
         &raw_like[..24],

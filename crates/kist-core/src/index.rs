@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -99,19 +99,42 @@ impl DiskTable {
     pub fn build(path: &Path, mut records: Vec<TableRecord>) -> Result<Self> {
         records.sort_by_key(|r| r.id);
         records.dedup_by(|later, earlier| later.id == earlier.id);
+        Self::build_sorted::<std::convert::Infallible>(path, records.into_iter().map(Ok))
+    }
+
+    /// 同 [`build`]，但紀錄由呼叫端**串流**給入（必須已依 ID 排序、無重複）。
+    /// 讓增量合併可以 k-way merge 舊表與新紀錄，不用把整張表物化成 Vec
+    ///（100 萬 chunk ≈ 96 MiB）。
+    pub fn build_sorted<E>(
+        path: &Path,
+        records: impl IntoIterator<Item = std::result::Result<TableRecord, E>>,
+    ) -> Result<Self>
+    where
+        E: std::fmt::Display,
+    {
         let tmp = path.with_extension("tbl.tmp");
         {
             let file = File::create(&tmp).map_err(|e| CoreError::io(&tmp, e))?;
             let mut w = BufWriter::new(file);
+            let mut count = 0u64;
             let mut header = [0u8; HEADER_LEN as usize];
             header[0..8].copy_from_slice(TABLE_MAGIC);
             header[8..12].copy_from_slice(&TABLE_VERSION.to_le_bytes());
-            header[16..24].copy_from_slice(&(records.len() as u64).to_le_bytes());
+            header[16..24].copy_from_slice(&count.to_le_bytes());
             w.write_all(&header).map_err(|e| CoreError::io(&tmp, e))?;
-            for r in &records {
-                w.write_all(&r.encode())
-                    .map_err(|e| CoreError::io(&tmp, e))?;
+            for record in records {
+                let r = record.map_err(|e| CoreError::Corrupt {
+                    key: "index cache".to_owned(),
+                    reason: e.to_string(),
+                })?;
+                w.write_all(&r.encode()).map_err(|e| CoreError::io(&tmp, e))?;
+                count += 1;
             }
+            // 紀錄數現在才確定：回頭補寫 header（暫存檔，無併發讀者）
+            w.seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| CoreError::io(&tmp, e))?;
+            header[16..24].copy_from_slice(&count.to_le_bytes());
+            w.write_all(&header).map_err(|e| CoreError::io(&tmp, e))?;
             w.flush().map_err(|e| CoreError::io(&tmp, e))?;
             w.into_inner()
                 .map_err(|e| CoreError::io(&tmp, e.into_error()))?

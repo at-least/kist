@@ -61,23 +61,59 @@ impl std::fmt::Debug for Repository {
     }
 }
 
-/// index blob 的明文 = `algorithm byte ‖ (可能 zstd 過的) CBOR`。
-fn encode_index_blob(blob: &IndexBlob) -> Result<Vec<u8>> {
-    let plain = cbor::encode(blob)?;
-    let compressed =
-        zstd::encode_all(plain.as_slice(), ZSTD_LEVEL).map_err(|e| CoreError::Corrupt {
-            key: "index".to_owned(),
-            reason: format!("zstd failed: {e}"),
-        })?;
-    let mut out = Vec::with_capacity(1 + compressed.len());
-    if compressed.len() < plain.len() - plain.len() / 16 {
-        out.push(Algorithm::Zstd as u8);
-        out.extend_from_slice(&compressed);
-    } else {
-        out.push(Algorithm::Raw as u8);
-        out.extend_from_slice(&plain);
+/// 計數 writer：zstd 的 `write::Encoder` 沒有 total_in，明文長度自己數
+///（用來判斷壓縮是否省下 ≥ 1/16）。
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
     }
-    Ok(out)
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// index blob 的明文 = `algorithm byte ‖ (可能 zstd 過的) CBOR`。
+/// CBOR **直接串流進 zstd 編碼器**：100 萬 chunk 的明文 ≈ 56 MiB，
+/// 不先物化成 Vec 再壓縮（那會多一份同樣大的暫存，疊在 backup 收尾的峰值上）。
+fn encode_index_blob(blob: &IndexBlob) -> Result<Vec<u8>> {
+    let mut enc = zstd::stream::write::Encoder::new(
+        CountingWriter {
+            inner: Vec::new(),
+            written: 0,
+        },
+        ZSTD_LEVEL,
+    )
+    .map_err(|e| CoreError::Corrupt {
+        key: "index".to_owned(),
+        reason: format!("zstd failed: {e}"),
+    })?;
+    cbor::encode_to_writer(blob, &mut enc)?;
+    let compressed_writer = enc.finish().map_err(|e| CoreError::Corrupt {
+        key: "index".to_owned(),
+        reason: format!("zstd failed: {e}"),
+    })?;
+    let plain_len = usize::try_from(compressed_writer.written).unwrap_or(usize::MAX);
+    let mut compressed = compressed_writer.inner;
+    if compressed.len() < plain_len - plain_len / 16 {
+        compressed.reserve(1);
+        compressed.insert(0, Algorithm::Zstd as u8);
+        Ok(compressed)
+    } else {
+        // 幾乎不會走到（index 內容重複性高）。真發生時退回原文，
+        // 規格行為不變，代價是重新物化一次明文。
+        let mut out = Vec::with_capacity(1 + plain_len);
+        out.push(Algorithm::Raw as u8);
+        let plain = cbor::encode(blob)?;
+        out.extend_from_slice(&plain);
+        Ok(out)
+    }
 }
 
 /// 解開 index blob 的明文（見 [`encode_index_blob`]）。
@@ -308,8 +344,10 @@ impl Repository {
     pub async fn write_index(&self, blob: IndexBlob) -> Result<ObjectId> {
         let keys = Arc::clone(&self.keys);
         let (id, bytes) = blocking(move || {
-            let payload = encode_index_blob(&blob)?;
-            let bytes = keys.seal_index_blob(&payload)?;
+            let mut payload = encode_index_blob(&blob)?;
+            // 就地加密把 tag 附加在後：先預留空間，避免附加時整份重配
+            payload.reserve(kist_format::pack::TAG_LEN);
+            let bytes = keys.seal_index_blob_in_place(payload)?;
             Ok((ObjectId::of(&bytes), bytes))
         })
         .await?;

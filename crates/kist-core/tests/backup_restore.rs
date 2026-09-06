@@ -298,3 +298,55 @@ async fn same_size_and_mtime_but_different_content_is_detected() {
     let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
     assert_same_tree(&src, &restored);
 }
+
+/// 超過 MAX_NODES_PER_TREE（10,000）的目錄會切成多段 tree（`prev` 串接）。
+/// 第二次 backup 的 parent 快速路徑必須**跨段**還能用：沒改的檔案直接沿用、
+/// 改過的重讀、restore 仍逐 byte 相同。
+#[tokio::test]
+async fn parent_reuse_across_tree_segments_in_one_dir() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("big");
+    std::fs::create_dir_all(&src).unwrap();
+    // 10,050 個檔案 → 至少兩段
+    for i in 0..10_050u32 {
+        std::fs::write(src.join(format!("f{i:06}.dat")), format!("content {i}\n"))
+            .unwrap();
+    }
+    let repo = t.open().await;
+    let first = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let packs_after_first = t.count("packs");
+
+    // 改掉一批跨段界的檔案（每段的頭、尾、中間都有）；fs::write 會更新
+    // mtime，parent 快速路徑因此失效，必須重讀。
+    let mut changed = 0u64;
+    for i in (0..10_050u32).step_by(97) {
+        std::fs::write(src.join(format!("f{i:06}.dat")), format!("CHANGED {i}\n")).unwrap();
+        changed += 1;
+    }
+
+    let second = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert_ne!(first.snapshot_key, second.snapshot_key);
+    assert_eq!(second.parent.as_deref(), Some(first.snapshot_key.as_str()));
+    assert_eq!(
+        second.stats.files_reused,
+        10_050 - changed,
+        "跨段界之外沒改的檔案都該走 parent 快速路徑"
+    );
+    assert_eq!(
+        second.stats.chunks_new, changed,
+        "改過的檔案各有一個新內容 chunk"
+    );
+
+    let target = t.dir.path().join("out2");
+    repo.restore(&second.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_same_tree(&src, &restored);
+}

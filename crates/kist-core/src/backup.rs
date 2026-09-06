@@ -19,7 +19,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,7 +41,10 @@ use crate::repo::Repository;
 use crate::{blocking, CoreError, Result};
 
 /// 同時在上傳中的 pack 上限（每個最多 pack_target_size bytes 的記憶體）。
-const MAX_INFLIGHT_UPLOADS: usize = 2;
+/// 1 而不是 2：每個 in-flight pack 都是整份 64 MiB，併發 2 會讓峰值記憶體
+/// 多 64 MiB（M5 目標 < 512 MiB）；S3 上傳通常是瓶頸，重疊第二個上傳的
+/// 吞吐收益遠小於這 64 MiB 的代價。
+const MAX_INFLIGHT_UPLOADS: usize = 1;
 
 /// GC 標記到真正刪除之間的最短時間（與 `prune` 的預設一致）。
 pub const DEFAULT_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
@@ -141,6 +143,9 @@ struct Backup {
     /// 這次 backup 已看過的硬連結：(dev, inode) → 第一個名字的 chunk 清單與大小。
     /// 後續名字直接沿用，不必重讀資料。
     hardlinks: HashMap<(u64, u64), (u64, Vec<ChunkId>, u8)>,
+    /// 切塊緩衝池（每個 2×chunker.max）：整個 backup 重用同一批，不在每個
+    /// 檔案各配一次。單執行緒走訪時通常只有一個；池化是為了之後並行切塊。
+    chunk_bufs: Vec<Vec<u8>>,
 }
 
 /// 呼叫進度 callback（有設才做）。stats 是幾個 u64 的 copy，成本可忽略。
@@ -156,6 +161,80 @@ fn report_progress(
             stats,
             current: current.map(|p| p.to_string_lossy().into_owned()),
         });
+    }
+}
+
+/// parent tree 鏈的串流游標（merge-join 用）。
+///
+/// 一次只持有一個 segment（≤ `MAX_NODES_PER_TREE` 個節點，約幾 MiB）。
+/// 原本是把整個目錄的 parent entries 讀成 `Vec` 再建成 HashMap——
+/// 100 萬檔的平面目錄光這兩個結構就要 ~450 MiB。
+///
+/// 段以 `prev` 串接、段內與段間都以名稱遞增（寫入端的排序合約，
+/// format.md §8），所以 `take_name` 用遞增的查詢名稱做 merge-join：
+/// 呼叫端（`process_dir`）本來就依名稱遞增走訪。
+struct ParentStream {
+    repo: Repository,
+    /// 尚未讀取的段 ID（舊→新）。
+    parts: std::collections::VecDeque<TreeId>,
+    /// 目前段的節點。比 `next_part` 之後進來的任何名稱都小的節點已在這裡被丟掉。
+    current: std::iter::Peekable<std::vec::IntoIter<Entry>>,
+}
+
+impl ParentStream {
+    /// 沿 `prev` 走完鏈取得段 ID（走訪時 entries 直接丟棄，不累積）。
+    /// 常見情況（目錄 ≤ 10,000 節點）只有一段。
+    async fn open(repo: &Repository, last: &TreeId) -> Result<Self> {
+        let mut parts = std::collections::VecDeque::new();
+        let mut next = Some(*last);
+        let mut seen = HashSet::new();
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                return Err(CoreError::Corrupt {
+                    key: keys::tree(&id),
+                    reason: "tree chain loops".to_owned(),
+                });
+            }
+            let tree = repo.read_tree(&id).await?;
+            next = tree.prev;
+            parts.push_front(id);
+        }
+        Ok(Self {
+            repo: repo.clone(),
+            parts,
+            current: Vec::new().into_iter().peekable(),
+        })
+    }
+
+    /// 回傳名稱等於 `name` 的 parent 節點（沒有則 `None`）。
+    /// 呼叫端必須用遞增的名稱查詢。段讀取失敗時 parent reuse 停擺
+    ///（後續都回 `None`，檔案重讀——與原本「讀不到就重建」同一語意）。
+    async fn take_name(&mut self, name: &[u8]) -> Option<Entry> {
+        loop {
+            while matches!(self.current.peek(), Some(e) if e.name.as_slice() < name) {
+                self.current.next();
+            }
+            let hits = matches!(self.current.peek(), Some(e) if e.name.as_slice() == name);
+            if hits {
+                while let Some(e) = self.current.next() {
+                    if e.name.as_slice() == name {
+                        return Some(e);
+                    }
+                }
+            }
+            if matches!(self.current.peek(), Some(e) if e.name.as_slice() > name) {
+                return None; // 目標不在鏈裡；游標留在原地給下一個（更大的）名稱
+            }
+            let id = self.parts.pop_front()?;
+            match self.repo.read_tree(&id).await {
+                Ok(tree) => self.current = tree.entries.into_iter().peekable(),
+                Err(e) => {
+                    tracing::warn!("cannot read parent tree {id}: {e}; parent reuse disabled");
+                    self.parts.clear();
+                    return None;
+                }
+            }
+        }
     }
 }
 
@@ -280,6 +359,12 @@ impl Repository {
         grace: std::time::Duration,
         now: time::OffsetDateTime,
     ) -> Result<()> {
+        if referenced.is_empty() {
+            // 沒有沿用任何舊 chunk（例如對空 repo 的第一次 backup）：
+            // 沒有要驗證的引用，連 index 都不必載入——這一步在 100 萬
+            // chunk 的 repo 上會觸發一次完整 index 讀取與快取重建。
+            return Ok(());
+        }
         let expired = |pack: &ObjectId| marks.get(pack).is_some_and(|m| *m + grace <= now);
         let fresh = self.load_index().await?;
         let mut pack_ok: HashMap<ObjectId, bool> = HashMap::new();
@@ -406,11 +491,18 @@ impl Repository {
         let index = self.load_index_for_backup(&marked).await?;
 
         let parent = self.find_parent(&opts.client_id, &path_bytes).await?;
-        let parent_entries = match &parent {
-            Some((_, snap)) => self.read_tree_chain(&snap.root).await.unwrap_or_default(),
-            None => Vec::new(),
+        // parent tree 用串流游標，不整份載入（平面大目錄的 parent 結構
+        // 會吃掉數百 MiB）；根層查詢的名稱已依 bytes 遞增，可直接 merge-join。
+        let mut parent_stream = match &parent {
+            Some((_, snap)) => match ParentStream::open(self, &snap.root).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!("cannot read parent tree {}: {e}; re-reading everything", snap.root);
+                    None
+                }
+            },
+            None => None,
         };
-        let parent_map = entries_by_name(parent_entries);
         let parent_start_ns = parent.as_ref().map(|(_, snap)| snap.time_ns).unwrap_or(0);
 
         let mut b = Backup {
@@ -420,6 +512,7 @@ impl Repository {
             packer: Some(PackWriter::new(
                 Arc::clone(self.keys()),
                 self.config().pack_target_size,
+                self.config().chunker.max,
             )),
             index: Some(index),
             written_trees: HashSet::new(),
@@ -433,14 +526,19 @@ impl Repository {
             referenced: HashMap::new(),
             progress: opts.progress.clone(),
             parity: opts.parity,
+            chunk_bufs: Vec::new(),
         };
 
         // 根 tree：每個來源路徑一個節點，名稱是絕對路徑。
         let mut root_entries = Vec::new();
         for (path, name) in abs_paths.iter().zip(path_bytes.iter()) {
             let meta = std::fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
+            let parent_entry = match parent_stream.as_mut() {
+                Some(s) => s.take_name(name).await,
+                None => None,
+            };
             let entry = b
-                .process_entry(path, name.clone(), &meta, parent_map.get(name))
+                .process_entry(path, name.clone(), &meta, parent_entry.as_ref())
                 .await?;
             if let Some(entry) = entry {
                 root_entries.push(entry);
@@ -448,9 +546,12 @@ impl Repository {
         }
         let root = b.write_tree_parts(root_entries).await?;
 
-        // flush 最後一個 pack，等所有上傳完成
+        // flush 最後一個 pack。走訪結束，去重用的 overlay（100 萬 chunk ≈
+        // 185 MiB）不再需要：上傳收尾後立刻丟掉，讓 index blob 的編碼
+        // 階段不跟它疊在同一個峰值。
         b.report("flush", None);
         b.flush_pack().await?;
+        b.index = None;
         b.wait_uploads(0).await?;
 
         // index blob（只包含這次新寫的 pack）
@@ -557,10 +658,6 @@ impl Repository {
     }
 }
 
-fn entries_by_name(entries: Vec<Entry>) -> HashMap<Vec<u8>, Entry> {
-    entries.into_iter().map(|e| (e.name.clone(), e)).collect()
-}
-
 impl Backup {
     /// 回報目前進度（有 callback 才做）。
     fn report(&self, phase: &'static str, current: Option<&Path>) {
@@ -659,18 +756,21 @@ impl Backup {
         parent_subtree: Option<TreeId>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TreeId>> + Send + 'a>> {
         Box::pin(async move {
-            let parent_map = match parent_subtree {
-                Some(id) => match self.repo.read_tree_chain(&id).await {
-                    Ok(entries) => entries_by_name(entries),
+            let mut parent_stream = match parent_subtree {
+                Some(id) => match ParentStream::open(&self.repo, &id).await {
+                    Ok(s) => Some(s),
                     Err(e) => {
-                        tracing::warn!("cannot read parent tree {id}: {e}");
-                        HashMap::new()
+                        tracing::warn!("cannot read parent tree {id}: {e}; re-reading this directory");
+                        None
                     }
                 },
-                None => HashMap::new(),
+                None => None,
             };
 
-            let mut entries = Vec::new();
+            // 只留名稱 bytes，完整路徑處理到該項目時才 join：1M 檔的平面
+            // 目錄，名稱 bytes ≈ 45 MiB；存 (bytes, OsString, PathBuf) 之類
+            // 的重複欄位會多出上百 MiB。
+            let mut names: Vec<Vec<u8>> = Vec::new();
             match std::fs::read_dir(path) {
                 Ok(rd) => {
                     for entry in rd {
@@ -682,7 +782,7 @@ impl Backup {
                             }
                         };
                         match fsmeta::name_to_bytes(&entry.file_name()) {
-                            Ok(name) => entries.push((name, entry.path())),
+                            Ok(name) => names.push(name),
                             Err(e) => {
                                 self.skip(&entry.path(), &e.to_string());
                             }
@@ -694,11 +794,13 @@ impl Backup {
                     self.skip(path, &e.to_string());
                 }
             }
-            entries.sort();
+            names.sort();
 
             let mut children: Vec<Entry> = Vec::new();
             let mut prev = None;
-            for (name, child_path) in entries {
+            for name in names {
+                let child_name = fsmeta::bytes_to_name(&name)?;
+                let child_path = path.join(&child_name);
                 let meta = match std::fs::symlink_metadata(&child_path) {
                     Ok(m) => m,
                     Err(e) => {
@@ -707,8 +809,12 @@ impl Backup {
                         continue;
                     }
                 };
+                let parent_entry = match parent_stream.as_mut() {
+                    Some(s) => s.take_name(&name).await,
+                    None => None,
+                };
                 let entry = self
-                    .process_entry(&child_path, name.clone(), &meta, parent_map.get(&name))
+                    .process_entry(&child_path, name, &meta, parent_entry.as_ref())
                     .await?;
                 if let Some(entry) = entry {
                     children.push(entry);
@@ -789,8 +895,9 @@ impl Backup {
                 return Ok(None);
             }
         };
-        let reader = BufReader::with_capacity(1 << 20, file);
-        let Some(result) = self.chunk_reader(reader, path.to_path_buf()).await? else {
+        // 直接把 File 交給 chunker：fill() 會讀滿自己的 2×max 緩衝，
+        // BufReader 只是多一層 1 MiB 的 memcpy 與每檔一次的大配置。
+        let Some(result) = self.chunk_reader(file, path.to_path_buf()).await? else {
             return Ok(None);
         };
         // size 用實際讀到的長度，不用讀檔前的 metadata：備份途中被 append 的檔案兩者會不同
@@ -895,8 +1002,14 @@ impl Backup {
     where
         R: std::io::Read + Send + 'static,
     {
+        // 先確認 packer/index 都在（內部不變量破損要在拿到緩衝之前返回），
+        // 緩衝進了 state 之後，所有錯誤路徑都要回收它。
+        if self.packer.is_none() || self.index.is_none() {
+            return Err(CoreError::Join("packer/index missing".into()));
+        }
+        let buf = self.chunk_bufs.pop().unwrap_or_default();
         let mut state = ChunkState {
-            chunks: self.chunker.chunks(reader),
+            chunks: self.chunker.chunks_with_buf(reader, buf),
             ids: Vec::new(),
             bytes_total: 0,
             bytes_new: 0,
@@ -916,54 +1029,75 @@ impl Backup {
             let keys = Arc::clone(&self.keys);
             let marked = Arc::clone(&self.marked);
 
-            let (packer, index, state_back, finished, done, read_error) = blocking(move || {
-                let mut finished = None;
-                let mut done = false;
-                let mut read_error = None;
-                loop {
-                    let chunk = match state.chunks.next() {
-                        None => {
-                            done = true;
+            // 錯誤一律帶著 state 出來：chunker 的 2×max 緩衝是整個 backup
+            // 共用的，不能在錯誤路徑上把它連同 state 一起丟掉。
+            let (packer, index, state_back, finished, done, read_error, hard_error) = blocking(
+                move || {
+                    let mut finished = None;
+                    let mut done = false;
+                    let mut read_error = None;
+                    let mut hard_error = None;
+                    loop {
+                        let chunk = match state.chunks.next() {
+                            None => {
+                                done = true;
+                                break;
+                            }
+                            Some(Err(e)) => {
+                                read_error = Some(e.to_string());
+                                done = true;
+                                break;
+                            }
+                            Some(Ok(c)) => c,
+                        };
+                        let id = keys.chunk_id(&chunk);
+                        state.bytes_total += chunk.len() as u64;
+                        state.ids.push(id);
+                        let mut in_marked_pack = false;
+                        if let Some(loc) = index.get(&id) {
+                            if marked.contains(&loc.pack) {
+                                in_marked_pack = true;
+                            } else {
+                                state.reused_count += 1;
+                                state.reused.push((id, loc.pack));
+                                continue;
+                            }
+                        }
+                        match packer.add(id, &chunk) {
+                            Ok(entry) => {
+                                if in_marked_pack {
+                                    index.replace_pending(&entry);
+                                } else {
+                                    index.add_pending(&entry);
+                                }
+                                state.bytes_new += chunk.len() as u64;
+                                state.chunks_new += 1;
+                            }
+                            Err(e) => {
+                                hard_error = Some(e);
+                                done = true;
+                                break;
+                            }
+                        }
+                        if packer.is_full() {
+                            match packer.finish() {
+                                Ok(Some(p)) => {
+                                    index.resolve_pending(p.id, p.bytes.len() as u64, &p.entries);
+                                    finished = Some(p);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    hard_error = Some(e);
+                                    done = true;
+                                    break;
+                                }
+                            }
                             break;
                         }
-                        Some(Err(e)) => {
-                            read_error = Some(e.to_string());
-                            done = true;
-                            break;
-                        }
-                        Some(Ok(c)) => c,
-                    };
-                    let id = keys.chunk_id(&chunk);
-                    state.bytes_total += chunk.len() as u64;
-                    state.ids.push(id);
-                    let mut in_marked_pack = false;
-                    if let Some(loc) = index.get(&id) {
-                        if marked.contains(&loc.pack) {
-                            in_marked_pack = true;
-                        } else {
-                            state.reused_count += 1;
-                            state.reused.push((id, loc.pack));
-                            continue;
-                        }
                     }
-                    let entry = packer.add(id, &chunk)?;
-                    if in_marked_pack {
-                        index.replace_pending(&entry);
-                    } else {
-                        index.add_pending(&entry);
-                    }
-                    state.bytes_new += chunk.len() as u64;
-                    state.chunks_new += 1;
-                    if packer.is_full() {
-                        if let Some(p) = packer.finish()? {
-                            index.resolve_pending(p.id, p.bytes.len() as u64, &p.entries);
-                            finished = Some(p);
-                        }
-                        break;
-                    }
-                }
-                Ok((packer, index, state, finished, done, read_error))
-            })
+                    Ok((packer, index, state, finished, done, read_error, hard_error))
+                },
+            )
             .await?;
             self.packer = Some(packer);
             self.index = Some(index);
@@ -972,11 +1106,17 @@ impl Backup {
             if let Some(p) = finished {
                 self.handle_finished(vec![p]).await?;
             }
+            if let Some(e) = hard_error {
+                self.chunk_bufs.push(state.chunks.take_buf());
+                return Err(e);
+            }
             if let Some(reason) = read_error {
+                self.chunk_bufs.push(state.chunks.take_buf());
                 self.skip(&path, &reason);
                 return Ok(None);
             }
             if done {
+                self.chunk_bufs.push(state.chunks.take_buf());
                 self.stats.chunks_read += state.reused_count;
                 return Ok(Some(FileResult {
                     chunks: state.ids,

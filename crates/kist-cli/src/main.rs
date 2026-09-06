@@ -8,6 +8,12 @@
 
 mod password;
 
+// 診斷用（bench/memory 歸因，暫時）：--features dhat 時改用 dhat 分配器，
+// main 結束寫出 dhat.json。
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use kist_app::client_id;
 use kist_app::duration::parse_duration;
 
@@ -243,6 +249,8 @@ enum Command {
 }
 
 fn main() {
+    #[cfg(feature = "dhat")]
+    let _dhat_profiler = dhat::Profiler::builder().build();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -253,7 +261,14 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
-    let runtime = match tokio::runtime::Runtime::new() {
+    // blocking pool 收斂到 4 執行緒：每個 glibc arena 都會保留自己的高水位，
+    // 預設上限 512 條會讓峰值記憶體隨 arena 數放大（M5 記憶體目標）。
+    // 加密/切塊/壓縮都是 CPU 密集，4 條已能餵飽 async 端的上傳。
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("error: cannot start async runtime: {e}");

@@ -90,11 +90,7 @@ impl IndexCache {
             .and_then(|_| DiskTable::open(&self.table_path()).ok());
 
         // 決定：增量、重建、或直接用
-        let (base_records, known_blobs, mut packs): (
-            Vec<TableRecord>,
-            Vec<ObjectId>,
-            Vec<(ObjectId, u64)>,
-        ) = match (manifest, table) {
+        match (manifest, table) {
             (Some(m), Some(t)) if m.blobs.iter().all(|b| live_set.contains(b)) => {
                 let known = m.blobs.clone();
                 let new_ids: Vec<ObjectId> = live
@@ -120,26 +116,29 @@ impl IndexCache {
                     // 舊 blob 被取代：增量合併會留下過期的紀錄，重建
                     return self.rebuild(live, fetch).await;
                 }
-                // 新 blob 的紀錄放前面：同一個 chunk 兩邊都有時取新的位置（DiskTable 去重保留第一筆）。
-                // 別台 client 因為舊 pack 被 GC 標記而重寫了同一個 chunk，這台才不會一直解析到被標記的 pack。
-                let mut records: Vec<TableRecord> = Vec::new();
+                // 新 blob 的紀錄與舊表做 k-way merge（兩邊都已依 ID 排序）：
+                // 同一個 chunk 兩邊都有時**新的贏**——別台 client 因為舊 pack
+                // 被 GC 標記而重寫了同一個 chunk，這台才不會一直解析到被標記
+                // 的 pack。整張舊表串流讀取，不物化成 Vec（100 萬 chunk ≈ 96 MiB）。
+                let mut new_records: Vec<TableRecord> = Vec::new();
                 let mut packs = m.packs.clone();
                 let mut blobs = known;
                 for (id, blob) in new_blobs {
                     if superseded.contains(&id) {
                         continue;
                     }
-                    push_blob(&mut records, &mut packs, &blob);
+                    push_blob(&mut new_records, &mut packs, &blob);
                     blobs.push(id);
                 }
-                records.extend(t.iter()?.collect::<Result<Vec<_>>>()?);
-                (records, blobs, packs)
+                new_records.sort_by_key(|r| r.id);
+                new_records.dedup_by(|later, earlier| later.id == earlier.id);
+                packs.sort();
+                packs.dedup();
+                // 舊表串流 merge 在 write() 裡進行（t 的所有權移進去）
+                return self.write(new_records, blobs, packs, Some(t));
             }
             _ => return self.rebuild(live, fetch).await,
         };
-        packs.sort();
-        packs.dedup();
-        self.write(base_records, known_blobs, packs)
     }
 
     async fn rebuild<F, Fut>(&self, live: &[ObjectId], fetch: F) -> Result<ChunkIndex>
@@ -147,9 +146,47 @@ impl IndexCache {
         F: Fn(ObjectId) -> Fut,
         Fut: std::future::Future<Output = Result<IndexBlob>>,
     {
-        let mut blobs = Vec::new();
-        for id in live {
-            blobs.push((*id, fetch(*id).await?));
+        // 樂觀單遍：絕大多數 rebuild 沒有 supersedes（第一次建表、正常成長），
+        // 逐 blob 讀取、合併、**立刻丟棄**。若真的有 blob 帶 supersedes
+        //（repack / rebuild-index 之類），退回保守兩遍重讀——那時全部 blob
+        // 才會同時在記憶體，因為 supersedes 要收齊才知道哪些紀錄要丟。
+        let (mut records, kept, mut packs) = match self.rebuild_pass(live, &fetch, true).await? {
+            RebuildOutcome::Done(out) => out,
+            RebuildOutcome::NeedsTwoPass => match self.rebuild_pass(live, &fetch, false).await? {
+                RebuildOutcome::Done(out) => out,
+                // 第二遍已收齊全部 supersedes，不會再需要
+                RebuildOutcome::NeedsTwoPass => {
+                    return Err(CoreError::Corrupt {
+                        key: "index".to_owned(),
+                        reason: "index cache rebuild failed twice".to_owned(),
+                    })
+                }
+            },
+        };
+        records.sort_by_key(|r| r.id);
+        records.dedup_by(|later, earlier| later.id == earlier.id);
+        packs.sort();
+        packs.dedup();
+        self.write(records, kept, packs, None)
+    }
+
+    /// 樂遍（`optimistic = true`）：blob 讀完即丟；遇到帶 supersedes 的 blob
+    /// 回 `NeedsTwoPass`。保守遍：先收齊全部 blob 與 supersedes，再合併未取代者。
+    async fn rebuild_pass<F, Fut>(
+        &self,
+        live: &[ObjectId],
+        fetch: &F,
+        optimistic: bool,
+    ) -> Result<RebuildOutcome>
+    where
+        F: Fn(ObjectId) -> Fut,
+        Fut: std::future::Future<Output = Result<IndexBlob>>,
+    {
+        let mut blobs: Vec<(ObjectId, IndexBlob)> = Vec::new();
+        if !optimistic {
+            for id in live {
+                blobs.push((*id, fetch(*id).await?));
+            }
         }
         let superseded: HashSet<ObjectId> = blobs
             .iter()
@@ -158,26 +195,47 @@ impl IndexCache {
         let mut records = Vec::new();
         let mut packs = Vec::new();
         let mut kept = Vec::new();
-        for (id, blob) in &blobs {
-            if superseded.contains(id) {
-                continue;
+        for id in live {
+            if optimistic {
+                let blob = fetch(*id).await?;
+                if !blob.supersedes.is_empty() {
+                    // 場上可能有取代關係（這個 blob 取代別人，或被別人取代）：
+                    // 單遍分不清，保守重來
+                    return Ok(RebuildOutcome::NeedsTwoPass);
+                }
+                push_blob(&mut records, &mut packs, &blob);
+                kept.push(*id);
+            } else {
+                if superseded.contains(id) {
+                    continue;
+                }
+                if let Some((_, b)) = blobs.iter().find(|(bid, _)| bid == id) {
+                    push_blob(&mut records, &mut packs, b);
+                    kept.push(*id);
+                }
             }
-            push_blob(&mut records, &mut packs, blob);
-            kept.push(*id);
         }
-        packs.sort();
-        packs.dedup();
-        self.write(records, kept, packs)
+        Ok(RebuildOutcome::Done((records, kept, packs)))
     }
 
+    /// 寫表與 manifest。`new_records` 必須已排序去重；`old` 是要合併進來的
+    /// 舊表（增量），同 ID 時新紀錄贏。
     fn write(
         &self,
-        records: Vec<TableRecord>,
+        mut new_records: Vec<TableRecord>,
         blobs: Vec<ObjectId>,
-        packs: Vec<(ObjectId, u64)>,
+        mut packs: Vec<(ObjectId, u64)>,
+        old: Option<DiskTable>,
     ) -> Result<ChunkIndex> {
         std::fs::create_dir_all(&self.dir).map_err(|e| CoreError::io(&self.dir, e))?;
-        let table = DiskTable::build(&self.table_path(), records)?;
+        let records: Box<dyn Iterator<Item = Result<TableRecord>> + '_> = match &old {
+            Some(t) => Box::new(MergeOldNew {
+                old: t.iter()?.peekable(),
+                new: new_records.into_iter().peekable(),
+            }),
+            None => Box::new(new_records.into_iter().map(Ok)),
+        };
+        let table = DiskTable::build_sorted(&self.table_path(), records)?;
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             blobs,
@@ -194,6 +252,58 @@ impl IndexCache {
     }
 }
 
+/// 舊表（串流）與新紀錄的 k-way merge：兩邊都已依 ID 排序，同 ID **新的贏**。
+/// 舊表的讀取錯誤原樣傳播。串流讓合併不把整張舊表物化成 Vec。
+struct MergeOldNew<O, N>
+where
+    O: Iterator<Item = Result<TableRecord>>,
+    N: Iterator<Item = TableRecord>,
+{
+    old: std::iter::Peekable<O>,
+    new: std::iter::Peekable<N>,
+}
+
+impl<O, N> Iterator for MergeOldNew<O, N>
+where
+    O: Iterator<Item = Result<TableRecord>>,
+    N: Iterator<Item = TableRecord>,
+{
+    type Item = Result<TableRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // 舊表的讀取錯誤原樣傳播（包括錯誤落在表尾、new 已耗盡的情況）
+        if matches!(self.old.peek(), Some(Err(_))) {
+            return self.old.next();
+        }
+        let o: Option<TableRecord> = match self.old.peek() {
+            Some(Ok(r)) => Some(*r),
+            _ => None,
+        };
+        let n: Option<TableRecord> = self.new.peek().copied();
+        match (o, n) {
+            (None, None) => None,
+            (None, Some(_)) => self.new.next().map(Ok),
+            (Some(_), None) => self.old.next(),
+            (Some(o), Some(n)) => {
+                if n.id <= o.id {
+                    // 同 ID：新的贏，丟掉舊的
+                    if n.id == o.id {
+                        self.old.next();
+                    }
+                    self.new.next().map(Ok)
+                } else {
+                    self.old.next()
+                }
+            }
+        }
+    }
+}
+
+enum RebuildOutcome {
+    Done((Vec<TableRecord>, Vec<ObjectId>, Vec<(ObjectId, u64)>)),
+    NeedsTwoPass,
+}
+
 fn push_blob(records: &mut Vec<TableRecord>, packs: &mut Vec<(ObjectId, u64)>, blob: &IndexBlob) {
     for p in &blob.packs {
         packs.push((p.pack, p.size));
@@ -208,5 +318,110 @@ fn push_blob(records: &mut Vec<TableRecord>, packs: &mut Vec<(ObjectId, u64)>, b
                 },
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kist_format::ChunkId;
+
+    fn rec(id: u8) -> TableRecord {
+        TableRecord {
+            id: ChunkId::from_bytes([id; 32]),
+            location: ChunkLocation {
+                pack: ObjectId::from_bytes([9; 32]),
+                offset: 0,
+                length: 1,
+                raw_len: 1,
+            },
+        }
+    }
+
+    fn new_at(id: u8, pack: u8) -> TableRecord {
+        TableRecord {
+            id: ChunkId::from_bytes([id; 32]),
+            location: ChunkLocation {
+                pack: ObjectId::from_bytes([pack; 32]),
+                offset: 0,
+                length: 1,
+                raw_len: 1,
+            },
+        }
+    }
+
+    /// 同 ID 時新紀錄贏、其餘照 ID 序合併——backup 對被 GC 標記的舊 pack
+    /// 重寫過的 chunk，不能一直解析到舊位置。
+    #[test]
+    fn merge_prefers_new_records_on_same_id() {
+        let old: Vec<Result<TableRecord>> =
+            vec![Ok(rec(1)), Ok(new_at(2, 0xAA)), Ok(rec(4)), Ok(rec(7))];
+        let new = vec![new_at(2, 0xBB), rec(3)];
+        let merged: Vec<TableRecord> = match (MergeOldNew {
+            old: old.into_iter().peekable(),
+            new: new.into_iter().peekable(),
+        })
+        .collect::<Result<Vec<_>>>()
+        {
+            Ok(v) => v,
+            Err(e) => panic!("merge failed: {e}"),
+        };
+        let ids: Vec<u8> = merged.iter().map(|r| r.id.as_bytes()[0]).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 7]);
+        // id 2 的位置是新的
+        assert_eq!(merged[1].location.pack.as_bytes()[0], 0xBB);
+    }
+
+    /// 舊表的讀取錯誤要傳播，不能默默吞掉少一段紀錄。
+    #[test]
+    fn merge_propagates_old_read_error() {
+        let err = Err(CoreError::Corrupt {
+            key: "old".to_owned(),
+            reason: "boom".to_owned(),
+        });
+        let old: Vec<Result<TableRecord>> = vec![Ok(rec(1)), err, Ok(rec(5))];
+        let new: Vec<TableRecord> = vec![rec(2)];
+        let merged: Result<Vec<TableRecord>> = MergeOldNew {
+            old: old.into_iter().peekable(),
+            new: new.into_iter().peekable(),
+        }
+        .collect();
+        assert!(merged.is_err(), "舊表錯誤必須傳播");
+    }
+
+    /// 舊表先耗盡、錯誤落在表尾：一樣要傳播（曾有吞掉錯誤的 bug）。
+    #[test]
+    fn merge_propagates_error_at_old_tail() {
+        let err = Err(CoreError::Corrupt {
+            key: "old".to_owned(),
+            reason: "tail".to_owned(),
+        });
+        let old: Vec<Result<TableRecord>> = vec![Ok(rec(1)), err];
+        let new: Vec<TableRecord> = vec![rec(2), rec(3)];
+        let merged: Result<Vec<TableRecord>> = MergeOldNew {
+            old: old.into_iter().peekable(),
+            new: new.into_iter().peekable(),
+        }
+        .collect();
+        assert!(merged.is_err(), "表尾錯誤必須傳播");
+    }
+
+    /// 舊表全部 ID 都比新紀錄小（random 32-byte ID 的常見情況）：
+    /// 舊表耗盡後要把剩下的新紀錄交完，不能卡住。
+    #[test]
+    fn merge_drains_new_after_old_exhausted() {
+        let old: Vec<Result<TableRecord>> = vec![Ok(rec(1)), Ok(rec(2))];
+        let new: Vec<TableRecord> = vec![rec(200), rec(201)];
+        let merged: Vec<TableRecord> = match (MergeOldNew {
+            old: old.into_iter().peekable(),
+            new: new.into_iter().peekable(),
+        })
+        .collect::<Result<Vec<_>>>()
+        {
+            Ok(v) => v,
+            Err(e) => panic!("merge failed: {e}"),
+        };
+        let ids: Vec<u8> = merged.iter().map(|r| r.id.as_bytes()[0]).collect();
+        assert_eq!(ids, vec![1, 2, 200, 201]);
     }
 }

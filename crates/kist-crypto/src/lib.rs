@@ -386,8 +386,21 @@ impl RepoKeys {
     }
 
     /// 密封 index blob：index key，AAD = 角色常數。
-    pub fn seal_index_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        seal(&self.index_key, kist_format::AAD_INDEX, plaintext)
+    /// 密封 index blob：**吃掉**明文 buffer、就地加密（tag 附加在後），
+    /// 回傳 `nonce ‖ ct ‖ tag`（與 [`Self::open_index_blob`] 對應）。
+    /// index blob 是 repo 裡最大的 meta（100 萬 chunk 的明文 ≈ 56 MiB），
+    /// 就地加密省掉 `encrypt` 的整份密文拷貝。呼叫端先 `reserve(TAG_LEN)`
+    /// 就不會在附加 tag 時觸發重配。
+    pub fn seal_index_blob_in_place(&self, mut buf: Vec<u8>) -> Result<Vec<u8>> {
+        use chacha20poly1305::aead::AeadInPlace;
+        let nonce = random_bytes::<NONCE_LEN>()?;
+        cipher(&self.index_key)
+            .encrypt_in_place(&XNonce::from(nonce), kist_format::AAD_INDEX, &mut buf)
+            .map_err(|_| CryptoError::AuthFailed)?;
+        let mut out = Vec::with_capacity(NONCE_LEN + buf.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&buf);
+        Ok(out)
     }
 
     /// 解開 index blob。

@@ -107,8 +107,65 @@ pub struct Entry {
     #[serde(rename = "nlink", default, skip_serializing_if = "is_zero_u64")]
     pub nlink: u64,
     /// 擴充屬性（鍵與值都是 bytes；規範編碼會排序）。
-    #[serde(rename = "xattrs", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "xattrs",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_xattrs_strict"
+    )]
     pub xattrs: Option<std::collections::BTreeMap<ByteBuf, ByteBuf>>,
+}
+
+/// xattrs 的嚴格解碼：重複的 key 是偽造或損壞（format.md §4），拒絕——
+/// serde 的 `BTreeMap` 訪問器會默默 last-wins，不能依賴。
+fn de_xattrs_strict<'de, D>(d: D) -> Result<Option<std::collections::BTreeMap<ByteBuf, ByteBuf>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Option<std::collections::BTreeMap<ByteBuf, ByteBuf>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map of xattrs")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut map = std::collections::BTreeMap::new();
+            while let Some((k, v)) = access.next_entry::<ByteBuf, ByteBuf>()? {
+                if map.insert(k, v).is_some() {
+                    return Err(serde::de::Error::custom("duplicate xattr key"));
+                }
+            }
+            Ok(Some(map))
+        }
+    }
+    d.deserialize_map(Visitor)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// 偽造的 tree 帶重複的 xattr key：必須被拒（format.md §4）。
+    #[test]
+    fn duplicate_xattr_keys_are_rejected() {
+        #[derive(Deserialize, Debug)]
+        struct Probe {
+            #[serde(rename = "x", deserialize_with = "de_xattrs_strict")]
+            x: Option<std::collections::BTreeMap<ByteBuf, ByteBuf>>,
+        }
+        // {"x": {h"aa": 1, h"aa": 2}} —— map 內兩個相同的 key
+        let bytes = [
+            0xa1, 0x61, 0x78, 0xa2, 0x42, 0x61, 0x61, 0x01, 0x42, 0x61, 0x61, 0x02,
+        ];
+        let v: Result<Probe, _> = crate::cbor::decode(&bytes);
+        assert!(v.is_err(), "重複的 xattr key 必須被拒");
+    }
 }
 
 fn is_zero_u32(v: &u32) -> bool {

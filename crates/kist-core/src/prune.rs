@@ -634,7 +634,11 @@ impl Repository {
             }
         }
         let keys_ = Arc::clone(self.keys());
-        let mut writer = Some(PackWriter::new(Arc::clone(self.keys()), pack_target_size));
+        let mut writer = Some(PackWriter::new(
+            Arc::clone(self.keys()),
+            pack_target_size,
+            self.config().chunker.max,
+        ));
         let mut copied: HashSet<ChunkId> = HashSet::new();
         let mut out = Vec::new();
         let mut moved = 0u64;

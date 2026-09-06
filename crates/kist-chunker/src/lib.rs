@@ -130,6 +130,28 @@ impl Chunker {
             },
         }
     }
+
+    /// 同 [`chunks`]，但重用呼叫端的緩衝：省掉每個輸入一次 2×max 的
+    /// 配置與歸零（backup 逐檔切塊時原本每檔都要配一次）。`buf` 的長度
+    /// 會被調整成 2×max，內容不需要預先清掉——`len`/`cursor` 之外的
+    /// 位元組不會被讀。iterator 跑完或讀取出錯之後，用
+    /// [`Chunks::take_buf`] 把緩衝拿回去給下一個輸入重用；
+    /// **`take_buf` 之後不可再迭代**（緩衝已被拿走）。
+    pub fn chunks_with_buf<R: Read>(&self, reader: R, mut buf: Vec<u8>) -> Chunks<R> {
+        buf.resize(2 * self.params.max as usize, 0);
+        Chunks {
+            state: State {
+                params: self.params,
+                mask_small: self.mask_small,
+                mask_large: self.mask_large,
+                reader: Some(reader),
+                buf,
+                len: 0,
+                cursor: 0,
+                eof: false,
+            },
+        }
+    }
 }
 
 /// 整數的 round(log2(v))：v >= 2^b·√2 時進位到 b+1。用整數比較
@@ -250,6 +272,14 @@ impl<R: Read> State<R> {
 
 pub struct Chunks<R> {
     state: State<R>,
+}
+
+impl<R> Chunks<R> {
+    /// 拿回內部緩衝供下一個輸入重用（內容殘留無妨，[`Chunker::chunks_with_buf`]
+    /// 會整段重設）。呼叫後這個 iterator 不可再迭代。
+    pub fn take_buf(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.state.buf)
+    }
 }
 
 impl<R: Read> Iterator for Chunks<R> {

@@ -110,6 +110,44 @@ fn read_error_is_propagated() {
     assert!(err.to_string().contains("disk on fire"), "{err}");
 }
 
+/// 重用緩衝的結果必須與每次全新配置完全相同，且緩衝可以跨檔案反覆重用
+///（backup 每個檔案建一次 iterator；1 MiB 內容 × 數輪）。
+#[test]
+fn reused_buffer_matches_fresh() {
+    let data = random_bytes(4, 1_000_000);
+    let fresh: Vec<Vec<u8>> = small()
+        .chunks(Cursor::new(&data))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let max_cap = 2 * 64 * 1024;
+    let mut buf = Vec::new(); // 故意從空 buf 開始：API 要自己調整大小
+    for round in 0..3 {
+        let mut it = small().chunks_with_buf(Cursor::new(&data), std::mem::take(&mut buf));
+        let got: Vec<Vec<u8>> = it
+            .by_ref()
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        assert_eq!(got, fresh, "round {round}: 重用緩衝改變了切塊結果");
+        buf = it.take_buf();
+        assert_eq!(buf.len(), max_cap, "take_buf 應交回完整緩衝");
+    }
+}
+
+/// 讀取錯誤之後緩衝一樣要拿得回來（backup 的錯誤路徑要回收 16 MiB）。
+#[test]
+fn buffer_survives_read_error() {
+    struct Broken;
+    impl std::io::Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk on fire"))
+        }
+    }
+    let mut it = small().chunks_with_buf(Broken, Vec::new());
+    assert!(it.next().unwrap().is_err());
+    let buf = it.take_buf();
+    assert_eq!(buf.len(), 2 * 64 * 1024);
+}
+
 proptest! {
     #[test]
     fn concat_is_identity(data in proptest::collection::vec(any::<u8>(), 0..200_000)) {

@@ -154,7 +154,13 @@ kist/
   `-rss_limit_mb=0 -malloc_limit_mb=2048` 並負向對照驗證（ADR 010 §6）。
   96h 全量（每 target 24h）腳本就緒：`nohup sh fuzz/longrun.sh 86400 &`，
   擇時執行。
-- 記憶體目標：100 萬檔 repo 的 backup 峰值 < 512 MiB。
+- 記憶體目標：100 萬檔 repo 的 backup 峰值 < 512 MiB【完成 2026-09-06】：
+  量測（dhat 歸因）找出每檔 16 MiB zeroed 切塊緩衝、每檔 1 MiB BufReader、
+  pack 緩衝 Vec 倍增到 128 MiB 級、CBOR 走 Value 中繼、平面大目錄把 parent
+  entries 整份讀成 HashMap 等根因；修後 A 集（1000 目錄）373–431 MiB、
+  B 集（單一平面 1M 檔）442–524 MiB，`MemoryMax=512M` 硬門檻 A 3/3、
+  B 4/4 通過。方法與根因清單：`bench/memory/`、ADR 011。
+  restore 71 MiB、prune 550 MiB（非門檻記錄；prune 留給之後）。
 - release：`cargo-dist` 或 GitHub Actions 產出 linux(musl)/macos/windows binary。
 
 ## 工程規範
@@ -177,8 +183,10 @@ kist/
 
 ## 下一步（產品路線，依優先序）
 1. **M5 硬化**：cargo-fuzz 四 target（pack、cbor、chunker、parity）已建
-   並過煙霧【2026-09-06】；1h×4 長跑全數 OK【2026-09-06】。接著大 repo
-   記憶體目標、release binary（`cargo-dist`）。
+   並過煙霧【2026-09-06】；1h×4 長跑全數 OK【2026-09-06】。大 repo 記憶體
+   目標達成【2026-09-06，ADR 011；advisor 簽核：以 MemoryMax 硬門檻為準】。
+   接著 prune 記憶體（實測 550 MiB，超過門檻；ADR 005 §5 的三份結構合一），
+   然後 release binary（`cargo-dist`）。
 2. **M4 尾巴**：SFTP 後端、`mount`（Go 參考實作有可對照的實作）。
 3. xattr 的 restore 套用（目前記錄了但還原只警告）。
 4. Windows：VSS、路徑語意驗證。
