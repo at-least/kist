@@ -161,7 +161,11 @@ kist/
   B 集（單一平面 1M 檔）442–524 MiB，`MemoryMax=512M` 硬門檻 A 3/3、
   B 4/4 通過。方法與根因清單：`bench/memory/`、ADR 011。
   restore 71 MiB、prune 550 MiB（非門檻記錄；prune 留給之後）。
-- release：`cargo-dist` 或 GitHub Actions 產出 linux(musl)/macos/windows binary。
+- release binary【完成 2026-09-06，ADR 012】：版本升 0.1.0；`./dist.sh` 從
+  本機 cross 產出 linux-musl ×2 / macOS ×2 / windows-gnu 五個 target 的
+  壓縮檔 + SHA256SUMS（zig + cargo-zigbuild；musl 兩個有煙霧全流程，
+  windows/macOS 僅建置驗證）。順手修掉 xattr 讓 Windows 編得過，並清掉
+  `cargo clippy --all-targets -D warnings` 的 13 個既有 error。
 
 ## 工程規範
 - `#![forbid(unsafe_code)]`、`#![deny(clippy::unwrap_used, clippy::expect_used)]` 在所有 lib crate。
@@ -187,7 +191,8 @@ kist/
    目標達成【2026-09-06，ADR 011；advisor 簽核：以 MemoryMax 硬門檻為準】。
    prune 記憶體同樣達成【2026-09-06：1.05 GiB → 230 MiB，walk_tree 鏈式持有
    與 ADR 005 §5 三份結構合一，見 ADR 011 prune 節】。
-   接著 release binary（`cargo-dist`）。
+   release binary 完成【2026-09-06，ADR 012：`./dist.sh` 產五個 target，
+   版本 0.1.0】。M5 至此全數完成。
 2. **M4 尾巴**：SFTP 後端、`mount`（Go 參考實作有可對照的實作）。
 3. xattr 的 restore 套用（目前記錄了但還原只警告）。
 4. Windows：VSS、路徑語意驗證。

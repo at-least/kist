@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "kist-app"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "blake3",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "kist-backend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures",
  "object_store",
@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "kist-chunker"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "blake3",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "kist-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "kist-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "filetime",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "kist-crypto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "blake3",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "kist-format"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "ciborium",

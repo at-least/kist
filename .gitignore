@@ -8,3 +8,6 @@
 *.pdb
 __pycache__/
 dhat-heap.json
+
+# dist 產物（./dist.sh）
+/dist/

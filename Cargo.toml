@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/newlix/kist"
@@ -59,3 +59,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 zeroize = { version = "1", features = ["derive"] }
 zstd = "0.13"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
