@@ -4,10 +4,12 @@
 //! - backup 只用 `put` / `put_if_absent` / `get` / `get_range` / `list`；
 //! - `delete` 只有 maintenance（prune）會用。
 //!
-//! 支援兩種位置（見 [`RepoLocation`]）：本機目錄，以及 `s3://bucket/prefix`（AWS S3 與
-//! MinIO 等相容服務）。S3 的憑證與端點走 `object_store` 讀的環境變數：
-//! `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_DEFAULT_REGION`、
-//! `AWS_ENDPOINT`（MinIO 等自架服務）、`AWS_ALLOW_HTTP=true`（端點不是 https 時）。
+//! 支援三種位置（見 [`RepoLocation`]）：本機目錄、`s3://bucket[/prefix]`（AWS S3 與
+//! MinIO 等相容服務），以及 `sftp://[user@]host[:port]/path`（見 [`sftp`] 模組：
+//! host key 嚴格驗證、認證順序與環境變數說明都在那裡）。S3 的憑證與端點走
+//! `object_store` 讀的環境變數：`AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、
+//! `AWS_DEFAULT_REGION`、`AWS_ENDPOINT`（MinIO 等自架服務）、`AWS_ALLOW_HTTP=true`
+//! （端點不是 https 時）。
 //!
 //! TLS：reqwest 用 rustls 但不帶 crypto provider，由這裡在建構時安裝 ring
 //! （避免 aws-lc-sys 在 Windows 上需要 CMake + NASM）。
@@ -25,6 +27,8 @@ use object_store::path::Path as StorePath;
 use object_store::prefix::PrefixStore;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 
+pub mod sftp;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     #[error("object not found: {0}")]
@@ -34,7 +38,7 @@ pub enum BackendError {
     #[error("invalid object key {0:?}: {1}")]
     InvalidKey(String, String),
     #[error(
-        "invalid repository location {0:?}: expected a directory path or s3://bucket[/prefix]"
+        "invalid repository location {0:?}: expected a directory path, s3://bucket[/prefix] or sftp://[user@]host[:port]/path"
     )]
     InvalidUrl(String),
     #[error("cannot open local repository at {path}: {source}")]
@@ -42,10 +46,19 @@ pub enum BackendError {
         path: String,
         source: std::io::Error,
     },
+    #[error("sftp backend: {0}")]
+    Sftp(String),
     #[error("storage error: {0}")]
     Store(#[from] object_store::Error),
     #[error("object {0} has an unrepresentable timestamp")]
     BadTimestamp(String),
+}
+
+/// russh 的 client::Handler 規定 handler 錯誤要能從 `russh::Error` 轉換。
+impl From<russh::Error> for BackendError {
+    fn from(e: russh::Error) -> Self {
+        BackendError::Sftp(e.to_string())
+    }
 }
 
 /// list / head 回傳的物件資訊。`modified` 是後端記的最後修改時間
@@ -79,10 +92,11 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 pub enum RepoLocation {
     Local(PathBuf),
     S3 { bucket: String, prefix: String },
+    Sftp(sftp::SftpConfig),
 }
 
 impl RepoLocation {
-    /// `s3://bucket/prefix` → S3；其他任何字串都當本機路徑。
+    /// `s3://bucket/prefix` → S3；`sftp://…` → SFTP；其他任何字串都當本機路徑。
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(rest) = s.strip_prefix("s3://") {
             let (bucket, prefix) = match rest.split_once('/') {
@@ -97,6 +111,9 @@ impl RepoLocation {
                 prefix: prefix.trim_matches('/').to_owned(),
             });
         }
+        if s.starts_with("sftp://") {
+            return Ok(Self::Sftp(sftp::parse_sftp_url(s)?));
+        }
         if s.contains("://") || s.is_empty() {
             return Err(BackendError::InvalidUrl(s.to_owned()));
         }
@@ -104,7 +121,7 @@ impl RepoLocation {
     }
 
     pub fn is_remote(&self) -> bool {
-        matches!(self, Self::S3 { .. })
+        matches!(self, Self::S3 { .. } | Self::Sftp(_))
     }
 }
 
@@ -114,6 +131,23 @@ impl std::fmt::Display for RepoLocation {
             Self::Local(p) => write!(f, "{}", p.display()),
             Self::S3 { bucket, prefix } if prefix.is_empty() => write!(f, "s3://{bucket}"),
             Self::S3 { bucket, prefix } => write!(f, "s3://{bucket}/{prefix}"),
+            Self::Sftp(c) => {
+                // IPv6 主機補上 []，跟 parse 對稱。
+                let host = if c.host.contains(':') {
+                    format!("[{}]", c.host)
+                } else {
+                    c.host.clone()
+                };
+                write!(f, "sftp://")?;
+                if let Some(u) = &c.user {
+                    write!(f, "{u}@")?;
+                }
+                if c.port == 22 {
+                    write!(f, "{host}/{}", c.path)
+                } else {
+                    write!(f, "{host}:{}/{}", c.port, c.path)
+                }
+            }
         }
     }
 }
@@ -131,11 +165,12 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
-    /// 依 `--repo` 字串開後端。
-    pub fn from_url(s: &str) -> Result<Self> {
+    /// 依 `--repo` 字串開後端。SFTP 會真的連線（async）；本機與 S3 只建構。
+    pub async fn from_url(s: &str) -> Result<Self> {
         match RepoLocation::parse(s)? {
             RepoLocation::Local(p) => Self::local(&p),
             RepoLocation::S3 { bucket, prefix } => Self::s3(&bucket, &prefix),
+            RepoLocation::Sftp(cfg) => Self::sftp(&cfg, sftp::auth_from_env()).await,
         }
     }
 
@@ -191,6 +226,17 @@ impl Backend {
             Arc::new(PrefixStore::new(s3, Self::path(prefix)?))
         };
         Ok(Self { store, location })
+    }
+
+    /// SFTP。會連線、驗 host key、認證、檢查伺服器擴充（見 [`sftp`] 模組說明）。
+    /// `auth` 給 `sftp::auth_from_env()` 就是 CLI 的行為；測試給明確值。
+    pub async fn sftp(cfg: &sftp::SftpConfig, auth: sftp::SftpAuth) -> Result<Self> {
+        let store = sftp::SftpStore::open(cfg, &auth).await?;
+        let location = RepoLocation::Sftp(cfg.clone());
+        Ok(Self {
+            store: Arc::new(store),
+            location,
+        })
     }
 
     /// 包任何 `object_store` 實作（測試用）。

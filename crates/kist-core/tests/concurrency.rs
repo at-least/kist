@@ -115,8 +115,9 @@ async fn two_clients_backup_concurrently_s3() {
         std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
     }
     let dir = tempfile::tempdir().unwrap();
-    let backend =
-        Backend::from_url(&format!("s3://{bucket}/concurrent-{}", std::process::id())).unwrap();
+    let backend = Backend::from_url(&format!("s3://{bucket}/concurrent-{}", std::process::id()))
+        .await
+        .unwrap();
     concurrent_scenario(backend, dir.path()).await;
 }
 

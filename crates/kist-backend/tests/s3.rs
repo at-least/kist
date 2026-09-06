@@ -17,7 +17,7 @@ fn s3_env() -> Option<(String, String)> {
 }
 
 /// 用環境變數建一個指到隨機 prefix 的後端；順便回傳同一 bucket 無 prefix 的後端做驗證。
-fn s3_backends(test: &str) -> Option<(Backend, Backend, String)> {
+async fn s3_backends(test: &str) -> Option<(Backend, Backend, String)> {
     let (endpoint, bucket) = s3_env().or_else(|| {
         eprintln!("KIST_TEST_S3_ENDPOINT / KIST_TEST_S3_BUCKET not set; S3 test skipped");
         None
@@ -29,14 +29,16 @@ fn s3_backends(test: &str) -> Option<(Backend, Backend, String)> {
         std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
     }
     let prefix = format!("test-{test}-{}", std::process::id());
-    let with_prefix = Backend::from_url(&format!("s3://{bucket}/{prefix}")).unwrap();
-    let root = Backend::from_url(&format!("s3://{bucket}")).unwrap();
+    let with_prefix = Backend::from_url(&format!("s3://{bucket}/{prefix}"))
+        .await
+        .unwrap();
+    let root = Backend::from_url(&format!("s3://{bucket}")).await.unwrap();
     Some((with_prefix, root, prefix))
 }
 
 #[tokio::test]
 async fn prefix_is_applied_and_basic_ops_work() {
-    let Some((b, root, prefix)) = s3_backends("prefix") else {
+    let Some((b, root, prefix)) = s3_backends("prefix").await else {
         return;
     };
     b.put("config", vec![1, 2, 3]).await.unwrap();
@@ -81,7 +83,7 @@ async fn prefix_is_applied_and_basic_ops_work() {
 
 #[tokio::test]
 async fn conditional_put_never_overwrites_on_s3() {
-    let Some((b, _, _)) = s3_backends("cond") else {
+    let Some((b, _, _)) = s3_backends("cond").await else {
         return;
     };
     b.put_if_absent("snapshots/c/1", vec![1]).await.unwrap();
@@ -96,7 +98,7 @@ async fn conditional_put_never_overwrites_on_s3() {
 
 #[tokio::test]
 async fn large_single_put() {
-    let Some((b, _, _)) = s3_backends("big") else {
+    let Some((b, _, _)) = s3_backends("big").await else {
         return;
     };
     let data = vec![7u8; 64 * 1024 * 1024];

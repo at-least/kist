@@ -14,6 +14,22 @@ docker rm -f kist-minio             # 用完關掉
 `tests/minio-setup.sh` 會印出要 export 的環境變數（root 帳號、Put/Get/List-only 的 `kistbackup`
 帳號）。每個測試用隨機 prefix，同一個 bucket 可以重複跑。（CI workflow 只手動觸發；驗證都在本機跑。）
 
+## SFTP
+
+SFTP 相關的測試（`crates/kist-backend/tests/sftp.rs`、`contract.rs` 裡的
+`sftp_backend_meets_the_contract`）預設略過，設了環境變數才會跑：
+
+```sh
+eval "$(sh tests/sftp-setup.sh)"    # 起 atmoz/sftp 容器、keyscan 產 known_hosts、備 key 認證素材
+cargo test --workspace
+docker rm -f kist-sftp              # 用完關掉
+```
+
+`tests/sftp-setup.sh` 會印出要 export 的環境變數：`KIST_TEST_SFTP_URL`（含隨機 port 的
+`kisttest` 帳號）、密碼、known_hosts 路徑，以及帶 passphrase 的 ed25519 key（測
+`KIST_SFTP_KEY` / `KIST_SFTP_KEY_PASSPHRASE` 認證路徑）。容器的 OpenSSH sftp-server
+支援 kist 需要的 `hardlink@openssh.com` / `posix-rename@openssh.com` 擴充。
+
 ## 驗收
 
 見 `tests/acceptance/README.md`。

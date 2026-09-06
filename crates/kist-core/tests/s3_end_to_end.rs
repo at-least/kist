@@ -8,7 +8,7 @@ use kist_core::{
     BackupOptions, CheckOptions, ForgetOptions, PruneOptions, Repository, RestoreOptions,
 };
 
-fn s3_backend(test: &str) -> Option<Backend> {
+async fn s3_backend(test: &str) -> Option<Backend> {
     let endpoint = std::env::var("KIST_TEST_S3_ENDPOINT").ok();
     let bucket = std::env::var("KIST_TEST_S3_BUCKET").ok();
     let (Some(endpoint), Some(bucket)) = (endpoint, bucket) else {
@@ -21,12 +21,16 @@ fn s3_backend(test: &str) -> Option<Backend> {
         std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
     }
     let prefix = format!("core-{test}-{}", std::process::id());
-    Some(Backend::from_url(&format!("s3://{bucket}/{prefix}")).unwrap())
+    Some(
+        Backend::from_url(&format!("s3://{bucket}/{prefix}"))
+            .await
+            .unwrap(),
+    )
 }
 
 #[tokio::test]
 async fn backup_restore_check_on_s3() {
-    let Some(backend) = s3_backend("e2e") else {
+    let Some(backend) = s3_backend("e2e").await else {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -80,7 +84,7 @@ async fn backup_restore_check_on_s3() {
 /// M2 驗收：只有 Put/Get/List 權限的使用者能完成整個 backup（含 snapshot 的 conditional put）。
 #[tokio::test]
 async fn put_only_user_completes_a_backup() {
-    let Some(root_backend) = s3_backend("putonly") else {
+    let Some(root_backend) = s3_backend("putonly").await else {
         return;
     };
     let (Some(key), Some(secret)) = (
@@ -132,7 +136,7 @@ async fn put_only_user_completes_a_backup() {
 /// M3 對 S3：標記（conditional put）、LastModified 當時間、刪除；用 grace 0 讓兩階段在幾秒內走完。
 #[tokio::test]
 async fn forget_and_prune_on_s3() {
-    let Some(backend) = s3_backend("prune") else {
+    let Some(backend) = s3_backend("prune").await else {
         return;
     };
     Repository::init(backend.clone(), PASSWORD.as_bytes(), init_options())

@@ -127,6 +127,31 @@ async fn s3_backend_meets_the_contract() {
     if std::env::var("AWS_DEFAULT_REGION").is_err() {
         std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
     }
-    let b = Backend::from_url(&format!("s3://{bucket}/contract-{}", std::process::id())).unwrap();
+    let b = Backend::from_url(&format!("s3://{bucket}/contract-{}", std::process::id()))
+        .await
+        .unwrap();
+    contract(&b).await;
+}
+
+#[tokio::test]
+async fn sftp_backend_meets_the_contract() {
+    let (Some(url), Some(password), Some(known_hosts)) = (
+        std::env::var("KIST_TEST_SFTP_URL").ok(),
+        std::env::var("KIST_TEST_SFTP_PASSWORD").ok(),
+        std::env::var("KIST_TEST_SFTP_KNOWN_HOSTS").ok(),
+    ) else {
+        eprintln!("SFTP contract test skipped (tests/sftp-setup.sh 未跑)");
+        return;
+    };
+    let cfg = kist_backend::sftp::parse_sftp_url(&url).unwrap();
+    let auth = kist_backend::sftp::SftpAuth {
+        known_hosts: Some(known_hosts.into()),
+        key: None,
+        password: Some(password),
+    };
+    // 每次測試用獨立子目錄，重複跑不互相污染
+    let mut cfg = cfg;
+    cfg.path = format!("{}/contract-{}", cfg.path, std::process::id());
+    let b = Backend::sftp(&cfg, auth).await.unwrap();
     contract(&b).await;
 }

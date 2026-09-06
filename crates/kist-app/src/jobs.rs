@@ -103,7 +103,7 @@ pub async fn run_job(
 /// 依設定開 repo（讀密碼檔、解 key）。每次呼叫都重新做 Argon2，故意不把 key 留在記憶體裡；
 /// Web UI 的 snapshots 頁也用這個。
 pub async fn open_repo(cfg: &Config) -> Result<Repository> {
-    let backend = Backend::from_url(&cfg.repo)?;
+    let backend = Backend::from_url(&cfg.repo).await?;
     let password = cfg.read_password()?;
     Ok(Repository::open_with_cache(backend, password.as_bytes(), cfg.cache_dir.clone()).await?)
 }

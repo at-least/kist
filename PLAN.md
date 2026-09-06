@@ -193,7 +193,9 @@ kist/
    與 ADR 005 §5 三份結構合一，見 ADR 011 prune 節】。
    release binary 完成【2026-09-06，ADR 012：`./dist.sh` 產五個 target，
    版本 0.1.0】。M5 至此全數完成。
-2. **M4 尾巴**：SFTP 後端、`mount`（Go 參考實作有可對照的實作）。
+2. **M4 尾巴**：SFTP 後端【完成 2026-09-07，ADR 013：russh + openssh-sftp-client，
+   host key 嚴格驗證、hardlink/posix-rename 原子寫入，合約測試與 CLI 端到端全過】、
+   `mount`（Go 參考實作有可對照的實作）。
 3. xattr 的 restore 套用（目前記錄了但還原只警告）。
 4. Windows：VSS、路徑語意驗證。
 5. CI 把跨語言 interop（Go 測試 + 共用向量）納入 pipeline。

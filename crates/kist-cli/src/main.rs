@@ -89,9 +89,11 @@ impl PruneArgs {
 /// 每個需要 repo 的命令共用的參數。
 #[derive(Debug, Args)]
 struct RepoArgs {
-    /// Repository location: a local directory, or `s3://bucket[/prefix]`.
+    /// Repository location: a local directory, `s3://bucket[/prefix]`, or
+    /// `sftp://[user@]host[:port]/path`.
     /// For S3 set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION,
     /// plus AWS_ENDPOINT (and AWS_ALLOW_HTTP=true) for MinIO and other S3-compatible services.
+    /// For SFTP set KIST_SFTP_PASSWORD or KIST_SFTP_KEY (see `kist_backend::sftp` docs).
     #[arg(long, short = 'r', env = "KIST_REPO", global = true)]
     repo: Option<String>,
 
@@ -397,7 +399,7 @@ async fn run(cli: Cli) -> Result<()> {
             chunker_avg,
             chunker_max,
         } => {
-            let backend = open_backend(&repo)?;
+            let backend = open_backend(&repo).await?;
             let password = password::obtain(&repo.password_file, true)?;
             let remote = backend.location().is_remote();
             let opts = InitOptions {
@@ -879,12 +881,12 @@ fn repo_display(args: &RepoArgs) -> Result<String> {
     Ok(repo_url(args)?.to_owned())
 }
 
-fn open_backend(args: &RepoArgs) -> Result<Backend> {
-    Ok(Backend::from_url(repo_url(args)?)?)
+async fn open_backend(args: &RepoArgs) -> Result<Backend> {
+    Ok(Backend::from_url(repo_url(args)?).await?)
 }
 
 async fn open_repo(args: &RepoArgs) -> Result<Repository> {
-    let backend = open_backend(args)?;
+    let backend = open_backend(args).await?;
     let password = password::obtain(&args.password_file, false)?;
     let cache_root = if args.no_cache {
         None

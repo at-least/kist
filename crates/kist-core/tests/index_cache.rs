@@ -189,7 +189,9 @@ async fn cache_directory_depends_on_repo_key_and_location() {
     {
         let alias = t.dir.path().join("repo-alias");
         std::os::unix::fs::symlink(t.repo_path(), &alias).unwrap();
-        let backend = kist_backend::Backend::from_url(alias.to_str().unwrap()).unwrap();
+        let backend = kist_backend::Backend::from_url(alias.to_str().unwrap())
+            .await
+            .unwrap();
         let repo = Repository::open_with_cache(backend, PASSWORD.as_bytes(), Some(cache_root(&t)))
             .await
             .unwrap();
