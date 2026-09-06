@@ -389,3 +389,19 @@ fn location(pack: ObjectId, e: &PackEntry) -> ChunkLocation {
         raw_len: e.raw_len,
     }
 }
+
+/// 走訪（check/prune 共用）對 chunk 查詢的最小介面。check 用完整的
+/// [`ChunkIndex`]；prune 用自己的排序表（見 `prune::PruneIndex`）。
+pub trait ChunkLocator {
+    fn contains(&self, id: &ChunkId) -> bool;
+    fn get(&self, id: &ChunkId) -> Option<ChunkLocation>;
+}
+
+impl ChunkLocator for ChunkIndex {
+    fn contains(&self, id: &ChunkId) -> bool {
+        ChunkIndex::contains(self, id)
+    }
+    fn get(&self, id: &ChunkId) -> Option<ChunkLocation> {
+        ChunkIndex::get(self, id)
+    }
+}

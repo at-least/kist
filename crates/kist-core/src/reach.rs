@@ -11,7 +11,7 @@ use kist_format::snapshot::Snapshot;
 use kist_format::tree::{content_type, node_type, Entry};
 use kist_format::{keys, ChunkId, ObjectId, TreeId};
 
-use crate::index::ChunkIndex;
+use crate::index::ChunkLocator;
 use crate::repo::Repository;
 use crate::Result;
 
@@ -22,7 +22,9 @@ pub struct Reachability {
     /// 從任一 snapshot 走得到的 tree（含 `prev` 段），以 gc 命名空間的名稱（ObjectId）記錄。
     pub live_trees: HashSet<ObjectId>,
     /// 被引用的 chunk：資料 chunk 與 Indirect 的清單 chunk 都算。
-    pub referenced_chunks: HashSet<ChunkId>,
+    /// 收集時不排序、可能重複；prune 排序去重後合併進自己的索引
+    ///（100 萬 chunk ≈ 32 MiB，HashSet 要 67 MiB 以上）。
+    pub referenced_chunks: Vec<ChunkId>,
     /// 走訪途中讀不到的東西（snapshot、tree、chunk 清單）。
     pub errors: Vec<String>,
 }
@@ -40,11 +42,14 @@ pub struct FileVisit<'a> {
 impl Repository {
     /// 走遍所有 snapshot。`on_file` 對每個檔案節點呼叫一次（同一個 tree 只走一次）。
     /// `Send`：讓 prune / check 的 future 能被 `tokio::spawn`（daemon 在別的 task 上跑工作）。
-    pub(crate) async fn walk_references(
+    pub(crate) async fn walk_references<I>(
         &self,
-        index: &ChunkIndex,
+        index: &I,
         on_file: &mut (dyn FnMut(FileVisit<'_>) + Send),
-    ) -> Result<Reachability> {
+    ) -> Result<Reachability>
+    where
+        I: ChunkLocator + Sync + ?Sized,
+    {
         let mut reach = Reachability::default();
         let snapshot_keys = self.list_snapshot_keys().await?;
         for key in snapshot_keys {
@@ -63,14 +68,17 @@ impl Repository {
         Ok(reach)
     }
 
-    fn walk_tree<'a>(
+    fn walk_tree<'a, I>(
         &'a self,
         id: &'a TreeId,
         context: &'a str,
-        index: &'a ChunkIndex,
+        index: &'a I,
         on_file: &'a mut (dyn FnMut(FileVisit<'_>) + Send),
         reach: &'a mut Reachability,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+    where
+        I: ChunkLocator + Sync + ?Sized + 'a,
+    {
         Box::pin(async move {
             if !reach
                 .live_trees
@@ -86,9 +94,7 @@ impl Repository {
                     return;
                 }
             };
-            if let Some(prev) = tree.prev {
-                self.walk_tree(&prev, context, index, on_file, reach).await;
-            }
+            let prev = tree.prev;
             for node in &tree.entries {
                 match node.kind {
                     node_type::DIR if !node.subtree.is_zero() => {
@@ -134,6 +140,13 @@ impl Repository {
                     }
                     _ => {}
                 }
+            }
+            // 這個 tree 處理完就丟，再去走 prev：遞迴是 Box::pin 的 future，
+            // 抱著 `tree` await 下去會把整條 prev chain（一個大目錄可能上百段）
+            // 同時留在記憶體（100 萬檔 ≈ 240 MiB）。
+            drop(tree);
+            if let Some(prev) = prev {
+                self.walk_tree(&prev, context, index, on_file, reach).await;
             }
         })
     }

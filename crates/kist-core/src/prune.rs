@@ -43,9 +43,9 @@ use kist_format::pack::PackEntry;
 use kist_format::{keys, ChunkId, ObjectId};
 use time::OffsetDateTime;
 
-use crate::index::ChunkIndex;
+use crate::index::{ChunkLocation, ChunkLocator, TableRecord};
 use crate::pack::{decode_chunk, PackWriter};
-use crate::repo::Repository;
+use crate::repo::{IndexBlobs, Repository};
 use crate::{blocking, CoreError, Result};
 
 #[derive(Debug, Clone)]
@@ -130,6 +130,132 @@ struct Target {
     info: ObjectInfo,
 }
 
+/// prune 專用的 chunk 索引：有效 index 裡的每個 (chunk, holder) 一筆，
+/// 依 (chunk, pack) 排序。一份結構取代原本三份 100 萬級的東西——walk 用的
+/// `ChunkIndex` overlay HashMap、`canonical` HashMap、`referenced` HashSet
+///（ADR 005 §5 的「三份合一」；100 萬 chunk 從 ~330 MiB 降到 ~90 MiB）。
+///
+/// 排序鍵**不含** phantom/marked：marks 的取得時點是競態語義的一部分，
+/// 正本選擇維持在原本的時點（walk 之後、list 過 gc/ 之後）由
+/// [`Self::mark_and_canonicalize`] 掃組計算。
+struct PruneIndex {
+    records: Vec<TableRecord>,
+    /// 與 records 平行：這筆 holder 的 chunk 是否被引用
+    ///（`mark_and_canonicalize` 之後才有效）。
+    referenced: Vec<u8>,
+}
+
+impl PruneIndex {
+    fn new(mut records: Vec<TableRecord>) -> Self {
+        records.sort_unstable_by(|a, b| {
+            (a.id, a.location.pack, a.location.offset).cmp(&(
+                b.id,
+                b.location.pack,
+                b.location.offset,
+            ))
+        });
+        // 同一個 pack 可能出現在多個 effective blob 裡（兩個 prune 重疊時
+        // index 取聯集）；不去重的話 live bytes 會被重複累加。同一 pack 的
+        // 同一 chunk 只該有一筆，保留 offset 最小的。
+        records.dedup_by(|later, earlier| {
+            later.id == earlier.id && later.location.pack == earlier.location.pack
+        });
+        let n = records.len();
+        Self {
+            records,
+            referenced: vec![0; n],
+        }
+    }
+
+    /// 同一 chunk 的所有 holder 在 `records` 裡的區間。
+    fn group(&self, id: &ChunkId) -> std::ops::Range<usize> {
+        let lo = self.records.partition_point(|r| r.id < *id);
+        let hi = lo + self.records[lo..].partition_point(|r| r.id == *id);
+        lo..hi
+    }
+
+    /// `referenced`（未排序、可能重複）排序去重後與 records 線性合併：
+    /// 把每個被引用 chunk 的所有非 phantom holder 打上旗標，並算出
+    /// 正本（非 phantom holder 裡 `(marked, pack)` 最小者）的
+    /// needed packs 與 live bytes。被引用 chunk 一個非 phantom holder
+    /// 都沒有 → 引用不完整，回 `Unsafe`（與原本 canonical 表相同語義）。
+    fn mark_and_canonicalize(
+        &mut self,
+        referenced: Vec<ChunkId>,
+        is_marked: &dyn Fn(&ObjectId) -> bool,
+        phantoms: &HashSet<ObjectId>,
+    ) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, u64>)> {
+        let mut ref_ids = referenced;
+        ref_ids.sort_unstable();
+        ref_ids.dedup();
+        let mut needed: HashSet<ObjectId> = HashSet::new();
+        let mut live: HashMap<ObjectId, u64> = HashMap::new();
+        let mut pos = 0usize;
+        for chunk in &ref_ids {
+            while pos < self.records.len() && self.records[pos].id < *chunk {
+                pos += 1;
+            }
+            let mut i = pos;
+            let mut best: Option<(ObjectId, u64)> = None;
+            while i < self.records.len() && self.records[i].id == *chunk {
+                let pid = self.records[i].location.pack;
+                if !phantoms.contains(&pid) {
+                    let rank = (is_marked(&pid), pid);
+                    let better = match best {
+                        None => true,
+                        Some((bp, _)) => rank < (is_marked(&bp), bp),
+                    };
+                    if better {
+                        best = Some((pid, self.records[i].location.length));
+                    }
+                    self.referenced[i] = 1;
+                }
+                i += 1;
+            }
+            match best {
+                Some((pack, len)) => {
+                    needed.insert(pack);
+                    *live.entry(pack).or_insert(0) += len;
+                }
+                None => {
+                    return Err(CoreError::Unsafe(format!(
+                        "chunk {chunk} is referenced but no existing pack holds it (the index lists a pack that is gone); run `kist check` and `kist rebuild-index` first"
+                    )));
+                }
+            }
+        }
+        Ok((needed, live))
+    }
+
+    /// 這個 chunk 是否被引用（`mark_and_canonicalize` 之後）。
+    fn is_referenced(&self, id: &ChunkId) -> bool {
+        self.group(id).any(|i| self.referenced[i] == 1)
+    }
+
+    /// 這個 chunk 是否有 holder 在 `packs` 裡（repack 的 kept_chunks 語義：
+    /// 任一副本在 kept pack 就不用搬，不限正本）。
+    fn held_by(&self, id: &ChunkId, packs: &HashSet<ObjectId>) -> bool {
+        self.group(id).any(|i| packs.contains(&self.records[i].location.pack))
+    }
+}
+
+impl ChunkLocator for PruneIndex {
+    fn contains(&self, id: &ChunkId) -> bool {
+        let g = self.group(id);
+        g.start < g.end
+    }
+    fn get(&self, id: &ChunkId) -> Option<ChunkLocation> {
+        // 組內依 pack 排序，第一筆 = 名稱最小的 holder——與 ChunkIndex
+        // 「同名 chunk 取名稱最小 pack」的規則一致（規格 §10）。
+        let g = self.group(id);
+        if g.start < g.end {
+            self.records.get(g.start).map(|r| r.location)
+        } else {
+            None
+        }
+    }
+}
+
 /// `prune_plan` 的結果：所有決定都做完了，還沒寫任何東西。
 pub struct PrunePlan {
     repo: Repository,
@@ -143,7 +269,8 @@ pub struct PrunePlan {
     marked_packs: HashSet<ObjectId>,
     /// 目前存在的所有 index blob（有效的與被取代的），新 blob 要 supersede 它們。
     all_blob_ids: Vec<ObjectId>,
-    referenced: HashSet<ChunkId>,
+    /// 全部 (chunk, holder)，含被引用旗標；repack 的引用/kept 查詢用。
+    idx: PruneIndex,
     /// 需要的 pack（是某個被引用 chunk 的正本）。
     needed_packs: HashSet<ObjectId>,
     to_delete: Vec<(Target, ObjectInfo)>,
@@ -174,25 +301,43 @@ impl Repository {
                 errors.len()
             )));
         }
-        let mut index = ChunkIndex::new();
-        let mut indexed: HashMap<ObjectId, IndexPack> = HashMap::new();
-        for (_, blob) in &blobs.effective {
-            for p in &blob.packs {
-                index.add_pack(p);
-                indexed.entry(p.pack).or_insert_with(|| p.clone());
-            }
-        }
-        let all_blob_ids: Vec<ObjectId> = blobs
-            .effective
+        let IndexBlobs {
+            effective: blob_list,
+            superseded: superseded_ids,
+        } = blobs;
+        let all_blob_ids: Vec<ObjectId> = blob_list
             .iter()
             .map(|(id, _)| *id)
-            .chain(blobs.superseded.iter().copied())
+            .chain(superseded_ids.iter().copied())
             .collect();
         let effective_blobs: HashSet<ObjectId> =
-            blobs.effective.iter().map(|(id, _)| *id).collect();
+            blob_list.iter().map(|(id, _)| *id).collect();
+        let mut indexed: HashMap<ObjectId, IndexPack> = HashMap::new();
+        let mut records: Vec<TableRecord> = Vec::new();
+        // 把 entries 從 blob move 出來：blob 解碼結果整份留著會讓 entries 在
+        // 記憶體裡多一份（100 萬 chunk ≈ 48 MiB）。同時把 (chunk, holder) 攤平
+        // 進 PruneIndex——walk 的 contains/get、正本選擇、repack 的引用查詢
+        // 都查這一份，不再各自建 HashMap/HashSet。
+        for (_, blob) in blob_list {
+            for p in blob.packs {
+                for e in &p.entries {
+                    records.push(TableRecord {
+                        id: e.id,
+                        location: ChunkLocation {
+                            pack: p.pack,
+                            offset: e.offset,
+                            length: e.length,
+                            raw_len: e.raw_len,
+                        },
+                    });
+                }
+                indexed.entry(p.pack).or_insert(p);
+            }
+        }
+        let mut idx = PruneIndex::new(records);
 
         // 2. 可達性（嚴格：連被引用的 chunk 不在 index 裡都算引用不完整）
-        let reach = self.walk_references(&index, &mut |_| {}).await?;
+        let reach = self.walk_references(&idx, &mut |_| {}).await?;
         if let Some(e) = reach.errors.first() {
             return Err(CoreError::Unsafe(format!(
                 "{} reference(s) cannot be resolved ({e}); run `kist check` (and `kist rebuild-index` if packs are missing from the index) first",
@@ -220,45 +365,19 @@ impl Repository {
                 phantoms.len()
             );
         }
-        let rank = |id: &ObjectId| (marks.contains_key(id), *id);
-        let mut canonical: HashMap<ChunkId, ObjectId> = HashMap::new();
-        for (pid, p) in &indexed {
-            if phantoms.contains(pid) {
-                continue;
-            }
-            for e in &p.entries {
-                if !reach.referenced_chunks.contains(&e.id) {
-                    continue;
-                }
-                match canonical.get(&e.id) {
-                    Some(cur) if rank(cur) <= rank(pid) => {}
-                    _ => {
-                        canonical.insert(e.id, *pid);
-                    }
-                }
-            }
-        }
-        if let Some(c) = reach
-            .referenced_chunks
-            .iter()
-            .find(|c| !canonical.contains_key(c))
-        {
-            return Err(CoreError::Unsafe(format!(
-                "chunk {c} is referenced but no existing pack holds it (the index lists a pack that is gone); run `kist check` and `kist rebuild-index` first"
-            )));
-        }
-        let needed_packs: HashSet<ObjectId> = canonical.values().copied().collect();
-        // 每個 pack 的 (正本 bytes, 全部 bytes)
+        // 掃 PruneIndex 的每個 chunk 組（組均 1–2 筆），同時把被引用 chunk 的 holder 打上旗標。
+        let is_marked = |id: &ObjectId| marks.contains_key(id);
+        let (needed_packs, live_bytes) =
+            idx.mark_and_canonicalize(reach.referenced_chunks, &is_marked, &phantoms)?;
+        // 每個 pack 的 (正本 bytes, 全部 bytes)：全部 bytes 從 indexed 累計，
+        // 正本 bytes 是 mark_and_canonicalize 算出的正本表。
         let mut pack_bytes: HashMap<ObjectId, (u64, u64)> = HashMap::new();
         for (pid, p) in &indexed {
-            let mut live = 0u64;
             let mut total = 0u64;
             for e in &p.entries {
                 total = total.saturating_add(e.length);
-                if canonical.get(&e.id) == Some(pid) {
-                    live = live.saturating_add(e.length);
-                }
             }
+            let live = live_bytes.get(pid).copied().unwrap_or(0);
             pack_bytes.insert(*pid, (live, total));
         }
         report.live_packs = needed_packs.len() as u64;
@@ -404,7 +523,7 @@ impl Repository {
             phantoms,
             indexed,
             all_blob_ids,
-            referenced: reach.referenced_chunks,
+            idx,
             needed_packs,
             to_delete,
             marks_to_remove,
@@ -450,7 +569,7 @@ impl PrunePlan {
             .repack_packs(
                 &self.repack,
                 &self.indexed,
-                &self.referenced,
+                &self.idx,
                 &kept,
                 self.pack_target_size,
             )
@@ -614,24 +733,19 @@ impl PrunePlan {
 }
 
 impl Repository {
-    /// 把 `packs` 裡它是正本的 chunk 搬到新 pack。已在別的需要的 pack（`kept`）有副本的 chunk 不搬。
+    /// 把 `packs` 裡它是正本的 chunk 搬到新 pack。已在別的需要的 pack（`kept`）
+    /// 有副本的 chunk 不搬（任一 holder 命中就算，不限正本）。
     /// 回傳新 pack 的 index 項目、搬動的 bytes、讀不出來的 pack（跳過）。
     async fn repack_packs(
         &self,
         packs: &[ObjectId],
         indexed: &HashMap<ObjectId, IndexPack>,
-        referenced: &HashSet<ChunkId>,
+        idx: &PruneIndex,
         kept: &HashSet<ObjectId>,
         pack_target_size: u64,
     ) -> Result<(Vec<IndexPack>, u64, Vec<(ObjectId, CoreError)>)> {
         if packs.is_empty() {
             return Ok((Vec::new(), 0, Vec::new()));
-        }
-        let mut kept_chunks: HashSet<ChunkId> = HashSet::new();
-        for id in kept {
-            if let Some(p) = indexed.get(id) {
-                kept_chunks.extend(p.entries.iter().map(|e| e.id));
-            }
         }
         let keys_ = Arc::clone(self.keys());
         let mut writer = Some(PackWriter::new(
@@ -651,8 +765,8 @@ impl Repository {
                 .entries
                 .iter()
                 .filter(|e| {
-                    referenced.contains(&e.id)
-                        && !kept_chunks.contains(&e.id)
+                    idx.is_referenced(&e.id)
+                        && !idx.held_by(&e.id, kept)
                         && !copied.contains(&e.id)
                 })
                 .cloned()
@@ -743,4 +857,276 @@ impl Repository {
 
 fn to_time_duration(d: std::time::Duration, what: &str) -> Result<time::Duration> {
     time::Duration::try_from(d).map_err(|_| CoreError::Usage(format!("{what} is too large")))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::index::{ChunkLocation, TableRecord};
+
+    fn oid(b: u8) -> ObjectId {
+        ObjectId::from_bytes([b; 32])
+    }
+    fn cid(b: u8) -> ChunkId {
+        ChunkId::from_bytes([b; 32])
+    }
+    fn rec(chunk: u8, pack: u8, len: u64) -> TableRecord {
+        TableRecord {
+            id: cid(chunk),
+            location: ChunkLocation {
+                pack: oid(pack),
+                offset: 0,
+                length: len,
+                raw_len: len,
+            },
+        }
+    }
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    /// model：與舊實作相同的語義。canonical = 非 phantom holder 裡
+    /// `(marked, pack)` 最小者；不存在 → 該 chunk 進 rejects。
+    fn model_canonical(
+        holders: &HashMap<u8, Vec<(u8, u64)>>, // chunk → [(pack, length)]
+        marks: &HashSet<u8>,
+        phantoms: &HashSet<u8>,
+        referenced: &[u8],
+    ) -> (HashSet<u8>, HashMap<u8, u64>, HashSet<u8>) {
+        let rank = |p: u8| (marks.contains(&p), p);
+        let mut needed = HashSet::new();
+        let mut live = HashMap::new();
+        let mut rejects = HashSet::new();
+        for c in referenced {
+            let mut best: Option<(u8, u64)> = None;
+            // 完全沒有 holder 的被引用 chunk 也算 rejects（同舊語義：Unsafe）
+            for (p, len) in holders.get(c).map_or(&[][..], |v| v.as_slice()) {
+                if phantoms.contains(p) {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some((bp, _)) => rank(*p) < rank(bp),
+                };
+                if better {
+                    best = Some((*p, *len));
+                }
+            }
+            match best {
+                Some((p, len)) => {
+                    needed.insert(p);
+                    *live.entry(p).or_insert(0) += len;
+                }
+                None => {
+                    rejects.insert(*c);
+                }
+            }
+        }
+        (needed, live, rejects)
+    }
+
+    #[test]
+    fn canonical_selection_matches_model() {
+        let mut state = 0x5eed_u64;
+        for _case in 0..300 {
+            let n_packs = 1 + (lcg(&mut state) % 6) as u8;
+            let n_chunks = 1 + (lcg(&mut state) % 30) as u8;
+            let mut holders: HashMap<u8, Vec<(u8, u64)>> = HashMap::new();
+            let mut records = Vec::new();
+            for c in 0..n_chunks {
+                let mut used = HashSet::new();
+                for p in 0..n_packs {
+                    if lcg(&mut state) % 3 == 0 && used.insert(p) {
+                        // 每個 holder 各自的 length（同 chunk 在不同 pack 的
+                        // 紀錄不必同長——雖然內容相同）
+                        let len = 1 + lcg(&mut state) % 1000;
+                        holders.entry(c).or_default().push((p, len));
+                        records.push(rec(c, p, len));
+                    }
+                }
+            }
+            // 兩個 prune 重疊時同一 blob 聯集裡會有重複的 (chunk, pack)：
+            // 隨機複製幾筆，語義必須與不重複時一致
+            for _ in 0..(lcg(&mut state) % 4) {
+                if !records.is_empty() {
+                    let i = (lcg(&mut state) % records.len() as u64) as usize;
+                    records.push(records[i].clone());
+                }
+            }
+            let mut marks = HashSet::new();
+            let mut phantoms = HashSet::new();
+            for p in 0..n_packs {
+                if lcg(&mut state) % 3 == 0 {
+                    marks.insert(p);
+                }
+                if lcg(&mut state) % 4 == 0 {
+                    phantoms.insert(p);
+                }
+            }
+            let referenced: Vec<u8> = (0..n_chunks)
+                .filter(|_| lcg(&mut state) % 2 == 0)
+                .collect();
+
+            let (m_needed, m_live, m_rejects) = model_canonical(&holders, &marks, &phantoms, &referenced);
+            let to_oid = |p: u8| oid(p);
+            let m_needed: HashSet<ObjectId> = m_needed.iter().map(|p| to_oid(*p)).collect();
+            let m_live: HashMap<ObjectId, u64> =
+                m_live.iter().map(|(p, l)| (to_oid(*p), *l)).collect();
+
+            let mut idx = PruneIndex::new(records.clone());
+            let marks_set = marks.clone();
+            let is_marked = move |id: &ObjectId| marks_set.contains(&id.as_bytes()[0]);
+            let phantoms_oid: HashSet<ObjectId> = phantoms.iter().map(|p| to_oid(*p)).collect();
+            let ref_ids: Vec<ChunkId> = referenced.iter().map(|c| cid(*c)).collect();
+            let out = idx.mark_and_canonicalize(ref_ids, &is_marked, &phantoms_oid);
+            if m_rejects.is_empty() {
+                let (needed, live) = out.unwrap();
+                assert_eq!(needed, m_needed, "case packs={n_packs} chunks={n_chunks} marks={marks:?} phantoms={phantoms:?} referenced={referenced:?}");
+                assert_eq!(live, m_live, "live bytes mismatch");
+                for c in 0..n_chunks {
+                    let referenced = referenced.contains(&c);
+                    assert_eq!(
+                        idx.is_referenced(&cid(c)),
+                        referenced,
+                        "is_referenced chunk {c}"
+                    );
+                }
+            } else {
+                assert!(out.is_err(), "phantom-only case must be rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn unmarked_beats_marked_and_smallest_pack_wins() {
+        let mut idx = PruneIndex::new(vec![rec(1, 9, 100), rec(1, 4, 100), rec(1, 7, 100)]);
+        let is_marked = |id: &ObjectId| id.as_bytes()[0] == 4;
+        let phantoms = HashSet::new();
+        let (needed, live) = idx
+            .mark_and_canonicalize(vec![cid(1)], &is_marked, &phantoms)
+            .unwrap();
+        // 4 被標記：7 與 9 未標記，7 名稱最小 → 正本
+        assert_eq!(needed, [oid(7)].into_iter().collect());
+        assert_eq!(live, [(oid(7), 100u64)].into_iter().collect());
+    }
+
+    #[test]
+    fn phantom_only_referenced_chunk_is_rejected() {
+        let mut idx = PruneIndex::new(vec![rec(1, 3, 100), rec(2, 3, 50)]);
+        let is_marked = |_: &ObjectId| false;
+        let phantoms: HashSet<ObjectId> = [3u8].iter().map(|p| oid(*p)).collect();
+        let err = idx
+            .mark_and_canonicalize(vec![cid(1), cid(2)], &is_marked, &phantoms)
+            .unwrap_err();
+        assert!(err.to_string().contains("no existing pack holds it"));
+    }
+
+    #[test]
+    fn referenced_flags_cover_all_holders() {
+        // 同一 chunk 三個 holder（其中一個 phantom）：flag 只落在非 phantom，
+        // 但 is_referenced 對整個 chunk 都是 true
+        let mut idx = PruneIndex::new(vec![rec(1, 2, 10), rec(1, 5, 10), rec(1, 8, 10)]);
+        let phantoms: HashSet<ObjectId> = [8u8].iter().map(|p| oid(*p)).collect();
+        let is_marked = |_: &ObjectId| false;
+        let (needed, _live) = idx
+            .mark_and_canonicalize(vec![cid(1)], &is_marked, &phantoms)
+            .unwrap();
+        assert_eq!(needed, [oid(2)].into_iter().collect());
+        assert!(idx.is_referenced(&cid(1)));
+        assert!(!idx.is_referenced(&cid(9)));
+    }
+
+    #[test]
+    fn held_by_matches_kept_union() {
+        // 舊語義：kept_chunks = kept pack 的所有 entries 聯集，任一 holder 命中即免搬
+        let mut idx = PruneIndex::new(vec![rec(1, 2, 10), rec(1, 5, 10), rec(2, 5, 10)]);
+        let kept: HashSet<ObjectId> = [2u8].iter().map(|p| oid(*p)).collect();
+        assert!(idx.held_by(&cid(1), &kept)); // holder 在 kept
+        assert!(!idx.held_by(&cid(2), &kept)); // 只有 holder 在非 kept
+        assert!(!idx.held_by(&cid(3), &kept)); // 不存在
+    }
+
+    #[test]
+    fn duplicate_pack_records_counted_once() {
+        // 同一 pack 經兩個 effective blob 出現兩次：live bytes 只能算一次
+        let mut idx = PruneIndex::new(vec![rec(1, 5, 100), rec(1, 5, 100), rec(2, 5, 40)]);
+        let is_marked = |_: &ObjectId| false;
+        let (needed, live) = idx
+            .mark_and_canonicalize(vec![cid(1), cid(2)], &is_marked, &HashSet::new())
+            .unwrap();
+        assert_eq!(needed, [oid(5)].into_iter().collect());
+        assert_eq!(live, [(oid(5), 140u64)].into_iter().collect());
+        assert_eq!(idx.group(&cid(1)).len(), 1);
+    }
+
+    #[test]
+    fn locator_get_matches_chunk_index_min_pack_rule() {
+        use crate::index::{ChunkIndex, ChunkLocator as _};
+        // 隨機 holder 順序下，PruneIndex::get 必須與 ChunkIndex 的
+        // 「名稱最小 pack 勝」規則一致
+        let mut state = 0xbeef_u64;
+        for _case in 0..100 {
+            let n_packs = 1 + (lcg(&mut state) % 5) as u8;
+            let n_chunks = 1 + (lcg(&mut state) % 20) as u8;
+            let mut entries: Vec<(u8, u8)> = Vec::new();
+            for c in 0..n_chunks {
+                for p in 0..n_packs {
+                    if lcg(&mut state) % 3 == 0 {
+                        entries.push((c, p));
+                    }
+                }
+            }
+            let mut index = ChunkIndex::new();
+            let mut records = Vec::new();
+            // 以隨機順序餵 pack（每個 pack 一次 add_pack），打亞 holder 順序
+            let mut packs: Vec<u8> = (0..n_packs).collect();
+            packs.sort();
+            for p in &packs {
+                let p = *p;
+                let mut pack_entries = Vec::new();
+                for c in 0..n_chunks {
+                    if entries.contains(&(c, p)) {
+                        pack_entries.push(kist_format::pack::PackEntry {
+                            id: cid(c),
+                            offset: 0,
+                            length: 10,
+                            raw_len: 10,
+                        });
+                    }
+                }
+                if pack_entries.is_empty() {
+                    continue;
+                }
+                index.add_pack(&kist_format::index::IndexPack {
+                    pack: oid(p),
+                    size: 100,
+                    entries: pack_entries,
+                });
+            }
+            // records 依隨機順序塞
+            let mut shuffled = entries.clone();
+            for i in (1..shuffled.len()).rev() {
+                let j = (lcg(&mut state) % (i as u64 + 1)) as usize;
+                shuffled.swap(i, j);
+            }
+            for (c, p) in &shuffled {
+                records.push(rec(*c, *p, 10));
+            }
+            let idx = PruneIndex::new(records);
+            for c in 0..n_chunks {
+                assert_eq!(
+                    idx.get(&cid(c)),
+                    index.get(&cid(c)),
+                    "get mismatch chunk {c}"
+                );
+                assert_eq!(idx.contains(&cid(c)), index.contains(&cid(c)));
+            }
+            assert!(!idx.contains(&cid(200)));
+        }
+    }
 }

@@ -185,8 +185,9 @@ kist/
 1. **M5 硬化**：cargo-fuzz 四 target（pack、cbor、chunker、parity）已建
    並過煙霧【2026-09-06】；1h×4 長跑全數 OK【2026-09-06】。大 repo 記憶體
    目標達成【2026-09-06，ADR 011；advisor 簽核：以 MemoryMax 硬門檻為準】。
-   接著 prune 記憶體（實測 550 MiB，超過門檻；ADR 005 §5 的三份結構合一），
-   然後 release binary（`cargo-dist`）。
+   prune 記憶體同樣達成【2026-09-06：1.05 GiB → 230 MiB，walk_tree 鏈式持有
+   與 ADR 005 §5 三份結構合一，見 ADR 011 prune 節】。
+   接著 release binary（`cargo-dist`）。
 2. **M4 尾巴**：SFTP 後端、`mount`（Go 參考實作有可對照的實作）。
 3. xattr 的 restore 套用（目前記錄了但還原只警告）。
 4. Windows：VSS、路徑語意驗證。

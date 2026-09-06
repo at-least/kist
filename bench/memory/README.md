@@ -20,6 +20,8 @@
   - 真正的驗收是 `--max-bytes 536870912`（512 MiB）跑法不被殺：kernel 會先回收
     clean page cache，過了才是真的過
 - `run-baseline.sh <kist-bin> <workdir> <setdir> <label> [--gate]`：init + first + second backup 各量一次。
+- `run-prune.sh <kist-bin> <workdir> <label> <n> [--gate]`：在 run-baseline.sh 建好的
+  repo 上量 `prune --dry-run` n 次（只讀不寫，可重複量；--gate = 512 MiB 硬門檻）。
 
 ## 流程
 
@@ -31,6 +33,8 @@ python3 bench/memory/generate.py /path/set-b b kist-memtest-1
 sh bench/memory/run-baseline.sh target/release/kist /path/work /path/set-a A
 # 3. 硬門檻
 sh bench/memory/run-baseline.sh target/release/kist /path/work /path/set-a A --gate
+# 4. prune（在同一個 repo 上）
+sh bench/memory/run-prune.sh target/release/kist /path/work A 3 --gate
 ```
 
 注意：機器要閒置；測試集放 ext4（tmpfs 的 shmem 頁不可回收，會灌大數字）。

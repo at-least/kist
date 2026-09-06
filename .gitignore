@@ -7,3 +7,4 @@
 **/*.rs.bk
 *.pdb
 __pycache__/
+dhat-heap.json

@@ -60,6 +60,9 @@ cat "$base/memory.events" > "$samples.events" 2>/dev/null || : > "$samples.event
 exit $rc
 INNER
 chmod +x "$inner"
+# 重跑同一 label 時不能讓舊樣本混進 max（樣本是 append 寫的）
+: > "$outdir/$label.samples"
+rm -f "$outdir/$label.samples.peak" "$outdir/$label.samples.events"
 
 # shellcheck disable=SC2086
 systemd-run --user --scope -q $props "$inner" "$outdir/$label.samples" "$@"

@@ -32,7 +32,7 @@ release build、本地後端、N≥3 取最大：
 | A first+second | 1.17–1.9 GiB | 373–431 MiB | 3/3 通過 |
 | B first+second | 1.69 GiB | 442–524 MiB | 4/4 通過 |
 
-非門檻記錄：restore（A 快照）71 MiB；`prune --dry-run`（A repo）550 MiB。
+非門檻記錄：restore（A 快照）71 MiB。
 
 ## 找到的根因與修正
 
@@ -89,11 +89,51 @@ tree CBOR）、pack 往返、fuzz target 的不變式，全部通過。
 （tree 的 `xattrs`）補回重複 key 的拒絕（`deserialize_with` 自訂 visitor，
 恢復 format.md §4 的完整語意）。
 
+## prune 的峰值記憶體（2026-09-06 追加）
+
+prune 同樣以「100 萬 chunk repo、512 MiB 門檻」驗收（`bench/memory/run-prune.sh`）。
+repo 用**當下程式**重建（`run-baseline.sh`，B 測試集；舊 repo 的 tree 未分段，
+量出來的數字混雜了歷史格式）。
+
+| 修正前 | 修正後 | 硬門檻 |
+|---|---|---|
+| 1.00–1.05 GiB | 225–234 MiB | 3/3 通過（memory.peak ~235 MiB） |
+
+dhat 歸因（max-live 總和 1266.7 → 466.6 MiB）找到四個根因：
+
+1. **`walk_tree` 遞迴抱住整條 prev chain**：遞迴是 `Pin<Box<dyn Future>>`，
+   每層在 await 下一層時自己的 `tree` 還活著；大目錄上百個 segment 全部同時在
+   記憶體（1M 檔 ≈ 240 MiB，1M 個 Entry 同時活著）。→ 先 iterate 自己的
+   entries、明確 `drop(tree)`、再遞迴 prev；同時只有一個 tree 在記憶體。
+   check 與 prune 共用 walk，同時受益。
+2. **三份 100 萬級結構**（ADR 005 §5 的承諾）：walk 用的 `ChunkIndex` overlay
+   HashMap（~200 MiB）、`canonical: HashMap<ChunkId, ObjectId>`（~130 MiB）、
+   `referenced_chunks: HashSet`（~67 MiB），加上 repack 的 `kept_chunks` HashSet。
+   → 合一成 `PruneIndex`：所有 (chunk, holder) 攤平成 `Vec<TableRecord>`
+   （88 B/筆），依 (chunk, pack) 排序；contains/get 二分搜尋；referenced 從
+   HashSet 改 Vec 收集、排序去重後線性合併打成旗標；正本在原本時點掃組計算。
+   **排序鍵不含 phantom/marked**——marks 的取得時點是競態語義的一部分，
+   正本選擇維持在 walk 之後、list 過 gc/ 之後。
+3. **`canonical.values().collect()` 照 size_hint 保留 100 萬槽**（實際只有
+   16 個 pack，66 MiB 瞬時）→ 逐個 insert。
+4. **decoded index blobs 整份留著 + `indexed` clone 一份** → entries 從 blob
+   move 出來，blob 用完即丟。
+
+等價性由 model-based 測試鎖住（`prune::tests`）：隨機 holders/marks/phantoms
+（含跨 blob 重複的 (chunk, pack) 紀錄——兩個 prune 重疊時 index 取聯集會產生）
+比對新掃描與舊 canonical 表語義（正本選擇、live bytes、phantom-only 拒絕、
+`held_by` 的 kept 語義、與 `ChunkIndex` 的最小 pack 規則）；重複紀錄由
+`PruneIndex::new` 排序後去重（獨立 reviewer 抓到：不去重時 live bytes 會被
+重複累計，repack 門檻偏保守、自癒但屬語義漂移）。gc_race proptest 100 案例
+通過。
+
 ## 沒做（留給之後）
 
-- **prune 的峰值記憶體**：`referenced`/`canonical`/`indexed` 三份結構合一
-  （ADR 005 §5 的承諾），量測值 550 MiB（1M chunk repo）已貼近門檻。
-  修法方向：三份結構合一 + 串流化，與 backup 的做法同理。
+- **overlay 的 88 B/entry**：`HashMap<ChunkId, ChunkLocation>` 在 100 萬 chunk
+  時 ~178 MiB（resize 瞬間新舊表並存 ~267 MiB），是目前 backup 峰值的大頭。
+  要再降得換緊湊的開放定址結構，違反「保守直白」，除非目標再往下修。
+- **prune 的 index blob 載入**：`load_index_blobs` 仍把全部解碼後的 blob 收在
+  Vec 裡（~88 MiB 瞬時，用完即丟）；要再降可逐 blob 串流。
 - **overlay 的 88 B/entry**：`HashMap<ChunkId, ChunkLocation>` 在 100 萬 chunk
   時 ~178 MiB（resize 瞬間新舊表並存 ~267 MiB），是目前峰值的大頭。要再降
   得換緊湊的開放定址結構，違反「保守直白」，除非目標再往下修。

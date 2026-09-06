@@ -13,7 +13,7 @@ use kist_format::tree::{content_type, node_type, ChunkList, Entry};
 use kist_format::{cbor, keys, ChunkId, TreeId};
 
 use crate::fsmeta;
-use crate::index::ChunkIndex;
+use crate::index::{ChunkIndex, ChunkLocator};
 use crate::pack::decode_chunk;
 use crate::repo::Repository;
 use crate::{blocking, CoreError, Result};
@@ -241,12 +241,15 @@ impl Repository {
     }
 
     /// 直接內容回傳原清單；間接內容先把清單 chunk 讀出來解成 ChunkList。
-    pub(crate) async fn resolve_chunks(
+    pub(crate) async fn resolve_chunks<I>(
         &self,
         chunks: &[ChunkId],
         content: u8,
-        index: &ChunkIndex,
-    ) -> Result<Vec<ChunkId>> {
+        index: &I,
+    ) -> Result<Vec<ChunkId>>
+    where
+        I: ChunkLocator + Sync + ?Sized,
+    {
         if content == content_type::DIRECT {
             return Ok(chunks.to_vec());
         }
@@ -271,7 +274,7 @@ impl Repository {
     ) -> Result<Vec<u8>> {
         let first = {
             let guard = index.index.read().await;
-            self.read_chunk(id, &guard).await
+            self.read_chunk(id, &*guard).await
         };
         match first {
             Err(CoreError::ChunkMissing(_))
@@ -291,11 +294,14 @@ impl Repository {
             }
         }
         let guard = index.index.read().await;
-        self.read_chunk(id, &guard).await
+        self.read_chunk(id, &*guard).await
     }
 
     /// 從 pack 讀一個 chunk 的明文（range read + 解密 + 驗證）。
-    pub(crate) async fn read_chunk(&self, id: &ChunkId, index: &ChunkIndex) -> Result<Vec<u8>> {
+    pub(crate) async fn read_chunk<I>(&self, id: &ChunkId, index: &I) -> Result<Vec<u8>>
+    where
+        I: ChunkLocator + Sync + ?Sized,
+    {
         let loc = index.get(id).ok_or(CoreError::ChunkMissing(*id))?;
         let key = keys::pack(&loc.pack);
         let end = loc
