@@ -31,6 +31,19 @@ M5 硬化要求「cargo-fuzz 對 pack parser、CBOR decoder、chunker 連續跑 
 5. **CBOR 深巢狀的第一獵物已被上游防掉**：ciborium 0.2 對深巢狀回
    `RecursionLimitExceeded`（實測 2M 層），`tests/cbor_depth.rs` 把這個
    行為釘住，防 ciborium 升級後防線消失。
+6. **看門狗用單次 malloc 上限，不用累計 RSS**（2026-09-06 長跑第一天發現）：
+   cbor 在 35 分鐘觸發 libFuzzer 預設 2GB RSS 上限，但 heap profile 顯示
+   live heap 只有 36MB；同 corpus 無 ASan 跑 758 萬次執行峰值僅 62Mb。
+   成長全是 ASan allocator 對數百萬次小配置的 redzone／碎片頁不還 OS，
+   之後飽和（ASan build 的 cbor plateau 在 ~2.5GB）。累計 RSS 檢查在
+   ASan build 上量不到 target 的真實記憶體，改傳
+   `-rss_limit_mb=0 -malloc_limit_mb=2048`：前者關掉被污染的累計檢查，
+   後者保留真正要抓的獵物——偽造 header 觸發的單次巨大配置（觸發時
+   abort stack 指向 target 配置點）。`malloc_limit_mb` 預設跟隨
+   `rss_limit_mb`，rss 歸零時必須顯式設，兩者都要寫。負向控制驗證過：
+   `-malloc_limit_mb=1` 立即在 `malloc(1048576)` abort。代價是失去
+   「reachable 但無限成長」的累計守門；target 無全域狀態、LSan exit
+   檢查仍在，可接受。
 
 ## 環境備忘（sandbox）
 

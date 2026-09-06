@@ -147,7 +147,13 @@ kist/
   （雙向 PoC + 共用 golden），ADR 009。
 - `cargo-fuzz`（基礎建設【完成 2026-09-06】，`fuzz/`：pack、cbor、
   chunker、parity 四 target + seed corpus；斷言有效性經負向對照驗證）；
-  連續跑 24h 的長跑待執行（指令見 `fuzz/README.md`）。
+  長跑【完成 2026-09-06】：每 target 1h 序列全數 OK（pack 4.6M exec、
+  cbor 21.5M、chunker 7.4M、parity 2.8M，零 crash、零 artifact、seeds
+  乾淨）；首輪 cbor 在 35 分鐘假性 OOM——ASan allocator 頁保留讓累計
+  RSS 失真（live heap 僅 36MB、無 ASan 對照峰值 62Mb），看門狗改
+  `-rss_limit_mb=0 -malloc_limit_mb=2048` 並負向對照驗證（ADR 010 §6）。
+  96h 全量（每 target 24h）腳本就緒：`nohup sh fuzz/longrun.sh 86400 &`，
+  擇時執行。
 - 記憶體目標：100 萬檔 repo 的 backup 峰值 < 512 MiB。
 - release：`cargo-dist` 或 GitHub Actions 產出 linux(musl)/macos/windows binary。
 
@@ -171,8 +177,8 @@ kist/
 
 ## 下一步（產品路線，依優先序）
 1. **M5 硬化**：cargo-fuzz 四 target（pack、cbor、chunker、parity）已建
-   並過煙霧【2026-09-06】；待 24h 長跑（指令見 `fuzz/README.md`）。接著
-   大 repo 記憶體目標、release binary（`cargo-dist`）。
+   並過煙霧【2026-09-06】；1h×4 長跑全數 OK【2026-09-06】。接著大 repo
+   記憶體目標、release binary（`cargo-dist`）。
 2. **M4 尾巴**：SFTP 後端、`mount`（Go 參考實作有可對照的實作）。
 3. xattr 的 restore 套用（目前記錄了但還原只警告）。
 4. Windows：VSS、路徑語意驗證。

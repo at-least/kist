@@ -24,7 +24,13 @@ CARGO_BUILD_RUSTC_WRAPPER=
 export CARGO_BUILD_RUSTC_WRAPPER
 
 mkdir -p "fuzz/corpus/$target"
-cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- -max_total_time="$secs"
+# 看門狗：-rss_limit_mb 的累計 RSS 檢查會被 ASan allocator 的頁保留行為
+# 騙到（2026-09-06 cbor 35 分鐘假性 OOM：RSS 2GB 但 live heap 只有 36MB；
+# 同 corpus 無 ASan 跑 7.58M execs 峰值僅 62Mb）。關掉累計檢查、改用
+# 單次 malloc 上限抓「偽造 header 觸發巨大配置」。malloc_limit 預設跟隨
+# rss_limit，rss 歸零時必須顯式設，否則守門一起消失。
+cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
+    -max_total_time="$secs" -rss_limit_mb=0 -malloc_limit_mb=2048
 
 if [ -n "$(git status --porcelain -- fuzz/seeds)" ]; then
     echo "ERROR: fuzz/seeds 被這次跑動寫入了（corpus/seeds 順序不該顛倒）：" >&2
