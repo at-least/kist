@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use kist_backend::Backend;
+use kist_backend::{Backend, RepoLocation};
 use kist_core::{
     BackupOptions, CheckOptions, ForgetOptions, ForgetSummary, InitOptions, PruneOptions,
     PruneReport, Repository, RestoreOptions, RetentionPolicy,
@@ -89,11 +89,14 @@ impl PruneArgs {
 /// 每個需要 repo 的命令共用的參數。
 #[derive(Debug, Args)]
 struct RepoArgs {
-    /// Repository location: a local directory, `s3://bucket[/prefix]`, or
-    /// `sftp://[user@]host[:port]/path`.
+    /// Repository location: a local directory, `s3://bucket[/prefix]`,
+    /// `sftp://[user@]host[:port]/path`, or `rclone://[remote/]path` (kist spawns
+    /// `rclone serve sftp --stdio` itself; the rclone bridge has weaker conditional-
+    /// write atomicity, see docs/decisions/014-rclone-bridge.md).
     /// For S3 set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION,
     /// plus AWS_ENDPOINT (and AWS_ALLOW_HTTP=true) for MinIO and other S3-compatible services.
     /// For SFTP set KIST_SFTP_PASSWORD or KIST_SFTP_KEY (see `kist_backend::sftp` docs).
+    /// For rclone set KIST_RCLONE_BIN if rclone is not on PATH.
     #[arg(long, short = 'r', env = "KIST_REPO", global = true)]
     repo: Option<String>,
 
@@ -401,7 +404,9 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let backend = open_backend(&repo).await?;
             let password = password::obtain(&repo.password_file, true)?;
-            let remote = backend.location().is_remote();
+            // config 是唯一可覆寫的物件；被蓋掉就打不開 repo。kist 自己驗不了 bucket 設定，只能提醒。
+            // （rclone:// 的 config 讀回驗證只擋同時 init，保護 config 還是要靠遠端本身的版本能力。）
+            let show_versioning_note = matches!(backend.location(), RepoLocation::S3 { .. });
             let opts = InitOptions {
                 chunker: kist_format::config::ChunkerParams {
                     min: chunker_min,
@@ -412,8 +417,7 @@ async fn run(cli: Cli) -> Result<()> {
             };
             Repository::init(backend, password.as_bytes(), opts).await?;
             println!("repository initialized at {}", repo_display(&repo)?);
-            if remote {
-                // config 是唯一可覆寫的物件；被蓋掉就打不開 repo。kist 自己驗不了 bucket 設定，只能提醒。
+            if show_versioning_note {
                 eprintln!(
                     "note: enable bucket versioning or Object Lock so that `config` cannot be \
                      overwritten or deleted, and keep a copy of the `config` object somewhere safe"
@@ -874,7 +878,7 @@ struct PruneJson<'a> {
 fn repo_url(args: &RepoArgs) -> Result<&str> {
     args.repo
         .as_deref()
-        .context("no repository given: use --repo <path|s3://bucket/prefix> or set KIST_REPO")
+        .context("no repository given: use --repo <path|s3://bucket/prefix|sftp://host/path|rclone://remote/path> or set KIST_REPO")
 }
 
 fn repo_display(args: &RepoArgs) -> Result<String> {

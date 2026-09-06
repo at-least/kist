@@ -21,6 +21,19 @@
 //! URL（見 [`parse_sftp_url`]）：`sftp://[user@]host[:port]/path`，路徑一律視為絕對
 //! 路徑；密碼不得寫進 URL（會進 shell 歷史與 process 清單）。
 //!
+//! **rclone 橋接**（見 [`parse_rclone_url`]）：`rclone://<remote>/<path>` 讓 kist 自己
+//! spawn `rclone serve sftp --stdio <remote>:<path>`，SFTP 走 stdio pipe——不開 TCP
+//! port、不用 known_hosts，任何 rclone 設定好的遠端（`rclone config`）都能當儲存體。
+//! rclone 的 SFTP 伺服器不實做 `hardlink@openssh.com` 與 O_EXCL 建檔（宣稱支援但
+//! 執行回 `OpUnsupported`，實測見 docs/decisions/014-rclone-bridge.md），所以這個
+//! 模式下寫入語意比 `sftp://` 寬鬆：暫存檔退回 create+truncate（名稱是 64 位元隨機
+//! 數，撞名可忽略；最終 publish 仍是原子的 posix-rename）、`put_if_absent` 退化成
+//! 「先 stat 再 posix-rename」。kist 的 `put_if_absent` key 都是「同 key 必同內容」
+//! （pack、parity、GC 標記）或一次性寫入（config、snapshot），race 的最壞結果與
+//! 緩解（init 讀回驗證）都記在 ADR 014。`sftp://` 的條件寫入守門（hardlink）不變；
+//! 暫存檔建檔在任何模式下遇到伺服器拒絕 O_EXCL 都會退回 create+truncate——那只
+//! 影響暫存檔（64 位元隨機名），不影響最終 publish 的原子性，也不影響合約。
+//!
 //! 為什麼是 russh + openssh-sftp-client：認證與 host key 全在程式內完成（不需要外部
 //! `ssh` 執行檔，密碼才能非互動輸入）；SFTP 協議層由 openssh-sftp-client 提供，
 //! 內建管線化寫入（64 MiB pack 在 WAN 上才不會慢）與三個 OpenSSH 擴充的偵測。
@@ -28,7 +41,8 @@
 use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -47,6 +61,7 @@ use russh::client::{self, Handle, Msg};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::known_host_keys_path;
 use russh::keys::{check_known_hosts_path, decode_secret_key, PrivateKeyWithHashAlg};
+use tokio::process::{Child, ChildStderr, Command};
 
 use crate::{BackendError, Result};
 
@@ -166,6 +181,61 @@ fn default_known_hosts() -> Result<PathBuf> {
         .ok_or_else(|| BackendError::Sftp("no known_hosts given and $HOME is not set".to_owned()))
 }
 
+/// rclone 位置：`rclone://<remote>/<path>` 解析後的結果。`remote` 為空字串代表
+/// rclone 的本機檔案系統（`rclone:///srv/backups`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcloneConfig {
+    pub remote: String,
+    /// rclone 遠端上的 repo 根目錄（不含前後斜線）。
+    pub path: String,
+}
+
+/// `rclone://<remote>/<path>`（remote 留空 = 本機目錄）。
+///
+/// kist spawn `rclone serve sftp --stdio <remote>:<path>`（remote 留空時直接給本機
+/// 絕對路徑），SFTP 走子程序的 stdin/stdout——不開 TCP port、不用 known_hosts；
+/// rclone 的雲端設定（`rclone config`）就是唯一的前置設定。二進位預設從 `PATH`
+/// 找，可用 `KIST_RCLONE_BIN` 覆蓋。rclone 寫到 stderr 的日誌會被收進一個 4 KiB
+/// 的尾巴緩衝：不清掉會塞爆 pipe 把協議卡死，收起來才能在啟動失敗時把真正的
+/// 錯誤（remote 名字打錯等）回給使用者。
+///
+/// **語意比 `sftp://` 寬鬆**（理由與風險分析見模組說明與 ADR 014）：選這個 scheme
+/// 就是同意這份妥協。
+pub fn parse_rclone_url(s: &str) -> Result<RcloneConfig> {
+    let rest = match s.strip_prefix("rclone://") {
+        Some(rest) => rest,
+        None => return Err(BackendError::InvalidUrl(s.to_owned())),
+    };
+    // remote 名字切在第一個 '/'；rclone 的 remote 名不含 '/'（設定檔的 section 名）。
+    let (remote, path) = match rest.split_once('/') {
+        Some((r, p)) => (r, p),
+        None => (rest, ""),
+    };
+    // remote 用**白名單**驗證。安全理由：remote 與 path 會合成**一個** argv 元素餵
+    // 給 rclone，而 rclone 的旗標解析穿插在位置參數之間——`--password-command=…`
+    // 這種「remote」會被解析成 rclone 的旗標，加密設定檔下該旗標的值會被 shell 執行
+    // （審查指出的注入面）。允許字母、數字、`-`、`_`、`.`（rclone 的設定檔 section
+    // 名允許點），不以 `-` 開頭；其餘一律拒絕（fail-closed：空白、`=`、控制字元等
+    // 都進不了 argv）。path 另拒控制字元。
+    if path.is_empty() || !valid_remote_name(remote) || path.chars().any(|c| c.is_control()) {
+        return Err(BackendError::InvalidUrl(s.to_owned()));
+    }
+    Ok(RcloneConfig {
+        remote: remote.to_owned(),
+        path: path.trim_matches('/').to_owned(),
+    })
+}
+
+/// rclone remote 名的白名單：空字串（= rclone 的本機檔案系統）或「字母數字、
+/// `-`、`_`、`.`、不以 `-` 開頭」。`-` 開頭是 flag injection 的關鍵防線。
+fn valid_remote_name(remote: &str) -> bool {
+    remote.is_empty()
+        || (!remote.starts_with('-')
+            && remote
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+}
+
 fn current_user() -> Result<String> {
     ["USER", "LOGNAME"]
         .iter()
@@ -220,10 +290,7 @@ impl client::Handler for HostKeyCheck {
 }
 
 /// 連線：TCP + 握手（host key 驗證）+ 認證 + SFTP subsystem + 伺服器能力檢查。
-async fn connect(
-    cfg: &SftpConfig,
-    auth: &SftpAuth,
-) -> Result<(Handle<HostKeyCheck>, Arc<Sftp>, bool)> {
+async fn connect(cfg: &SftpConfig, auth: &SftpAuth) -> Result<(Keepalive, Arc<Sftp>, bool)> {
     let user = match &cfg.user {
         Some(u) => u.clone(),
         None => current_user()?,
@@ -313,7 +380,167 @@ async fn connect(
         ));
     }
     let fsync = sftp.support_fsync();
-    Ok((handle, Arc::new(sftp), fsync))
+    Ok((Keepalive::Ssh { _handle: handle }, Arc::new(sftp), fsync))
+}
+
+/// 讓連線活著的所有權：SSH 模式是 russh 的連線把手（drop 即斷線）；rclone 模式
+/// 是子程序（`kill_on_drop`）。`SftpInner` 的欄位順序讓 sftp 先 drop（關掉 stdin，
+/// rclone 才有機會自己收尾），子程序最後才被 kill。
+enum Keepalive {
+    Ssh {
+        _handle: Handle<HostKeyCheck>,
+    },
+    Stdio {
+        /// `kill_on_drop(true)`：drop 即 kill。kist 的每個操作都等伺服器 ACK 才算
+        /// 完成，CLI 結束時不會有還在飛的請求；kill 只是避免子程序在異常路徑上
+        /// 掛著（正常路徑 sftp drop 已關 stdin，rclone 會自己退出）。
+        _child: Child,
+    },
+}
+
+/// rclone 的 stderr 尾巴緩衝：背景任務永久讀、只留最後 4 KiB。不清 stderr 的話
+/// pipe 滿了 rclone 會卡死；收起來才能在啟動失敗時附上真正的錯誤訊息。
+struct StderrTail {
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// 收集任務的把手：`text_settled` 等它結束，尾巴才保證是全部。
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StderrTail {
+    fn spawn(mut stderr: ChildStderr) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::clone(&buf);
+        let task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut chunk = [0u8; 512];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut buf = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        buf.extend_from_slice(&chunk[..n]);
+                        let excess = buf.len().saturating_sub(4096);
+                        drain_front(&mut buf, excess);
+                    }
+                }
+            }
+        });
+        Self { buf, task }
+    }
+
+    /// 等背景收集任務把 stderr 讀完（子程序退出 → EOF → 任務結束）再回傳尾巴。
+    /// `wait` 是上限：任務沒能結束時照樣回目前已收到的內容。
+    async fn text_settled(mut self, wait: std::time::Duration) -> String {
+        let _ = tokio::time::timeout(wait, &mut self.task).await;
+        let buf = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&buf).trim().to_owned()
+    }
+}
+
+/// `Vec::drain(..n)` 的借用分離寫法（在還持有 lock 的當下整理緩衝）。
+fn drain_front(buf: &mut Vec<u8>, n: usize) {
+    let rest = buf.split_off(n);
+    *buf = rest;
+}
+
+/// spawn `rclone serve sftp --stdio <source>` 並完成 SFTP 版本交換。
+/// 回傳（子程序、sftp、是否支援 fsync、stderr 尾巴）。
+async fn connect_stdio(cfg: &RcloneConfig) -> Result<(Child, Arc<Sftp>, bool, StderrTail)> {
+    let bin = std::env::var("KIST_RCLONE_BIN").unwrap_or_else(|_| "rclone".to_owned());
+    // remote 留空 = 本機目錄，直接給絕對路徑；否則 rclone 的 `remote:path` 寫法。
+    let source = if cfg.remote.is_empty() {
+        format!("/{}", cfg.path)
+    } else {
+        format!("{}:{}", cfg.remote, cfg.path)
+    };
+    let mut child = Command::new(&bin)
+        .args(["serve", "sftp", "--stdio", "--log-level", "ERROR", &source])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            BackendError::Rclone(format!(
+                "cannot spawn {bin} (set KIST_RCLONE_BIN if rclone is not in PATH): {e}"
+            ))
+        })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| BackendError::Rclone("spawned rclone without stdin".to_owned()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BackendError::Rclone("spawned rclone without stdout".to_owned()))?;
+    let tail = StderrTail::spawn(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| BackendError::Rclone("spawned rclone without stderr".to_owned()))?,
+    );
+
+    let sftp = tokio::select! {
+        // 正常路徑：版本交換完成。
+        res = Sftp::new(stdin, stdout, Default::default()) => match res {
+            Ok(s) => s,
+            Err(e) => {
+                // 版本交換失敗：等子程序退出（stderr EOF），附上 rclone 說的話。
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    child.wait(),
+                )
+                .await;
+                let said = tail.text_settled(std::time::Duration::from_millis(500)).await;
+                let mut details = format!("start sftp over rclone stdio: {e}");
+                if !said.is_empty() {
+                    details.push_str(&format!("; rclone said: {said}"));
+                }
+                if let Ok(Some(status)) = child.try_wait() {
+                    details.push_str(&format!("; rclone exited: {status}"));
+                }
+                return Err(BackendError::Rclone(details));
+            }
+        },
+        // rclone 提前退出（remote 名字打錯、設定檔壞掉……）：版本交換永遠等不到。
+        // 上游在 multi_thread runtime 上 stdout EOF 不會喚醒 Sftp::new（會無限等，
+        // 見 ADR 014），所以用 wait() 先看到退出。wait() 是 cancel safe 的。
+        status = child.wait() => {
+            let said = tail.text_settled(std::time::Duration::from_millis(500)).await;
+            let mut details =
+                "rclone exited before completing the sftp handshake".to_owned();
+            match status {
+                Ok(status) => details.push_str(&format!(" (exit: {status})")),
+                Err(e) => details.push_str(&format!(" (wait failed: {e})")),
+            }
+            if !said.is_empty() {
+                details.push_str(&format!("; rclone said: {said}"));
+            }
+            return Err(BackendError::Rclone(details));
+        }
+        // 保險絲：30 秒沒完成版本交換（懸掛、極慢的遠端）——殺掉回錯。
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let said = tail.text_settled(std::time::Duration::from_millis(500)).await;
+            let mut details =
+                "rclone did not complete the sftp handshake within 30s".to_owned();
+            if !said.is_empty() {
+                details.push_str(&format!("; rclone said: {said}"));
+            }
+            return Err(BackendError::Rclone(details));
+        }
+    };
+    // 寬鬆模式唯一的 publish 原語是 posix-rename（hardlink 在 rclone 上不會動）。
+    if !sftp.support_posix_rename() {
+        return Err(BackendError::Rclone(
+            "rclone's sftp server does not offer posix-rename@openssh.com, \
+             which kist needs to publish objects atomically"
+                .to_owned(),
+        ));
+    }
+    let fsync = sftp.support_fsync();
+    Ok((child, Arc::new(sftp), fsync, tail))
 }
 
 async fn authenticate(
@@ -401,6 +628,15 @@ fn is_not_found(e: &SftpError) -> bool {
     )
 }
 
+/// SFTP 檔案錯誤是否為「伺服器不支援這個操作」（SSH_FX_OP_UNSUPPORTED）。
+/// rclone 對 O_EXCL 建檔與 hardlink 都是這個：宣稱支援、執行才拒絕。
+fn is_unsupported(e: &SftpError) -> bool {
+    matches!(
+        e,
+        SftpError::SftpError(openssh_sftp_client::error::SftpErrorKind::OpUnsupported, _)
+    )
+}
+
 fn generic(e: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     StoreError::Generic {
         store: "sftp",
@@ -433,12 +669,31 @@ fn dir_of(path: &str) -> &str {
 
 /// 共用的連線狀態（`SftpStore` 內包 `Arc`：`delete_stream`／`list` 需要 `'static`）。
 struct SftpInner {
-    /// russh 的連線把手：留著連線才不會斷（drop 即關閉）。
-    _handle: Handle<HostKeyCheck>,
     sftp: Arc<Sftp>,
     fsync: bool,
+    /// rclone:// 橋接的寬鬆模式：`put_if_absent` 退化成 stat + posix-rename
+    /// （見模組說明與 ADR 014）。
+    relaxed: bool,
+    /// O_EXCL 建檔被伺服器拒絕時只警告一次。
+    warned_no_o_excl: AtomicBool,
+    /// rclone 的 stderr 尾巴（stdio 模式才有；錯誤訊息附帶 rclone 說了什麼）。
+    stderr_tail: Option<StderrTail>,
+    /// **欄位順序即 drop 順序**：先 drop sftp（關 stdin 讓 rclone 收尾），連線
+    /// 把手／子程序最後才 drop（斷線／kill）。
+    keepalive: Keepalive,
     root: String,
     display: String,
+}
+
+impl Drop for SftpInner {
+    fn drop(&mut self) {
+        // 欄位宣告順序已保證 sftp 先 drop（關掉 stdin，rclone 有機會自己收尾），
+        // keepalive（ssh 把手＝斷線、子程序＝kill_on_drop）與 stderr 的背景任務
+        // 最後收。這裡讀取只是把這個所有權契約寫成程式碼。
+        let _ = &self.sftp;
+        let _ = &self.stderr_tail;
+        let _ = &self.keepalive;
+    }
 }
 
 impl SftpInner {
@@ -483,14 +738,38 @@ impl SftpInner {
         getrandom::fill(&mut name).map_err(generic)?;
         let scratch = format!("{dir}/.tmp-{}", hex::encode(name));
 
-        let mut f = self
+        // O_EXCL 建檔是第一選擇（撞名的第二個寫入者會直接失敗）。伺服器不支援時
+        // （rclone 對 create_new 回 OpUnsupported）退回 create+truncate：名稱是
+        // 64 位元隨機數，撞名機率可忽略，最終 publish 仍是原子的
+        // （hardlink／posix-rename）。只對 OpUnsupported 退——權限等其他錯誤照傳。
+        let opened = self
             .sftp
             .options()
             .write(true)
             .create_new(true)
             .open(&scratch)
-            .await
-            .map_err(generic)?;
+            .await;
+        let mut f = match opened {
+            Ok(f) => f,
+            Err(e) if is_unsupported(&e) => {
+                if !self.warned_no_o_excl.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "kist: server rejected exclusive scratch-file creation (operation \
+                         unsupported); falling back to create+truncate with a random name — \
+                         publishing the final object stays atomic"
+                    );
+                }
+                self.sftp
+                    .options()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&scratch)
+                    .await
+                    .map_err(generic)?
+            }
+            Err(e) => return Err(generic(e)),
+        };
         let wrote = async {
             f.write_all(bytes).await.map_err(generic)?;
             if self.fsync {
@@ -549,12 +828,15 @@ pub(crate) struct SftpStore(Arc<SftpInner>);
 
 impl SftpStore {
     pub async fn open(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
-        let (handle, sftp, fsync) = connect(cfg, auth).await?;
+        let (keepalive, sftp, fsync) = connect(cfg, auth).await?;
         let root = format!("/{}", cfg.path.trim_matches('/'));
         let inner = Arc::new(SftpInner {
-            _handle: handle,
             sftp,
             fsync,
+            relaxed: false,
+            warned_no_o_excl: AtomicBool::new(false),
+            stderr_tail: None,
+            keepalive,
             root: root.clone(),
             display: format!(
                 "sftp://{}@{}:{}/{}",
@@ -565,6 +847,29 @@ impl SftpStore {
             ),
         });
         inner.ensure_dir(&root).await?;
+        Ok(Self(inner))
+    }
+
+    /// rclone 橋接（寬鬆語意，見模組說明與 ADR 014）。served root 就是 rclone 的
+    /// source，所以 SFTP 路徑的 root 是 `/`；repo 的目錄結構由 `ensure_dir` 在
+    /// 各自的寫入路徑上按需建立。
+    pub async fn open_rclone(cfg: &RcloneConfig) -> Result<Self> {
+        let (child, sftp, fsync, tail) = connect_stdio(cfg).await?;
+        let display = if cfg.remote.is_empty() {
+            format!("rclone:///{}", cfg.path)
+        } else {
+            format!("rclone://{}/{}", cfg.remote, cfg.path)
+        };
+        let inner = Arc::new(SftpInner {
+            sftp,
+            fsync,
+            relaxed: true,
+            warned_no_o_excl: AtomicBool::new(false),
+            stderr_tail: Some(tail),
+            keepalive: Keepalive::Stdio { _child: child },
+            root: String::new(),
+            display,
+        });
         Ok(Self(inner))
     }
 }
@@ -652,7 +957,7 @@ impl ObjectStore for SftpStore {
         match opts.mode {
             PutMode::Create => {
                 // 快路徑：已存在就早退（每晚對同一棵未變 tree 重複上傳時省下整份上傳）；
-                // 真正的守門還是後面的 hardlink。
+                // 真正的守門是後面的 hardlink（嚴格模式）或 publish 前的這次 stat（寬鬆模式）。
                 if inner.meta_of(&full).await.is_ok() {
                     return Err(StoreError::AlreadyExists {
                         path: location.to_string(),
@@ -660,24 +965,49 @@ impl ObjectStore for SftpStore {
                     });
                 }
                 let scratch = inner.spool(dir_of(&full), &bytes).await?;
-                let mut fs = inner.sftp.fs();
-                let linked = fs.hard_link(&scratch, &full).await;
-                drop(fs);
-                inner.remove_quiet(&scratch).await;
-                match linked {
+                let published = if inner.relaxed {
+                    // rclone 橋接：hardlink 在 rclone 上不會動（宣稱支援、執行回
+                    // OpUnsupported），退化成 posix-rename publish。race 視窗（兩個
+                    // 寫入者同時通過上面的 stat）與緩解見模組說明與 ADR 014。
+                    let mut fs = inner.sftp.fs();
+                    let renamed = fs.rename(&scratch, &full).await;
+                    drop(fs);
+                    inner.remove_quiet(&scratch).await;
+                    renamed.map(|_| ())
+                } else {
+                    let mut fs = inner.sftp.fs();
+                    let linked = fs.hard_link(&scratch, &full).await;
+                    drop(fs);
+                    inner.remove_quiet(&scratch).await;
+                    linked
+                };
+                match published {
                     Ok(()) => Ok(PutResult {
                         e_tag: None,
                         version: None,
                         extensions: Default::default(),
                     }),
                     Err(e) => {
-                        // link 被拒：用 stat 判別「已存在」還是別種錯誤（link 是原子的，
-                        // 目標在的話就是完整的）。
+                        // publish 被拒：用 stat 判別「已存在」還是別種錯誤
+                        // （hardlink 是原子的，目標在的話就是完整的）。
                         let exists = inner.meta_of(&full).await.is_ok();
                         if exists {
                             Err(StoreError::AlreadyExists {
                                 path: location.to_string(),
                                 source: Box::new(e),
+                            })
+                        } else if !inner.relaxed && is_unsupported(&e) {
+                            // 伺服器宣稱支援 hardlink 卻在實際 link 時拒絕（rclone
+                            // 就是這樣）：給出指向橋接的明確錯誤，而不是莫名的 generic。
+                            Err(StoreError::Generic {
+                                store: "sftp",
+                                source: format!(
+                                    "server advertises hardlink@openssh.com but rejected the \
+                                     link ({e}); kist needs it for atomic conditional writes — \
+                                     if this is rclone serve sftp, use the rclone:// bridge \
+                                     instead"
+                                )
+                                .into(),
                             })
                         } else {
                             Err(generic(e))
@@ -822,8 +1152,10 @@ impl ObjectStore for SftpStore {
                     let mut fs = inner.sftp.fs();
                     match fs.remove_file(&full).await {
                         Ok(()) => Ok(Some(loc)),
-                        // 刪不存在的物件視為已刪（與 S3 一致），且不回報該路徑。
-                        Err(e) if is_not_found(&e) => Ok(None),
+                        // 刪不存在的物件視為已刪（與 S3 一致）。**要回報該路徑**：
+                        // object_store 的單鍵 delete 包裝要求 delete_stream 對一個
+                        // location 剛好 yield 一次，靜默跳過會讓它變成錯誤。
+                        Err(e) if is_not_found(&e) => Ok(Some(loc)),
                         Err(e) => Err(generic(e)),
                     }
                 }
@@ -848,6 +1180,8 @@ impl ObjectStore for SftpStore {
             Some(p) => format!("{}/{}", self.0.root, p),
             None => self.0.root.clone(),
         };
+        // rclone 模式的 root 是空字串（served root 即 SFTP 根）；SFTP 路徑要絕對。
+        let dir = if dir.is_empty() { "/".to_owned() } else { dir };
         let root = self.0.root.clone();
         let task = async move {
             let mut out = Vec::new();
@@ -873,6 +1207,7 @@ impl ObjectStore for SftpStore {
             Some(p) => format!("{}/{}", root, p),
             None => root.clone(),
         };
+        let dir = if dir.is_empty() { "/".to_owned() } else { dir };
         let mut fs = self.0.sftp.fs();
         let d = match fs.open_dir(&dir).await {
             Ok(d) => d,

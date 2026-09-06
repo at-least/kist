@@ -195,7 +195,12 @@ kist/
    版本 0.1.0】。M5 至此全數完成。
 2. **M4 尾巴**：SFTP 後端【完成 2026-09-07，ADR 013：russh + openssh-sftp-client，
    host key 嚴格驗證、hardlink/posix-rename 原子寫入，合約測試與 CLI 端到端全過】、
+   rclone 橋接【完成 2026-09-07，ADR 014：`rclone://` stdio 橋接（kist spawn
+   `rclone serve sftp --stdio`），寬鬆條件寫入 opt-in、config 讀回驗證擋雙重 init；
+   實測 rclone 不實做 hardlink/O_EXCL，`sftp://` 維持嚴格並給明確錯誤】、
    `mount`（Go 參考實作有可對照的實作）。
 3. xattr 的 restore 套用（目前記錄了但還原只警告）。
-4. Windows：VSS、路徑語意驗證。
-5. CI 把跨語言 interop（Go 測試 + 共用向量）納入 pipeline。
+4. 回報上游：openssh-sftp-client 0.15.8 `Sftp::new` 在 multi_thread runtime 上
+   stdout EOF 不喚醒（重現與細節見 ADR 014「上游怪癖」節；繞法已進 kist）。
+5. Windows：VSS、路徑語意驗證。
+6. CI 把跨語言 interop（Go 測試 + 共用向量）納入 pipeline。

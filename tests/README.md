@@ -30,6 +30,21 @@ docker rm -f kist-sftp              # 用完關掉
 `KIST_SFTP_KEY` / `KIST_SFTP_KEY_PASSPHRASE` 認證路徑）。容器的 OpenSSH sftp-server
 支援 kist 需要的 `hardlink@openssh.com` / `posix-rename@openssh.com` 擴充。
 
+## rclone 橋接
+
+rclone 相關的測試（`crates/kist-backend/tests/rclone.rs`、`rclone_bin.rs`）預設略過，
+需要 PATH 上有 rclone 並設環境變數：
+
+```sh
+eval "$(sh tests/rclone-setup.sh)"  # 只是確認 rclone 在 PATH 上並 export KIST_TEST_RCLONE=1
+cargo test --workspace
+```
+
+stdio 模式不用起伺服器：`rclone://` 會讓 kist 自己 spawn `rclone serve sftp --stdio`。
+這些測試同時驗證 rclone 的擴充「宣稱支援但實際行為」——`put` 走 O_EXCL fallback +
+posix-rename、`put_if_absent` 走 stat + posix-rename（rclone 不實做 hardlink 與
+O_EXCL 建檔，寬鬆語意的理由見 `docs/decisions/014-rclone-bridge.md`）。
+
 ## 驗收
 
 見 `tests/acceptance/README.md`。

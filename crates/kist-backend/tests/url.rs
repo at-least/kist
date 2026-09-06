@@ -1,4 +1,4 @@
-//! `Backend::from_url`：本機路徑、s3:// 與 sftp:// URL 的解析。
+//! `Backend::from_url`：本機路徑、s3://、sftp:// 與 rclone:// URL 的解析。
 
 use kist_backend::{Backend, BackendError, RepoLocation};
 
@@ -85,6 +85,74 @@ fn sftp_url_parses_user_host_port_path() {
         parse_sftp_url("https://example.com/repo"),
         Err(BackendError::InvalidUrl(_))
     ));
+}
+
+#[test]
+fn rclone_url_parses_remote_and_path() {
+    use kist_backend::sftp::parse_rclone_url;
+
+    // remote:path 形式
+    let cfg = parse_rclone_url("rclone://gdrive/backups/laptop").unwrap();
+    assert_eq!(cfg.remote, "gdrive");
+    assert_eq!(cfg.path, "backups/laptop");
+
+    // remote 留空 = rclone 的本機檔案系統；路徑視為絕對路徑
+    let cfg = parse_rclone_url("rclone:///srv/backups").unwrap();
+    assert_eq!(cfg.remote, "");
+    assert_eq!(cfg.path, "srv/backups");
+
+    // Display 往返
+    assert_eq!(
+        RepoLocation::parse("rclone://gdrive/backups")
+            .unwrap()
+            .to_string(),
+        "rclone://gdrive/backups"
+    );
+    assert_eq!(
+        RepoLocation::parse("rclone:///srv/backups")
+            .unwrap()
+            .to_string(),
+        "rclone:///srv/backups"
+    );
+    // 尾斜線正規化掉
+    assert_eq!(
+        RepoLocation::parse("rclone://gdrive/backups/")
+            .unwrap()
+            .to_string(),
+        "rclone://gdrive/backups"
+    );
+
+    // 拒絕：沒有路徑
+    assert!(parse_rclone_url("rclone://gdrive").is_err());
+    assert!(parse_rclone_url("rclone://gdrive/").is_err());
+    assert!(parse_rclone_url("rclone://").is_err());
+    // 拒絕：remote 名字裡出現不是 remote name 的字元（可能是把 sftp:// 的寫法搬過來）
+    assert!(parse_rclone_url("rclone://gd:rive/x").is_err());
+    assert!(parse_rclone_url("rclone://bob@gdrive/x").is_err());
+    // 拒絕：remote 名字會被 rclone 當成旗標解析（remote/path 合成一個 argv 元素，
+    // rclone 的旗標解析穿插在位置參數之間——加密設定檔下 --password-command 的值
+    // 會被 shell 執行，見 ADR 014）
+    assert!(parse_rclone_url("rclone://--config=evil/x").is_err());
+    assert!(parse_rclone_url("rclone://--password-command=id/x").is_err());
+    assert!(parse_rclone_url("rclone://-x/y").is_err());
+    assert!(parse_rclone_url("rclone://a b/c").is_err());
+    assert!(parse_rclone_url("rclone://a=b/c").is_err());
+    // 白名單內的合法 remote 名（字母數字、-、_、.；rclone 的 section 名允許點）
+    assert!(parse_rclone_url("rclone://gdrive-2_x/backups").is_ok());
+    assert!(parse_rclone_url("rclone://my.remote/backups").is_ok());
+    // rclone:// 不吃路徑以外的 scheme 誤用
+    assert!(matches!(
+        parse_rclone_url("sftp://example.com/repo"),
+        Err(BackendError::InvalidUrl(_))
+    ));
+    // RepoLocation 路由與 is_remote
+    assert!(matches!(
+        RepoLocation::parse("rclone://gdrive/backups").unwrap(),
+        RepoLocation::Rclone(_)
+    ));
+    assert!(RepoLocation::parse("rclone://gdrive/backups")
+        .unwrap()
+        .is_remote());
 }
 
 #[tokio::test]

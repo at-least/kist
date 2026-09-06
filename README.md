@@ -5,8 +5,10 @@
 > 目前狀態：**M4 進行中** —— M3（GC、無鎖並發）完成：本機與 S3（含 MinIO）repo 的 `init` /
 > `backup` / `snapshots` / `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，
 > 多台機器可同時備份到同一個 repo，GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
-> M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics 與 Web UI（`kist serve`）；
-> 還沒有：SFTP、`mount`、Windows VSS。
+> M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics 與 Web UI（`kist serve`）、
+> SFTP 後端（[ADR 013](docs/decisions/013-sftp-backend.md)）與 rclone 橋接
+> （[ADR 014](docs/decisions/014-rclone-bridge.md)）；
+> 還沒有：`mount`、Windows VSS。
 
 ## 建置
 
@@ -178,6 +180,36 @@ Object Lock，並把 `config` 另存一份。backup 需要的權限是 `PutObjec
 每台機器第一次 backup 時會產生一個 client id（`~/.local/share/kist/client-id`，
 可用 `--client-id-file` 或 `KIST_CLIENT_ID_FILE` 指定）。
 
+### SFTP
+
+```sh
+export KIST_REPO=sftp://user@backup.example.com/srv/backups/laptop
+# 認證：SSH agent → key 檔 → 密碼，擇一：
+export KIST_SFTP_KEY=~/.ssh/id_ed25519            # 可再加 KIST_SFTP_KEY_PASSPHRASE
+export KIST_SFTP_PASSWORD=...                     # 或 SSH_AUTH_SOCK 的 agent
+kist init
+```
+
+Host key **嚴格驗證**：只接受 `~/.ssh/known_hosts`（或 `KIST_SFTP_KNOWN_HOSTS`）裡有的
+key，不做 TOFU——先用 `ssh user@host` 連一次把 key 記進 known_hosts。伺服器必須支援
+`hardlink@openssh.com` 與 `posix-rename@openssh.com`（OpenSSH 的 sftp-server 都有；
+rclone 的 `serve sftp` 會在連線後明確拒絕，見下節）。
+
+### rclone 橋接（任何 rclone 認得的遠端）
+
+```sh
+rclone config                                     # 設定好遠端，例如 gdrive
+export KIST_REPO=rclone://gdrive/backups/laptop   # 遠端留空 = 本機目錄：rclone:///srv/backups
+kist init
+```
+
+kist 自己 spawn `rclone serve sftp --stdio <remote>:<path>`（restic 同款做法）：不開
+TCP port、不用 known_hosts，rclone 的設定就是全部。`KIST_RCLONE_BIN` 可指定 rclone
+路徑。**語意比 `sftp://` 寬鬆**：rclone 不實做 hardlink 與 O_EXCL 建檔，`put_if_absent`
+退化成「先 stat 再 posix-rename」；kist 用它的 key 都是「同 key 必同內容」或一次性寫入
+（init 另有讀回驗證擋雙重 init），風險分析見
+[ADR 014](docs/decisions/014-rclone-bridge.md)。`sftp://` 維持嚴格語意不變。
+
 ## 開發
 
 所有驗證都在本機跑（GitHub Actions 的 workflow 只留手動觸發，避免吃配額）；四道關卡：
@@ -198,7 +230,7 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 | `kist-format` | on-disk 格式：結構定義、CBOR 序列化、golden files（改動需負責人確認） |
 | `kist-crypto` | 金鑰階層（Argon2id → KEK → master key → 派生子金鑰）與 XChaCha20-Poly1305 封裝 |
 | `kist-chunker` | 內容定義切塊（FastCDC，512 KiB / 2 MiB / 8 MiB） |
-| `kist-backend` | 儲存後端（`object_store`；M1 只有本機目錄）|
+| `kist-backend` | 儲存後端（本機、S3、SFTP、rclone 橋接）|
 | `kist-core` | backup / restore / check / snapshots 流程 |
 | `kist-cli` | `kist` 執行檔（clap） |
 

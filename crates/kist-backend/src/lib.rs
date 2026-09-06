@@ -4,12 +4,12 @@
 //! - backup 只用 `put` / `put_if_absent` / `get` / `get_range` / `list`；
 //! - `delete` 只有 maintenance（prune）會用。
 //!
-//! 支援三種位置（見 [`RepoLocation`]）：本機目錄、`s3://bucket[/prefix]`（AWS S3 與
-//! MinIO 等相容服務），以及 `sftp://[user@]host[:port]/path`（見 [`sftp`] 模組：
-//! host key 嚴格驗證、認證順序與環境變數說明都在那裡）。S3 的憑證與端點走
-//! `object_store` 讀的環境變數：`AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、
-//! `AWS_DEFAULT_REGION`、`AWS_ENDPOINT`（MinIO 等自架服務）、`AWS_ALLOW_HTTP=true`
-//! （端點不是 https 時）。
+//! 支援四種位置（見 [`RepoLocation`]）：本機目錄、`s3://bucket[/prefix]`（AWS S3 與
+//! MinIO 等相容服務）、`sftp://[user@]host[:port]/path` 與 rclone 橋接
+//! `rclone://<remote>/<path>`（見 [`sftp`] 模組：host key 嚴格驗證、認證順序與環境
+//! 變數說明都在那裡）。S3 的憑證與端點走 `object_store` 讀的環境變數：
+//! `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_DEFAULT_REGION`、
+//! `AWS_ENDPOINT`（MinIO 等自架服務）、`AWS_ALLOW_HTTP=true`（端點不是 https 時）。
 //!
 //! TLS：reqwest 用 rustls 但不帶 crypto provider，由這裡在建構時安裝 ring
 //! （避免 aws-lc-sys 在 Windows 上需要 CMake + NASM）。
@@ -38,7 +38,7 @@ pub enum BackendError {
     #[error("invalid object key {0:?}: {1}")]
     InvalidKey(String, String),
     #[error(
-        "invalid repository location {0:?}: expected a directory path, s3://bucket[/prefix] or sftp://[user@]host[:port]/path"
+        "invalid repository location {0:?}: expected a directory path, s3://bucket[/prefix], sftp://[user@]host[:port]/path or rclone://[remote/]path"
     )]
     InvalidUrl(String),
     #[error("cannot open local repository at {path}: {source}")]
@@ -48,6 +48,13 @@ pub enum BackendError {
     },
     #[error("sftp backend: {0}")]
     Sftp(String),
+    #[error("rclone bridge: {0}")]
+    Rclone(String),
+    #[error(
+        "concurrent write detected on {0}: the object changed between create and read-back \
+         (another kist process wrote the same key at the same time)"
+    )]
+    ConcurrentWrite(String),
     #[error("storage error: {0}")]
     Store(#[from] object_store::Error),
     #[error("object {0} has an unrepresentable timestamp")]
@@ -93,10 +100,12 @@ pub enum RepoLocation {
     Local(PathBuf),
     S3 { bucket: String, prefix: String },
     Sftp(sftp::SftpConfig),
+    Rclone(sftp::RcloneConfig),
 }
 
 impl RepoLocation {
-    /// `s3://bucket/prefix` → S3；`sftp://…` → SFTP；其他任何字串都當本機路徑。
+    /// `s3://bucket/prefix` → S3；`sftp://…` → SFTP；`rclone://…` → rclone 橋接；
+    /// 其他任何字串都當本機路徑。
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(rest) = s.strip_prefix("s3://") {
             let (bucket, prefix) = match rest.split_once('/') {
@@ -114,6 +123,9 @@ impl RepoLocation {
         if s.starts_with("sftp://") {
             return Ok(Self::Sftp(sftp::parse_sftp_url(s)?));
         }
+        if s.starts_with("rclone://") {
+            return Ok(Self::Rclone(sftp::parse_rclone_url(s)?));
+        }
         if s.contains("://") || s.is_empty() {
             return Err(BackendError::InvalidUrl(s.to_owned()));
         }
@@ -121,7 +133,7 @@ impl RepoLocation {
     }
 
     pub fn is_remote(&self) -> bool {
-        matches!(self, Self::S3 { .. } | Self::Sftp(_))
+        matches!(self, Self::S3 { .. } | Self::Sftp(_) | Self::Rclone(_))
     }
 }
 
@@ -148,6 +160,8 @@ impl std::fmt::Display for RepoLocation {
                     write!(f, "{host}:{}/{}", c.port, c.path)
                 }
             }
+            Self::Rclone(c) if c.remote.is_empty() => write!(f, "rclone:///{}", c.path),
+            Self::Rclone(c) => write!(f, "rclone://{}/{}", c.remote, c.path),
         }
     }
 }
@@ -171,6 +185,7 @@ impl Backend {
             RepoLocation::Local(p) => Self::local(&p),
             RepoLocation::S3 { bucket, prefix } => Self::s3(&bucket, &prefix),
             RepoLocation::Sftp(cfg) => Self::sftp(&cfg, sftp::auth_from_env()).await,
+            RepoLocation::Rclone(cfg) => Self::rclone(&cfg).await,
         }
     }
 
@@ -239,6 +254,18 @@ impl Backend {
         })
     }
 
+    /// rclone 橋接：spawn `rclone serve sftp --stdio`，任何 rclone 設定好的遠端都能
+    /// 當儲存體（見 [`sftp`] 模組說明與 ADR 014）。**語意比 `sftp://` 寬鬆**
+    /// （`put_if_absent` 沒有原子守門），選 `rclone://` 就是同意這份妥協。
+    pub async fn rclone(cfg: &sftp::RcloneConfig) -> Result<Self> {
+        let store = sftp::SftpStore::open_rclone(cfg).await?;
+        let location = RepoLocation::Rclone(cfg.clone());
+        Ok(Self {
+            store: Arc::new(store),
+            location,
+        })
+    }
+
     /// 包任何 `object_store` 實作（測試用）。
     pub fn from_store(store: Arc<dyn ObjectStore>, location: RepoLocation) -> Self {
         Self { store, location }
@@ -277,6 +304,20 @@ impl Backend {
             .put_opts(&Self::path(key)?, bytes.into(), opts)
             .await
             .map_err(|e| Self::map_err(key, e))?;
+        Ok(())
+    }
+
+    /// `put_if_absent` 加讀回驗證：成功後重讀一次比對內容，物件在寫入與讀回之間被
+    /// 換掉（寬鬆後端上兩個 `kist init` 同時跑的 race）就回
+    /// [`BackendError::ConcurrentWrite`]。讀回攔得住大多數交錯，但不是鎖——對方的
+    /// 覆蓋若落在自己讀回之後，兩邊都會成功。只給 init 的 config 用——每個物件多
+    /// 一次 GET，不值得為一般寫入付。
+    pub async fn put_if_absent_verified(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        self.put_if_absent(key, bytes.clone()).await?;
+        let stored = self.get(key).await?;
+        if stored != bytes {
+            return Err(BackendError::ConcurrentWrite(key.to_owned()));
+        }
         Ok(())
     }
 

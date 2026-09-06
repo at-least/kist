@@ -162,7 +162,12 @@ impl Repository {
             .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
 
         let bytes = cbor::encode(&config)?;
-        match backend.put_if_absent(keys::CONFIG, bytes).await {
+        // 讀回驗證：寬鬆後端（rclone://）上 put_if_absent 沒有原子守門，兩個 init
+        // 同時跑可能互相覆蓋 config。讀回比對攔下大多數交錯（讀回看到對方的內容
+        // 就回 ConcurrentWrite），但不是鎖——對方的 rename 若落在自己讀回之後，
+        // 兩邊都會回報成功。嚴格後端上這次讀取只是便宜的確認（hardlink 守門本來
+        // 就保證讀回一致）。
+        match backend.put_if_absent_verified(keys::CONFIG, bytes).await {
             Ok(()) => {}
             Err(BackendError::AlreadyExists(_)) => return Err(CoreError::RepoExists),
             Err(e) => return Err(e.into()),
