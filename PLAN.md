@@ -208,8 +208,17 @@ kist/
    0o444 排序案例與 symlink 案例】。
 4. 回報上游【完成 2026-09-07：openssh-rust/openssh-sftp-client#183，
    https://github.com/openssh-rust/openssh-sftp-client/issues/183 】。
-5. Windows：VSS、路徑語意驗證。【**需要 Windows 機器**才能實作與驗證，本機
-   是 Linux——保持開放，等有 Windows 環境再做；不寫無法驗證的 stub。】
-6. CI 把跨語言 interop（Go 測試 + 共用向量）納入 pipeline。【完成 2026-09-07：
+5. CI 把跨語言 interop（Go 測試 + 共用向量）納入 pipeline。【完成 2026-09-07：
    workflow 加手動觸發的 interop job（維持「只手動觸發、不吃配額」政策）；
    Go interop 測試本機跑過。】
+
+以上路線圖全部完成【2026-09-07】。
+
+## 已接受的限制（非待辦）
+
+- **Windows VSS 與 Windows 路徑語意驗證**：裁示為已接受的限制，自路線圖移除
+  【2026-09-07】。VSS 是 Windows COM API、路徑語意（UTF-16、保留名稱、結尾
+  點/空白）只能在真 Windows 上驗——Linux 開發機上無法實作亦無法驗證，不寫
+  測不了的 stub。**若未來取得 Windows 環境**，從這裡重啟：先在 Windows 上跑
+  既有測試套件確認編譯與基本行為，再實作 VSS（`backup` 前取 shadow copy）與
+  路徑語意驗證；格式層（`kist-format`）已平台中性，不需改動。
