@@ -15,6 +15,7 @@ kist-chunker = { path = "crates/kist-chunker" }
 kist-core = { path = "crates/kist-core" }
 kist-crypto = { path = "crates/kist-crypto" }
 kist-format = { path = "crates/kist-format" }
+kist-mount = { path = "crates/kist-mount" }
 kist-app = { path = "crates/kist-app" }
 
 anyhow = "1"

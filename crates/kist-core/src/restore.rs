@@ -39,6 +39,40 @@ impl ReloadableIndex {
     pub async fn get(&self) -> tokio::sync::RwLockReadGuard<'_, ChunkIndex> {
         self.index.read().await
     }
+
+    /// 直接換上新的 index（mount 看到新 snapshot 時的主動重載；限流在呼叫端）。
+    pub async fn store(&self, index: ChunkIndex) {
+        *self.index.write().await = index;
+    }
+
+    /// chunk 的明文長度；不在 index 時（prune 的 repack 搬走了、或 mount 之後才
+    /// 出現的新 pack）限流重載一次再查。真的沒有 = `None`。
+    pub async fn raw_len_reloading(&self, repo: &Repository, id: &ChunkId) -> Result<Option<u64>> {
+        {
+            let guard = self.index.read().await;
+            if let Some(loc) = guard.get(id) {
+                return Ok(Some(loc.raw_len));
+            }
+        }
+        self.reload(repo).await?;
+        let guard = self.index.read().await;
+        Ok(guard.get(id).map(|loc| loc.raw_len))
+    }
+
+    async fn reload(&self, repo: &Repository) -> Result<()> {
+        let mut last = self.last_reload.lock().await;
+        let due = last.is_none_or(|t| t.elapsed() >= RELOAD_MIN_INTERVAL);
+        if due {
+            tracing::warn!(
+                "a chunk or its pack is missing from the index; reloading the index \
+                 (a repack may be in progress)"
+            );
+            let fresh = repo.load_index().await?;
+            *self.index.write().await = fresh;
+            *last = Some(std::time::Instant::now());
+        }
+        Ok(())
+    }
 }
 
 const RELOAD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -281,18 +315,7 @@ impl Repository {
             | Err(CoreError::Backend(kist_backend::BackendError::NotFound(_))) => {}
             other => return other,
         }
-        {
-            let mut last = index.last_reload.lock().await;
-            let due = last.is_none_or(|t| t.elapsed() >= RELOAD_MIN_INTERVAL);
-            if due {
-                tracing::warn!(
-                    "chunk {id}: its pack is missing; reloading the index (a repack may be in progress)"
-                );
-                let fresh = self.load_index().await?;
-                *index.index.write().await = fresh;
-                *last = Some(std::time::Instant::now());
-            }
-        }
+        index.reload(self).await?;
         let guard = index.index.read().await;
         self.read_chunk(id, &*guard).await
     }

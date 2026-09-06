@@ -155,6 +155,14 @@ enum Command {
         #[command(flatten)]
         repo: RepoArgs,
     },
+    /// Browse snapshots as a read-only filesystem (Linux/macOS).
+    #[cfg(unix)]
+    Mount {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Existing empty directory to mount at.
+        mountpoint: PathBuf,
+    },
     /// Restore a snapshot into a target directory.
     Restore {
         #[command(flatten)]
@@ -512,6 +520,29 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
             Ok(())
+        }
+        #[cfg(unix)]
+        Command::Mount { repo, mountpoint } => {
+            let r = open_repo(&repo).await?;
+            let mounted =
+                kist_mount::mount(r, &mountpoint, kist_mount::MountConfig::default()).await?;
+            eprintln!(
+                "mounted at {}; interrupt (Ctrl-C) to unmount",
+                mountpoint.display()
+            );
+            tokio::select! {
+                res = tokio::signal::ctrl_c() => {
+                    res.context("installing the Ctrl-C handler")?;
+                }
+                res = sigterm() => {
+                    res.context("installing the SIGTERM handler")?;
+                }
+            }
+            // 有檔案還開著時 FUSE 會回 EBUSY——把原錯誤帶上人話。
+            mounted.unmount().context(format!(
+                "unmounting {}; is something still open under it?",
+                mountpoint.display()
+            ))
         }
         Command::Restore {
             repo,
@@ -887,6 +918,15 @@ fn repo_display(args: &RepoArgs) -> Result<String> {
 
 async fn open_backend(args: &RepoArgs) -> Result<Backend> {
     Ok(Backend::from_url(repo_url(args)?).await?)
+}
+
+/// `kist mount` 的第二個結束訊號（systemd/終端機都會送 SIGTERM）。
+#[cfg(unix)]
+async fn sigterm() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    term.recv().await;
+    Ok(())
 }
 
 async fn open_repo(args: &RepoArgs) -> Result<Repository> {

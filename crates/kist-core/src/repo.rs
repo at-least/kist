@@ -318,8 +318,9 @@ impl Repository {
     }
 
     /// 把 tree 編成規範 CBOR、以明文 keyed hash 命名、隨機 nonce 密封。
-    /// 回傳（名稱, bytes)；不上傳。
-    pub(crate) async fn seal_tree(&self, tree: Tree) -> Result<(TreeId, Vec<u8>)> {
+    /// 回傳（名稱, bytes)；不上傳。pub：kist-mount 的測試要手工組 snapshot。
+    /// 呼叫端必須把 bytes 存到 `keys::tree(&id)` 這個 key，內容才找得回來。
+    pub async fn seal_tree(&self, tree: Tree) -> Result<(TreeId, Vec<u8>)> {
         let keys = Arc::clone(&self.keys);
         blocking(move || {
             let plain = cbor::encode(&tree)?;
@@ -331,7 +332,8 @@ impl Repository {
     }
 
     /// 沿 `prev` 收集一個目錄的所有段，回傳依名稱排序的完整節點清單。
-    pub(crate) async fn read_tree_chain(&self, last: &TreeId) -> Result<Vec<Entry>> {
+    /// 公開給 `kist-mount`（FUSE 掛載逐目錄載入）。
+    pub async fn read_tree_chain(&self, last: &TreeId) -> Result<Vec<Entry>> {
         let mut parts = Vec::new();
         let mut next = Some(*last);
         let mut seen = HashSet::new();
@@ -464,7 +466,11 @@ impl Repository {
         Ok(index)
     }
 
-    pub(crate) async fn write_snapshot(&self, key: &str, snapshot: Snapshot) -> Result<()> {
+    /// 寫 snapshot 物件。pub：kist-mount 的測試要手工組 snapshot（一般流程用
+    /// `backup`，它會先 prepare/commit，不會直接呼叫這個）。
+    /// **不檢查 key 與內容一致**——`read_snapshot` 讀取時會核對（client、時間戳），
+    /// 呼叫端必須自己保證 `keys::snapshot(&client_id, ts)` 與內容相符。
+    pub async fn write_snapshot(&self, key: &str, snapshot: Snapshot) -> Result<()> {
         let keys = Arc::clone(&self.keys);
         let key_owned = key.to_owned();
         let bytes = blocking(move || {

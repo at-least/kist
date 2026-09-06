@@ -6,9 +6,10 @@
 > `backup` / `snapshots` / `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，
 > 多台機器可同時備份到同一個 repo，GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
 > M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics 與 Web UI（`kist serve`）、
-> SFTP 後端（[ADR 013](docs/decisions/013-sftp-backend.md)）與 rclone 橋接
-> （[ADR 014](docs/decisions/014-rclone-bridge.md)）；
-> 還沒有：`mount`、Windows VSS。
+> SFTP 後端（[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接
+> （[ADR 014](docs/decisions/014-rclone-bridge.md)）與唯讀 FUSE 掛載
+> （[ADR 015](docs/decisions/015-mount-fuse.md)）；M4 全數完成。
+> 還沒有：Windows VSS。
 
 ## 建置
 
@@ -194,6 +195,20 @@ Host key **嚴格驗證**：只接受 `~/.ssh/known_hosts`（或 `KIST_SFTP_KNOW
 key，不做 TOFU——先用 `ssh user@host` 連一次把 key 記進 known_hosts。伺服器必須支援
 `hardlink@openssh.com` 與 `posix-rename@openssh.com`（OpenSSH 的 sftp-server 都有；
 rclone 的 `serve sftp` 會在連線後明確拒絕，見下節）。
+
+### 瀏覽 snapshot：`kist mount`（Linux/macOS）
+
+```sh
+kist mount --repo $KIST_REPO /mnt/snapshots   # 目標目錄需已存在且為空
+ls /mnt/snapshots/<client id>/<timestamp>/    # 備份的樹，唯讀
+cp /mnt/snapshots/<client>/<ts>/tmp/…/report.pdf .
+# Ctrl-C（或 SIGTERM）卸載
+```
+
+隨機讀直接定位 chunk（不解前面資料），適合翻大檔、比對、拷貝少數檔案；整目錄
+還原請用 `restore`（較快）。檔案進 kernel page cache，翻過一次第二次就快。
+掛載時有檔案開著 → 卸載 EBUSY。細節與限制見
+[ADR 015](docs/decisions/015-mount-fuse.md)。
 
 ### rclone 橋接（任何 rclone 認得的遠端）
 

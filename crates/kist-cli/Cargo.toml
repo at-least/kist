@@ -35,6 +35,10 @@ dhat = { version = "0.3", optional = true }
 tracing-subscriber.workspace = true
 zeroize.workspace = true
 
+# FUSE 掛載（kist mount）：fuser 在 Windows 上不存在，依賴與命令一起閘在 unix。
+[target.'cfg(unix)'.dependencies]
+kist-mount.workspace = true
+
 [dev-dependencies]
 rand.workspace = true
 tempfile.workspace = true

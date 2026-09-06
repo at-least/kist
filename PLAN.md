@@ -198,7 +198,9 @@ kist/
    rclone 橋接【完成 2026-09-07，ADR 014：`rclone://` stdio 橋接（kist spawn
    `rclone serve sftp --stdio`），寬鬆條件寫入 opt-in、config 讀回驗證擋雙重 init；
    實測 rclone 不實做 hardlink/O_EXCL，`sftp://` 維持嚴格並給明確錯誤】、
-   `mount`（Go 參考實作有可對照的實作）。
+   `mount`【完成 2026-09-07，ADR 015：`crates/kist-mount`（fuser 0.18），
+   唯讀 `<client>/<ts>/<樹>`、index `raw_len` 隨機讀、volatile/immutable TTL、
+   子程序 E2E 與 CLI 手動驗證全過】。**M4 全數完成。**
 3. xattr 的 restore 套用（目前記錄了但還原只警告）。
 4. 回報上游：openssh-sftp-client 0.15.8 `Sftp::new` 在 multi_thread runtime 上
    stdout EOF 不喚醒（重現與細節見 ADR 014「上游怪癖」節；繞法已進 kist）。

@@ -677,3 +677,107 @@ fn serve_exposes_metrics() {
     child.kill().unwrap();
     child.wait().unwrap();
 }
+
+/// FUSE 掛載：起 `kist mount` 子程序，經 kernel 讀 snapshot，SIGTERM 乾淨卸載。
+/// 需要 /dev/fuse + fusermount3 且 `KIST_TEST_FUSE=1`（tests/fuse-setup.sh）。
+#[cfg(unix)]
+#[test]
+fn mount_round_trip() {
+    if std::env::var("KIST_TEST_FUSE").ok().as_deref() != Some("1") {
+        eprintln!("FUSE 掛載測試跳過（tests/fuse-setup.sh 未跑）");
+        return;
+    }
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+
+    let mnt = env.dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["mount", mnt.to_str().unwrap()])
+        .env("KIST_REPO", env.repo())
+        .env("KIST_PASSWORD", "cli test password")
+        .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // 等掛載生效：根目錄（FUSE）列出 client 目錄
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let client_dir = loop {
+        match std::fs::read_dir(&mnt) {
+            Ok(mut rd) => {
+                if let Some(entry) = rd.next() {
+                    break entry.unwrap().path();
+                }
+            }
+            Err(e) => {
+                if std::time::Instant::now() > deadline {
+                    panic!("client directory never appeared: {e}");
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("client directory never appeared (timeout)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    // client → timestamp → tmp/<tmpname>/src
+    let ts_dir = std::fs::read_dir(&client_dir)
+        .unwrap()
+        .next()
+        .expect("至少一個 timestamp")
+        .unwrap()
+        .path();
+    // 備份路徑是 <tempdir>/src：虛擬層級 = tmp/<tempdir 名>/src
+    let tmpname = env.dir.path().file_name().unwrap();
+    let snap = ts_dir.join("tmp").join(tmpname).join("src");
+
+    // 小檔
+    assert_eq!(
+        std::fs::read_to_string(snap.join("a.txt")).unwrap(),
+        "hello\n"
+    );
+    // 大檔（跨多 chunk）全檔讀
+    let want = std::fs::read(src.join("big.bin")).unwrap();
+    let got = std::fs::read(snap.join("big.bin")).unwrap();
+    assert_eq!(got.len(), want.len());
+    assert!(got == want, "全檔讀必須位元組一致");
+    // 偏移讀
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(snap.join("big.bin")).unwrap();
+    f.seek(SeekFrom::Start(65536)).unwrap();
+    let mut buf = vec![0u8; 1000];
+    f.read_exact(&mut buf).unwrap();
+    drop(f); // 還開著檔案時 fusermount3 -u 會 EBUSY
+    assert_eq!(buf, want[65536..66536]);
+    // 子目錄
+    assert_eq!(
+        std::fs::read_to_string(snap.join("sub/b.txt")).unwrap(),
+        "world\n"
+    );
+    // 唯讀：寫入必敗
+    assert!(std::fs::write(snap.join("nope"), b"x").is_err());
+
+    // SIGTERM → kist 自己 fusermount 卸載、exit 0（與手動 Ctrl-C 同一路徑）
+    let st = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(st.success(), "kill -TERM");
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "kist mount should exit 0 after SIGTERM; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 卸載後掛載點回到普通空目錄
+    assert!(std::fs::read_dir(&mnt).unwrap().next().is_none());
+}

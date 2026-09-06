@@ -45,6 +45,20 @@ stdio 模式不用起伺服器：`rclone://` 會讓 kist 自己 spawn `rclone se
 posix-rename、`put_if_absent` 走 stat + posix-rename（rclone 不實做 hardlink 與
 O_EXCL 建檔，寬鬆語意的理由見 `docs/decisions/014-rclone-bridge.md`）。
 
+## FUSE 掛載
+
+真實掛載測試（`crates/kist-cli/tests/cli.rs` 的 `mount_round_trip`：起 `kist mount`
+子程序、經 kernel 讀、SIGTERM 卸載）預設略過，需要 /dev/fuse + fusermount3 並設
+環境變數：
+
+```sh
+eval "$(sh tests/fuse-setup.sh)"    # 確認 /dev/fuse 與 fusermount3，export KIST_TEST_FUSE=1
+cargo test --workspace
+```
+
+`crates/kist-mount` 的其他測試（純邏輯與 `FsCore` 對真 repo 的讀取）不需要 FUSE，
+`cargo test --workspace` 就會跑。
+
 ## 驗收
 
 見 `tests/acceptance/README.md`。
