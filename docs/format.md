@@ -235,7 +235,16 @@ Snapshot {
 }
 ```
 
-`client` 由每台機器隨機產生存本機（不是 hostname）。AAD = 完整 key。
+`stats` 的計數口徑（兩個實作必須一致；2026-09-08 釘定，此前 Go 多算合成根
+tree 與 hard link 重複）：`files` / `symlinks` 依節點名稱計，hard link 的每個
+名字各算一個；`dirs` 為目錄節點數，含作為備份來源的目錄本身、**不含**合成的
+根 tree；`bytes` 為檔案內容 bytes 總和，同一份 hard link 內容**只算一次**。
+`files` 按名字、`bytes` 按內容是刻意的不對稱：一個數節點、一個數資料。其餘
+欄位是本次 backup 的動作計數（新 chunk、讀過的 chunk、新 pack、復活的 pack、
+實際寫入的 bytes、錯誤、走快速路徑沿用的檔案）。
+
+`client` 由每個寫入端隨機產生、存在本機（不是 hostname；一台機器一個或每個
+repo 一個皆可，只需在 repo 內唯一）。AAD = 完整 key。
 快速路徑（v1 Rust 設計）：parent 存在且 `paths` 相同時，size + mtime +
 ctime + inode 都沒變、且 mtime/ctime 早於 parent 開始時間（防 racy clean）
 的檔案直接沿用 chunk 清單。

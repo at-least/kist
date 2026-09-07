@@ -415,3 +415,43 @@ async fn xattrs_survive_backup_restore() {
     );
     assert_eq!(get(&root.join("plain.txt"), "user.tag"), b"file-value");
 }
+
+/// docs/format.md §9 釘的 stats 口徑：`dirs` 含來源目錄本身、不含合成根
+/// tree；`files` 依名字計（hard link 各算一個）；`bytes` 同一份 hard link
+/// 內容只算一次。Go 參考實作以同一組數字斷言（internal/repo/backup_test.go）。
+#[cfg(unix)]
+#[tokio::test]
+async fn stats_count_dirs_without_root_tree_and_hard_link_bytes_once() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::create_dir_all(src.join("empty")).unwrap();
+    let payload = random_bytes(7, 300 * 1024);
+    std::fs::write(src.join("a.bin"), &payload).unwrap();
+    std::fs::hard_link(src.join("a.bin"), src.join("b.bin")).unwrap();
+    std::fs::write(src.join("sub").join("c.txt"), b"c").unwrap();
+    std::os::unix::fs::symlink("a.bin", src.join("link")).unwrap();
+
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert_eq!(
+        s.stats.dirs, 3,
+        "src, sub, empty — 不含合成根 tree：{:?}",
+        s.stats
+    );
+    assert_eq!(
+        s.stats.files, 3,
+        "a.bin、b.bin（hard link）、sub/c.txt：{:?}",
+        s.stats
+    );
+    assert_eq!(s.stats.symlinks, 1, "{:?}", s.stats);
+    assert_eq!(
+        s.stats.bytes,
+        payload.len() as u64 + 1,
+        "hard link 內容只算一次：{:?}",
+        s.stats
+    );
+}
