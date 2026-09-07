@@ -212,7 +212,10 @@ kist/
    workflow 加手動觸發的 interop job（維持「只手動觸發、不吃配額」政策）；
    Go interop 測試本機跑過。】
 
-以上路線圖全部完成【2026-09-07】。
+以上路線圖全部完成【2026-09-07】。完成審計【2026-09-07】：本機 gate 全綠——
+`cargo fmt --check`、`clippy --all-targets -D warnings`、`cargo test --workspace`
+（56 個測試執行檔零失敗）、`cargo deny check` 四項 ok（修復 RUSTSEC-2024-0384
+紅燈後，見已接受的限制）、MinIO S3 整合測試（contract + s3 共七案）全過。
 
 ## 已接受的限制（非待辦）
 
@@ -231,3 +234,10 @@ kist/
   型別與鎖行為（ADR 009 已與 Go 逐 byte 驗證），為消一條資訊性提示重驗不
   值得（advisor 簽核）。**移除條件**：reed-solomon-erasure 發新版脫離
   parking_lot 0.11、更換 RS crate，或 instant 日後出現真正的漏洞 advisory。
+
+- **CI interop job 首次觸發前需設 `GO_REF_TOKEN`**【2026-09-07 記錄】：
+  at-least/kist 是 private repo，同 repo 的 github.token 讀不到它；第一次
+  dispatch interop job 前要在 repo secrets 放一顆可讀該 repo 的 PAT
+  （見 ci.yml interop job 內註解）。未設則該 job 預期失敗，**不影響其餘
+  gate**，不要誤判為 regression。另：本機開發環境未設定 git remote，
+  commit 均只存在本地，push 需先由負責人加上遠端。
