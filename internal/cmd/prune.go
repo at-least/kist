@@ -32,6 +32,12 @@ func newPruneCommand() *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ev := event("prune")
+			// Validation goes through finish so that --json still gets
+			// its one object; the error doubles as the exit code.
+			err := validatePruneFlags(cmd, grace, forgetClientsAfter, clockSkew)
+			if err != nil {
+				return finish(cmd, ev, err)
+			}
 			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
 				result, err := r.Prune(ctx, repo.PruneOptions{
 					Grace:              grace,
@@ -83,4 +89,21 @@ func newPruneCommand() *cobra.Command {
 	f.DurationVar(&clockSkew, "clock-skew", repo.DefaultClockSkew, "clock disagreement tolerated between clients and this machine")
 	f.BoolVar(&dryRun, "dry-run", false, "report what would happen and change nothing")
 	return cmd
+}
+
+// validatePruneFlags rejects nonsense the flag default cannot express:
+// an explicit zero grace or wait time would be read as "default" by the
+// library, so the flag says so instead of silently substituting. Zero
+// clock skew is a real setting for clients that share a clock and stays.
+func validatePruneFlags(cmd *cobra.Command, grace, forgetClientsAfter, clockSkew time.Duration) error {
+	if cmd.Flags().Changed("grace") && grace <= 0 {
+		return fmt.Errorf("--grace must be positive; omit it for the default of %s", repo.DefaultGrace)
+	}
+	if cmd.Flags().Changed("forget-clients-after") && forgetClientsAfter <= 0 {
+		return fmt.Errorf("--forget-clients-after must be positive; omit it for the default")
+	}
+	if clockSkew < 0 {
+		return fmt.Errorf("--clock-skew must not be negative")
+	}
+	return nil
 }

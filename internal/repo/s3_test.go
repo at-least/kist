@@ -577,7 +577,7 @@ func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
 	duplicates := before - 1 // one canonical pack holds everything
 	t.Logf("%d packs stored for two concurrent backups; %d duplicate(s) to reclaim", before, duplicates)
 
-	first, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	first, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew})
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
@@ -587,7 +587,7 @@ func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
 
 	clk.advance(2 * time.Hour)
 	backupAll(t.TempDir()) // both clients active since the mark
-	sweep, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	sweep, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew})
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
@@ -714,7 +714,7 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 		t.Fatalf("forgotten snapshot still reads on the lock bucket: %v", err)
 	}
 
-	marked, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	marked, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew})
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
@@ -725,7 +725,7 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 	if _, _, err := client.Backup(ctx, []string{keep}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	sweep, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	sweep, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew})
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
@@ -750,7 +750,7 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 	if report.Snapshots != 2 {
 		t.Errorf("%d snapshots, want 2", report.Snapshots)
 	}
-	next, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour})
+	next, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew})
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}

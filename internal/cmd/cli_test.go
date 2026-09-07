@@ -426,3 +426,34 @@ func snapshotKey(t *testing.T, listing string) string {
 	t.Fatalf("no snapshot key in listing:\n%s", listing)
 	return ""
 }
+
+// A flag validation failure still honours the JSON contract: one object
+// on stdout saying what happened, the error for the exit code.
+func TestPruneRejectsBadFlagsButStillSpeaksJSON(t *testing.T) {
+	t.Setenv(PasswordEnv, "a test password")
+
+	for _, flag := range []string{"--grace=0", "--forget-clients-after=0", "--clock-skew=-1s"} {
+		stdout, _, err := run(t, "prune", "--json", flag)
+		if err == nil {
+			t.Errorf("%s: accepted", flag)
+		}
+		var ev report.Event
+		if jsonErr := json.Unmarshal([]byte(stdout), &ev); jsonErr != nil {
+			t.Errorf("%s: stdout is not one JSON object: %q (%v)", flag, stdout, jsonErr)
+			continue
+		}
+		if ev.OK || ev.Kind != "prune" || ev.Error == "" {
+			t.Errorf("%s: event = %+v", flag, ev)
+		}
+	}
+
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	if _, _, err := run(t, "init", "--repo", repoDir); err != nil {
+		t.Fatal(err)
+	}
+	// Zero skew is a real setting for clients that share a clock: it
+	// passes validation and runs.
+	if _, _, err := run(t, "prune", "--repo", repoDir, "--clock-skew=0"); err != nil {
+		t.Errorf("clock-skew 0 is a real setting, got %v", err)
+	}
+}

@@ -206,7 +206,6 @@ func (r *Runner) backup(ctx context.Context, b *config.Backup) error {
 }
 
 func (r *Runner) maintain(ctx context.Context) error {
-	p := r.Config.Prune
 	ev := report.Event{Kind: "prune", Job: "maintenance", Started: r.now()}
 	warn := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
@@ -227,10 +226,9 @@ func (r *Runner) maintain(ctx context.Context) error {
 			ev.Forget = report.FromForget(result, false)
 			r.logf("maintenance: forgot %d snapshot(s), kept %d", len(result.Removed), len(result.Kept))
 		}
-		result, err := rp.Prune(ctx, repo.PruneOptions{
-			Grace: p.Grace, ClockSkew: p.ClockSkew, ForgetClientsAfter: p.ForgetClientsAfter,
-			Progressf: func(format string, args ...any) { r.logf("maintenance: "+format, args...) },
-		})
+		opts := r.Config.Prune.Options()
+		opts.Progressf = func(format string, args ...any) { r.logf("maintenance: "+format, args...) }
+		result, err := rp.Prune(ctx, opts)
 		if err != nil {
 			return err
 		}

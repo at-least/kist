@@ -100,10 +100,31 @@ func (r *Retention) Policy() repo.RetentionPolicy {
 type Prune struct {
 	Schedule           string        `toml:"schedule"`
 	Grace              time.Duration `toml:"grace"`
-	ClockSkew          time.Duration `toml:"clock_skew"`
 	ForgetClientsAfter time.Duration `toml:"forget_clients_after"`
 
+	// ClockSkew is a pointer so that an absent key and an explicit zero
+	// are different settings: absent takes the library default, an
+	// explicit "0s" really means "the clocks agree". The library takes
+	// the value it is given literally.
+	ClockSkew *time.Duration `toml:"clock_skew"`
+
 	schedule cron.Schedule
+}
+
+// Options converts to the repository's type the way the maintenance job
+// runs it: every key the config leaves out takes the default the CLI
+// flags default to, so a scheduled prune and a hand-run prune agree.
+func (p *Prune) Options() repo.PruneOptions {
+	opts := repo.PruneOptions{
+		Grace:              p.Grace,
+		ForgetClientsAfter: p.ForgetClientsAfter,
+	}
+	if p.ClockSkew != nil {
+		opts.ClockSkew = *p.ClockSkew
+	} else {
+		opts.ClockSkew = repo.DefaultClockSkew
+	}
+	return opts
 }
 
 // Webhook receives a JSON report after every job.
@@ -194,6 +215,15 @@ func (c *Config) validate() error {
 			return fmt.Errorf("prune.schedule %q: %w", c.Prune.Schedule, err)
 		}
 		c.Prune.schedule = s
+		if c.Prune.Grace < 0 {
+			return fmt.Errorf("prune.grace is %s, want a positive duration (omit it for the default of %s)", c.Prune.Grace, repo.DefaultGrace)
+		}
+		if c.Prune.ClockSkew != nil && *c.Prune.ClockSkew < 0 {
+			return fmt.Errorf("prune.clock_skew is %s, want a non-negative duration", *c.Prune.ClockSkew)
+		}
+		if c.Prune.ForgetClientsAfter < 0 {
+			return fmt.Errorf("prune.forget_clients_after is %s, want a non-negative duration (omit it for the default)", c.Prune.ForgetClientsAfter)
+		}
 	}
 	if c.Webhook != nil && c.Webhook.URL == "" {
 		return errors.New("webhook.url is required")

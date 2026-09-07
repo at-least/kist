@@ -223,7 +223,7 @@ const (
 
 // shortGrace makes the two phases observable in one test without a
 // three-day sleep; the clock still has to be moved past it explicitly.
-var shortGrace = PruneOptions{Grace: time.Hour}
+var shortGrace = PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew}
 
 func TestPruneMarksThenSweepsAfterTheGrace(t *testing.T) {
 	s := newScenario(t)
@@ -293,7 +293,7 @@ func TestPruneHoldsForAClientWithNoSnapshotNewerThanTheMark(t *testing.T) {
 	if len(third.Held) != 1 || len(third.Deleted) != 0 {
 		t.Fatalf("after the grace: %+v", third)
 	}
-	want := "client " + clientA + " has no snapshot newer than the mark"
+	want := "client " + clientA + " has no snapshot newer than the mark plus clock skew (1h0m0s)"
 	if third.Held[0].Reason != want {
 		t.Errorf("hold reason = %q, want %q", third.Held[0].Reason, want)
 	}
@@ -313,7 +313,7 @@ func TestPruneDryRunChangesNothing(t *testing.T) {
 	h := s.backup(a, s.source("one", 100<<10))
 	s.forget(a, h)
 
-	report := s.prune(s.pruner(), PruneOptions{DryRun: true})
+	report := s.prune(s.pruner(), PruneOptions{DryRun: true, ClockSkew: DefaultClockSkew})
 	if len(report.Marked) != 1 {
 		t.Fatalf("dry run reported %+v", report)
 	}
@@ -385,7 +385,7 @@ func TestPruneForgetsAClientNotHeardFromInLong(t *testing.T) {
 	s.forget(a, s.backup(a, s.source("one", 100<<10)))
 	s.backup(a, s.source("two", 10<<10)) // the client's newest snapshot
 	p := s.pruner()
-	opts := PruneOptions{Grace: time.Hour, ForgetClientsAfter: 10 * time.Hour}
+	opts := PruneOptions{Grace: time.Hour, ForgetClientsAfter: 10 * time.Hour, ClockSkew: DefaultClockSkew}
 	s.prune(p, opts)
 
 	s.clock.advance(2 * time.Hour)

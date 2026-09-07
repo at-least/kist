@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/at-least/kist/internal/repo"
 )
 
 const full = `
@@ -59,7 +61,7 @@ func TestParseFullConfig(t *testing.T) {
 	if p.Daily != 7 || p.Weekly != 4 || p.Within != 72*time.Hour {
 		t.Errorf("policy = %+v", p)
 	}
-	if cfg.Prune.Grace != 96*time.Hour || cfg.Prune.ClockSkew != 30*time.Minute {
+	if cfg.Prune.Grace != 96*time.Hour || *cfg.Prune.ClockSkew != 30*time.Minute {
 		t.Errorf("prune = %+v", cfg.Prune)
 	}
 	if cfg.Webhook.Timeout != 5*time.Second || cfg.Metrics.Listen != "127.0.0.1:9345" {
@@ -81,6 +83,9 @@ func TestParseRejectsMistakes(t *testing.T) {
 		{"duplicate names", "[repository]\nlocation='x'\n[[backup]]\nname='a'\npaths=['/a']\nschedule='@daily'\n[[backup]]\nname='a'\npaths=['/b']\nschedule='@daily'", "duplicate name"},
 		{"webhook without url", "[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\ntimeout='1s'", "webhook.url is required"},
 		{"bad duration", "[repository]\nlocation='x'\n[prune]\nschedule='@daily'\ngrace='three days'", "grace"},
+		{"negative grace", "[repository]\nlocation='x'\n[prune]\nschedule='@daily'\ngrace='-1h'", "prune.grace"},
+		{"negative clock skew", "[repository]\nlocation='x'\n[prune]\nschedule='@daily'\nclock_skew='-1h'", "prune.clock_skew"},
+		{"negative forget_clients_after", "[repository]\nlocation='x'\n[prune]\nschedule='@daily'\nforget_clients_after='-1h'", "prune.forget_clients_after"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -89,6 +94,38 @@ func TestParseRejectsMistakes(t *testing.T) {
 				t.Fatalf("err = %v, want it to mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// Options resolves the [prune] section the way the library consumes it:
+// absent clock_skew means the library default (a scheduled prune must
+// keep tolerating skew), an explicit value -- including zero, a real
+// setting for clients that share a clock -- passes through literally.
+func TestPruneOptionsResolveDefaults(t *testing.T) {
+	const base = "[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n"
+
+	cfg, err := Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := cfg.Prune.Options()
+	if opts.ClockSkew != repo.DefaultClockSkew {
+		t.Errorf("absent clock_skew = %s, want %s", opts.ClockSkew, repo.DefaultClockSkew)
+	}
+	if opts.Grace != 0 || opts.ForgetClientsAfter != 0 {
+		t.Errorf("absent grace/forget_clients_after should pass through zero for the library to default: %+v", opts)
+	}
+
+	cfg, err = Parse(base + "grace='48h'\nclock_skew='0s'\nforget_clients_after='0s'\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts = cfg.Prune.Options()
+	if opts.ClockSkew != 0 {
+		t.Errorf("explicit clock_skew 0s = %s, want 0", opts.ClockSkew)
+	}
+	if opts.Grace != 48*time.Hour || opts.ForgetClientsAfter != 0 {
+		t.Errorf("explicit values must pass through: %+v", opts)
 	}
 }
 

@@ -101,7 +101,10 @@ type PruneOptions struct {
 	ForgetClientsAfter time.Duration
 
 	// ClockSkew is how far apart the clocks of the pruner and a client
-	// are allowed to be. Zero means DefaultClockSkew.
+	// are allowed to be, taken literally: zero is a real setting for
+	// clients that share a clock, so whoever builds PruneOptions from
+	// user input (the CLI flag, the config) applies DefaultClockSkew
+	// when the user said nothing.
 	//
 	// The sweep compares a client's activity, stamped by the client's
 	// clock, with a mark, stamped by the pruner's backend. A client whose
@@ -136,11 +139,10 @@ func (o PruneOptions) grace() time.Duration {
 	return DefaultGrace
 }
 
+// clockSkew is taken literally: zero is a real setting for clients that
+// share a clock, so the default lives in the CLI flag, not here.
 func (o PruneOptions) clockSkew() time.Duration {
-	if o.ClockSkew > 0 {
-		return o.ClockSkew
-	}
-	return DefaultClockSkew
+	return o.ClockSkew
 }
 
 func (o PruneOptions) forgetClientsAfter() time.Duration {
@@ -451,7 +453,7 @@ func holdReason(markedAt, now time.Time, activity map[string]time.Time, opts Pru
 	}
 	if len(waiting) > 0 {
 		slices.Sort(waiting)
-		return fmt.Sprintf("client %s has no snapshot newer than the mark", strings.Join(waiting, ", "))
+		return fmt.Sprintf("client %s has no snapshot newer than the mark plus clock skew (%s)", strings.Join(waiting, ", "), opts.clockSkew())
 	}
 	return ""
 }
