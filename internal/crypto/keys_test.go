@@ -58,9 +58,9 @@ func TestDeriveKeysDependsOnTheMasterKey(t *testing.T) {
 // byte range, so tampering with the plaintext config fails the unwrap
 // instead of silently breaking deduplication.
 func TestMasterAADEncodesRepoIDAndChunkerParams(t *testing.T) {
-	const min, avg, max = 512 << 10, 2 << 20, 8 << 20
+	const minSize, avgSize, maxSize = 512 << 10, 2 << 20, 8 << 20
 
-	aad := MasterAAD(goldenRepoID, min, avg, max)
+	aad := MasterAAD(goldenRepoID, minSize, avgSize, maxSize)
 	if got, want := len(aad), len(AADMasterKey)+RepoIDSize+12; got != want {
 		t.Fatalf("aad length = %d, want %d", got, want)
 	}
@@ -71,7 +71,7 @@ func TestMasterAADEncodesRepoIDAndChunkerParams(t *testing.T) {
 	if !bytes.Equal(rest[:RepoIDSize], goldenRepoID[:]) {
 		t.Errorf("repository ID is not carried verbatim: %x", rest[:RepoIDSize])
 	}
-	fields := []uint32{min, avg, max}
+	fields := []uint32{minSize, avgSize, maxSize}
 	for i, want := range fields {
 		off := RepoIDSize + 4*i
 		if got := binary.LittleEndian.Uint32(rest[off:]); got != want {

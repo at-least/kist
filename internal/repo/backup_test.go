@@ -299,6 +299,7 @@ func TestIncrementalBackupOnlyRewritesTheChangedPath(t *testing.T) {
 
 func TestBackupSkipsUnsupportedFileTypes(t *testing.T) {
 	if runtime.GOOS == "windows" {
+		t.Skip("no FIFOs on Windows")
 	}
 	ctx := context.Background()
 	r, _ := initRepo(t, "fifo")
@@ -327,6 +328,7 @@ func TestBackupSkipsUnsupportedFileTypes(t *testing.T) {
 
 func TestHardLinksAreStoredOnceAndRestoredAsLinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
+		t.Skip("hard links are not tracked on Windows")
 	}
 	ctx := context.Background()
 	r, dir := initRepo(t, "hardlink")
@@ -500,18 +502,9 @@ func TestDuplicateContentWithinOnePackIsStoredOnce(t *testing.T) {
 	compareTrees(t, source, filepath.Join(target, source))
 }
 
-// PRODUCTION GAP (v2): `kist backup <single-file>` writes a root-tree
-// FILE entry named by the file's absolute path, and restore never creates
-// the intermediate directories for such an entry -- it only mkdirs for
-// directory entries -- so the snapshot commits but cannot be restored
-// (repro: kist backup /tmp/x/one.txt; kist restore <key> /tmp/out ->
-// "open .../out/tmp/x/one.txt: no such file or directory"). The fix
-// belongs in restore (create parents for absolute-path file entries) or
-// in backup (another naming for file sources); this test pins the
-// end-to-end OUTCOME -- the file comes back under the target by its full
-// path, per docs/format.md §7 -- not the mechanism. Enable after fixing.
-const singleFileRestoreGap = "PRODUCTION GAP: restore cannot recreate absolute-path file entries at the snapshot root (no parent directories are created)"
-
+// A single-file source names its root-tree FILE entry by the file's
+// absolute path (docs/format.md §7), and restore creates the parents for
+// it, so the file comes back under the target by its full path.
 func TestBackupOfASingleFileRestores(t *testing.T) {
 	ctx := context.Background()
 	r, _ := initRepo(t, "single-file")

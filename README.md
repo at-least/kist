@@ -7,16 +7,16 @@ Deduplicating, encrypted backups to object storage, from one binary with no cgo.
 
 ```console
 $ export KIST_REPOSITORY=/backup/kist KIST_PASSWORD=...
-$ kist init
-$ kist backup ~/work
+$ kist-go init
+$ kist-go backup ~/work
 snapshot snapshots/fe2988.../20260904t141955.943279016z
   3 files, 3 directories, 1 symlinks
   3.7 MiB read, 2.9 MiB stored in 1 new packs
-$ kist backup ~/work            # 沒改東西
+$ kist-go backup ~/work         # 沒改東西
   3.7 MiB read, 0 B stored in 0 new packs
-$ kist snapshots
-$ kist restore snapshots/fe2988.../20260904t141955.943279016z /tmp/out
-$ kist check --read-data
+$ kist-go snapshots
+$ kist-go restore snapshots/fe2988.../20260904t141955.943279016z /tmp/out
+$ kist-go check --read-data
 ```
 
 ## 它做什麼
@@ -31,16 +31,16 @@ $ kist check --read-data
 
 | 指令 | 說明 |
 | --- | --- |
-| `kist init` | 建立 repo（密碼問兩次，救不回來） |
-| `kist backup [--parity M] <path>...` | 備份並提交一個 snapshot；`--parity 2` 在每個 pack 旁存 12.5% 的 Reed-Solomon 冗餘 |
-| `kist snapshots` | 列出 snapshot，舊的在前 |
-| `kist restore <snapshot> <target>` | 還原到一個空目錄 |
-| `kist check [--read-data] [--repair]` | 驗證 repo；`--repair` 用 parity 修回損壞的 pack |
-| `kist forget --keep-daily 7 ...` | 依 retention 規則（或指名）移除 snapshot |
-| `kist prune` | 標記沒人引用的 pack，grace（預設 72h）之後的下一次刪掉 |
-| `kist rebuild-index` | 從 pack trailer 重建 index |
-| `kist run --config kist.toml [--once]` | 依設定檔的排程跑備份與維護工作 |
-| `kist mount <dir>` | 把所有 snapshot 掛成唯讀檔案系統（`<client>/<時間戳>/…`，Linux/macOS） |
+| `kist-go init` | 建立 repo（密碼問兩次，救不回來） |
+| `kist-go backup [--parity M] <path>...` | 備份並提交一個 snapshot；`--parity 2` 在每個 pack 旁存 12.5% 的 Reed-Solomon 冗餘 |
+| `kist-go snapshots` | 列出 snapshot，舊的在前 |
+| `kist-go restore <snapshot> <target>` | 還原到一個空目錄 |
+| `kist-go check [--read-data] [--repair]` | 驗證 repo；`--repair` 用 parity 修回損壞的 pack |
+| `kist-go forget --keep-daily 7 ...` | 依 retention 規則（或指名）移除 snapshot |
+| `kist-go prune` | 標記沒人引用的 pack，grace（預設 72h）之後的下一次刪掉 |
+| `kist-go rebuild-index` | 從 pack trailer 重建 index |
+| `kist-go run --config kist.toml [--once]` | 依設定檔的排程跑備份與維護工作 |
+| `kist-go mount <dir>` | 把所有 snapshot 掛成唯讀檔案系統（`<client>/<時間戳>/…`，Linux/macOS） |
 
 每個指令都接受 `--json`：stdout 只印一個 JSON 物件（`snapshots` 印一個陣列），警告與進度仍在 stderr，失敗仍以非零結束。
 

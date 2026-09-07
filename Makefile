@@ -1,7 +1,7 @@
 # kist — dev entry points. Everything CI runs, you can run here.
 
-BIN     := kist
-PKG     := ./cmd/kist
+BIN     := kist-go
+PKG     := ./cmd/kist-go
 MODULE  := github.com/at-least/kist
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -17,7 +17,7 @@ FUZZPARALLEL ?=
 
 .PHONY: build test test-s3 test-sftp test-race vet lint fuzz fuzz-long release-snapshot verify clean
 
-## build: compile the release binary. No cgo, ever — a kist binary must
+## build: compile the release binary. No cgo, ever — a kist-go binary must
 ## run on any machine of its GOOS/GOARCH without a libc to match.
 build:
 	CGO_ENABLED=0 go build -trimpath \

@@ -20,7 +20,7 @@ func TestVersionCommand(t *testing.T) {
 	}
 
 	got := out.String()
-	want := "kist " + Version() + " " + runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version() + "\n"
+	want := "kist-go " + Version() + " " + runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version() + "\n"
 	if got != want {
 		t.Errorf("stdout = %q, want %q", got, want)
 	}
@@ -57,7 +57,7 @@ func TestRootWithoutArgsShowsHelp(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute root: %v", err)
 	}
-	if !strings.Contains(out.String(), "kist") {
+	if !strings.Contains(out.String(), "kist-go") {
 		t.Errorf("stdout = %q, want the help text", out.String())
 	}
 }

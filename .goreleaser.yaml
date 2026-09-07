@@ -10,8 +10,8 @@ project_name: kist
 
 builds:
   - id: kist
-    main: ./cmd/kist
-    binary: kist
+    main: ./cmd/kist-go
+    binary: kist-go
     env:
       - CGO_ENABLED=0
     goos: [linux, darwin, windows]

@@ -131,17 +131,9 @@ func mounted(t *testing.T) (*repo.Repository, string, string, []byte) {
 	return r, dir, src, blob
 }
 
-// The mount cannot yet serve v2's root-tree naming rule: root entries are
-// named by the backup source's full absolute path ("/tmp/x/src"), and the
-// kernel resolves paths component by component, while dirNode matches
-// single components exactly. Readdir of a snapshot root returns EIO (a
-// name containing "/" is not a valid dirent) and Lookup of the first
-// component fails. Until mount.go splits absolute root names (or strips
-// them), these scenario tests are skipped; see the migration report.
-const mountAbsoluteRootGap = "PRODUCTION GAP: mount cannot serve v2 absolute-path root names (Readdir EIO / component Lookup fails); enable after fixing mount.go"
-
-// Repro: back up any directory, mount the repository, and walk below
-// <client>/<timestamp>/: Readdir of the snapshot root fails with EIO (the
+// Root entries are named by the backup source's absolute path (the v2
+// rule), so the source is served under that full path below
+// <client>/<timestamp>/.
 func TestMountServesTheSnapshot(t *testing.T) {
 	r, dir, src, blob := mounted(t)
 	ctx := context.Background()

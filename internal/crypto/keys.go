@@ -78,7 +78,7 @@ func DeriveKeys(master Key) *Keys {
 	return keys
 }
 
-// ChunkID is the keyed content address of chunk plaintext under the hash
+// ContentIDv2 is the keyed content address of chunk plaintext under the hash
 // key (crypto.ID keyed mode). Trees use the same function over their
 // encoded bytes: see tree.Encode.
 func ContentIDv2(keys *Keys, plaintext []byte) ID {
@@ -214,13 +214,13 @@ func (s *KeySlot) Unwrap(password []byte, aad []byte) (Key, error) {
 // The chunker parameters are part of it because the config that carries
 // them is plaintext: tampering must fail the unwrap, not silently break
 // deduplication.
-func MasterAAD(repoID RepoID, min, avg, max uint32) []byte {
+func MasterAAD(repoID RepoID, minSize, avgSize, maxSize uint32) []byte {
 	aad := make([]byte, 0, len(AADMasterKey)+16+12)
 	aad = append(aad, AADMasterKey...)
 	aad = append(aad, repoID[:]...)
-	aad = binary.LittleEndian.AppendUint32(aad, min)
-	aad = binary.LittleEndian.AppendUint32(aad, avg)
-	aad = binary.LittleEndian.AppendUint32(aad, max)
+	aad = binary.LittleEndian.AppendUint32(aad, minSize)
+	aad = binary.LittleEndian.AppendUint32(aad, avgSize)
+	aad = binary.LittleEndian.AppendUint32(aad, maxSize)
 	return aad
 }
 

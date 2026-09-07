@@ -226,7 +226,7 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
 	}
 	for _, s := range skipped {
-		opts.warn("%v; run `kist rebuild-index` to repair the index", s)
+		opts.warn("%v; run `kist-go rebuild-index` to repair the index", s)
 	}
 	if cache != nil {
 		if listed, _, err := index.List(ctx, b); err == nil {
@@ -273,7 +273,7 @@ func (r *Repository) refreshIndex(ctx context.Context, warn func(string, ...any)
 		return err
 	}
 	for _, s := range skipped {
-		warn("%v; run `kist rebuild-index` to repair the index", s)
+		warn("%v; run `kist-go rebuild-index` to repair the index", s)
 	}
 	r.index = ix
 	return nil

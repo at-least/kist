@@ -180,6 +180,6 @@ func (f *repoFlags) withRepository(cmd *cobra.Command, fn func(context.Context, 
 
 func warnTo(cmd *cobra.Command) func(string, ...any) {
 	return func(format string, args ...any) {
-		fmt.Fprintf(cmd.ErrOrStderr(), "kist: warning: "+format+"\n", args...)
+		fmt.Fprintf(cmd.ErrOrStderr(), "kist-go: warning: "+format+"\n", args...)
 	}
 }

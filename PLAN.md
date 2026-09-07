@@ -70,7 +70,7 @@ parity/<packID>             選配 Reed-Solomon sidecar（他端忽略）
 - `go mod init`、cobra 根命令、`internal/` 分層：`backend`、`crypto`、`chunker`、`pack`、`index`、`tree`、`snapshot`、`repo`、`cmd`。
 - Makefile：`build`、`test`、`lint`（golangci-lint）、`fuzz`。
 - CI：GitHub Actions 跑 test + lint 在 linux/macos/windows。
-- 驗收：`kist version` 可執行，CI 綠燈。
+- 驗收：`kist-go version` 可執行，CI 綠燈。
 
 ### M1 格式定案（第 1–2 週）【完成；v1 已被 v2（M6）取代】
 - Backend 介面：`Put/Get/List/Delete/Stat`，加 `PutIfAbsent`；local 實作。

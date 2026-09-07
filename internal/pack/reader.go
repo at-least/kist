@@ -84,7 +84,11 @@ func (r *Reader) Chunk(ctx context.Context, entry Entry) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read chunk %s from pack %s: %w", entry.ID, r.id, err)
 	}
-	sealed, err := readRange(ctx, r.backend, Key(r.id), offset, int64(entry.Length))
+	length, err := lengthOf(entry.Length)
+	if err != nil {
+		return nil, fmt.Errorf("read chunk %s from pack %s: %w", entry.ID, r.id, err)
+	}
+	sealed, err := readRange(ctx, r.backend, Key(r.id), offset, length)
 	if err != nil {
 		return nil, fmt.Errorf("read chunk %s from pack %s: %w", entry.ID, r.id, err)
 	}

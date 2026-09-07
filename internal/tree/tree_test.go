@@ -495,3 +495,30 @@ func TestGoldenTree(t *testing.T) {
 		t.Error("the tree object format changed")
 	}
 }
+
+// docs/format.md: integers take their shortest encoding. The head form
+// changes at 24, 2^8, 2^16 and 2^32; the last step is the one a
+// four-byte-only writer would silently truncate.
+func TestWriteHeadUsesTheShortestForm(t *testing.T) {
+	cases := []struct {
+		length uint64
+		want   string
+	}{
+		{0, "40"},
+		{23, "57"},
+		{24, "5818"},
+		{0xff, "58ff"},
+		{0x100, "590100"},
+		{0xffff, "59ffff"},
+		{0x10000, "5a00010000"},
+		{0xffffffff, "5affffffff"},
+		{0x100000000, "5b0000000100000000"},
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		writeHead(&buf, 2, tc.length)
+		if got := hex.EncodeToString(buf.Bytes()); got != tc.want {
+			t.Errorf("writeHead(2, %#x) = %s, want %s", tc.length, got, tc.want)
+		}
+	}
+}

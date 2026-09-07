@@ -8,6 +8,7 @@ package interop
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"strconv"
@@ -15,11 +16,11 @@ import (
 	"testing"
 
 	"golang.org/x/crypto/argon2"
+	"lukechampine.com/blake3"
 
 	"github.com/at-least/kist/internal/chunker"
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/tree"
-	"lukechampine.com/blake3"
 )
 
 // corpusBytes is the shared test input: xorshift64* bytes, generated
@@ -70,7 +71,7 @@ func TestInteropChunkerBoundaries(t *testing.T) {
 		var got []int
 		for {
 			chunk, err := c.Next()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
@@ -175,7 +176,9 @@ func TestInteropTreeCanonicalCBOR(t *testing.T) {
 	want, err := os.ReadFile("testdata/tree-canonical.hex")
 	if err != nil {
 		// First run: record. The Rust side must produce the same bytes.
-		_ = os.WriteFile("testdata/tree-canonical.hex", []byte(hex.EncodeToString(encoded)+"\n"), 0o644)
+		if err := os.WriteFile("testdata/tree-canonical.hex", []byte(hex.EncodeToString(encoded)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		t.Skipf("recorded tree-canonical.hex (%d bytes)", len(encoded))
 	}
 	if got := hex.EncodeToString(encoded); got != strings.TrimSpace(string(want)) {

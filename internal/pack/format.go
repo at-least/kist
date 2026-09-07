@@ -165,6 +165,13 @@ func offsetOf(v uint64) (int64, error) {
 	return int64(v), nil
 }
 
+func lengthOf(v uint64) (int64, error) {
+	if v > math.MaxInt64 {
+		return 0, fmt.Errorf("%w: length %d is outside the addressable range", ErrCorrupt, v)
+	}
+	return int64(v), nil
+}
+
 func sizeOf(v int64) (uint64, error) {
 	if v < 0 {
 		return 0, fmt.Errorf("%w: backend reported a size of %d", ErrCorrupt, v)

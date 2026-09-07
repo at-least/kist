@@ -3,6 +3,7 @@ package tree
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -95,23 +96,22 @@ func (x Xattrs) MarshalCBOR() ([]byte, error) {
 }
 
 // writeHead emits a definite-length CBOR head with the shortest form.
-func writeHead(buf *bytes.Buffer, major, length uint64) {
+func writeHead(buf *bytes.Buffer, major byte, length uint64) {
 	switch {
 	case length < 24:
-		buf.WriteByte(byte(major)<<5 | byte(length))
+		buf.WriteByte(major<<5 | byte(length))
 	case length <= 0xff:
-		buf.WriteByte(byte(major)<<5 | 24)
+		buf.WriteByte(major<<5 | 24)
 		buf.WriteByte(byte(length))
 	case length <= 0xffff:
-		buf.WriteByte(byte(major)<<5 | 25)
-		buf.WriteByte(byte(length >> 8))
-		buf.WriteByte(byte(length))
+		buf.WriteByte(major<<5 | 25)
+		buf.Write(binary.BigEndian.AppendUint16(nil, uint16(length)))
+	case length <= 0xffffffff:
+		buf.WriteByte(major<<5 | 26)
+		buf.Write(binary.BigEndian.AppendUint32(nil, uint32(length)))
 	default:
-		buf.WriteByte(byte(major)<<5 | 26)
-		buf.WriteByte(byte(length >> 24))
-		buf.WriteByte(byte(length >> 16))
-		buf.WriteByte(byte(length >> 8))
-		buf.WriteByte(byte(length))
+		buf.WriteByte(major<<5 | 27)
+		buf.Write(binary.BigEndian.AppendUint64(nil, length))
 	}
 }
 

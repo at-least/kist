@@ -11,13 +11,13 @@ import (
 // mount needs FUSE, which Windows does not have.
 var platformCommands []func() *cobra.Command
 
-// NewRootCommand builds the kist command tree. Tests use it to execute a
+// NewRootCommand builds the kist-go command tree. Tests use it to execute a
 // command with buffers attached instead of the process streams.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "kist",
+		Use:   "kist-go",
 		Short: "Deduplicating, encrypted, multi-client backups",
-		Long: "kist backs up to object storage with client-side encryption,\n" +
+		Long: "kist-go backs up to object storage with client-side encryption,\n" +
 			"content-defined deduplication and lock-free maintenance.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -48,7 +48,7 @@ func NewRootCommand() *cobra.Command {
 // only place in the binary that terminates the process.
 func Execute() {
 	if err := NewRootCommand().Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "kist: %v\n", err)
+		fmt.Fprintf(os.Stderr, "kist-go: %v\n", err)
 		os.Exit(1)
 	}
 }

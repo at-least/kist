@@ -42,8 +42,8 @@ func DefaultChunkerParams() ChunkerParams {
 	return ChunkerParams{MinSize: chunker.MinSize, AvgSize: chunker.AvgSize, MaxSize: chunker.MaxSize}
 }
 
-// PackTargetSize bounds how large a pack grows before it is flushed.
-// The default matches the Go v1 constant and the Rust default.
+// DefaultPackTargetSize bounds how large a pack grows before it is
+// flushed. The default matches the Go v1 constant and the Rust default.
 const DefaultPackTargetSize uint64 = 64 << 20
 
 // chunkerParams converts to the chunker package's type.

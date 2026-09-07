@@ -276,7 +276,7 @@ func (run *restoreRun) resolveChunkList(ctx context.Context, chunks []crypto.ID)
 	}
 	var list tree.ChunkList
 	if err := crypto.Unmarshal(buf, &list); err != nil {
-		return nil, fmt.Errorf("%w: chunk list: %v", tree.ErrCorrupt, err)
+		return nil, fmt.Errorf("%w: chunk list: %w", tree.ErrCorrupt, err)
 	}
 	if list.Version != tree.Version {
 		return nil, fmt.Errorf("%w: chunk list declares version %d, this build reads %d", tree.ErrCorrupt, list.Version, tree.Version)

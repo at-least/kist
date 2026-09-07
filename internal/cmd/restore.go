@@ -16,7 +16,7 @@ func newRestoreCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "restore <snapshot> <target>",
 		Short: "Restore a snapshot into an empty directory",
-		Long: "Restore a snapshot, named by the key that `kist snapshots` prints.\n\n" +
+		Long: "Restore a snapshot, named by the key that `kist-go snapshots` prints.\n\n" +
 			"The target must not exist or must be empty. Restoring over live data\n" +
 			"is not something a backup tool should do by inference.",
 		Args: cobra.ExactArgs(2),

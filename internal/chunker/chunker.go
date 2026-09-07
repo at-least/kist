@@ -20,12 +20,6 @@ const (
 	// MaxSize is the longest chunk, and therefore the largest buffer any
 	// single-chunk operation has to hold.
 	MaxSize = 8 << 20 // 8 MiB
-
-	// bufSize is the working buffer. It must exceed MaxSize so that the
-	// splitter always sees a full maximum-length window before deciding a
-	// boundary; that is what makes boundaries independent of how the
-	// input happens to arrive from the reader.
-	bufSize = 2 * MaxSize
 )
 
 // FastCDC normalisation, level 2. The splitter uses a stricter mask
@@ -180,9 +174,9 @@ func (c *Chunker) Next() (Chunk, error) {
 // boundary could be decided on a short window and would then depend on
 // the size of the reader's writes rather than on the content.
 func (c *Chunker) fill() error {
-	max := int(c.params.Max)
+	maxSize := int(c.params.Max)
 	remaining := len(c.buf) - c.cursor
-	if remaining >= max {
+	if remaining >= maxSize {
 		return nil
 	}
 

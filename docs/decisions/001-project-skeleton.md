@@ -40,13 +40,13 @@ CI 的 matrix 跑 `1.26.x` 與 `stable`：go directive 若只寫不測，遲早�
 
 `internal/` 下的 `backend`、`crypto`、`chunker`、`pack`、`index`、`tree`、`snapshot`、`repo`、`cmd` 目前都只有 `doc.go`。這不是佔位符：doc.go 先把每個 package 的職責寫死，之後放程式碼時就有一份可以對照的合約（例如「backend 只看得到密文」、「index 是快取，永遠可以從 pack trailer 重建」）。工程規範本來就要求每個 package 有 doc.go，先寫比後補誠實。
 
-CLI 的進入點是 `cmd/kist/main.go`，內容只有一行 `cmd.Execute()`；命令樹在 `internal/cmd`。這樣命令可以在測試裡用 buffer 執行，不必開 subprocess。
+CLI 的進入點是 `cmd/kist-go/main.go`，內容只有一行 `cmd.Execute()`；命令樹在 `internal/cmd`。這樣命令可以在測試裡用 buffer 執行，不必開 subprocess。
 
 ### 4. `version` 是子命令，版本號由連結期注入
 
 `var version = "dev"`，由 `make build` 以 `-ldflags -X` 蓋掉，`VERSION` 預設取 `git describe --tags --always --dirty`，在還不是 git repo 的情況下退回 `dev`（M0 當下就是這個情形）。
 
-做成 `kist version` 子命令而不是只掛 `rootCmd.Version`，是因為 M0 的驗收條件是「`kist version` 可執行」，而子命令才有辦法在單元測試裡驗證輸出。`internal/cmd/version_test.go` 是本階段唯一的測試，但它讓 `go test ./...` 有東西可以失敗——全部 `no test files` 的綠燈不是證據。
+做成 `kist-go version` 子命令而不是只掛 `rootCmd.Version`，是因為 M0 的驗收條件是「`kist-go version` 可執行」，而子命令才有辦法在單元測試裡驗證輸出。`internal/cmd/version_test.go` 是本階段唯一的測試，但它讓 `go test ./...` 有東西可以失敗——全部 `no test files` 的綠燈不是證據。
 
 ### 5. 不帶 cgo 建置；`-race` 是測試專用建置
 

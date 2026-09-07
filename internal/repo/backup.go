@@ -548,7 +548,7 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 		ids = append(ids, id)
 		total += uint64(len(chunk.Data))
 
-		if b.has(ctx, id) {
+		if b.has(id) {
 			continue
 		}
 		if err := b.add(ctx, id, chunk.Data); err != nil {
@@ -566,7 +566,7 @@ func (b *backupRun) chunkAll(ctx context.Context, r io.Reader) ([]crypto.ID, uin
 // the data safe, and the next prune re-evaluates the mark on its own --
 // by then a live snapshot resolves chunks to this run's pack, so the
 // marked pack is genuinely dead and its space is reclaimed.
-func (b *backupRun) has(ctx context.Context, id crypto.ID) bool {
+func (b *backupRun) has(id crypto.ID) bool {
 	if _, ok := b.uploaded[id]; ok {
 		return true
 	}
