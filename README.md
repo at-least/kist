@@ -2,8 +2,9 @@
 
 Deduplicating, encrypted backups to object storage, from one binary with no cgo.
 
-> **狀態：M1（本機格式定案）完成，格式已凍結。** S3 後端是 M2，無鎖 GC 是 M3。
-> 現在可以用，但只能寫本機路徑，而且還沒有 `forget` / `prune`。
+> **狀態：儲存格式 v2（Go/Rust 統一版，2026-09-05 定案）。** 本 repo 是參考實作，
+> 產品是 `kist-rs`；兩者讀寫同一種 repo、互為驗證（[`PLAN.md`](PLAN.md)）。
+> 本機 / S3 / SFTP 後端、無鎖 GC（`forget` / `prune`）、排程 `run`、`mount` 都已具備。
 
 ```console
 $ export KIST_REPOSITORY=/backup/kist KIST_PASSWORD=...
@@ -106,7 +107,7 @@ Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,r
 
 ## 文件
 
-- [`docs/format.md`](docs/format.md) — 儲存格式 v1（已凍結），含「每個說法由哪個測試守著」的對照表
+- [`docs/format.md`](docs/format.md) — 儲存格式 v2（Go/Rust 統一版），含「設計決定 × 證據」對照表
 - [`docs/decisions/`](docs/decisions/) — ADR，記錄為什麼這樣設計
 - [`docs/release.md`](docs/release.md) — 版本、平台、release 流程
 - [`PLAN.md`](PLAN.md) — 里程碑與工程規範
