@@ -222,3 +222,12 @@ kist/
   測不了的 stub。**若未來取得 Windows 環境**，從這裡重啟：先在 Windows 上跑
   既有測試套件確認編譯與基本行為，再實作 VSS（`backup` 前取 shadow copy）與
   路徑語意驗證；格式層（`kist-format`）已平台中性，不需改動。
+
+- **cargo-deny ignore RUSTSEC-2024-0384（`instant` unmaintained）**【2026-09-07】：
+  `instant` 是 reed-solomon-erasure 6.0.0 → parking_lot 0.11 的傳遞依賴，
+  6.0.0 即最新版、上游無升級路徑；advisory 屬「停止維護」而非已知漏洞，
+  instant 本身只是 std::time shim（無 unsafe），實際風險為零。不走「關
+  default features 進 no_std」的路——那會改變格式關鍵的 parity 路徑的錯誤
+  型別與鎖行為（ADR 009 已與 Go 逐 byte 驗證），為消一條資訊性提示重驗不
+  值得（advisor 簽核）。**移除條件**：reed-solomon-erasure 發新版脫離
+  parking_lot 0.11、更換 RS crate，或 instant 日後出現真正的漏洞 advisory。
