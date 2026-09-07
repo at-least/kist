@@ -166,7 +166,6 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	if err != nil {
 		return nil, snapshot.Handle{}, fmt.Errorf("backup: %w", err)
 	}
-	b.stats.Dirs++
 
 	// The index blob is a cache, so it is written before the commit but a
 	// failure to write it is still fatal: a backup that cannot record
@@ -471,7 +470,6 @@ func (b *backupRun) backupFile(ctx context.Context, path string, info fs.FileInf
 			entry.Chunks = first.chunks
 			entry.ContentType = uint8(first.ctype)
 			entry.Size = first.size
-			b.stats.Bytes += first.size
 			return nil
 		}
 	}

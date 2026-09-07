@@ -759,3 +759,38 @@ func logTreeDifferences(t *testing.T, r *Repository) {
 	}
 	walk("", roots[0], roots[1])
 }
+
+// docs/format.md §9 pins how stats count: dirs includes the source
+// directory itself but not the synthetic root tree; files counts every
+// name, hard links included; bytes counts hard-linked content once.
+// kist-rs asserts the same numbers (kist-core/tests/backup_restore.rs).
+func TestSnapshotStatsFollowTheSpecCounting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hard links are not tracked on Windows")
+	}
+	ctx := context.Background()
+	r, _ := initRepo(t, "stats")
+
+	source := t.TempDir()
+	payload := randomBytes(t, "stats-data", 300<<10)
+	writeTree(t, source, []fileSpec{{path: "a.bin", data: payload}, {path: "sub/c.txt", data: []byte("c")}})
+	if err := os.Link(filepath.Join(source, "a.bin"), filepath.Join(source, "b.bin")); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(source, "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a.bin", filepath.Join(source, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	want := snapshot.Stats{Files: 3, Dirs: 3, Symlinks: 1, Bytes: uint64(len(payload)) + 1}
+	got := snapshot.Stats{Files: snap.Stats.Files, Dirs: snap.Stats.Dirs, Symlinks: snap.Stats.Symlinks, Bytes: snap.Stats.Bytes}
+	if got != want {
+		t.Errorf("stats = %+v, want %+v", got, want)
+	}
+}
