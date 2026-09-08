@@ -14,6 +14,8 @@ use rand::{RngExt, SeedableRng};
 pub const PASSWORD: &str = "test password";
 
 /// 小 chunk、小 pack：讓小量資料就能跑出多 chunk、多 pack、indirect content。
+/// replicas=0：絕大多數測試斷言物件數與列表形狀，副本（`.r1`）會讓它們翻倍；
+/// 副本行為由 `replicas=1` 的專門測試覆蓋。
 pub fn init_options() -> InitOptions {
     InitOptions {
         chunker: ChunkerParams {
@@ -27,6 +29,7 @@ pub fn init_options() -> InitOptions {
             t_cost: 1,
             p_cost: 1,
         },
+        replicas: Some(0),
     }
 }
 

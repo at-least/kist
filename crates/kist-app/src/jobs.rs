@@ -134,7 +134,7 @@ async fn run_job_inner(
             };
             let paths: Vec<PathBuf> = b.paths.clone();
             let summary = repo.backup(&paths, opts).await?;
-            let incomplete = summary.stats.errors > 0;
+            let incomplete = summary.report.errors > 0;
             Ok((
                 incomplete,
                 serde_json::to_value(&summary).unwrap_or_default(),

@@ -253,58 +253,67 @@ async fn xattrs_are_exposed() {
     assert_eq!(core.get_xattr(hello.ino, b"user.nope").unwrap(), None);
 }
 
-/// `kist backup /` 會產生名為 "/" 的根條目：mount 必須把它的子樹攤平到
-/// snapshot 頂層（與 restore 併入目標根的語意一致）。手工組這樣的 snapshot
-/// （public 的 `seal_tree` + `write_snapshot`），驗證瀏覽看到的是子樹內容。
+/// `kist backup /` 在 v2 會產生名為 "/" 的合成根，mount 把它的子樹攤平到
+/// snapshot 頂層（與 restore 併入目標根的語意一致）。v3 沒有合成根：root 的
+/// 內容樹直接掛在 `roots[].tree`（這裡以 public 的 `seal_tree` +
+/// `write_snapshot` 手工組一個 path="/" 的 root，內容 bin、etc）。
+/// v2 的攤平斷言原樣保留——v3 的 mount 對 locator 切不出組件的 root 是
+/// 整個跳過（vpath），此測試釘住兩代語意的差異。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slash_root_entry_flattens_to_top() {
-    use kist_format::snapshot::{format_key_timestamp, Snapshot};
-    use kist_format::tree::{node_type, Tree};
+    use kist_format::snapshot::{format_key_timestamp, Root, Snapshot};
+    use kist_format::tree::{meta_kind, node_type, Tree};
     use kist_format::FORMAT_VERSION;
     use time::OffsetDateTime;
 
     let t = TestRepo::new().await;
     let repo = t.open().await;
 
-    fn dir_entry(name: &[u8]) -> kist_format::tree::Entry {
+    fn dir_entry(name: &[u8], subtree: kist_format::TreeId) -> kist_format::tree::Entry {
         kist_format::tree::Entry {
             name: name.to_vec(),
             kind: node_type::DIR,
-            mode: 0o40555,
-            uid: 0,
-            gid: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
+            meta_kind: meta_kind::POSIX,
             size: 0,
             target: Vec::new(),
             chunks: Vec::new(),
             content: 0,
-            subtree: kist_format::TreeId::ZERO,
-            dev: 0,
-            inode: 0,
-            nlink: 0,
+            subtree,
+            mode: Some(0o40555),
+            uid: Some(0),
+            gid: Some(0),
+            mtime_ns: Some(0),
+            ctime_ns: None,
+            dev: None,
+            inode: None,
+            nlink: None,
             xattrs: None,
+            etag: None,
+            vern: None,
         }
     }
 
-    // 子樹：兩個空目錄 bin、etc（dir entry 不需要任何 chunk）
-    let child_tree = Tree {
+    // 空目錄 = 一個空 tree（v3 的 dir entry 必須帶非零 subtree）
+    let empty = Tree {
         version: FORMAT_VERSION,
-        entries: vec![dir_entry(b"bin"), dir_entry(b"etc")],
+        entries: Vec::new(),
         prev: None,
     };
-    let (child_id, child_bytes) = repo.seal_tree(child_tree).await.unwrap();
+    let (bin_id, bin_bytes) = repo.seal_tree(empty.clone()).await.unwrap();
     t.backend
-        .put(&kist_format::keys::tree(&child_id), child_bytes)
+        .put(&kist_format::keys::tree(&bin_id), bin_bytes)
+        .await
+        .unwrap();
+    let (etc_id, etc_bytes) = repo.seal_tree(empty).await.unwrap();
+    t.backend
+        .put(&kist_format::keys::tree(&etc_id), etc_bytes)
         .await
         .unwrap();
 
-    // 根 tree：只有一個名為 "/" 的目錄，subtree 指向子樹
-    let mut slash = dir_entry(b"/");
-    slash.subtree = child_id;
+    // "/" 的內容樹：bin、etc 兩個空目錄（dir entry 不需要任何 chunk）
     let root_tree = Tree {
         version: FORMAT_VERSION,
-        entries: vec![slash],
+        entries: vec![dir_entry(b"bin", bin_id), dir_entry(b"etc", etc_id)],
         prev: None,
     };
     let (root_id, root_bytes) = repo.seal_tree(root_tree).await.unwrap();
@@ -319,11 +328,13 @@ async fn slash_root_entry_flattens_to_top() {
     let key = kist_format::keys::snapshot(&[0x22; 16], &ts);
     let snapshot = Snapshot {
         version: FORMAT_VERSION,
-        root: root_id,
+        roots: vec![Root {
+            path: b"/".to_vec().into(),
+            tree: root_id,
+        }],
         time_ns: t0.unix_timestamp_nanos() as i64,
         host: "handcraft".to_owned(),
         user: String::new(),
-        paths: vec![b"/".to_vec().into()],
         client_id: vec![0x22; 16],
         parent: None,
         stats: Default::default(),

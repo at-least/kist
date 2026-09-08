@@ -56,9 +56,9 @@ fn pack_rejects_bad_magic_and_unsupported_version() {
             what: "pack header"
         })
     ));
-    // 檔頭版號不支援（v3）：magic 含版號，整段不符就是 BadMagic
+    // 檔頭版號不支援（v4）：magic 含版號，整段不符就是 BadMagic
     let mut bad_version = good.clone();
-    bad_version[6..8].copy_from_slice(&3u16.to_be_bytes());
+    bad_version[6..8].copy_from_slice(&4u16.to_be_bytes());
     assert!(matches!(
         pack::trailer_bytes(&bad_version),
         Err(FormatError::BadMagic {

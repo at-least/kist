@@ -46,13 +46,13 @@ async fn backup_restore_check_on_s3() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert!(s1.stats.packs_new >= 2);
+    assert!(s1.report.packs_new >= 2);
     let s2 = repo
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert_eq!(s2.stats.packs_new, 0);
-    assert_eq!(s2.stats.files_reused, s2.stats.files);
+    assert_eq!(s2.report.packs_new, 0);
+    assert_eq!(s2.report.files_reused, s2.stats.files);
 
     let target = dir.path().join("out");
     let summary = repo
@@ -113,12 +113,12 @@ async fn put_only_user_completes_a_backup() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert!(s.stats.packs_new > 0);
+    assert!(s.report.packs_new > 0);
     let s2 = repo
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert_eq!(s2.stats.chunks_new, 0);
+    assert_eq!(s2.report.chunks_new, 0);
     // 受限帳號也能 check（只需 Get / List）
     let report = repo
         .check(CheckOptions {

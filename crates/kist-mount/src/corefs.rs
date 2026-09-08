@@ -20,7 +20,7 @@ use kist_format::tree::{content_type, node_type, ChunkList, Entry};
 use kist_format::{cbor, ChunkId};
 
 use crate::offsets::ChunkOffsets;
-use crate::vpath::{VEntry, VirtualRoot};
+use crate::vpath::{RootContents, VEntry, VirtualRoot};
 
 /// 頂兩層（client、timestamp 列表）的快取期限。
 pub const VOLATILE_TTL: Duration = Duration::from_secs(1);
@@ -386,30 +386,45 @@ impl FsCore {
                     Err(CoreError::SnapshotNotFound(_)) => return Err(FsError::NotFound),
                     Err(_) => return Err(FsError::Io),
                 };
-                let entries = self
-                    .repo
-                    .read_tree_chain(&info.root)
-                    .await
-                    .map_err(|_| FsError::Io)?;
-                // 名為 "/" 的根條目（`kist backup /`）：它的子樹**就是** snapshot
-                // 根的內容，攤平到頂層——restore 對 "/" 也是併入目標根，語意一致。
-                // 未來若有其他「整段路徑就是根」的形態（Windows 磁碟根等），這裡
-                // 是要 revisiting 的地方（見 ADR 015）。
-                let mut top: Vec<Entry> = Vec::with_capacity(entries.len());
-                for e in entries {
-                    if e.name.as_slice() == b"/" && e.kind == node_type::DIR && !e.subtree.is_zero()
-                    {
-                        let children = self
+                // v3：roots 的定位字串不是單一組件——展開成虛擬層級。
+                // 每個 root 讀 tree 判別形態：恰好一個非目錄 entry 且名稱 =
+                // 定位末段 → 檔案/symlink 來源（葉子 = 那個 entry，與 restore
+                // 落點一致）；定位沒有組件（`/`）→ 內容攤平到頂層；否則目錄
+                // 來源（葉子 = 攜帶 subtree 的合成 DIR，children 懶載入）。
+                let mut pairs = Vec::with_capacity(info.roots.len());
+                for root in &info.roots {
+                    let comps: Vec<&[u8]> = root
+                        .path
+                        .as_slice()
+                        .split(|&b| b == b'/')
+                        .filter(|c| !c.is_empty() && *c != b".")
+                        .collect();
+                    let contents = match comps.split_last() {
+                        // 定位沒有組件：攤平（`kist backup /` 的 v3 形態）。
+                        None => self
                             .repo
-                            .read_tree_chain(&e.subtree)
+                            .read_tree_chain(&root.tree)
                             .await
-                            .map_err(|_| FsError::Io)?;
-                        top.extend(children);
-                    } else {
-                        top.push(e);
-                    }
+                            .map(RootContents::Flatten)
+                            .unwrap_or(RootContents::Dir),
+                        Some((last, _)) => {
+                            let leaf = match self.repo.read_tree_chain(&root.tree).await {
+                                Ok(entries) => matches!(
+                                    entries.as_slice(),
+                                    [e] if e.kind != node_type::DIR && e.name == *last
+                                )
+                                .then(|| Box::new(entries[0].clone())),
+                                Err(_) => None,
+                            };
+                            match leaf {
+                                Some(e) => RootContents::Leaf(e),
+                                None => RootContents::Dir,
+                            }
+                        }
+                    };
+                    pairs.push((root.clone(), contents));
                 }
-                let vroot = Arc::new(VirtualRoot::build(&top));
+                let vroot = Arc::new(VirtualRoot::build(pairs));
                 let attr = Attr::dir(0o555, info.time_ns);
                 let ino = {
                     self.inodes
@@ -750,19 +765,18 @@ fn entry_attr(e: &Entry) -> Attr {
             node_type::SYMLINK => Kind::Symlink,
             _ => Kind::File,
         },
-        perm: e.mode & 0o7777,
+        perm: e.mode.unwrap_or(0o555) & 0o7777,
         size: if e.kind == node_type::FILE {
             e.size
         } else {
             u64::try_from(e.target.len()).unwrap_or(0)
         },
-        uid: e.uid,
-        gid: e.gid,
-        mtime_ns: e.mtime_ns,
-        ctime_ns: if e.ctime_ns != 0 {
-            e.ctime_ns
-        } else {
-            e.mtime_ns
+        uid: e.uid.unwrap_or(0),
+        gid: e.gid.unwrap_or(0),
+        mtime_ns: e.mtime_ns.unwrap_or(0),
+        ctime_ns: match (e.ctime_ns, e.mtime_ns) {
+            (Some(c), _) if c != 0 => c,
+            (_, m) => m.unwrap_or(0),
         },
     }
 }

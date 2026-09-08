@@ -504,9 +504,9 @@ fn snapshot_row(info: &SnapshotInfo) -> SnapshotRow {
         files: s.stats.files.to_string(),
         size: human_bytes(s.stats.bytes),
         paths: s
-            .paths
+            .roots
             .iter()
-            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .map(|r| String::from_utf8_lossy(r.path.as_slice()).into_owned())
             .collect::<Vec<_>>()
             .join(", "),
     }
@@ -544,8 +544,8 @@ fn status_view(state: &ServeState, notice: Option<String>) -> StatusView {
             files: p.stats.files.to_string(),
             dirs: p.stats.dirs.to_string(),
             bytes_total: human_bytes(p.stats.bytes),
-            bytes_new: human_bytes(p.stats.bytes_stored),
-            errors: p.stats.errors.to_string(),
+            bytes_new: human_bytes(p.report.bytes_stored),
+            errors: p.report.errors.to_string(),
             current: p.current.clone(),
         }),
     });

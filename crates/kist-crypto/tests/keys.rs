@@ -31,11 +31,12 @@ fn key_slot_round_trip() {
     assert_eq!(slot.kdf.algorithm, "argon2id");
     assert_eq!(slot.kdf.salt.len(), 16);
     assert_eq!(slot.created_ns, CREATED_NS);
-    // wrapped = nonce(24) ‖ 密文(32) ‖ tag(16)
-    assert_eq!(slot.wrapped.len(), 24 + 32 + 16);
+    // wrapped = nonce(24) ‖ 密文(master 32 ‖ Invariants CBOR) ‖ tag(16)；
+    // v3 起密文比 32 bytes 長（帶不變式）。
+    assert!(slot.wrapped.len() > 24 + 32 + 16);
 
-    let unlocked = unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).unwrap();
-    assert_eq!(unlocked.as_bytes(), master.as_bytes());
+    let unlocked = unlock_key_slot(PASSWORD.as_bytes(), &slot).unwrap();
+    assert_eq!(unlocked.master.as_bytes(), master.as_bytes());
 }
 
 #[test]
@@ -49,7 +50,7 @@ fn wrong_password_is_rejected() {
     )
     .unwrap();
     assert!(matches!(
-        unlock_key_slot(b"wrong", &slot, &binding()),
+        unlock_key_slot(b"wrong", &slot),
         Err(CryptoError::WrongPassword)
     ));
 }
@@ -65,7 +66,7 @@ fn tampered_wrapped_key_is_rejected() {
     )
     .unwrap();
     slot.wrapped[30] ^= 1; // 動密文部分（nonce 之後）
-    assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).is_err());
+    assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot).is_err());
 }
 
 #[test]
@@ -80,7 +81,7 @@ fn unknown_kdf_is_rejected() {
     .unwrap();
     slot.kdf.algorithm = "scrypt".to_owned();
     assert!(matches!(
-        unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()),
+        unlock_key_slot(PASSWORD.as_bytes(), &slot),
         Err(CryptoError::UnsupportedKdf(_))
     ));
 }
@@ -94,9 +95,7 @@ fn two_slots_wrap_the_same_master_key_differently() {
     assert_ne!(slot_a.kdf.salt, slot_b.kdf.salt);
     assert_ne!(slot_a.wrapped, slot_b.wrapped);
     assert_eq!(
-        unlock_key_slot(b"b", &slot_b, &binding())
-            .unwrap()
-            .as_bytes(),
+        unlock_key_slot(b"b", &slot_b).unwrap().master.as_bytes(),
         master.as_bytes()
     );
 }
@@ -306,27 +305,59 @@ fn binding() -> kist_crypto::KeyBinding {
     }
 }
 
+/// v3：不變式在認證密文裡——解鎖永遠成功取回**綁定時**的值，與明文 config
+/// 的不符由 `Invariants::check_matches` 以明確錯誤揭露（不是「默默解不開」）。
 #[test]
-fn key_slot_is_bound_to_repo_id_and_chunker_params() {
+fn invariants_travel_inside_the_authenticated_payload() {
     let (slot, _) = create_key_slot(PASSWORD.as_bytes(), "d", 0, fast_kdf(), &binding()).unwrap();
-    assert!(unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()).is_ok());
+    let unlocked = unlock_key_slot(PASSWORD.as_bytes(), &slot).unwrap();
+    let truth = &unlocked.invariants;
+    assert_eq!(truth.repo_id, vec![9; 16]);
+    assert_eq!(truth.chunker, kist_format::config::ChunkerParams::default());
 
-    let mut other_repo = binding();
-    other_repo.repo_id[0] ^= 1;
+    // 明文 config 被改（repo_id / chunker）：認證不變式 vs 被改的 config
+    // 必須明確拒絕。
+    let mut tampered_repo = config_from(&binding());
+    tampered_repo.repo_id[0] ^= 1;
     assert!(
-        matches!(
-            unlock_key_slot(PASSWORD.as_bytes(), &slot, &other_repo),
-            Err(CryptoError::WrongPassword)
-        ),
-        "repo_id 被改 → 解不開"
+        truth.check_matches(&tampered_repo).is_err(),
+        "config 的 repo_id 被改 → 明確拒絕"
     );
 
-    let mut other_chunker = binding();
-    other_chunker.chunker.avg += 1;
+    let mut tampered_chunker = config_from(&binding());
+    tampered_chunker.chunker.avg += 1;
     assert!(
-        unlock_key_slot(PASSWORD.as_bytes(), &slot, &other_chunker).is_err(),
-        "chunker 被改 → 解不開"
+        truth.check_matches(&tampered_chunker).is_err(),
+        "config 的 chunker 被改 → 明確拒絕"
     );
+
+    // 沒被動過的 config：相符。
+    assert!(truth.check_matches(&config_from(&binding())).is_ok());
+}
+
+fn config_from(b: &kist_crypto::KeyBinding) -> kist_format::config::RepoConfig {
+    kist_format::config::RepoConfig {
+        version: kist_format::FORMAT_VERSION,
+        repo_id: b.repo_id.clone(),
+        created_ns: 0,
+        chunker: b.chunker,
+        pack_target_size: 64 * 1024 * 1024,
+        min_reader: kist_format::FORMAT_VERSION.try_into().unwrap(),
+        replicas: 0,
+        key: kist_format::config::KeySlot {
+            version: kist_format::FORMAT_VERSION,
+            name: String::new(),
+            created_ns: 0,
+            kdf: kist_format::config::KdfParams {
+                algorithm: "argon2id".to_owned(),
+                t_cost: 1,
+                m_cost_kib: 8,
+                p_cost: 1,
+                salt: vec![0; 16],
+            },
+            wrapped: Vec::new(),
+        },
+    }
 }
 
 #[test]
@@ -336,14 +367,14 @@ fn absurd_kdf_parameters_are_rejected_before_running_argon2() {
     slot.kdf.m_cost_kib = u32::MAX; // 4 TiB
     let started = std::time::Instant::now();
     assert!(matches!(
-        unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()),
+        unlock_key_slot(PASSWORD.as_bytes(), &slot),
         Err(CryptoError::BadKdfParams(_))
     ));
     assert!(started.elapsed().as_secs() < 1, "不該真的去配置記憶體");
     slot.kdf.m_cost_kib = 8;
     slot.kdf.t_cost = u32::MAX;
     assert!(matches!(
-        unlock_key_slot(PASSWORD.as_bytes(), &slot, &binding()),
+        unlock_key_slot(PASSWORD.as_bytes(), &slot),
         Err(CryptoError::BadKdfParams(_))
     ));
 }

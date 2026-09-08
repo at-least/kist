@@ -126,6 +126,41 @@ impl Repository {
         report.errors.extend(file_errors);
         report.trees = reach.live_trees.len() as u64;
 
+        // 3b. 副本健康（v3 §13.5）。孤兒副本（`.r1` 在、主體不在）→ **錯誤**：
+        //     那是「主體意外遺失」的災難訊號，prune 刻意不自動清理，這裡回報
+        //     （restore 端會自動落到副本）。replicas=1 時，活樹缺副本 → 警告
+        //     （可修補，不影響資料安全）。
+        let replica_keys: Vec<String> = self
+            .backend()
+            .list(keys::TREES_PREFIX)
+            .await?
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| k.ends_with(kist_format::keys::REPLICA_SUFFIX))
+            .collect();
+        for rk in replica_keys {
+            let Some(base) = kist_format::keys::strip_replica(&rk) else {
+                continue;
+            };
+            if self.backend().head(base).await.is_err() {
+                report.errors.push(format!(
+                    "{rk}: replica exists but its primary tree is missing \
+                     (possible data-loss event; data can be recovered from the replica)"
+                ));
+            }
+        }
+        if self.config().replicas > 0 {
+            for tid in &reach.live_trees {
+                let tree_id = kist_format::TreeId::from_bytes(*tid.as_bytes());
+                let rk = keys::tree_replica(&tree_id);
+                if self.backend().head(&rk).await.is_err() {
+                    report
+                        .warnings
+                        .push(format!("{}: tree replica is missing (repairable)", rk));
+                }
+            }
+        }
+
         // 4. 讀資料
         if opts.read_data {
             // index 沒有反向表：先把「每個 pack 在 index 裡有哪些 chunk」整理出來

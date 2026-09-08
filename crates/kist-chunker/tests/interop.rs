@@ -79,20 +79,20 @@ fn interop_key_derivation() {
 
     for (ctx, want) in [
         (
-            "kist/v2/hash",
-            "1953dd93ebf5b2e60606cb54e9b5a01debcb64a51c186fcaed7a698e776c8a24",
+            "kist/v3/hash",
+            "cb79b897d172c800d23506629ca5b14781f8b0232ab1714c7f85b8199f4e527d",
         ),
         (
-            "kist/v2/chunk",
-            "cd800501750684a7f2de3982090396759351e2ba153a47c0cabd7a307c844d59",
+            "kist/v3/chunk",
+            "15806189fdb9ae9e6b867a9d40a1cce2ac24a26c74492b64389ce5aafffb579f",
         ),
         (
-            "kist/v2/meta",
-            "b9bb8e689db093d3b7969ebd013efbcf04bb0f49c59d8934484fbda5bff91581",
+            "kist/v3/meta",
+            "c4f44efcd5a8c073177757493a3d7f895800060bef9bca2102c5aa6f13ebaf52",
         ),
         (
-            "kist/v2/index",
-            "7db4ac7f2de7ff9f7ea22282af0bd5963a2a955d773db866210dd3055ecd8d7b",
+            "kist/v3/index",
+            "2121d5548b3373b970ab0a1618a068985e8f41f38565586c1cdf60c1e266e93f",
         ),
     ] {
         assert_eq!(

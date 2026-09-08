@@ -117,7 +117,9 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
         "第一階段不能刪 tree"
     );
     // b2 的根 tree 活著、不能被標記
-    assert!(!marked.contains(&ObjectId::from_bytes(*b2.root.as_bytes())));
+    for root in &b2.roots {
+        assert!(!marked.contains(&ObjectId::from_bytes(*root.tree.as_bytes())));
+    }
     // repo 一致（index 已重寫，不含被 repack 的 pack）
     let report = t
         .open()
@@ -136,7 +138,7 @@ async fn mark_then_delete_after_grace_when_active_clients_moved_on() {
         .backup(std::slice::from_ref(&src), client(1, r + Duration::days(5)))
         .await
         .unwrap();
-    assert_eq!(b3.stats.chunks_new, 0, "{:?}", b3.stats);
+    assert_eq!(b3.report.chunks_new, 0, "{:?}", b3.report);
 
     // 第二次 prune：標記已超過 grace，且唯一的活躍 client 在標記後有新 snapshot → 刪
     settle().await;
@@ -261,7 +263,7 @@ async fn refuses_to_prune_when_references_are_incomplete() {
         .await
         .unwrap();
     // 弄壞根 tree：引用不完整，prune 必須拒絕，什麼都不寫
-    let path = t.repo_path().join(keys::tree(&b1.root));
+    let path = t.repo_path().join(keys::tree(&b1.roots[0].tree));
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[40] ^= 1;
     std::fs::write(&path, bytes).unwrap();
@@ -539,7 +541,7 @@ async fn duplicate_copies_are_reclaimed() {
         )
         .await
         .unwrap();
-    assert!(s2.stats.chunks_new > 0);
+    assert!(s2.report.chunks_new > 0);
     for id in &first {
         std::fs::remove_file(t.repo_path().join(keys::gc(id))).unwrap();
     }

@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use kist_format::config::{ChunkerParams, KdfParams, KeySlot, RepoConfig};
 use kist_format::index::{IndexBlob, IndexPack};
 use kist_format::pack::{self, PackEntry, PackTrailer};
-use kist_format::snapshot::{Snapshot, SnapshotStats};
-use kist_format::tree::{content_type, node_type, ChunkList, Entry, Tree};
-use kist_format::{cbor, ChunkId, TreeId};
+use kist_format::snapshot::{Root, Snapshot, SnapshotStats};
+use kist_format::tree::{content_type, meta_kind, node_type, ChunkList, Entry, Tree};
+use kist_format::{cbor, ChunkId, TreeId, FORMAT_VERSION};
 
 /// `2026-09-04T12:00:00Z` 的 Unix 奈秒。
 const CREATED_NS: i64 = 1_788_523_200_000_000_000;
@@ -49,17 +49,20 @@ fn tree_id(b: u8) -> TreeId {
 fn sample_config() -> RepoConfig {
     let wrapped = {
         let mut v = vec![0xBB; 24]; // nonce
-        v.extend_from_slice(&[0xCC; 32 + 16]); // 密文(32) ‖ tag(16)
+                                    // 密文(master 32 + Invariants CBOR + tag 16)：長度是示意，真正內容由 kist-crypto 測試釘
+        v.extend_from_slice(&[0xCC; 32 + 16]);
         v
     };
     RepoConfig {
-        version: 2,
+        version: FORMAT_VERSION,
         repo_id: (0u8..16).collect(),
         created_ns: CREATED_NS,
         chunker: ChunkerParams::default(),
         pack_target_size: 64 * 1024 * 1024,
+        min_reader: FORMAT_VERSION.try_into().unwrap(),
+        replicas: 0,
         key: KeySlot {
-            version: 2,
+            version: FORMAT_VERSION,
             name: "default".to_owned(),
             created_ns: CREATED_NS,
             kdf: KdfParams {
@@ -74,40 +77,43 @@ fn sample_config() -> RepoConfig {
     }
 }
 
-/// 填好預設值的 Entry，測試再覆寫有興趣的欄位。
+/// 填好預設值的 Entry（posix 檔案），測試再覆寫有興趣的欄位。
 fn entry(name: &[u8]) -> Entry {
     Entry {
         name: name.to_vec(),
         kind: node_type::FILE,
-        mode: 0,
-        uid: 0,
-        gid: 0,
-        mtime_ns: 0,
-        ctime_ns: 0,
+        meta_kind: meta_kind::POSIX,
         size: 0,
         target: Vec::new(),
-        chunks: Vec::new(),
         content: content_type::DIRECT,
+        chunks: Vec::new(),
         subtree: TreeId::ZERO,
-        dev: 0,
-        inode: 0,
-        nlink: 0,
+        mode: Some(0),
+        uid: Some(0),
+        gid: Some(0),
+        mtime_ns: Some(0),
+        ctime_ns: None,
+        dev: None,
+        inode: None,
+        nlink: None,
         xattrs: None,
+        etag: None,
+        vern: None,
     }
 }
 
 fn sample_tree() -> Tree {
     let mut a = entry(b"a.txt");
-    a.mode = 0o100644;
-    a.uid = 1000;
-    a.gid = 1000;
-    a.mtime_ns = 1_700_000_000_123_456_789;
-    a.ctime_ns = 1_700_000_001_000_000_005;
+    a.mode = Some(0o100644);
+    a.uid = Some(1000);
+    a.gid = Some(1000);
+    a.mtime_ns = Some(1_700_000_000_123_456_789);
+    a.ctime_ns = Some(1_700_000_001_000_000_005);
     a.size = 3_000_000;
     a.chunks = vec![chunk_id(1), chunk_id(2)];
-    a.nlink = 2; // 硬連結：dev/ino/nlink 只有 nlink > 1 才記
-    a.dev = 7;
-    a.inode = 424_242;
+    a.nlink = Some(2); // 硬連結：dev/ino/nlink 只有 nlink > 1 才記
+    a.dev = Some(7);
+    a.inode = Some(424_242);
     a.xattrs = Some(
         vec![(
             serde_bytes::ByteBuf::from(b"user.comment".to_vec()),
@@ -124,12 +130,12 @@ fn sample_tree() -> Tree {
 
     let mut link = entry(b"link");
     link.kind = node_type::SYMLINK;
-    link.mode = 0o120777;
+    link.mode = Some(0o120777);
     link.target = b"a.txt".to_vec();
 
     let mut sub = entry(b"sub");
     sub.kind = node_type::DIR;
-    sub.mode = 0o040755;
+    sub.mode = Some(0o040755);
     sub.subtree = tree_id(4);
 
     Tree::new(vec![a, big, link, sub], Some(tree_id(5)))
@@ -159,8 +165,10 @@ fn sample_snapshot() -> Snapshot {
         host: "host".to_owned(),
         user: "user".to_owned(),
         time_ns: CREATED_NS,
-        paths: vec![serde_bytes::ByteBuf::from(b"/home/user".to_vec())],
-        root: tree_id(9),
+        roots: vec![Root {
+            path: serde_bytes::ByteBuf::from(b"/home/user".to_vec()),
+            tree: tree_id(9),
+        }],
         parent: Some(
             "snapshots/000102030405060708090a0b0c0d0e0f/20260903T120000000000000Z".to_owned(),
         ),
@@ -169,13 +177,6 @@ fn sample_snapshot() -> Snapshot {
             dirs: 1,
             symlinks: 1,
             bytes: 10_003_000_000,
-            chunks_new: 2,
-            chunks_read: 3,
-            packs_new: 1,
-            packs_revived: 1,
-            bytes_stored: 3_000_000,
-            errors: 0,
-            files_reused: 1,
         },
     }
 }
@@ -281,10 +282,10 @@ fn tree_without_ctime_fields_still_decodes() {
 
     let tree: Tree = cbor::decode(&older).unwrap();
     assert_eq!(tree.entries.len(), 4);
-    assert_eq!(tree.entries[0].mtime_ns, 1_700_000_000_123_456_789);
-    assert_eq!(tree.entries[0].ctime_ns, 0);
+    assert_eq!(tree.entries[0].mtime_ns, Some(1_700_000_000_123_456_789));
+    assert_eq!(tree.entries[0].ctime_ns, None);
     let mut expected = sample_tree();
-    expected.entries[0].ctime_ns = 0;
+    expected.entries[0].ctime_ns = None;
     assert_eq!(tree, expected);
 }
 

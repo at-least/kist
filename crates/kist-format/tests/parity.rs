@@ -33,8 +33,19 @@ fn golden_go_parity_repairs_rust_side() {
     let pack = fake_pack("golden", 4321);
     assert_eq!(ObjectId::of(&pack), id, "pack stream diverged from Go");
 
+    // v3 起向量由 Rust 錄製（UPDATE_VECTOR=1），Go 端 testdata 保持同份拷貝。
+    if std::env::var_os("UPDATE_VECTOR").is_some() {
+        let ours = parity::encode(&id, &pack, 2).unwrap();
+        std::fs::write(
+            "tests/testdata/parity-golden.txt",
+            format!("pack {id}\nparity {}\n", hex::encode(&ours)),
+        )
+        .unwrap();
+        return;
+    }
+
     let obj = parity::parse(&raw).unwrap();
-    assert_eq!(obj.version(), 2);
+    assert_eq!(obj.version(), kist_format::FORMAT_VERSION);
     assert_eq!(obj.parity_shards(), 2);
     assert_eq!(obj.pack_size(), 4321);
 
@@ -210,7 +221,10 @@ fn parse_rejects_inconsistent_headers() {
         kist_format::cbor::encode(&w).unwrap()
     };
     let cases: Vec<(&str, Vec<u8>)> = vec![
-        ("version", mutate(&|w| w.v = 3)),
+        (
+            "version",
+            mutate(&|w| w.v = kist_format::FORMAT_VERSION + 1),
+        ),
         ("k", mutate(&|w| w.k = 8)),
         ("m zero", mutate(&|w| w.m = 0)),
         ("m too big", mutate(&|w| w.m = 9)),

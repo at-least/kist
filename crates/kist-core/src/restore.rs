@@ -97,19 +97,36 @@ impl Repository {
         let snapshot = self.read_snapshot(snapshot_key).await?;
         let index = ReloadableIndex::new(self.load_index().await?);
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
-        let entries = self.read_tree_chain(&snapshot.root).await?;
         let mut summary = RestoreSummary::default();
         // 硬連結：(dev, inode) → 第一個還原出來的路徑；後續名字 hard_link 過去。
+        // 範圍是**整個 snapshot、跨 roots**（format-v3-draft §8.3）。
         let mut hardlinks: std::collections::HashMap<(u64, u64), PathBuf> =
             std::collections::HashMap::new();
-        for entry in entries {
-            let rel = fsmeta::bytes_to_relative_path(&entry.name)?;
-            let path = target.join(rel);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
+        for root in &snapshot.roots {
+            let rel = fsmeta::locator_to_relative(root.path.as_slice())?;
+            let entries = self.read_tree_chain(&root.tree).await?;
+            // v3 的 restore 映射（format-v3-draft §9）：目錄來源的 entries 放在
+            // `target/<locator>` 之下；**檔案/symlink 來源**（root tree 恰好一個
+            // 非目錄 entry、名稱 = 定位的末段）落在 `target/<locator 去掉末段>/`
+            // ——與 v2「絕對路徑還原」的落點完全一致，而「目錄恰好只含一個同名
+            // 檔案」的還原結果也相同，所以這個判別沒有歧義代價。
+            let file_root = entries.len() == 1
+                && entries[0].kind != node_type::DIR
+                && rel.file_name().map(|f| f.as_encoded_bytes().to_vec())
+                    == Some(entries[0].name.clone());
+            let base = if file_root {
+                target.join(rel.parent().unwrap_or(Path::new("")))
+            } else {
+                target.join(&rel)
+            };
+            std::fs::create_dir_all(&base).map_err(|e| CoreError::io(&base, e))?;
+            for entry in entries {
+                // v3：節點名一律是單一路徑元件（合成根已淘汰）。
+                fsmeta::validate_child_name(&entry.name)?;
+                let path = base.join(fsmeta::bytes_to_name(&entry.name)?);
+                self.restore_node(&entry, &path, &index, &mut summary, &mut hardlinks)
+                    .await;
             }
-            self.restore_node(&entry, &path, &index, &mut summary, &mut hardlinks)
-                .await;
         }
         Ok(summary)
     }
@@ -131,8 +148,8 @@ impl Repository {
                         .await
                 }
                 node_type::FILE => {
-                    let hardlink_key = (node.nlink > 1)
-                        .then_some((node.dev, node.inode))
+                    let hardlink_key = (node.nlink.unwrap_or(0) > 1)
+                        .then_some((node.dev.unwrap_or(0), node.inode.unwrap_or(0)))
                         .filter(|k| k.1 != 0);
                     if let Some(k) = hardlink_key {
                         if let Some(first) = hardlinks.get(&k) {

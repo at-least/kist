@@ -34,6 +34,9 @@ pub struct InitOptions {
     pub chunker: ChunkerParams,
     pub pack_target_size: u64,
     pub kdf_cost: KdfCost,
+    /// trees/snapshots 的 `.r1` 副本數（0 或 1）。`None` = 依後端決定
+    /// （本機 = 1、遠端 = 0；format-v3-draft §11）。
+    pub replicas: Option<u8>,
 }
 
 impl Default for InitOptions {
@@ -42,6 +45,7 @@ impl Default for InitOptions {
             chunker: ChunkerParams::default(),
             pack_target_size: 64 * 1024 * 1024,
             kdf_cost: KdfCost::default(),
+            replicas: None,
         }
     }
 }
@@ -157,6 +161,16 @@ impl Repository {
         let mut config = RepoConfig::new(repo_id, created_ns, slot);
         config.chunker = opts.chunker;
         config.pack_target_size = opts.pack_target_size;
+        // v3 副本預設（format-v3-draft §11）：本機後端 = 1（單碟無冗餘，
+        // trees/snapshots 是不可重建的 metadata）；S3/SFTP/rclone = 0
+        //（後端已有冗餘，或頻寬成本）。InitOptions.replicas 可覆寫。
+        config.replicas = match opts.replicas {
+            Some(n) => n,
+            None => match backend.location() {
+                kist_backend::RepoLocation::Local(_) => 1,
+                _ => 0,
+            },
+        };
         config
             .validate()
             .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
@@ -197,18 +211,32 @@ impl Repository {
             Err(e) => return Err(e.into()),
         };
         let config: RepoConfig = cbor::decode(&bytes)?;
-        // config 是明文：先確認參數合理，再用它們（綁在 AAD 裡）解 master key
+        // config 是明文：先確認參數合理，再解 master key（v3：不變式在認證
+        // 密文裡，解開後回頭比對）。
         config
             .validate()
             .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
-        let binding = KeyBinding {
-            repo_id: config.repo_id.clone(),
-            chunker: config.chunker,
-        };
+        // min_reader 閘門：repo 要求的最低版本高於本 build → 明確拒絕，
+        // 不是靠忽略未知欄位半讀（format-v3-draft §11）。
+        if u32::from(config.min_reader) > kist_format::FORMAT_VERSION {
+            return Err(CoreError::InvalidConfig(format!(
+                "repository requires a reader of format v{} or newer; this build reads v{}",
+                config.min_reader,
+                kist_format::FORMAT_VERSION
+            )));
+        }
         let password = Zeroizing::new(password.to_vec());
         let slot = config.key.clone();
-        let master = blocking(move || Ok(unlock_key_slot(&password, &slot, &binding)?)).await?;
-        let keys = Arc::new(RepoKeys::from_master(&master));
+        let unlocked = blocking(move || Ok(unlock_key_slot(&password, &slot)?)).await?;
+        unlocked
+            .invariants
+            .validate()
+            .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
+        unlocked
+            .invariants
+            .check_matches(&config)
+            .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
+        let keys = Arc::new(RepoKeys::from_master(&unlocked.master));
         let cache = cache_root.map(|root| {
             crate::cache::IndexCache::new(&root, &keys.cache_id(), &backend.location().to_string())
         });
@@ -278,11 +306,33 @@ impl Repository {
 
     /// 讀 tree：AAD = 自己的 ID，解開後重算 keyed hash 對名稱——
     /// 名稱是對**明文**的 hash，這一步證明當初寫入時名稱沒有說謊。
+    /// 主體讀不到或驗不過時嘗試 `.r1` 副本（同 bytes；v3 §13.5）。
     pub(crate) async fn read_tree(&self, id: &TreeId) -> Result<Tree> {
-        let key = keys::tree(id);
-        let bytes = self.backend.get(&key).await?;
+        match self.read_tree_once(&keys::tree(id), id).await {
+            Ok(t) => Ok(t),
+            Err(e @ CoreError::Backend(BackendError::NotFound(_)))
+            | Err(e @ CoreError::Corrupt { .. }) => {
+                let replica = keys::tree_replica(id);
+                match self.read_tree_once(&replica, id).await {
+                    Ok(t) => {
+                        tracing::warn!(
+                            "tree {id} read from its .r1 replica (primary missing or corrupt)"
+                        );
+                        Ok(t)
+                    }
+                    Err(_) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 讀單一 key 的 tree 並完整驗證（AAD、名稱 hash、版本、結構）。
+    /// backup 的自我修復用它判斷既有的 bytes 是否還是好的。
+    pub(crate) async fn read_tree_once(&self, key: &str, id: &TreeId) -> Result<Tree> {
+        let bytes = self.backend.get(key).await?;
         let keys = Arc::clone(&self.keys);
-        let key_owned = key.clone();
+        let key_owned = key.to_owned();
         let expected = *id;
         blocking(move || {
             let plain = keys
@@ -312,9 +362,23 @@ impl Repository {
                     ),
                 });
             }
+            tree.validate().map_err(|e| CoreError::Corrupt {
+                key: keys::tree(&expected),
+                reason: e.to_string(),
+            })?;
             Ok(tree)
         })
         .await
+    }
+
+    /// 樹的復活訊號：覆寫式 Put 固定 8 bytes——**後端 mtime 的刷新就是訊號**。
+    /// 內容固定，覆寫無害（v2 的 backup 本來就覆寫整棵樹的 bytes；v3 把
+    /// 覆寫面縮到這一種物件，format-v3-draft §13.1）。
+    pub(crate) async fn touch_tree(&self, id: &TreeId) -> Result<()> {
+        self.backend
+            .put(&keys::touch(id), keys::TOUCH_MAGIC.to_vec())
+            .await?;
+        Ok(())
     }
 
     /// 把 tree 編成規範 CBOR、以明文 keyed hash 命名、隨機 nonce 密封。
@@ -470,6 +534,8 @@ impl Repository {
     /// `backup`，它會先 prepare/commit，不會直接呼叫這個）。
     /// **不檢查 key 與內容一致**——`read_snapshot` 讀取時會核對（client、時間戳），
     /// 呼叫端必須自己保證 `keys::snapshot(&client_id, ts)` 與內容相符。
+    /// `replicas=1` 時 `.r1` 副本**先寫**：主體出現＝commit，副本先行不會
+    /// 造成假 commit（format-v3-draft §13.5）。
     pub async fn write_snapshot(&self, key: &str, snapshot: Snapshot) -> Result<()> {
         let keys = Arc::clone(&self.keys);
         let key_owned = key.to_owned();
@@ -478,16 +544,38 @@ impl Repository {
             Ok(keys.seal_snapshot(&key_owned, &plain)?)
         })
         .await?;
+        if self.config.replicas > 0 {
+            let replica_key = format!("{key}{}", kist_format::keys::REPLICA_SUFFIX);
+            let replica_bytes = bytes.clone();
+            match self
+                .backend
+                .put_if_absent(&replica_key, replica_bytes)
+                .await
+            {
+                Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         self.backend.put_if_absent(key, bytes).await?;
         Ok(())
     }
 
     /// 讀 snapshot（AAD = 完整 key），並驗證內容與 key 一致（client id、時間戳）。
+    /// 主體讀不到時嘗試 `.r1` 副本。
     pub(crate) async fn read_snapshot(&self, key: &str) -> Result<Snapshot> {
         let bytes = match self.backend.get(key).await {
             Ok(b) => b,
             Err(BackendError::NotFound(_)) => {
-                return Err(CoreError::SnapshotNotFound(key.to_owned()))
+                let replica = format!("{key}{}", kist_format::keys::REPLICA_SUFFIX);
+                match self.backend.get(&replica).await {
+                    Ok(b) => {
+                        tracing::warn!(
+                            "snapshot {key} read from its .r1 replica (primary missing)"
+                        );
+                        b
+                    }
+                    Err(_) => return Err(CoreError::SnapshotNotFound(key.to_owned())),
+                }
             }
             Err(e) => return Err(e.into()),
         };

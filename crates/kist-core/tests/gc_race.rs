@@ -288,7 +288,7 @@ impl World {
                     .insert(s.snapshot_key.clone(), (client, variant));
                 self.log.push(format!(
                     "commit client {client} variant {variant} → {} (new chunks {})",
-                    s.snapshot_key, s.stats.chunks_new
+                    s.snapshot_key, s.report.chunks_new
                 ));
             }
             Err(e) => {

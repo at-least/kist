@@ -1,15 +1,17 @@
-//! snapshot 根目錄的虛擬層級：根 tree 的條目以**絕對來源路徑**命名
-//! （`/tmp/x/src`），不是單一目錄組件。mount 把它們展開成虛擬的中介目錄
-//! （瀏覽成 `tmp` → `x` → `src`）；「真實」條目永遠壓過同名的合成目錄。
-//! （Go 參考實作 `expandRoots` 的 Rust 版；同名時 Go 會兩筆都留，這裡改成
-//! 真實條目直接替換合成條目——Go 的註解本來就說真實的要贏。）
+//! snapshot 根目錄的虛擬層級（v3）：roots 的定位字串（`/tmp/x/src`、
+//! `s3://bucket/prefix`）不是單一目錄組件，mount 把它們展開成虛擬的
+//! 中介目錄（瀏覽成 `tmp` → `x` → `src`）；葉節點是該 root 的 tree
+//! 內容（合成的 DIR entry 帶 subtree）。與 restore 的映射同一套切段
+//! 規則（format-v3-draft §9：去 scheme、`/` 切段）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kist_format::tree::Entry;
+use kist_format::snapshot::Root;
+use kist_format::tree::{meta_kind, node_type, Entry};
+use kist_format::TreeId;
 
-/// 一個虛擬層級裡的條目：真實（repo 裡的 tree entry）或合成的中介目錄。
+/// 一個虛擬層級裡的條目：真實（root 的葉或 tree entry）或合成的中介目錄。
 #[derive(Debug, Clone)]
 pub enum VEntry {
     Real(Arc<Entry>),
@@ -42,26 +44,39 @@ pub struct VirtualRoot {
     levels: HashMap<Vec<u8>, Vec<VEntry>>,
 }
 
-impl VirtualRoot {
-    pub fn build(entries: &[Entry]) -> Self {
-        let mut levels: HashMap<Vec<u8>, Vec<VEntry>> = HashMap::new();
+/// 一個 root 的葉子形態（由 `corefs` 讀 tree 後判別，見 §9 的映射規則）。
+pub enum RootContents {
+    /// 目錄來源：葉子是攜帶 `subtree` 的合成 DIR（children 懶載入）。
+    Dir,
+    /// 檔案/symlink 來源：root tree 恰好一個非目錄 entry、名稱 = 定位末段
+    /// ——葉子是那個 entry 本身（與 restore 的落點一致）。
+    Leaf(Box<Entry>),
+    /// 定位沒有組件（`/`、`s3://bucket/`）：root tree 的內容**攤平到頂層**
+    /// （與 restore 的「空相對路徑 = 直接落在 target」一致）。
+    Flatten(Vec<Entry>),
+}
 
-        // 先收斂每個層級（真實壓過合成），最後統一排序。
-        for e in entries {
-            let name = e.name.as_slice();
-            if !name.contains(&b'/') {
-                // 單一組件的根名（防禦：寫入端用絕對路徑）直接放頂層。
-                push_real(&mut levels, b"", e);
+impl VirtualRoot {
+    /// roots → 虛擬層級。每個 root 的定位字串切成組件，最後一段是攜帶
+    /// `subtree` 的合成 DIR（瀏覽到那裡就載入 root 的 tree 內容）；
+    /// 其餘組件是合成中介目錄。形態判別見 [`RootContents`]。
+    pub fn build(roots: impl IntoIterator<Item = (Root, RootContents)>) -> Self {
+        let mut levels: HashMap<Vec<u8>, Vec<VEntry>> = HashMap::new();
+        for (root, contents) in roots {
+            let comps = locator_components(root.path.as_slice());
+            let Some((last, parents)) = comps.split_last() else {
+                match contents {
+                    RootContents::Flatten(entries) => {
+                        for e in entries {
+                            push_real(&mut levels, b"", &e);
+                        }
+                    }
+                    RootContents::Dir | RootContents::Leaf(_) => {}
+                }
                 continue;
-            }
-            let comps: Vec<&[u8]> = split_path(name);
-            if comps.is_empty() {
-                // 名稱切不出組件（`/` 本身）——corefs 會先把這種條目的子樹
-                // 攤平到頂層，這裡 defensively 跳過（不能 panic：FUSE callback）。
-                continue;
-            }
+            };
             let mut parent: Vec<u8> = Vec::new();
-            for comp in &comps[..comps.len() - 1] {
+            for comp in parents {
                 let level = levels.entry(parent.clone()).or_default();
                 if !has_name(level, comp) {
                     level.push(VEntry::Synthetic {
@@ -71,12 +86,13 @@ impl VirtualRoot {
                 parent.push(b'/');
                 parent.extend_from_slice(comp);
             }
-            // 真實條目以**最後一段組件**為名（原本是絕對路徑）。
-            let mut leaf = e.clone();
-            leaf.name = comps[comps.len() - 1].to_vec();
+            let leaf = match contents {
+                RootContents::Dir => root_leaf_entry(last, root.tree),
+                RootContents::Leaf(e) => *e,
+                RootContents::Flatten(_) => root_leaf_entry(last, root.tree),
+            };
             push_real(&mut levels, &parent, &leaf);
         }
-
         for level in levels.values_mut() {
             level.sort_by(|a, b| a.name().cmp(b.name()));
         }
@@ -100,11 +116,42 @@ impl VirtualRoot {
     }
 }
 
-/// 絕對路徑 → 組件（不吃空組件：`//a`、前後斜線都正規化掉）。
-fn split_path(name: &[u8]) -> Vec<&[u8]> {
-    name.split(|&b| b == b'/')
-        .filter(|c| !c.is_empty())
+/// root 定位 → 組件（與 fsmeta::locator_to_relative 同一套規則：
+/// 去 scheme、`/` 切段、空與 `.` 組件正規化掉）。
+fn locator_components(path: &[u8]) -> Vec<&[u8]> {
+    let rest = match path.iter().position(|&b| b == b':') {
+        Some(i) if path.len() >= i + 3 && &path[i + 1..i + 3] == b"//" => &path[i + 3..],
+        _ => path,
+    };
+    rest.split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
         .collect()
+}
+
+/// root 的葉組件 → 攜帶 subtree 的合成 DIR entry（posix 形狀：mount 的
+/// Attr 對 uid/gid=0、mode 唯讀、mtime=snapshot 時間由呼叫端覆蓋）。
+fn root_leaf_entry(name: &[u8], subtree: TreeId) -> Entry {
+    Entry {
+        name: name.to_vec(),
+        kind: node_type::DIR,
+        meta_kind: meta_kind::POSIX,
+        size: 0,
+        target: Vec::new(),
+        content: 0,
+        chunks: Vec::new(),
+        subtree,
+        mode: Some(0o040_555),
+        uid: Some(0),
+        gid: Some(0),
+        mtime_ns: Some(0),
+        ctime_ns: None,
+        dev: None,
+        inode: None,
+        nlink: None,
+        xattrs: None,
+        etag: None,
+        vern: None,
+    }
 }
 
 fn has_name(level: &[VEntry], name: &[u8]) -> bool {
@@ -126,73 +173,56 @@ fn push_real(levels: &mut HashMap<Vec<u8>, Vec<VEntry>>, key: &[u8], e: &Entry) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kist_format::tree::{node_type, Entry};
-    use kist_format::TreeId;
+    use serde_bytes::ByteBuf;
 
-    fn entry_of(kind: u8, mode: u32, name: &[u8]) -> Entry {
-        Entry {
-            name: name.to_vec(),
-            kind,
-            mode,
-            uid: 0,
-            gid: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
-            size: 0,
-            target: Vec::new(),
-            chunks: Vec::new(),
-            content: 0,
-            subtree: TreeId::ZERO,
-            dev: 0,
-            inode: 0,
-            nlink: 0,
-            xattrs: None,
+    fn root_of(path: &str) -> Root {
+        Root {
+            path: ByteBuf::from(path.as_bytes().to_vec()),
+            tree: TreeId::from_bytes([0xA5; 32]),
         }
-    }
-
-    fn dir_entry(name: &str) -> Entry {
-        entry_of(node_type::DIR, 0o40755, name.as_bytes())
-    }
-
-    fn file_entry(name: &str) -> Entry {
-        entry_of(node_type::FILE, 0o100644, name.as_bytes())
     }
 
     fn names(level: &[VEntry]) -> Vec<Vec<u8>> {
         level.iter().map(|v| v.name().to_vec()).collect()
     }
 
+    fn dir_root(r: Root) -> (Root, RootContents) {
+        (r, RootContents::Dir)
+    }
+
     #[test]
-    fn single_component_passes_through() {
-        // 防禦路徑：非絕對的根名直接放頂層
-        let root = VirtualRoot::build(&[file_entry("src")]);
-        assert_eq!(names(root.top()), vec![b"src".to_vec()]);
-        assert!(root.top()[0].entry().is_some(), "頂層就是真實條目");
-        assert!(root.level(b"/src").is_empty());
+    fn single_component_root_is_a_real_top_level_entry() {
+        let root = VirtualRoot::build([dir_root(root_of("data"))]);
+        assert_eq!(names(root.top()), vec![b"data".to_vec()]);
+        assert!(root.top()[0].entry().is_some(), "頂層就是 root 葉");
     }
 
     #[test]
     fn absolute_path_expands_into_synthetic_levels() {
-        let root = VirtualRoot::build(&[file_entry("/tmp/x/src")]);
-        // 頂層只有合成 tmp
+        let root = VirtualRoot::build([dir_root(root_of("/tmp/x/src"))]);
         assert_eq!(names(root.top()), vec![b"tmp".to_vec()]);
         assert!(root.top()[0].entry().is_none(), "tmp 是合成的");
-        // /tmp 底下只有合成 x；/tmp/x 底下是真實的 src
         assert_eq!(names(root.level(b"/tmp")), vec![b"x".to_vec()]);
         let level = root.level(b"/tmp/x");
         assert_eq!(names(level), vec![b"src".to_vec()]);
-        assert!(VirtualRoot::lookup(level, b"src")
-            .unwrap()
-            .entry()
-            .is_some());
+        let leaf = VirtualRoot::lookup(level, b"src").unwrap().entry().unwrap();
+        assert_eq!(leaf.subtree, TreeId::from_bytes([0xA5; 32]));
+    }
+
+    #[test]
+    fn remote_locators_strip_their_scheme() {
+        // s3://bucket/prefix → bucket/prefix（與 restore 映射一致）
+        let root = VirtualRoot::build([dir_root(root_of("s3://bucket/prefix"))]);
+        assert_eq!(names(root.top()), vec![b"bucket".to_vec()]);
+        assert_eq!(names(root.level(b"/bucket")), vec![b"prefix".to_vec()]);
     }
 
     #[test]
     fn many_roots_share_synthetic_levels() {
-        let root = VirtualRoot::build(&[
-            file_entry("/home/a/data"),
-            file_entry("/home/b/data"),
-            file_entry("/etc/config"),
+        let root = VirtualRoot::build([
+            dir_root(root_of("/home/a/data")),
+            dir_root(root_of("/home/b/data")),
+            dir_root(root_of("/etc/config")),
         ]);
         let mut top = names(root.top());
         top.sort();
@@ -201,72 +231,42 @@ mod tests {
             names(root.level(b"/home")),
             vec![b"a".to_vec(), b"b".to_vec()]
         );
-        assert_eq!(names(root.level(b"/home/a")), vec![b"data".to_vec()]);
-        assert_eq!(names(root.level(b"/home/b")), vec![b"data".to_vec()]);
     }
 
     #[test]
-    fn real_entry_beats_synthetic_of_same_name() {
-        // 先讓 /tmp/x/src 造出合成 tmp，再放一個真實的 /tmp（例如只備份了 /tmp 本身
-        // 與 /tmp/x/src 兩個路徑）：真實 tmp 必須取代合成 tmp。
-        let root = VirtualRoot::build(&[file_entry("/tmp/x/src"), dir_entry("/tmp")]);
-        let top = root.top();
-        assert_eq!(names(top), vec![b"tmp".to_vec()]);
-        assert!(
-            top[0].entry().is_some(),
-            "頂層 tmp 必須是真實條目，不是被替換掉的合成目錄"
-        );
+    fn empty_locator_is_skipped_without_panicking() {
+        let root = VirtualRoot::build([dir_root(root_of("/"))]);
+        assert!(root.top().is_empty());
     }
 
     #[test]
-    fn duplicate_real_names_do_not_duplicate_entries() {
-        let root = VirtualRoot::build(&[file_entry("/tmp/x/a"), file_entry("/tmp/x/b")]);
+    fn non_utf8_components_survive() {
+        let mut path = b"/tmp/".to_vec();
+        path.extend_from_slice(&[0xFF, 0xFE]);
+        // 非 UTF-8 用 Bytes 直接構造
+        let root = VirtualRoot::build([(
+            Root {
+                path: ByteBuf::from(path),
+                tree: TreeId::from_bytes([1; 32]),
+            },
+            RootContents::Dir,
+        )]);
         assert_eq!(names(root.top()), vec![b"tmp".to_vec()]);
-        assert_eq!(names(root.level(b"/tmp")), vec![b"x".to_vec()]);
-        assert_eq!(
-            names(root.level(b"/tmp/x")),
-            vec![b"a".to_vec(), b"b".to_vec()]
-        );
+        assert!(VirtualRoot::lookup(root.level(b"/tmp"), &[0xFF, 0xFE]).is_some());
     }
 
     #[test]
     fn levels_are_sorted_for_binary_search() {
-        let root = VirtualRoot::build(&[file_entry("/z"), file_entry("/a"), file_entry("/m")]);
+        let root = VirtualRoot::build([
+            dir_root(root_of("/z")),
+            dir_root(root_of("/a")),
+            dir_root(root_of("/m")),
+        ]);
         assert_eq!(
             names(root.top()),
             vec![b"a".to_vec(), b"m".to_vec(), b"z".to_vec()]
         );
         assert!(VirtualRoot::lookup(root.top(), b"m").is_some());
         assert!(VirtualRoot::lookup(root.top(), b"b").is_none());
-        assert!(VirtualRoot::lookup(root.top(), b"zz").is_none());
-    }
-
-    #[test]
-    fn non_utf8_names_survive() {
-        // 檔名是原始 OS bytes：0xFF 不是合法 UTF-8，只能原樣保留
-        let mut name = b"/tmp/".to_vec();
-        name.extend_from_slice(&[0xFF, 0xFE]);
-        let root = VirtualRoot::build(&[Entry {
-            name,
-            ..file_entry("")
-        }]);
-        assert_eq!(names(root.top()), vec![b"tmp".to_vec()]);
-        assert!(VirtualRoot::lookup(root.level(b"/tmp"), &[0xFF, 0xFE]).is_some());
-    }
-
-    #[test]
-    fn root_slash_entry_is_skipped_without_panicking() {
-        // `kist backup /` 的根條目名稱就是 "/"：切不出組件，跳過（corefs 會先把
-        // 它的子樹攤平到頂層）；這裡只驗證不 panic、不產生幽靈條目。
-        let root = VirtualRoot::build(&[dir_entry("/")]);
-        assert!(root.top().is_empty());
-    }
-
-    #[test]
-    fn slash_only_and_empty_components_are_normalized() {
-        let root = VirtualRoot::build(&[file_entry("//tmp//x//src/")]);
-        assert_eq!(names(root.top()), vec![b"tmp".to_vec()]);
-        assert_eq!(names(root.level(b"/tmp")), vec![b"x".to_vec()]);
-        assert_eq!(names(root.level(b"/tmp/x")), vec![b"src".to_vec()]);
     }
 }

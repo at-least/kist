@@ -46,14 +46,25 @@ pub fn path_to_bytes(path: &Path) -> Result<Vec<u8>> {
 
 /// bytes → 路徑，並去掉根（`/` 或 `C:\`），讓它可以接在 restore 目標底下。
 pub fn bytes_to_relative_path(bytes: &[u8]) -> Result<PathBuf> {
-    let full = PathBuf::from(bytes_to_name(bytes)?);
+    locator_to_relative(bytes)
+}
+
+/// v3 的 root 定位字串（`Root.path`）→ restore 目標底下的相對路徑。
+/// 本機絕對路徑 `/srv/data` → `srv/data`；帶 scheme 的遠端定位去掉 scheme
+/// 後切段：`s3://bucket/prefix` → `bucket/prefix`、`sftp://host/path` →
+/// `host/path`（format-v3-draft §9 的 restore 映射，兩實作必須一致）。
+pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
+    // 去掉 `scheme://`（有 scheme 且後接 // 才剝；Windows 的 `C:` 不會中）。
+    let rest = match bytes.iter().position(|&b| b == b':') {
+        Some(i) if bytes.len() >= i + 3 && &bytes[i + 1..i + 3] == b"//" => &bytes[i + 3..],
+        _ => bytes,
+    };
     let mut rel = PathBuf::new();
-    for comp in full.components() {
+    for comp in rest.split(|&b| b == b'/') {
         match comp {
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {}
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => rel.push("__parent__"),
-            std::path::Component::Normal(n) => rel.push(n),
+            b"" | b"." => {}
+            b".." => rel.push("__parent__"),
+            name => rel.push(bytes_to_name(name)?),
         }
     }
     Ok(rel)
@@ -103,16 +114,18 @@ pub struct FsMeta {
 }
 
 /// parent tree 裡的檔案 entry → FsMeta（快速路徑的比較用）。
+/// v3 的 Entry 欄位是 Option：posix 來源必填 mode/uid/gid/mtime，缺席的
+/// 選填欄位以 0 呈現（與「平台沒有」同一語意，不拿來比對）。
 pub fn meta_of_entry(entry: &Entry) -> FsMeta {
     FsMeta {
-        mode: entry.mode,
-        uid: entry.uid,
-        gid: entry.gid,
-        mtime_ns: entry.mtime_ns,
-        ctime_ns: entry.ctime_ns,
-        inode: entry.inode,
-        dev: entry.dev,
-        nlink: entry.nlink,
+        mode: entry.mode.unwrap_or(0),
+        uid: entry.uid.unwrap_or(0),
+        gid: entry.gid.unwrap_or(0),
+        mtime_ns: entry.mtime_ns.unwrap_or(0),
+        ctime_ns: entry.ctime_ns.unwrap_or(0),
+        inode: entry.inode.unwrap_or(0),
+        dev: entry.dev.unwrap_or(0),
+        nlink: entry.nlink.unwrap_or(0),
     }
 }
 

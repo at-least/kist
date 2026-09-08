@@ -1,23 +1,25 @@
-//! kist 的金鑰階層（password → KEK → master key → 派生子金鑰）與 AEAD 封裝（v2）。
+//! kist 的金鑰階層（password → KEK → master key → 派生子金鑰）與 AEAD 封裝（v3）。
 //!
 //! 所有密碼學原語都來自 RustCrypto（`argon2`、`chacha20poly1305`、`blake3`），
 //! 這裡只做組合，不自己實作任何原語。金鑰型別離開作用域時會被清零（`zeroize`）。
 //!
-//! v2 重點（`docs/format.md` §3、§5）：
-//! - 子金鑰 = BLAKE3 DeriveKey，context 為 `kist/v2/{hash,chunk,meta,index}`；
-//!   **沒有 nonce key**——v2 沒有任何決定性 nonce，全部用 OS 亂數。
+//! v3 重點（`docs/format-v3-draft.md` §3、§5）：
+//! - 子金鑰 = BLAKE3 DeriveKey，context 為 `kist/v3/{hash,chunk,meta,index}`；
+//!   **沒有 nonce key**——沒有任何決定性 nonce，全部用 OS 亂數。
 //! - sealed 物件沒有 header：`nonce(24) ‖ 密文 ‖ tag(16)`，AAD 依角色
 //!   （tree = 自己的 ID、snapshot = 完整 key、trailer/index = 角色常數）。
-//! - master key 封裝的 AAD 綁 repo_id 與 chunker 參數（[`kist_format::master_aad`]）。
+//! - master key 封裝的**認證密文裡帶不變式**（`master(32) ‖ Invariants CBOR`）：
+//!   解鎖即取得權威的 repo_id/chunker 參數，與明文 config 比對（v2 把欄位
+//!   列舉進 AAD，每加不變式都要改排版；AAD 現在是常數 [`kist_format::AAD_MASTER`]）。
 //!
-//! 金鑰推導的跨語言測試向量見 `tests/poc_keys.rs`（與 Go 實作逐 byte 相同）。
+//! 金鑰推導的跨語言測試向量見 `tests/poc_keys.rs`。
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use kist_format::config::{ChunkerParams, KdfParams, KeySlot, KDF_ARGON2ID};
+use kist_format::config::{ChunkerParams, Invariants, KdfParams, KeySlot, KDF_ARGON2ID};
 use kist_format::pack::{CHUNK_NONCE_LEN, TAG_LEN};
 use kist_format::{ChunkId, TreeId};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -30,11 +32,11 @@ pub const MAX_KDF_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
 pub const MAX_KDF_T_COST: u32 = 64;
 pub const MAX_KDF_P_COST: u32 = 64;
 
-const CTX_HASH_KEY: &str = "kist/v2/hash";
-const CTX_CHUNK_KEY: &str = "kist/v2/chunk";
-const CTX_META_KEY: &str = "kist/v2/meta";
-const CTX_INDEX_KEY: &str = "kist/v2/index";
-const CTX_CACHE_ID: &str = "kist/v2/cache";
+const CTX_HASH_KEY: &str = "kist/v3/hash";
+const CTX_CHUNK_KEY: &str = "kist/v3/chunk";
+const CTX_META_KEY: &str = "kist/v3/meta";
+const CTX_INDEX_KEY: &str = "kist/v3/index";
+const CTX_CACHE_ID: &str = "kist/v3/cache";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -48,6 +50,8 @@ pub enum CryptoError {
     UnsupportedKdf(String),
     #[error("invalid KDF parameters: {0}")]
     BadKdfParams(String),
+    #[error("wrapped master payload is malformed: {0}")]
+    BadWrappedPayload(String),
     #[error("{what} has wrong length: {actual} bytes, expected {expected}")]
     BadLength {
         what: &'static str,
@@ -59,6 +63,12 @@ pub enum CryptoError {
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
+
+impl From<kist_format::FormatError> for CryptoError {
+    fn from(e: kist_format::FormatError) -> Self {
+        CryptoError::BadWrappedPayload(format!("{e}"))
+    }
+}
 
 /// Argon2id 的成本參數。`Default` = 64 MiB / t=3 / p=4（RFC 9106 第二組建議），
 /// 與 Go 實作一致（跨語言向量見 tests/poc_keys.rs）。
@@ -79,11 +89,17 @@ impl Default for KdfCost {
     }
 }
 
-/// 綁進 master key AAD 的 repo 參數（見 [`kist_format::master_aad`]）。
+/// 綁進 wrapped master 密文的不變式（[`Invariants`] 的輸入形狀）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyBinding {
     pub repo_id: Vec<u8>,
     pub chunker: ChunkerParams,
+}
+
+impl KeyBinding {
+    fn invariants(&self) -> Invariants {
+        Invariants::new(self.repo_id.clone(), self.chunker)
+    }
 }
 
 /// 32-byte master key。離開作用域時清零。
@@ -167,6 +183,7 @@ pub fn create_key_slot(
 }
 
 /// 用一組（新的）密碼把既有的 master key 包成 key slot（加密碼 / 換密碼用）。
+/// wrapped 的認證密文 = `master(32) ‖ Invariants CBOR`，AAD = 常數。
 pub fn wrap_master_key(
     master: &MasterKey,
     password: &[u8],
@@ -183,7 +200,10 @@ pub fn wrap_master_key(
         salt: random_bytes::<16>()?.to_vec(),
     };
     let kek = kdf(password, &params)?;
-    let sealed = seal_meta(&kek, &binding.aad(), master.as_bytes())?;
+    let mut payload = Vec::with_capacity(32 + 64);
+    payload.extend_from_slice(master.as_bytes());
+    payload.extend_from_slice(&kist_format::cbor::encode(&binding.invariants())?);
+    let sealed = seal_meta(&kek, kist_format::AAD_MASTER, &payload)?;
     Ok(KeySlot {
         version: kist_format::FORMAT_VERSION,
         name: name.to_owned(),
@@ -193,26 +213,36 @@ pub fn wrap_master_key(
     })
 }
 
-impl KeyBinding {
-    fn aad(&self) -> Vec<u8> {
-        kist_format::master_aad(&self.repo_id, &self.chunker)
-    }
+/// 解開 key slot 的結果：master key ＋ 從**認證密文**取出的不變式。
+/// 呼叫端必須以 [`Invariants::check_matches`] 與明文 config 比對。
+#[derive(Debug)]
+pub struct UnlockedMaster {
+    pub master: MasterKey,
+    pub invariants: Invariants,
 }
 
-/// 用密碼解開 key slot 裡的 master key。
-pub fn unlock_key_slot(password: &[u8], slot: &KeySlot, binding: &KeyBinding) -> Result<MasterKey> {
+/// 用密碼解開 key slot：master key 與認證過的不變式。
+pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<UnlockedMaster> {
     let kek = kdf(password, &slot.kdf)?;
-    let plain =
-        open_meta(&kek, &binding.aad(), &slot.wrapped).map_err(|_| CryptoError::WrongPassword)?;
-    let key: [u8; 32] = plain
-        .as_slice()
-        .try_into()
-        .map_err(|_| CryptoError::BadLength {
-            what: "master key",
+    let plain = open_meta(&kek, kist_format::AAD_MASTER, &slot.wrapped)
+        .map_err(|_| CryptoError::WrongPassword)?;
+    if plain.len() < 32 {
+        return Err(CryptoError::BadLength {
+            what: "unwrapped master payload",
             expected: 32,
             actual: plain.len(),
-        })?;
-    Ok(MasterKey(key))
+        });
+    }
+    let key: [u8; 32] = plain[..32].try_into().map_err(|_| CryptoError::BadLength {
+        what: "master key",
+        expected: 32,
+        actual: plain.len(),
+    })?;
+    let invariants: Invariants = kist_format::cbor::decode(&plain[32..])?;
+    Ok(UnlockedMaster {
+        master: MasterKey(key),
+        invariants,
+    })
 }
 
 fn nonce_from_slice(bytes: &[u8]) -> Result<[u8; NONCE_LEN]> {

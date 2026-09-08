@@ -39,9 +39,9 @@ async fn corrupt_tree_is_healed_by_the_next_backup() {
         .await
         .unwrap();
     assert_eq!(
-        s.stats.chunks_new, 0,
+        s.report.chunks_new, 0,
         "資料沒變，不該有新 chunk：{:?}",
-        s.stats
+        s.report
     );
     let after = repo
         .check(CheckOptions {

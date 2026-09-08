@@ -479,7 +479,14 @@ fn json_flag_outputs_parseable_results() {
         .unwrap()
         .starts_with("snapshots/"));
     assert_eq!(v["stats"]["files"], 3);
-    assert_eq!(v["root"].as_str().unwrap().len(), 64, "root 是 64 字元 hex");
+    // v3：roots 取代 root——每個 root 帶 path 與 64 字元 hex 的 tree ID
+    assert_eq!(v["roots"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["roots"][0]["tree"].as_str().unwrap().len(),
+        64,
+        "roots[0].tree 是 64 字元 hex"
+    );
+    assert_eq!(v["roots"][0]["path"], src.to_str().unwrap());
     assert!(v["parent"].is_null());
 
     let v: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
@@ -494,7 +501,9 @@ fn json_flag_outputs_parseable_results() {
         serde_json::from_str(&env.ok(&["restore", "--json", "latest", target.to_str().unwrap()]))
             .unwrap();
     assert_eq!(v["files"], 3);
-    assert_eq!(v["dirs"], 2);
+    // v3：dirs 不含 roots 本身（root 是 path 不是 entry，規格 §9.1）——
+    // v2 的合成根會把來源根也算一個，這裡只剩資料裡真的有的子目錄。
+    assert_eq!(v["dirs"], 1);
     assert_eq!(v["errors"], Value::Array(vec![]));
 
     let v: Value = serde_json::from_str(&env.ok(&["check", "--json"])).unwrap();

@@ -1,11 +1,17 @@
-//! `config` 物件（v2）：repo 參數與 master key 的封裝。
+//! `config` 物件（v3）：repo 參數與 master key 的封裝。
 //!
 //! repo 裡**唯一以明文 CBOR 存放**的物件（打開 repo 前需要裡面的 KDF 參數），
-//! 也是唯一允許覆寫的物件（換密碼、調 pack_target）。裡面沒有祕密：
+//! 也是唯一允許覆寫的物件（換密碼、調非不變式參數）。裡面沒有祕密：
 //! master key 已被 KEK 包住，salt 與 KDF 參數本來就是公開的。
 //!
-//! `wrapped` 是 `nonce(24) ‖ 密文(32) ‖ tag(16)` 的單一 byte string；
-//! AAD = [`crate::master_aad`]（綁 repo_id 與 chunker 參數）。
+//! v3 的防竄改方向反轉：**不變式（repo_id、chunker 參數）放在 wrapped
+//! master 的密文裡**（[`Invariants`]），解鎖時從通過 Poly1305 認證的明文
+//! 取出權威值，與這份明文 config 比對——不符即「config 已被竄改」的明確
+//! 錯誤。v2 把欄位列舉進 AAD，每加一個不變式都要改 AAD 排版；v3 加欄位
+//! 只加進 Invariants（零值省略＋忽略未知＋never-round-trip 適用）。
+//!
+//! `wrapped` 是 `nonce(24) ‖ AEAD密文(master(32) ‖ Invariants CBOR) ‖ tag(16)`
+//! 的單一 byte string；AAD = 常數 [`crate::AAD_MASTER`]。
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +24,7 @@ pub const KDF_ARGON2ID: &str = "argon2id";
 pub struct RepoConfig {
     #[serde(rename = "v")]
     pub version: u32,
-    /// 隨機 16 bytes，用來區分不同 repo。
+    /// 隨機 16 bytes，用來區分不同 repo。必須 == [`Invariants::repo_id`]。
     #[serde(rename = "repo_id", with = "serde_bytes")]
     pub repo_id: Vec<u8>,
     /// 建立時間（Unix 奈秒，UTC）。
@@ -29,6 +35,13 @@ pub struct RepoConfig {
     /// pack 寫滿多少 bytes 就 flush。
     #[serde(rename = "pack_target")]
     pub pack_target_size: u64,
+    /// 能安全讀本 repo 的最低格式版號。讀取端版本 < min_reader → 明確拒絕
+    /// （不是靠忽略未知欄位半讀）。只升不降。
+    #[serde(rename = "min_reader")]
+    pub min_reader: u16,
+    /// trees/snapshots 是否寫 `.r1` 副本（0 或 1）。寫入端政策，非不變式。
+    #[serde(rename = "replicas")]
+    pub replicas: u8,
     /// 第 0 個 key slot。
     #[serde(rename = "slot")]
     pub key: KeySlot,
@@ -38,6 +51,59 @@ pub struct RepoConfig {
 pub const MIN_PACK_TARGET_SIZE: u64 = 64 * 1024;
 pub const MAX_PACK_TARGET_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
+/// wrapped master 攜帶的不變式：解開即權威，與明文 config 比對。
+/// 加新欄位走零值省略＋忽略未知（never-round-trip 規則適用）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invariants {
+    #[serde(rename = "v")]
+    pub version: u32,
+    /// 必須 == `RepoConfig.repo_id`（不符 = config 被竄改）。
+    #[serde(rename = "repo_id", with = "serde_bytes")]
+    pub repo_id: Vec<u8>,
+    /// 必須 == `RepoConfig.chunker`（同上）。
+    #[serde(rename = "chunker")]
+    pub chunker: ChunkerParams,
+}
+
+impl Invariants {
+    pub fn new(repo_id: Vec<u8>, chunker: ChunkerParams) -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            repo_id,
+            chunker,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != FORMAT_VERSION {
+            return Err(FormatError::UnsupportedVersion {
+                what: "key invariants",
+                version: self.version,
+            });
+        }
+        if self.repo_id.len() != 16 {
+            return Err(FormatError::InvalidParams(format!(
+                "invariants repo_id must be 16 bytes, got {}",
+                self.repo_id.len()
+            )));
+        }
+        self.chunker.validate()
+    }
+
+    /// 與明文 config 比對：任何不符都是「config 已被竄改」的明確錯誤
+    /// （不是 v2 的「默默解不開」，更不是去重悄悄失效）。
+    pub fn check_matches(&self, config: &RepoConfig) -> Result<()> {
+        if self.repo_id != config.repo_id || self.chunker != config.chunker {
+            return Err(FormatError::InvalidParams(
+                "plaintext config does not match the authenticated invariants \
+                 (repo_id or chunker parameters were tampered)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl RepoConfig {
     pub fn new(repo_id: Vec<u8>, created_ns: i64, key: KeySlot) -> Self {
         Self {
@@ -46,6 +112,8 @@ impl RepoConfig {
             created_ns,
             chunker: ChunkerParams::default(),
             pack_target_size: 64 * 1024 * 1024,
+            min_reader: FORMAT_VERSION.try_into().unwrap_or(3),
+            replicas: 0,
             key,
         }
     }
@@ -78,6 +146,19 @@ impl RepoConfig {
             return Err(FormatError::InvalidParams(
                 "chunker.max must not exceed pack_target".to_owned(),
             ));
+        }
+        let min_reader = u32::from(self.min_reader);
+        if !(3..=FORMAT_VERSION).contains(&min_reader) {
+            return Err(FormatError::InvalidParams(format!(
+                "min_reader {} is outside 3..={FORMAT_VERSION}",
+                self.min_reader
+            )));
+        }
+        if self.replicas > 1 {
+            return Err(FormatError::InvalidParams(format!(
+                "replicas {} is outside 0..=1",
+                self.replicas
+            )));
         }
         self.key.kdf.validate()?;
         Ok(())
@@ -146,7 +227,8 @@ pub struct KeySlot {
     pub created_ns: i64,
     #[serde(rename = "kdf")]
     pub kdf: KdfParams,
-    /// KEK 包住的 master key：`nonce(24) ‖ 密文(32) ‖ tag(16)`。
+    /// KEK 包住的 master key ＋ 不變式：
+    /// `nonce(24) ‖ AEAD密文(master(32) ‖ Invariants CBOR) ‖ tag(16)`。
     #[serde(rename = "wrapped", with = "serde_bytes")]
     pub wrapped: Vec<u8>,
 }

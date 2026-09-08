@@ -41,7 +41,8 @@ async fn open_empty_dir_is_not_a_repo() {
     ));
 }
 
-/// config 是明文；改動 chunker 參數後必須解不開（綁進 master key 的 AAD），而不是悄悄讓去重失效。
+/// config 是明文；改動 chunker 參數後必須解不開（v3：綁進 master key 的
+/// authenticated invariants），而不是悄悄讓去重失效。
 #[tokio::test]
 async fn tampered_chunker_params_in_config_are_detected() {
     let t = TestRepo::new().await;
@@ -53,7 +54,10 @@ async fn tampered_chunker_params_in_config_are_detected() {
     let err = Repository::open(t.backend.clone(), PASSWORD.as_bytes())
         .await
         .unwrap_err();
-    assert!(matches!(err, CoreError::Crypto(_)), "{err}");
+    assert!(
+        matches!(&err, CoreError::InvalidConfig(msg) if msg.contains("tampered")),
+        "{err}"
+    );
 }
 
 /// 荒謬的 chunker 參數：回錯誤，不能 panic（fastcdc 在 release 沒有檢查）。

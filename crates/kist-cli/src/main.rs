@@ -457,6 +457,7 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;
+            let rep = summary.report;
             if json {
                 print_json(&summary)?;
             } else {
@@ -470,16 +471,16 @@ async fn run(cli: Cli) -> Result<()> {
                 );
                 println!(
                     "  new: {} in {} chunks, {} packs written",
-                    human_bytes(s.bytes_stored),
-                    s.chunks_new,
-                    s.packs_new
+                    human_bytes(rep.bytes_stored),
+                    rep.chunks_new,
+                    rep.packs_new
                 );
             }
-            if s.errors > 0 {
+            if rep.errors > 0 {
                 // snapshot 已經寫出（不含那些項目）；結束碼 3 讓排程器知道要看警告
                 return Err(Incomplete(format!(
                     "{} item(s) could not be read and were skipped (see warnings above)",
-                    s.errors
+                    rep.errors
                 ))
                 .into());
             }
@@ -504,9 +505,9 @@ async fn run(cli: Cli) -> Result<()> {
             for s in snaps {
                 let paths: Vec<String> = s
                     .snapshot
-                    .paths
+                    .roots
                     .iter()
-                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .map(|r| String::from_utf8_lossy(r.path.as_slice()).into_owned())
                     .collect();
                 println!(
                     "{:<8} {:<25} {:<19} {:<12} {:>8} {:>10}  {}",
@@ -840,8 +841,9 @@ struct SnapshotJson {
     time: String,
     hostname: String,
     username: String,
+    /// v3：roots 的定位字串（lossy UTF-8）。
     paths: Vec<String>,
-    root: kist_format::TreeId,
+    roots: Vec<kist_format::snapshot::Root>,
     stats: kist_format::snapshot::SnapshotStats,
 }
 
@@ -856,11 +858,11 @@ impl SnapshotJson {
             username: s.snapshot.user.clone(),
             paths: s
                 .snapshot
-                .paths
+                .roots
                 .iter()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .map(|r| String::from_utf8_lossy(r.path.as_slice()).into_owned())
                 .collect(),
-            root: s.snapshot.root,
+            roots: s.snapshot.roots.clone(),
             stats: s.snapshot.stats,
         }
     }

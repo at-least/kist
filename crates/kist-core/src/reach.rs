@@ -60,10 +60,12 @@ impl Repository {
                     continue;
                 }
             };
-            let root = snapshot.root;
+            let roots: Vec<TreeId> = snapshot.roots.iter().map(|r| r.tree).collect();
             reach.snapshots.push((key.clone(), snapshot));
-            self.walk_tree(&root, &key, index, on_file, &mut reach)
-                .await;
+            for root in roots {
+                self.walk_tree(&root, &key, index, on_file, &mut reach)
+                    .await;
+            }
         }
         Ok(reach)
     }

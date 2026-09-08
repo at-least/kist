@@ -54,7 +54,7 @@ async fn concurrent_scenario(backend: Backend, work: &Path) {
     );
     let (sa, sb) = (ra.unwrap(), rb.unwrap());
     assert_ne!(sa.snapshot_key, sb.snapshot_key);
-    assert!(sa.stats.chunks_new > 0 && sb.stats.chunks_new > 0);
+    assert!(sa.report.chunks_new > 0 && sb.report.chunks_new > 0);
 
     // repo 一致
     let fresh = Repository::open(backend.clone(), PASSWORD.as_bytes())
@@ -89,8 +89,8 @@ async fn concurrent_scenario(backend: Backend, work: &Path) {
         .backup(std::slice::from_ref(&src_b), client(0xA))
         .await
         .unwrap();
-    assert_eq!(sa2.stats.chunks_new, 0, "{:?}", sa2.stats);
-    assert_eq!(sa2.stats.packs_new, 0);
+    assert_eq!(sa2.report.chunks_new, 0, "{:?}", sa2.report);
+    assert_eq!(sa2.report.packs_new, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1,9 +1,10 @@
-//! kist 的 on-disk 格式（v2，Go/Rust 統一版）：所有結構定義、CBOR 序列化
-//! 與位元組排版。其他 crate 只能透過這裡讀寫 repo 內容。
+//! kist 的 on-disk 格式（v3）：所有結構定義、CBOR 序列化與位元組排版。
+//! 其他 crate 只能透過這裡讀寫 repo 內容。
 //!
 //! 這個 crate 只描述「bytes 長什麼樣」，**不持有任何金鑰**：加密／解密由
-//! `kist-crypto` 負責。完整規格見 `docs/format.md`（與 Go 實作共用同一份）；
-//! 任何改動都必須同步更新該文件、golden files，**以及 Go 實作**。
+//! `kist-crypto` 負責。完整規格見 `docs/format-v3-draft.md`（v3 草案；
+//! 定案後取代 `docs/format.md`，與 Go 實作共用同一份）；任何改動都必須
+//! 同步更新該文件、golden files，**以及 Go 實作**。
 //!
 //! 模組一覽：
 //! - [`ids`]：`ChunkId` / `TreeId`（keyed hash）與 `ObjectId`（pack/index 的密文 hash）。
@@ -31,28 +32,17 @@ pub mod tree;
 
 pub use ids::{ChunkId, ObjectId, TreeId};
 
-/// 目前的格式版本。所有結構的 `v` 欄位與 pack magic 版號在 v2 都是 2。
-pub const FORMAT_VERSION: u32 = 2;
+/// 目前的格式版本。所有結構的 `v` 欄位與 pack magic 版號在 v3 都是 3。
+pub const FORMAT_VERSION: u32 = 3;
 
 /// pack trailer 密封時的 AAD（角色常數）。
-pub const AAD_PACK_TRAILER: &[u8] = b"kist/v2/pack-trailer";
+pub const AAD_PACK_TRAILER: &[u8] = b"kist/v3/pack-trailer";
 /// index blob 密封時的 AAD（角色常數）。
-pub const AAD_INDEX: &[u8] = b"kist/v2/index";
-/// master key 封裝的 AAD 前綴；後接 `repo_id` 與 chunker 參數（見 [`master_aad`]）。
-pub const AAD_MASTER_PREFIX: &[u8] = b"kist/v2/master\0";
-
-/// 構造 master key 封裝的 AAD：前綴 ‖ repo_id(16) ‖ min/avg/max（u32 LE）。
-/// chunker 參數綁進 AAD——config 是明文可竄改的，綁住之後改參數會讓
-/// master key 解不開，而不是悄悄讓去重失效。
-pub fn master_aad(repo_id: &[u8], chunker: &config::ChunkerParams) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(AAD_MASTER_PREFIX.len() + 16 + 12);
-    aad.extend_from_slice(AAD_MASTER_PREFIX);
-    aad.extend_from_slice(repo_id);
-    for v in [chunker.min, chunker.avg, chunker.max] {
-        aad.extend_from_slice(&v.to_le_bytes());
-    }
-    aad
-}
+pub const AAD_INDEX: &[u8] = b"kist/v3/index";
+/// master key 封裝的 AAD（v3 起是常數）：不變式在**認證密文裡**
+/// （`master(32) ‖ Invariants CBOR`），不靠 AAD 排版綁欄位——未來加
+/// 不變式欄位不需要動這裡（v2 的列舉式 AAD 每加一欄就要改排版）。
+pub const AAD_MASTER: &[u8] = b"kist/v3/master";
 
 /// 明文壓縮演算法：以 1 byte 出現在 chunk 與 index blob 的明文開頭。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +87,10 @@ pub enum FormatError {
     BadTimestamp(String),
     #[error("invalid repository parameters: {0}")]
     InvalidParams(String),
+    #[error("invalid tree entry: {0}")]
+    InvalidEntry(String),
+    #[error("invalid snapshot: {0}")]
+    InvalidSnapshot(String),
     #[error("parity object is corrupt: {0}")]
     ParityCorrupt(String),
     #[error("pack cannot be repaired: {0}")]

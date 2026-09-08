@@ -34,7 +34,7 @@ async fn unreadable_file_is_skipped_and_counted() {
     std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    assert_eq!(s.stats.errors, 2, "{:?}", s.stats);
+    assert_eq!(s.report.errors, 2, "{:?}", s.report);
     assert!(
         t.repo_path().join(&s.snapshot_key).is_file(),
         "snapshot 仍然要寫出"
@@ -110,7 +110,7 @@ async fn indirect_fast_path_verifies_data_chunks_not_just_the_list() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert!(s1.stats.chunks_new > 256, "要是 Indirect：{:?}", s1.stats);
+    assert!(s1.report.chunks_new > 256, "要是 Indirect：{:?}", s1.report);
 
     // append 1 byte：資料 chunk 幾乎全部重用（在 index blob 1），新清單 chunk 在 blob 2
     data.push(7);
@@ -128,9 +128,9 @@ async fn indirect_fast_path_verifies_data_chunks_not_just_the_list() {
         .await
         .unwrap();
     assert!(
-        s3.stats.chunks_new > 100,
+        s3.report.chunks_new > 100,
         "資料 chunk 不在 index 裡，必須重讀重傳：{:?}",
-        s3.stats
+        s3.report
     );
     let target = t.dir.path().join("out");
     repo.restore(&s3.snapshot_key, &target, RestoreOptions::default())
@@ -152,7 +152,7 @@ async fn indirect_fast_path_counts_data_chunks() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert!(s1.stats.chunks_new > 256, "要是 Indirect：{:?}", s1.stats);
+    assert!(s1.report.chunks_new > 256, "要是 Indirect：{:?}", s1.report);
     let s2 = repo
         .backup(std::slice::from_ref(&src), backup_options())
         .await
@@ -160,12 +160,12 @@ async fn indirect_fast_path_counts_data_chunks() {
     // 沿用時 `chunks_read` 數的是解開清單後的資料 chunk（> 256 個），
     // 不是樹裡那 1-2 個清單 chunk
     assert!(
-        s2.stats.chunks_read > 256,
+        s2.report.chunks_read > 256,
         "{:?} vs {:?}",
-        s1.stats,
-        s2.stats
+        s1.report,
+        s2.report
     );
-    assert_eq!(s2.stats.chunks_new, 0, "{:?}", s2.stats);
+    assert_eq!(s2.report.chunks_new, 0, "{:?}", s2.report);
 }
 
 /// 「racily clean」：ctime 不早於上一次 backup 開始時間的檔案不能走快速路徑。
@@ -216,12 +216,12 @@ async fn fast_path_uses_parent_start_time_and_reports_reused_files() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert_eq!(s1.stats.files_reused, 0);
+    assert_eq!(s1.report.files_reused, 0);
     let s2 = repo
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert_eq!(s2.stats.files_reused, s2.stats.files, "{:?}", s2.stats);
+    assert_eq!(s2.report.files_reused, s2.stats.files, "{:?}", s2.report);
 
     let snap2 = repo.read_snapshot_by_key(&s2.snapshot_key).await.unwrap();
     let start = time::OffsetDateTime::from_unix_timestamp_nanos(snap2.time_ns as i128).unwrap();
@@ -233,12 +233,12 @@ async fn fast_path_uses_parent_start_time_and_reports_reused_files() {
         .await
         .unwrap();
     assert_eq!(
-        s3.stats.files_reused,
+        s3.report.files_reused,
         s3.stats.files - 1,
         "mtime == parent 開始時間的檔案必須重讀：{:?}",
-        s3.stats
+        s3.report
     );
-    assert_eq!(s3.stats.chunks_new, 0, "內容沒變，重讀也不寫新 chunk");
+    assert_eq!(s3.report.chunks_new, 0, "內容沒變，重讀也不寫新 chunk");
 }
 
 /// snapshot 內容的 `time` 與 key 裡的時間戳必須來自同一個瞬間（開始時間）。

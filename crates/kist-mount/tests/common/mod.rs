@@ -27,6 +27,8 @@ pub fn init_options() -> InitOptions {
             t_cost: 1,
             p_cost: 1,
         },
+        // 副本行為由專門測試覆蓋；這裡的斷言不預期 `.r1` 物件。
+        replicas: Some(0),
     }
 }
 

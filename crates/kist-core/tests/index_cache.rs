@@ -85,7 +85,7 @@ async fn new_index_blob_from_another_client_is_merged() {
         .backup(std::slice::from_ref(&src_b), b_opts)
         .await
         .unwrap();
-    assert!(sb.stats.chunks_new > 0);
+    assert!(sb.report.chunks_new > 0);
 
     // A 重新 open：只多讀 B 的新 blob，然後 B 的資料對 A 而言已存在
     let a = open_cached(&t).await;
@@ -94,9 +94,9 @@ async fn new_index_blob_from_another_client_is_merged() {
         .await
         .unwrap();
     assert_eq!(
-        sa.stats.chunks_new, 0,
+        sa.report.chunks_new, 0,
         "B 上傳過的 chunk 不該再上傳：{:?}",
-        sa.stats
+        sa.report
     );
     let cached = a.load_index().await.unwrap();
     let fresh = t.open().await.load_index().await.unwrap();

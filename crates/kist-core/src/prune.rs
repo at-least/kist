@@ -48,6 +48,10 @@ use crate::pack::{decode_chunk, PackWriter};
 use crate::repo::{IndexBlobs, Repository};
 use crate::{blocking, CoreError, Result};
 
+/// 有效（未被 supersede）index blob 超過這個數，prune 必須合併重寫為一顆
+/// （format-v3-draft §10 的壓縮觸發；v2 的 ADR 005 未做項）。
+pub const MAX_EFFECTIVE_BLOBS: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct PruneOptions {
     /// 標記到刪除的最短間隔。必須長於最長的一次 backup。
@@ -597,7 +601,14 @@ impl PrunePlan {
             .filter(|(t, _)| t.kind == Kind::Pack && self.indexed.contains_key(&t.id))
             .map(|(t, _)| t.id)
             .collect();
-        if !deleted_packs.is_empty() || !new_packs.is_empty() || !self.phantoms.is_empty() {
+        if !deleted_packs.is_empty()
+            || !new_packs.is_empty()
+            || !self.phantoms.is_empty()
+            // v3（format-v3-draft §10）：有效 blob 超過上限就必須合併——
+            // 只增不刪的 repo 每次 backup 多一顆 blob，讀取端的 Get＋合併
+            // 成本隨之增長；64 顆以內的增量合併代價可忽略。
+            || self.all_blob_ids.len() > MAX_EFFECTIVE_BLOBS
+        {
             // 順序有意義：讀取端同一個 chunk 取第一個位置，所以新 pack 在前、被標記的（含被 repack 的舊 pack）
             // 在最後，之後的 backup 才不會把 chunk 解析到被標記的 pack 而白白重傳。幽靈 pack 丟掉。
             let dropped =
@@ -629,6 +640,9 @@ impl PrunePlan {
         }
 
         // 11. 刪除（刪之前再看一眼：標記後被重寫過就復活。S3 的時間是秒級，同一秒算重寫過——安全那邊）
+        //     v3 的樹是 write-once，復活訊號在 `touch/<id>`：touch 不存在或
+        //     **嚴格小於**標記才算死（touch ≥ mark＝活，同秒取安全側，
+        //     與 backup 端的比較一致——format-v3-draft §13.2）。
         let mut marks_to_remove = std::mem::take(&mut self.marks_to_remove);
         for (target, mark) in std::mem::take(&mut self.to_delete) {
             let key = target.kind.key(&target.id);
@@ -647,6 +661,21 @@ impl PrunePlan {
                 }
                 Err(e) => return Err(e.into()),
             }
+            if target.kind == Kind::Tree {
+                // touch 檢查：活的 touch（≥ 標記）＝復活。
+                let tree_id = kist_format::TreeId::from_bytes(*target.id.as_bytes());
+                let revived_by_touch = match repo.backend().head(&keys::touch(&tree_id)).await {
+                    Ok(t) => t.modified >= mark.modified,
+                    Err(BackendError::NotFound(_)) => false,
+                    Err(e) => return Err(e.into()),
+                };
+                if revived_by_touch {
+                    tracing::info!("{key}: touched after it was marked; keeping it");
+                    self.report.revived += 1;
+                    marks_to_remove.push(target.id);
+                    continue;
+                }
+            }
             match repo.backend().delete(&key).await {
                 Ok(()) => {
                     self.report.deleted += 1;
@@ -659,6 +688,17 @@ impl PrunePlan {
                         match repo.backend().delete(&parity_key).await {
                             Ok(()) | Err(BackendError::NotFound(_)) => {}
                             Err(e) => return Err(e.into()),
+                        }
+                    }
+                    // 樹的成組生命週期（format-v3-draft §13.2/§13.5）：
+                    // `.r1` 副本與 touch 訊號隨主體一起走。
+                    if target.kind == Kind::Tree {
+                        let tree_id = kist_format::TreeId::from_bytes(*target.id.as_bytes());
+                        for group_key in [keys::tree_replica(&tree_id), keys::touch(&tree_id)] {
+                            match repo.backend().delete(&group_key).await {
+                                Ok(()) | Err(BackendError::NotFound(_)) => {}
+                                Err(e) => return Err(e.into()),
+                            }
                         }
                     }
                 }
@@ -721,6 +761,36 @@ impl PrunePlan {
                     if !pack_gone {
                         continue;
                     }
+                    match repo.backend().delete(&key).await {
+                        Ok(()) | Err(BackendError::NotFound(_)) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
+
+        // 14. 孤兒 touch 清掃（v3 §13.2）：`touch/<hex>` 在而 `trees/<hex>`
+        //     不在——之前死掉的 run 留下的，刪。**孤兒 `.r1`（主體不在、無標記）
+        //     刻意不清理**：那是「主體意外遺失」的災難訊號，副本存在的目的
+        //     就是它；交給 `check` 回報。
+        if !self.dry_run {
+            let touches: Vec<String> = repo
+                .backend()
+                .list(keys::TOUCH_PREFIX)
+                .await?
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
+            for key in touches {
+                let Some(hex) = key.strip_prefix(&format!("{}/", keys::TOUCH_PREFIX)) else {
+                    continue;
+                };
+                let Ok(tree_id) = kist_format::TreeId::from_hex(hex) else {
+                    // 不是 touch 命名：當垃圾清
+                    let _ = repo.backend().delete(&key).await;
+                    continue;
+                };
+                if repo.backend().head(&keys::tree(&tree_id)).await.is_err() {
                     match repo.backend().delete(&key).await {
                         Ok(()) | Err(BackendError::NotFound(_)) => {}
                         Err(e) => return Err(e.into()),

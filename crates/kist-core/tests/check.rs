@@ -157,8 +157,16 @@ fn swap_objects_excluding(dir: &std::path::Path, exclude: &[String]) -> (String,
 async fn tree_copied_over_another_tree_is_detected() {
     let (t, repo) = repo_with_data().await;
     let key = repo.resolve_snapshot("latest").await.unwrap();
-    let root = repo.read_snapshot_by_key(&key).await.unwrap().root.to_hex();
-    let (_a, b) = swap_objects_excluding(&t.repo_path().join("trees"), &[root]);
+    // v3：roots 是清單——所有 root tree 都不能當受害者
+    let roots: Vec<String> = repo
+        .read_snapshot_by_key(&key)
+        .await
+        .unwrap()
+        .roots
+        .iter()
+        .map(|r| r.tree.to_hex())
+        .collect();
+    let (_a, b) = swap_objects_excluding(&t.repo_path().join("trees"), &roots);
     let report = repo
         .check(CheckOptions {
             read_data: false,
@@ -193,9 +201,19 @@ async fn tree_copied_over_another_tree_is_detected() {
 async fn tree_whose_content_does_not_match_its_name_is_detected() {
     let (t, repo) = repo_with_data().await;
     let key = repo.resolve_snapshot("latest").await.unwrap();
-    let root = repo.read_snapshot_by_key(&key).await.unwrap().root.to_hex();
+    // v3：roots 是清單——所有 root tree 都排除在受害者之外
+    let roots: Vec<String> = repo
+        .read_snapshot_by_key(&key)
+        .await
+        .unwrap()
+        .roots
+        .iter()
+        .map(|r| r.tree.to_hex())
+        .collect();
     let mut trees = walk_files(&t.repo_path().join("trees"));
-    trees.retain(|p| p.is_file() && p.file_name().unwrap().to_str() != Some(&root));
+    trees.retain(|p| {
+        p.is_file() && !roots.contains(&p.file_name().unwrap().to_str().unwrap().to_owned())
+    });
     trees.sort();
     let (a, b) = (trees[0].clone(), trees[1].clone());
     let id_a = kist_format::TreeId::from_hex(a.file_name().unwrap().to_str().unwrap()).unwrap();

@@ -77,12 +77,12 @@ async fn marked_pack_is_not_used_for_dedup() {
         .await
         .unwrap();
     assert_eq!(
-        s.stats.chunks_new,
+        s.report.chunks_new,
         victim_chunks.len() as u64,
         "{:?}",
-        s.stats
+        s.report
     );
-    assert!(s.stats.packs_new >= 1);
+    assert!(s.report.packs_new >= 1);
     // 重傳的 chunk 現在在新 pack 裡：新 blob 的 entries 涵蓋 victim 的每個 chunk
     let mut errors = Vec::new();
     let blobs = t.open().await.load_index_blobs(&mut errors).await.unwrap();
@@ -101,7 +101,7 @@ async fn marked_pack_is_not_used_for_dedup() {
         .backup(std::slice::from_ref(&src), client(1))
         .await
         .unwrap();
-    assert_eq!(s.stats.chunks_new, 0, "{:?}", s.stats);
+    assert_eq!(s.report.chunks_new, 0, "{:?}", s.report);
 }
 
 #[tokio::test]
@@ -270,7 +270,7 @@ async fn reading_a_moved_chunk_reloads_the_index() {
     assert!(matches!(err, CoreError::ChunkMissing(_)), "{err}");
 }
 
-/// 寫過的 tree 有過期標記：我們的 put 比標記新 → 可以 commit；put 比標記舊（backup 跑超過 grace）→ 不行。
+/// 寫過的 tree 有過期標記：我們的 touch 比標記新 → 可以 commit；touch 比標記舊（backup 跑超過 grace）→ 不行。
 #[tokio::test]
 async fn commit_checks_expired_markers_on_written_trees() {
     let t = TestRepo::new().await;
@@ -287,8 +287,8 @@ async fn commit_checks_expired_markers_on_written_trees() {
         .backup_prepare(std::slice::from_ref(&src), client(1))
         .await
         .unwrap();
-    // 標記比我們的 put 舊：prune 刪前會看到 tree 被重寫過而撤銷標記 → 允許
-    mark(&t, &tree_object_id(&first.root), four_days);
+    // 標記比我們的復活訊號舊：prune 刪前會看到 touch 而撤銷標記 → 允許
+    mark(&t, &tree_object_id(&root_tree(&first)), four_days);
     prepared.commit().await.unwrap();
     assert_eq!(t.count("snapshots"), 2);
 
@@ -296,13 +296,19 @@ async fn commit_checks_expired_markers_on_written_trees() {
         .backup_prepare(std::slice::from_ref(&src), client(1))
         .await
         .unwrap();
-    // 把 tree 的修改時間改到標記之前：等於 put 發生在標記前、backup 跑了超過 grace
-    let tree_path = t.repo_path().join(keys::tree(&first.root));
+    // v3 的樹不再重 put，復活訊號是 `touch/<id>` 的 mtime（走訪時覆寫刷新）。
+    // 把 touch 的修改時間改到標記之前：等於 touch 發生在標記前、backup 跑了超過 grace
+    let touch_path = t.repo_path().join(keys::touch(&root_tree(&first)));
     let older = std::time::SystemTime::now() - five_days();
-    filetime::set_file_mtime(&tree_path, filetime::FileTime::from_system_time(older)).unwrap();
+    filetime::set_file_mtime(&touch_path, filetime::FileTime::from_system_time(older)).unwrap();
     let err = prepared.commit().await.unwrap_err();
     assert!(matches!(err, CoreError::TreeMarked(_)), "{err}");
     assert_eq!(t.count("snapshots"), 2);
+}
+
+/// v3：單一來源 backup 的 root tree（這些測試都只備份一個路徑）。
+fn root_tree(s: &kist_core::BackupSummary) -> kist_format::TreeId {
+    s.roots[0].tree
 }
 
 /// tree 的 GC 標記在 gc/ 命名空間以 ObjectId 記（與 pack/index 共用）。
@@ -379,7 +385,7 @@ async fn commit_after_a_repack_keeps_its_chunks_reachable() {
     assert!(rs.errors.is_empty(), "{:?}", rs.errors);
 }
 
-/// reviewer 的 1-B：tree 在 backup 開始時已被標記（還年輕）；backup 重 put 它；prune 在 HEAD 與 DELETE
+/// reviewer 的 1-B：tree 在 backup 開始時已被標記（還年輕）；backup touch 它；prune 在 HEAD 與 DELETE
 /// 之間沒看到而把它刪掉、連標記一起清了。commit 必須發現 tree 不見了。
 #[tokio::test]
 async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
@@ -393,7 +399,7 @@ async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
         .unwrap();
     mark(
         &t,
-        &tree_object_id(&first.root),
+        &tree_object_id(&root_tree(&first)),
         std::time::Duration::from_secs(3600),
     );
     let prepared = repo
@@ -401,16 +407,20 @@ async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
         .await
         .unwrap();
     // prune 刪掉 tree 並清掉標記
-    std::fs::remove_file(t.repo_path().join(keys::tree(&first.root))).unwrap();
-    std::fs::remove_file(t.repo_path().join(keys::gc(&tree_object_id(&first.root)))).unwrap();
+    std::fs::remove_file(t.repo_path().join(keys::tree(&root_tree(&first)))).unwrap();
+    std::fs::remove_file(
+        t.repo_path()
+            .join(keys::gc(&tree_object_id(&root_tree(&first)))),
+    )
+    .unwrap();
     let err = prepared.commit().await.unwrap_err();
     assert!(matches!(err, CoreError::TreeMarked(_)), "{err}");
     assert_eq!(t.count("snapshots"), 1);
 
-    // 沒被刪（我們的 put 比標記新）：可以 commit
+    // 沒被刪（我們的 touch 比標記新）：可以 commit
     mark(
         &t,
-        &tree_object_id(&first.root),
+        &tree_object_id(&root_tree(&first)),
         std::time::Duration::from_secs(3600),
     );
     let prepared = repo

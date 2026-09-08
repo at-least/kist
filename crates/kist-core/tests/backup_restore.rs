@@ -18,9 +18,9 @@ async fn backup_then_restore_is_byte_identical() {
         .unwrap();
     assert!(summary.stats.files >= 7, "{:?}", summary.stats);
     assert!(
-        summary.stats.packs_new >= 2,
+        summary.report.packs_new >= 2,
         "小 pack 設定下應該有多個 pack：{:?}",
-        summary.stats
+        summary.report
     );
     assert!(t.repo_path().join(&summary.snapshot_key).is_file());
 
@@ -63,8 +63,8 @@ async fn second_backup_writes_no_new_packs() {
         trees_after_first,
         "目錄沒變，tree 應該全部重用"
     );
-    assert_eq!(second.stats.chunks_new, 0);
-    assert_eq!(second.stats.packs_new, 0);
+    assert_eq!(second.report.chunks_new, 0);
+    assert_eq!(second.report.packs_new, 0);
     assert_eq!(second.stats.bytes, first.stats.bytes);
     assert_eq!(second.parent.as_deref(), Some(first.snapshot_key.as_str()));
     assert_eq!(t.count("snapshots"), 2);
@@ -90,9 +90,9 @@ async fn modified_file_is_picked_up_and_only_it_is_new() {
         .await
         .unwrap();
     assert!(
-        second.stats.chunks_new >= 2 && second.stats.chunks_new <= 4,
+        second.report.chunks_new >= 2 && second.report.chunks_new <= 4,
         "{:?}",
-        second.stats
+        second.report
     );
 
     let target = t.dir.path().join("out");
@@ -120,8 +120,8 @@ async fn touching_mtime_without_changing_content_does_not_write_chunks() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert_eq!(second.stats.chunks_new, 0);
-    assert_eq!(second.stats.packs_new, 0);
+    assert_eq!(second.report.chunks_new, 0);
+    assert_eq!(second.report.packs_new, 0);
 }
 
 #[tokio::test]
@@ -136,7 +136,7 @@ async fn large_file_uses_indirect_content_and_restores() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert!(s.stats.chunks_new > 256, "{:?}", s.stats);
+    assert!(s.report.chunks_new > 256, "{:?}", s.report);
 
     let target = t.dir.path().join("out");
     repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
@@ -163,8 +163,9 @@ async fn huge_directory_is_split_into_tree_parts_and_restores() {
         s.stats.files as usize,
         kist_format::tree::MAX_NODES_PER_TREE + 5
     );
-    // 根 tree（1 段）+ 大目錄（2 段）
-    assert_eq!(t.count("trees"), 3);
+    // v3：root tree = 來源目錄內容本身（大目錄 2 段）——沒有 v2 的合成根，
+    // 少一顆樹。
+    assert_eq!(t.count("trees"), 2);
 
     let target = t.dir.path().join("out");
     repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
@@ -287,9 +288,9 @@ async fn same_size_and_mtime_but_different_content_is_detected() {
         .await
         .unwrap();
     assert!(
-        second.stats.chunks_new > 0,
+        second.report.chunks_new > 0,
         "內容變了卻沒有新 chunk：快速路徑誤判 {:?}",
-        second.stats
+        second.report
     );
     let target = t.dir.path().join("out");
     repo.restore(&second.snapshot_key, &target, RestoreOptions::default())
@@ -333,12 +334,12 @@ async fn parent_reuse_across_tree_segments_in_one_dir() {
     assert_ne!(first.snapshot_key, second.snapshot_key);
     assert_eq!(second.parent.as_deref(), Some(first.snapshot_key.as_str()));
     assert_eq!(
-        second.stats.files_reused,
+        second.report.files_reused,
         10_050 - changed,
         "跨段界之外沒改的檔案都該走 parent 快速路徑"
     );
     assert_eq!(
-        second.stats.chunks_new, changed,
+        second.report.chunks_new, changed,
         "改過的檔案各有一個新內容 chunk"
     );
 
@@ -437,9 +438,11 @@ async fn stats_count_dirs_without_root_tree_and_hard_link_bytes_once() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
+    // v3 口徑（§9.1）：dirs 是樹裡的目錄 entry 數，root 是 path 不是 entry
+    // ——只有 sub、empty 兩個。
     assert_eq!(
-        s.stats.dirs, 3,
-        "src, sub, empty — 不含合成根 tree：{:?}",
+        s.stats.dirs, 2,
+        "sub, empty（root 本身不算）：{:?}",
         s.stats
     );
     assert_eq!(

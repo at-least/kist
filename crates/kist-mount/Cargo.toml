@@ -18,6 +18,7 @@ tracing.workspace = true
 kist-backend.workspace = true
 kist-crypto.workspace = true
 hex.workspace = true
+serde_bytes.workspace = true
 tempfile.workspace = true
 time.workspace = true
 

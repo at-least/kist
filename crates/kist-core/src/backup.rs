@@ -1,21 +1,30 @@
-//! backup：走訪目錄、切塊、去重、寫 pack / tree / index / snapshot。
+//! backup：走訪目錄、切塊、去重、寫 pack / tree / index / snapshot（v3）。
 //!
-//! 流程（寫入順序是刻意的，見 `docs/format.md` §13）：
+//! 流程（寫入順序是刻意的，見 `docs/format-v3-draft.md` §13、§17）：
 //! 1. 讀進所有 index。
-//! 2. 找同一台 client、同一組路徑的上一個 snapshot 當 parent：
+//! 2. 找同一台 client、同一組 roots 的上一個 snapshot 當 parent：
 //!    檔案的 size 與 mtime 沒變就直接沿用它的 chunk 清單，不重讀檔案。
 //! 3. 依名稱排序遞迴走訪。檔案在 blocking thread 裡串流切塊、算 ID、對 index 去重、
 //!    新 chunk 壓縮加密進 pack；pack 滿了就交回 async 端上傳（最多 2 個同時在飛）。
-//! 4. 每個目錄結束時封成 tree（決定性加密）並上傳（冪等，見 `write_tree`）。
+//! 4. 每個目錄結束時封成 tree 上傳：**新樹** put_if_absent；**沿用的既有樹**
+//!    以覆寫式 Put 寫 `touch/<id>`（8 bytes）刷新 mtime——那是復活訊號本體
+//!    （v2 每次 backup 重 put 整棵樹的 bytes，v3 樹 bytes 永不重寫）。
 //! 5. 全部結束：flush 最後一個 pack、等上傳完成、寫 index blob（到這裡是 `backup_prepare`）。
-//! 6. `commit`：確認引用到的每個 pack 都還在，然後寫 snapshot。
+//! 6. `commit`：確認引用到的每個 pack 都還在、有標記的可達樹 touch 夠新，然後
+//!    寫 snapshot（replicas=1 時 `.r1` 副本先寫，主體出現＝commit）。
 //!
-//! 面對 GC（M3，見 `docs/format.md` §11）：
+//! v3 的 roots：每個備份來源是 `Root { path, tree }`——path 是不透明定位
+//! （本機絕對路徑；遠端來源是 `sftp://…`/`s3://…`，見 Source 抽象），
+//! 樹節點名**一律**是單一路徑元件（v2 的合成根已淘汰）。
+//!
+//! 面對 GC：
 //! - 開始時列 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。backup 因此不需要
 //!   刪標記（維持 Put-only），prune 第二階段看到新 snapshot 引用會自己撤銷標記。
 //! - commit 前重新載入 index：引用到的每個 chunk 都要解析得到，且解析到的 pack 存在、標記沒超過
 //!   grace；否則失敗、不寫 snapshot。這把「backup 跑得比 grace 還久」與「prune 在 backup 途中
 //!   repack 掉它去重到的 chunk」都從悄悄留下壞 snapshot 變成安全失敗（重跑會重傳）。
+//! - commit 前對「帶標記的可達樹」HEAD：樹要存在、touch 要比標記新——這是對
+//!   prune 單次 HEAD→DELETE TOCTOU 視窗的防線（平常是空集合，零成本）。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -27,9 +36,10 @@ use kist_chunker::Chunker;
 use kist_crypto::RepoKeys;
 use kist_format::index::{IndexBlob, IndexPack};
 use kist_format::parity;
-use kist_format::snapshot::{format_key_timestamp, Snapshot, SnapshotStats};
+use kist_format::snapshot::{format_key_timestamp, Root, Snapshot, SnapshotStats};
 use kist_format::tree::{
-    content_type, node_type, ChunkList, Entry, Tree, MAX_INLINE_CHUNKS, MAX_NODES_PER_TREE,
+    content_type, meta_kind, node_type, ChunkList, Entry, Tree, MAX_INLINE_CHUNKS,
+    MAX_NODES_PER_TREE,
 };
 use kist_format::{cbor, keys, ChunkId, ObjectId, TreeId};
 use tokio::task::JoinSet;
@@ -65,6 +75,25 @@ pub struct BackupOptions {
     pub progress: Option<ProgressCallback>,
 }
 
+/// **過程計數**（v3 起不在格式裡——它們依 GC 狀態與去重順序而變，兩個實作
+/// 可以「合法地」數出不同數字；不可變結構只收資料事實，見 snapshot.stats）。
+/// 屬於 backup 的執行報告，給 CLI / JSON / metrics 用。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BackupReport {
+    /// 這次新寫進 repo 的 chunk 個數。
+    pub chunks_new: u64,
+    /// 這次讀了資料的 chunk 個數（含沿用的確認）。
+    pub chunks_read: u64,
+    pub packs_new: u64,
+    /// 引用到被 GC 標記的 pack 而重寫資料的次數回報。
+    pub packs_revived: u64,
+    pub bytes_stored: u64,
+    /// backup 時讀不到而被略過的項目數。snapshot 仍會寫出，CLI 以非 0 結束。
+    pub errors: u64,
+    /// 走快速路徑沿用 chunk 清單的檔案數。
+    pub files_reused: u64,
+}
+
 /// backup 進行中的即時狀態（給 UI 顯示進度）。每處理完一個目錄項目呼叫一次 callback；結尾的
 /// 驗證與 commit 階段也各呼叫一次（phase 不同）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -72,6 +101,7 @@ pub struct BackupProgress {
     /// "files" | "flush" | "verify" | "commit"
     pub phase: &'static str,
     pub stats: SnapshotStats,
+    pub report: BackupReport,
     /// 目前處理的路徑（lossy UTF-8）；結尾階段為 None。
     pub current: Option<String>,
 }
@@ -91,8 +121,9 @@ impl std::fmt::Debug for ProgressCallback {
 pub struct BackupSummary {
     pub snapshot_key: String,
     pub parent: Option<String>,
-    pub root: TreeId,
+    pub roots: Vec<Root>,
     pub stats: SnapshotStats,
+    pub report: BackupReport,
 }
 
 /// 一個檔案切塊後的結果。
@@ -123,16 +154,19 @@ struct Backup {
     /// 走訪期間會被移進 blocking closure 再移回來，所以用 Option。
     packer: Option<PackWriter>,
     index: Option<ChunkIndex>,
-    /// 這次 backup 已經寫過的 tree（同一次裡同內容的目錄不重寫）。
-    written_trees: HashSet<TreeId>,
+    /// 這次 backup 可達的 tree（新寫或沿用）：commit 驗證的對象。
+    seen_trees: HashSet<TreeId>,
     new_packs: Vec<IndexPack>,
     uploads: JoinSet<Result<()>>,
+    /// 資料事實（進 snapshot）。
     stats: SnapshotStats,
+    /// 過程計數（進報告，不進格式）。
+    report: BackupReport,
     /// parent snapshot 的開始時間（Unix 奈秒）；沒有 parent 時快速路徑不會用到。
     parent_start_ns: i64,
     /// backup 開始時已被 GC 標記的 pack：不拿來去重。
     marked: Arc<HashSet<ObjectId>>,
-    /// backup 開始時所有的標記（含 tree）：commit 時要驗「開始時已被標記、這次又 put 過」的 tree。
+    /// backup 開始時所有的標記（含 tree）：commit 時驗可達樹的 touch 新鮮度。
     marks_at_start: HashMap<ObjectId, time::OffsetDateTime>,
     /// 這次沿用的既有 chunk 各自在哪個 pack（commit 前要驗這些 pack 還在）。
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
@@ -143,22 +177,27 @@ struct Backup {
     /// 這次 backup 已看過的硬連結：(dev, inode) → 第一個名字的 chunk 清單與大小。
     /// 後續名字直接沿用，不必重讀資料。
     hardlinks: HashMap<(u64, u64), (u64, Vec<ChunkId>, u8)>,
+    /// 已把 bytes 計入 stats 的硬連結群組（(dev,ino)）：`bytes` 對同一份內容
+    /// 只算一次（format-v3-draft §9.1），跨 roots 也一樣。
+    counted_hardlinks: HashSet<(u64, u64)>,
     /// 切塊緩衝池（每個 2×chunker.max）：整個 backup 重用同一批，不在每個
     /// 檔案各配一次。單執行緒走訪時通常只有一個；池化是為了之後並行切塊。
     chunk_bufs: Vec<Vec<u8>>,
 }
 
-/// 呼叫進度 callback（有設才做）。stats 是幾個 u64 的 copy，成本可忽略。
+/// 呼叫進度 callback（有設才做）。stats/report 是幾個 u64 的 copy，成本可忽略。
 fn report_progress(
     progress: Option<&ProgressCallback>,
     phase: &'static str,
     stats: SnapshotStats,
+    report: BackupReport,
     current: Option<&Path>,
 ) {
     if let Some(cb) = progress {
         (cb.0)(&BackupProgress {
             phase,
             stats,
+            report,
             current: current.map(|p| p.to_string_lossy().into_owned()),
         });
     }
@@ -171,7 +210,7 @@ fn report_progress(
 /// 100 萬檔的平面目錄光這兩個結構就要 ~450 MiB。
 ///
 /// 段以 `prev` 串接、段內與段間都以名稱遞增（寫入端的排序合約，
-/// format.md §8），所以 `take_name` 用遞增的查詢名稱做 merge-join：
+/// format-v3-draft §8），所以 `take_name` 用遞增的查詢名稱做 merge-join：
 /// 呼叫端（`process_dir`）本來就依名稱遞增走訪。
 struct ParentStream {
     repo: Repository,
@@ -244,14 +283,14 @@ pub struct PreparedBackup {
     repo: Repository,
     opts: BackupOptions,
     started: time::OffsetDateTime,
-    paths: Vec<Vec<u8>>,
-    root: TreeId,
+    roots: Vec<Root>,
     parent_key: Option<String>,
     stats: SnapshotStats,
+    report: BackupReport,
     /// 引用到的 pack → 其中被引用的 chunk（這次新寫的 pack 也在內）。
     referenced: HashMap<ObjectId, Vec<ChunkId>>,
-    /// 這次 put 過的 tree。
-    written_trees: HashSet<TreeId>,
+    /// 這次可達的 tree（新寫或沿用）。
+    seen_trees: HashSet<TreeId>,
     marks_at_start: HashMap<ObjectId, time::OffsetDateTime>,
     /// 這次自己寫出的 pack：commit 時不需要再驗（存在與否由 BackupTooLong 保證）。
     own_packs: HashSet<ObjectId>,
@@ -263,6 +302,10 @@ const GRACE_SAFETY_MARGIN: time::Duration = time::Duration::hours(1);
 impl PreparedBackup {
     pub fn stats(&self) -> &SnapshotStats {
         &self.stats
+    }
+
+    pub fn report(&self) -> &BackupReport {
+        &self.report
     }
 
     /// 驗證引用到的資料都還在，然後寫 snapshot。
@@ -285,7 +328,13 @@ impl PreparedBackup {
             });
         }
         let marks = self.repo.list_gc_marks().await?;
-        report_progress(self.opts.progress.as_ref(), "verify", self.stats, None);
+        report_progress(
+            self.opts.progress.as_ref(),
+            "verify",
+            self.stats,
+            self.report,
+            None,
+        );
         self.repo
             .verify_referenced_chunks(
                 &self.referenced,
@@ -296,22 +345,27 @@ impl PreparedBackup {
             )
             .await?;
         self.repo
-            .verify_written_trees(
-                &self.written_trees,
+            .verify_touched_trees(
+                &self.seen_trees,
                 &self.marks_at_start,
                 &marks,
                 self.opts.gc_grace,
                 now,
             )
             .await?;
-        report_progress(self.opts.progress.as_ref(), "commit", self.stats, None);
+        report_progress(
+            self.opts.progress.as_ref(),
+            "commit",
+            self.stats,
+            self.report,
+            None,
+        );
         let snapshot_key = self
             .repo
             .commit_snapshot(
                 &self.opts,
                 self.started,
-                self.paths,
-                self.root,
+                self.roots.clone(),
                 self.parent_key.clone(),
                 self.stats,
             )
@@ -319,8 +373,9 @@ impl PreparedBackup {
         Ok(BackupSummary {
             snapshot_key,
             parent: self.parent_key,
-            root: self.root,
+            roots: self.roots,
             stats: self.stats,
+            report: self.report,
         })
     }
 }
@@ -400,45 +455,70 @@ impl Repository {
         Ok(())
     }
 
-    /// commit 前對這次 put 過的 tree 做兩個檢查（兩個集合平常都是空的，零成本）：
-    /// 1. 現在有**已超過 grace** 的標記：prune 隨時會刪它。我們的 put 會刷新它的修改時間
-    ///    （prune 刪前會再看一眼、看到就撤銷標記），所以只有「修改時間沒比標記新」才危險——
-    ///    那表示 put 發生在標記之前，backup 已經跑了超過 grace。
-    /// 2. **開始時就已被標記**的 tree：prune 可能在我們 put 之後才刪它、連標記一起清掉，
-    ///    事後從標記看不出來，所以直接 HEAD：要存在，而且修改時間比開始時的標記新。
-    async fn verify_written_trees(
+    /// commit 前對「帶標記的可達樹」做檢查（兩個集合平常都是空的，零成本）。
+    /// v3 的樹不再重 put，復活訊號是 `touch/<id>` 的 mtime（走訪時覆寫刷新）：
+    /// 1. **現在**有已超過 grace 的標記的可達樹：prune 隨時會刪。樹必須存在、
+    ///    touch 必須比標記新（時間整秒：同一秒算新，與 prune 的安全側一致）。
+    /// 2. **開始時就已被標記**的可達樹：prune 可能在我們 touch 之後才刪它、
+    ///    連標記一起清掉，事後從標記看不出來，所以同樣 HEAD：要存在，而且
+    ///    touch 比開始時的標記新——這是 HEAD→DELETE TOCTOU 視窗的防線。
+    async fn verify_touched_trees(
         &self,
-        written: &HashSet<TreeId>,
+        seen: &HashSet<TreeId>,
         marks_at_start: &HashMap<ObjectId, time::OffsetDateTime>,
         marks: &HashMap<ObjectId, time::OffsetDateTime>,
         grace: std::time::Duration,
         now: time::OffsetDateTime,
     ) -> Result<()> {
-        let written: HashSet<ObjectId> = written
+        let seen_of: HashSet<ObjectId> = seen
             .iter()
             .map(|t| ObjectId::from_bytes(*t.as_bytes()))
             .collect();
         for (id, marked_at) in marks.iter() {
-            if *marked_at + grace > now || !written.contains(id) {
+            if *marked_at + grace > now || !seen_of.contains(id) {
                 continue;
             }
             let tree_id = TreeId::from_bytes(*id.as_bytes());
-            let info = self.backend().head(&keys::tree(&tree_id)).await?;
-            // 時間是整秒：同一秒算重寫過。prune 刪前的比較也是 >=（同一秒不刪），兩邊一致才安全。
-            if info.modified < *marked_at {
-                return Err(CoreError::TreeMarked(*id));
-            }
+            self.head_tree_and_touch(&tree_id, marked_at).await?;
         }
         for (id, marked_at) in marks_at_start {
-            if !written.contains(id) {
+            if !seen_of.contains(id) {
                 continue;
             }
             let tree_id = TreeId::from_bytes(*id.as_bytes());
-            match self.backend().head(&keys::tree(&tree_id)).await {
-                Ok(info) if info.modified >= *marked_at => {}
-                Ok(_) | Err(BackendError::NotFound(_)) => return Err(CoreError::TreeMarked(*id)),
-                Err(e) => return Err(e.into()),
-            }
+            self.head_tree_and_touch(&tree_id, marked_at).await?;
+        }
+        Ok(())
+    }
+
+    /// 樹要存在，而且 **touch** 的修改時間 ≥ 標記（同一秒算新——prune 的
+    /// 比較也是 `>=`，兩邊一致才安全）。任一不成立 → 安全失敗、不 commit
+    /// （重跑會沿用已上傳資料）。
+    /// 樹自身的 mtime **不**參與比較：v3 的樹是 write-once，mtime 永遠停在
+    /// 初寫時刻；復活訊號只有 touch（format-v3-draft §13.2/§13.3）。
+    async fn head_tree_and_touch(
+        &self,
+        tree_id: &TreeId,
+        marked_at: &time::OffsetDateTime,
+    ) -> Result<()> {
+        let marked_id = ObjectId::from_bytes(*tree_id.as_bytes());
+        // 樹要存在（touch 在而樹不在 = prune 已刪了它——TOCTOU 視窗命中）。
+        if let Err(e) = self.backend().head(&keys::tree(tree_id)).await {
+            return Err(match e {
+                BackendError::NotFound(_) => CoreError::TreeMarked(marked_id),
+                e => e.into(),
+            });
+        }
+        let touch = self
+            .backend()
+            .head(&keys::touch(tree_id))
+            .await
+            .map_err(|e| match e {
+                BackendError::NotFound(_) => CoreError::TreeMarked(marked_id),
+                e => e.into(),
+            })?;
+        if touch.modified < *marked_at {
+            return Err(CoreError::TreeMarked(marked_id));
         }
         Ok(())
     }
@@ -456,7 +536,7 @@ impl Repository {
             let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
             abs_paths.push(abs);
         }
-        // 根 tree 的節點名稱是路徑的 bytes，排序也必須依 bytes（format.md §8），不是 PathBuf 的順序
+        // roots 依 path bytes 排序（format-v3-draft §9），不是 PathBuf 的順序
         let mut with_bytes = Vec::new();
         for p in abs_paths {
             with_bytes.push((fsmeta::path_to_bytes(&p)?, p));
@@ -490,21 +570,16 @@ impl Repository {
         let index = self.load_index_for_backup(&marked).await?;
 
         let parent = self.find_parent(&opts.client_id, &path_bytes).await?;
-        // parent tree 用串流游標，不整份載入（平面大目錄的 parent 結構
-        // 會吃掉數百 MiB）；根層查詢的名稱已依 bytes 遞增，可直接 merge-join。
-        let mut parent_stream = match &parent {
-            Some((_, snap)) => match ParentStream::open(self, &snap.root).await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    tracing::warn!(
-                        "cannot read parent tree {}: {e}; re-reading everything",
-                        snap.root
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
+        // 每個 root 各自開 parent 串流（v3：parent 的同 path root 才是這個 root 的 parent）。
+        let parent_roots: Vec<(Vec<u8>, TreeId)> = parent
+            .as_ref()
+            .map(|(_, snap)| {
+                snap.roots
+                    .iter()
+                    .map(|r| (r.path.to_vec(), r.tree))
+                    .collect()
+            })
+            .unwrap_or_default();
         let parent_start_ns = parent.as_ref().map(|(_, snap)| snap.time_ns).unwrap_or(0);
 
         let mut b = Backup {
@@ -517,12 +592,14 @@ impl Repository {
                 self.config().chunker.max,
             )),
             index: Some(index),
-            written_trees: HashSet::new(),
+            seen_trees: HashSet::new(),
             new_packs: Vec::new(),
             uploads: JoinSet::new(),
             stats: SnapshotStats::default(),
+            report: BackupReport::default(),
             parent_start_ns,
             hardlinks: HashMap::new(),
+            counted_hardlinks: HashSet::new(),
             marked: Arc::new(marked),
             marks_at_start,
             referenced: HashMap::new(),
@@ -531,27 +608,62 @@ impl Repository {
             chunk_bufs: Vec::new(),
         };
 
-        // 根 tree：每個來源路徑一個節點，名稱是絕對路徑。
-        let mut root_entries = Vec::new();
-        for (path, name) in abs_paths.iter().zip(path_bytes.iter()) {
+        // v3 roots：每個來源路徑的**內容**走訪成自己的 tree（沒有合成根，
+        // 根目錄本身不是 entry——stats 的 dirs 不計 roots，規格 §9.1）。
+        // 檔案（或 symlink）當來源：root tree 含單一 entry（名稱 = 路徑的
+        // 最後元件）——mount/restore 瀏覽成 `base/<name>`。
+        let mut roots = Vec::new();
+        for (path, pb) in abs_paths.iter().zip(path_bytes.iter()) {
+            let parent_subtree = parent_roots
+                .iter()
+                .find(|(pp, _)| pp.as_slice() == pb.as_slice())
+                .map(|(_, t)| *t);
             let meta = std::fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
-            let parent_entry = match parent_stream.as_mut() {
-                Some(s) => s.take_name(name).await,
-                None => None,
+            let tree = if meta.is_dir() {
+                b.walk_dir(path, parent_subtree).await?
+            } else {
+                let name = pb
+                    .rsplit(|&b| b == b'/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        CoreError::Usage(format!(
+                            "cannot derive a name for source path {}",
+                            path.display()
+                        ))
+                    })?
+                    .to_vec();
+                let parent_entry = match parent_roots
+                    .iter()
+                    .find(|(pp, _)| pp.as_slice() == pb.as_slice())
+                {
+                    Some((_, t)) => match ParentStream::open(self, t).await {
+                        Ok(mut s) => s.take_name(&name).await,
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+                let Some(entry) = b
+                    .process_entry(path, name, &meta, parent_entry.as_ref())
+                    .await?
+                else {
+                    return Err(CoreError::Usage(format!(
+                        "{}: source could not be read",
+                        path.display()
+                    )));
+                };
+                b.write_tree(Tree::new(vec![entry], None)).await?
             };
-            let entry = b
-                .process_entry(path, name.clone(), &meta, parent_entry.as_ref())
-                .await?;
-            if let Some(entry) = entry {
-                root_entries.push(entry);
-            }
+            roots.push(Root {
+                path: serde_bytes::ByteBuf::from(pb.clone()),
+                tree,
+            });
         }
-        let root = b.write_tree_parts(root_entries).await?;
 
         // flush 最後一個 pack。走訪結束，去重用的 overlay（100 萬 chunk ≈
         // 185 MiB）不再需要：上傳收尾後立刻丟掉，讓 index blob 的編碼
         // 階段不跟它疊在同一個峰值。
-        b.report("flush", None);
+        b.report_phase("flush", None);
         b.flush_pack().await?;
         b.index = None;
         b.wait_uploads(0).await?;
@@ -566,12 +678,12 @@ impl Repository {
 
         Ok(PreparedBackup {
             repo: self.clone(),
-            paths: path_bytes,
-            root,
+            roots,
             parent_key: parent.as_ref().map(|(k, _)| k.clone()),
             stats: b.stats,
+            report: b.report,
             referenced: std::mem::take(&mut b.referenced),
-            written_trees: std::mem::take(&mut b.written_trees),
+            seen_trees: std::mem::take(&mut b.seen_trees),
             marks_at_start: std::mem::take(&mut b.marks_at_start),
             own_packs,
             opts,
@@ -579,7 +691,7 @@ impl Repository {
         })
     }
 
-    /// 同一台 client 最新的 snapshot，且備份的路徑組相同，才當 parent。
+    /// 同一台 client 最新的 snapshot，且備份的 roots 相同（path 集合與順序），才當 parent。
     async fn find_parent(
         &self,
         client_id: &[u8; 16],
@@ -606,21 +718,20 @@ impl Repository {
                 return Ok(None);
             }
         };
-        let same_paths = snap.paths.len() == paths.len()
+        let same_roots = snap.roots.len() == paths.len()
             && snap
-                .paths
+                .roots
                 .iter()
                 .zip(paths.iter())
-                .all(|(a, b)| a.as_ref() as &[u8] == b.as_slice());
-        Ok(same_paths.then_some((latest, snap)))
+                .all(|(r, p)| r.path.as_slice() == p.as_slice());
+        Ok(same_roots.then_some((latest, snap)))
     }
 
     async fn commit_snapshot(
         &self,
         opts: &BackupOptions,
         started: time::OffsetDateTime,
-        paths: Vec<Vec<u8>>,
-        root: TreeId,
+        roots: Vec<Root>,
         parent: Option<String>,
         stats: SnapshotStats,
     ) -> Result<String> {
@@ -639,12 +750,7 @@ impl Repository {
                         reason: "timestamp out of range".to_owned(),
                     }
                 })?,
-                paths: paths
-                    .iter()
-                    .cloned()
-                    .map(serde_bytes::ByteBuf::from)
-                    .collect(),
-                root,
+                roots: roots.clone(),
                 parent: parent.clone(),
                 stats,
             };
@@ -662,8 +768,14 @@ impl Repository {
 
 impl Backup {
     /// 回報目前進度（有 callback 才做）。
-    fn report(&self, phase: &'static str, current: Option<&Path>) {
-        report_progress(self.progress.as_ref(), phase, self.stats, current);
+    fn report_phase(&self, phase: &'static str, current: Option<&Path>) {
+        report_progress(
+            self.progress.as_ref(),
+            phase,
+            self.stats,
+            self.report,
+            current,
+        );
     }
 
     /// 處理一個目錄項目，回傳它的 tree 節點；不支援的類型回 `None`（略過並警告）。
@@ -676,7 +788,7 @@ impl Backup {
         parent: Option<&Entry>,
     ) -> Result<Option<Entry>> {
         let node = self.process_entry_inner(path, name, meta, parent).await?;
-        self.report("files", Some(path));
+        self.report_phase("files", Some(path));
         Ok(node)
     }
 
@@ -689,23 +801,28 @@ impl Backup {
     ) -> Result<Option<Entry>> {
         let ft = meta.file_type();
         let fs = fsmeta::capture(meta);
+        // v3：本機走訪一律是 posix kind（mode/uid/gid/mtime 必填——uid 0 = root
+        // 是真實值；ctime/dev/ino/nlink 有才記）。
         let mut entry = Entry {
             name,
             kind: 0,
-            mode: fs.mode,
-            uid: fs.uid,
-            gid: fs.gid,
-            mtime_ns: fs.mtime_ns,
-            ctime_ns: fs.ctime_ns,
+            meta_kind: meta_kind::POSIX,
             size: 0,
             target: Vec::new(),
-            chunks: Vec::new(),
             content: content_type::DIRECT,
+            chunks: Vec::new(),
             subtree: TreeId::ZERO,
-            dev: 0,
-            inode: 0,
-            nlink: 0,
+            mode: Some(fs.mode),
+            uid: Some(fs.uid),
+            gid: Some(fs.gid),
+            mtime_ns: Some(fs.mtime_ns),
+            ctime_ns: Some(fs.ctime_ns).filter(|v| *v != 0),
+            dev: None,
+            inode: None,
+            nlink: None,
             xattrs: None,
+            etag: None,
+            vern: None,
         };
         if ft.is_symlink() {
             let target = match std::fs::read_link(path) {
@@ -720,7 +837,7 @@ impl Backup {
                 Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
                 _ => None,
             };
-            let subtree = self.process_dir(path, parent_subtree).await?;
+            let subtree = self.walk_dir(path, parent_subtree).await?;
             self.stats.dirs += 1;
             entry.kind = node_type::DIR;
             entry.subtree = subtree;
@@ -737,9 +854,9 @@ impl Backup {
             entry.content = content;
             // 硬連結：記下識別，restore 才能重建連結而不是第二份複本。
             if fs.nlink > 1 {
-                entry.dev = fs.dev;
-                entry.inode = fs.inode;
-                entry.nlink = fs.nlink;
+                entry.dev = Some(fs.dev);
+                entry.inode = Some(fs.inode);
+                entry.nlink = Some(fs.nlink);
             }
         } else {
             tracing::warn!("{}: unsupported file type, skipped", path.display());
@@ -749,9 +866,10 @@ impl Backup {
         Ok(Some(entry))
     }
 
-    /// 遞迴處理一個目錄，回傳它（最後一段）tree 的名稱。
+    /// 遞迴走訪一個目錄的**內容**，回傳它（最後一段）tree 的名稱。
+    /// v3 的根目錄也走這裡（roots[].tree = 根目錄內容的 tree）。
     /// `Send`：讓整個 backup 的 future 能被 `tokio::spawn`（daemon 在別的 task 上跑工作）。
-    fn process_dir<'a>(
+    fn walk_dir<'a>(
         &'a mut self,
         path: &'a Path,
         parent_subtree: Option<TreeId>,
@@ -831,35 +949,54 @@ impl Backup {
         })
     }
 
-    /// 根層級的節點清單也可能很長，同樣分段。
-    async fn write_tree_parts(&mut self, nodes: Vec<Entry>) -> Result<TreeId> {
-        let mut prev = None;
-        let mut iter = nodes.into_iter().peekable();
-        loop {
-            let mut part = Vec::new();
-            while part.len() < MAX_NODES_PER_TREE {
-                match iter.next() {
-                    Some(n) => part.push(n),
-                    None => break,
-                }
-            }
-            let id = self.write_tree(Tree::new(part, prev)).await?;
-            if iter.peek().is_none() {
-                return Ok(id);
-            }
-            prev = Some(id);
-        }
-    }
-
-    /// tree 是 content-addressed 而且 put 冪等（同名同 bytes），所以**一律 put**，
-    /// 不先列 `trees/` 看存不存在：(1) 壞掉或被換掉的 tree 會在下一次 backup 自我修復；
-    /// (2) 不依賴 backup 開始時的列表，M3 GC 在中途刪掉 tree 也不會被漏掉；
-    /// (3) 省掉一次可能有數十萬筆的 list。代價是每個目錄一次 put（S3 上要算錢；
-    /// M2 有本地快取後可以用 cache_id 記住「這台機器寫過的 tree」再省掉）。
+    /// tree 是 content-addressed：**新樹**以 put_if_absent 寫入；已存在的
+    /// （沿用的）以覆寫式 Put 寫 `touch/<id>` 刷新 mtime——那是 GC 復活
+    /// 訊號（format-v3-draft §13.1）。同一次 backup 內同內容的目錄只處理一次。
+    /// `replicas=1` 時順手寫 `.r1` 副本（同 bytes、冪等；已存在則略過）。
     async fn write_tree(&mut self, tree: Tree) -> Result<TreeId> {
         let (id, bytes) = self.repo.seal_tree(tree).await?;
-        if self.written_trees.insert(id) {
-            self.repo.backend().put(&keys::tree(&id), bytes).await?;
+        if self.seen_trees.insert(id) {
+            let replica_bytes = (self.repo.config().replicas > 0).then(|| bytes.clone());
+            let primary = match self
+                .repo
+                .backend()
+                .put_if_absent(&keys::tree(&id), bytes.clone())
+                .await
+            {
+                Ok(()) => true,
+                Err(BackendError::AlreadyExists(_)) => {
+                    // 已存在：驗證現有 bytes（自我修復）。v2 靠無條件重 put
+                    // 順手療癒壞樹；v3 正常路徑零額外寫入，只在驗證失敗時
+                    // 覆寫——同名必同內容（名稱 = 明文 keyed hash），所以
+                    // 覆寫絕不會蓋掉「不同的合法樹」。
+                    if self
+                        .repo
+                        .read_tree_once(&keys::tree(&id), &id)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("tree {id} is corrupt; healing with good bytes");
+                        self.repo.backend().put(&keys::tree(&id), bytes).await?;
+                    }
+                    false
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if let Some(replica) = replica_bytes {
+                match self
+                    .repo
+                    .backend()
+                    .put_if_absent(&keys::tree_replica(&id), replica)
+                    .await
+                {
+                    Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !primary {
+                // 沿用的既有樹：touch（覆寫式 Put，mtime 必須刷新）。
+                self.repo.touch_tree(&id).await?;
+            }
         }
         Ok(id)
     }
@@ -867,7 +1004,7 @@ impl Backup {
     /// 記錄一個讀不到的項目：警告、計數、不寫進 tree。回傳 `None` 方便呼叫端直接 return。
     fn skip(&mut self, path: &Path, reason: &str) -> Option<Entry> {
         tracing::warn!("{}: {reason}; skipped", path.display());
-        self.stats.errors += 1;
+        self.report.errors += 1;
         None
     }
 
@@ -881,7 +1018,7 @@ impl Backup {
         parent: Option<&Entry>,
     ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
         if let Some(reused) = self.try_reuse(fs, current_size, parent).await? {
-            self.stats.files_reused += 1;
+            self.report.files_reused += 1;
             return Ok(Some(reused));
         }
         // 硬連結：同一個 (dev, inode) 在這次 backup 已經讀過 → 直接沿用 chunk 清單。
@@ -906,9 +1043,16 @@ impl Backup {
         };
         // size 用實際讀到的長度，不用讀檔前的 metadata：備份途中被 append 的檔案兩者會不同
         let size = result.bytes_total;
-        self.stats.bytes += result.bytes_total;
-        self.stats.bytes_stored += result.bytes_new;
-        self.stats.chunks_new += result.chunks_new;
+        if fs.nlink > 1 {
+            // bytes 對同一份硬連結內容只算一次（§9.1；跨 roots）。
+            if self.counted_hardlinks.insert((fs.dev, fs.inode)) {
+                self.stats.bytes += result.bytes_total;
+            }
+        } else {
+            self.stats.bytes += result.bytes_total;
+        }
+        self.report.bytes_stored += result.bytes_new;
+        self.report.chunks_new += result.chunks_new;
 
         let out = if result.chunks.len() <= MAX_INLINE_CHUNKS {
             (size, result.chunks, content_type::DIRECT)
@@ -922,7 +1066,7 @@ impl Backup {
                 )
                 .await?
                 .ok_or_else(|| CoreError::Join("chunk list read failed".into()))?;
-            self.stats.chunks_new += list_result.chunks_new;
+            self.report.chunks_new += list_result.chunks_new;
             (size, list_result.chunks, content_type::INDIRECT)
         };
         if fs.nlink > 1 {
@@ -988,8 +1132,16 @@ impl Backup {
             }
         }
         self.record_referenced(packs);
-        self.stats.bytes += pentry.size;
-        self.stats.chunks_read += data_ids.len() as u64;
+        // bytes：非硬連結每個名字都算；硬連結同一份內容只算一次（§9.1）。
+        let count_bytes = if fs.nlink > 1 {
+            self.counted_hardlinks.insert((fs.dev, fs.inode))
+        } else {
+            true
+        };
+        if count_bytes {
+            self.stats.bytes += pentry.size;
+        }
+        self.report.chunks_read += data_ids.len() as u64;
         Ok(Some((pentry.size, pentry.chunks.clone(), content)))
     }
 
@@ -1124,7 +1276,7 @@ impl Backup {
             }
             if done {
                 self.chunk_bufs.push(state.chunks.take_buf());
-                self.stats.chunks_read += state.reused_count;
+                self.report.chunks_read += state.reused_count;
                 return Ok(Some(FileResult {
                     chunks: state.ids,
                     bytes_total: state.bytes_total,
@@ -1165,7 +1317,7 @@ impl Backup {
                 size: p.bytes.len() as u64,
                 entries: p.entries,
             });
-            self.stats.packs_new += 1;
+            self.report.packs_new += 1;
             let backend: Backend = self.repo.backend().clone();
             let id = p.id;
             let key = keys::pack(&id);

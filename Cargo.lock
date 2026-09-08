@@ -1945,6 +1945,7 @@ dependencies = [
  "kist-core",
  "kist-crypto",
  "kist-format",
+ "serde_bytes",
  "tempfile",
  "time",
  "tokio",

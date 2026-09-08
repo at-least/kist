@@ -207,7 +207,7 @@ impl Repository {
                             key: s.key.clone(),
                             reason: format!("bad time {}: {e}", s.snapshot.time_ns),
                         })?;
-                let paths = s.snapshot.paths.iter().map(|p| p.to_vec()).collect();
+                let paths = s.snapshot.roots.iter().map(|r| r.path.to_vec()).collect();
                 groups
                     .entry((s.snapshot.client_id.clone(), paths))
                     .or_default()
@@ -230,6 +230,14 @@ impl Repository {
         if !opts.dry_run {
             for key in &removed {
                 debug_assert!(key.starts_with(keys::SNAPSHOTS_PREFIX));
+                // 副本隨主體（format-v3-draft §13.5）；不存在就算了。
+                if let Err(e) = self
+                    .backend()
+                    .delete(&format!("{key}{}", kist_format::keys::REPLICA_SUFFIX))
+                    .await
+                {
+                    tracing::debug!("no replica for {key}: {e}");
+                }
                 self.backend().delete(key).await?;
             }
         }

@@ -35,6 +35,8 @@ fn timestamp_of(key: &str) -> &str {
 
 impl Repository {
     /// 所有 snapshot 的 key，依時間排序（舊 → 新）。
+    /// `.r1` 副本不是獨立的 snapshot（它是主體的逐 byte 複製，
+    /// format-v3-draft §13.5），列出時排除。
     pub async fn list_snapshot_keys(&self) -> Result<Vec<String>> {
         let mut keys: Vec<String> = self
             .backend()
@@ -42,6 +44,7 @@ impl Repository {
             .await?
             .into_iter()
             .map(|o| o.key)
+            .filter(|k| !k.ends_with(kist_format::keys::REPLICA_SUFFIX))
             .collect();
         keys.sort_by(|a, b| timestamp_of(a).cmp(timestamp_of(b)).then_with(|| a.cmp(b)));
         Ok(keys)
