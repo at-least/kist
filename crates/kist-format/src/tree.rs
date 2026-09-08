@@ -197,6 +197,7 @@ impl Entry {
         // 名稱：一律單一路徑元件（v3 沒有合成根的例外）。
         if self.name.is_empty()
             || self.name.contains(&b'/')
+            || self.name.contains(&0)
             || self.name == b"."
             || self.name == b".."
         {

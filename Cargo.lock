@@ -1826,6 +1826,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "kist-format",
  "object_store",
  "openssh-sftp-client",
  "reqwest",
@@ -1835,6 +1836,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

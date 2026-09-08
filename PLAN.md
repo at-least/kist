@@ -217,6 +217,35 @@ kist/
 （56 個測試執行檔零失敗）、`cargo deny check` 四項 ok（修復 RUSTSEC-2024-0384
 紅燈後，見已接受的限制）、MinIO S3 整合測試（contract + s3 共七案）全過。
 
+## M7：format v3 ＋ 遠端來源（2026-09-08 起）【進行中】
+
+新輸入兩個：**遠端來源需求**（`kist backup sftp://…`/`s3://…`，client 當
+轉運、金鑰不出機器）與 v1/v2 教訓清單。設計立場：v2 核心全保留（有 PoC
+與 200-case proptest 背書），變更外科手術式九項，每項對應教訓或需求
+（ADR 016；規格草案 `docs/format-v3-draft.md`，定案後逐 byte 取代
+`docs/format.md` 成唯一權威副本）。
+
+- 設計草案＋advisor 檢查點【完成 2026-09-08，commit 7e626db】：advisor
+  抓出 touch 用 PutIfAbsent 的**資料遺失級競態**（第二次 backup 重用已
+  標記樹時 mtime 不刷新 → prune 誤刪 → snapshot 懸掛），修為覆寫式 Put
+  ＋commit 檢查收窄，時間線釘成向量 V3-GC-5。
+- kist-rs 全面遷移【完成 2026-09-08，commit f256642】：roots 取代合成根、
+  stats 只留資料事實（過程計數移 `BackupReport`）、Entry metadata 聯集
+  （mk＋etag/vern，posix uid/gid 必填）、Invariants 入 wrapped 密文、
+  min_reader、touch 復活＋驗證式自愈、`.r1` 副本（GC 成組、孤兒不自動
+  刪）、index 壓縮觸發（>64）、restore/mount 的 roots 映射與檔案來源
+  落點。gate：fmt/clippy -D warnings/270 測試零失敗/deny 四項 ok。
+  過程中修掉：snapshot 列表未排除 `.r1`、commit 檢查誤比 write-once 樹的
+  mtime、檔案來源被丟棄。
+- 遠端來源（Source 抽象）【進行中】：`kist-backend::source`（Local/
+  ObjectStore-backed SFTP/S3，blocking Read 橋接）已完成；walker 接線與
+  etag 快速路徑測試進行中。
+- kist-go 鏡射 v3【進行中】：對齊 Rust 端錄製的 v3 向量（金鑰、tree
+  canonical CBOR、parity）。
+- 待辦：gc_race 200-case 在 touch 語意下重跑（含 V3-GC-5 時間線）、
+  雙向 E2E、規格正式取代＋CI 逐 byte 同步檢查、replica 專門測試、
+  大 repo 記憶體重審（SourceItem 進走訪清單後的峰值）。
+
 ## 已接受的限制（非待辦）
 
 - **Windows VSS 與 Windows 路徑語意驗證**：裁示為已接受的限制，自路線圖移除

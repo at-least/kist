@@ -131,6 +131,7 @@ async fn run_job_inner(
                 gc_grace: b.gc_grace.unwrap_or(kist_core::DEFAULT_GC_GRACE),
                 parity: b.parity,
                 progress,
+                source: kist_core::SourceSpec::default(),
             };
             let paths: Vec<PathBuf> = b.paths.clone();
             let summary = repo.backup(&paths, opts).await?;

@@ -111,6 +111,7 @@ fn opts(client: u8, now: OffsetDateTime) -> BackupOptions {
         gc_grace: 72 * H,
         parity: 0,
         progress: None,
+        source: kist_core::SourceSpec::default(),
     }
 }
 

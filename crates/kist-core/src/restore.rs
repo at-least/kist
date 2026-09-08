@@ -86,6 +86,17 @@ pub struct RestoreSummary {
     pub errors: Vec<String>,
 }
 
+/// 套用 metadata（mtime；mode 一起）。mtime **沒記錄**的 entry（§8 聯集裡
+/// s3/generic 的缺席＝來源未知）不動目標的時間——設成 epoch 比不設更糟；
+/// 這種 entry 也不會帶 mode（§8.1），所以整個 apply 可以省。posix/sftp 的
+/// mtime 必填，行為不變。
+fn apply_meta(path: &Path, node: &Entry, is_symlink: bool) -> Result<()> {
+    if node.mtime_ns.is_none() {
+        return Ok(());
+    }
+    fsmeta::apply(path, &fsmeta::meta_of_entry(node), is_symlink)
+}
+
 impl Repository {
     /// 還原到 `target`。目標目錄最好是空的：既有檔案會被覆寫、既有 symlink 會被跟隨。
     pub async fn restore(
@@ -141,7 +152,6 @@ impl Repository {
         hardlinks: &'a mut std::collections::HashMap<(u64, u64), PathBuf>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            let meta = fsmeta::meta_of_entry(node);
             let result = match node.kind {
                 node_type::DIR if !node.subtree.is_zero() => {
                     self.restore_dir(&node.subtree, node, path, index, summary, hardlinks)
@@ -180,7 +190,7 @@ impl Repository {
                             // xattr 在 times/mode **之前**：記錄的 mode 可能是唯讀，
                             // 之後 user.* 會設不進去（EACCES）。
                             fsmeta::apply_xattrs(path, node.xattrs.as_ref())
-                                .and_then(|()| fsmeta::apply(path, &meta, false))
+                                .and_then(|()| apply_meta(path, node, false))
                         }
                         Err(e) => {
                             // 別留下寫到一半的檔案：使用者會誤以為它是完整的
@@ -199,7 +209,7 @@ impl Repository {
                                     path.display()
                                 );
                             }
-                            fsmeta::apply(path, &meta, true)
+                            apply_meta(path, node, true)
                         }
                         Err(e) => Err(e),
                     },
@@ -240,7 +250,7 @@ impl Repository {
         summary.dirs += 1;
         // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋；xattr 在 times/mode 之前
         fsmeta::apply_xattrs(path, node.xattrs.as_ref())?;
-        fsmeta::apply(path, &fsmeta::meta_of_entry(node), false)
+        apply_meta(path, node, false)
     }
 
     async fn restore_file(

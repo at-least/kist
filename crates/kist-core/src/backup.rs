@@ -17,6 +17,13 @@
 //! （本機絕對路徑；遠端來源是 `sftp://…`/`s3://…`，見 Source 抽象），
 //! 樹節點名**一律**是單一路徑元件（v2 的合成根已淘汰）。
 //!
+//! 走訪消費 `kist_backend::Source`（本機 = `LocalSource`，遠端 = URL 開出的
+//! `ObjectStoreSource`，測試可注入）：「直接遠端備份」就是 client 當轉運——
+//! 讀遠端 → 切塊 → 加密 → 上傳，金鑰不出機器。metadata 依來源種類記錄
+//! （format-v3-draft §8 的聯集），快速路徑依 §8.2 分級：posix 用 ctime+inode
+//! （kernel 背書）、s3 用 etag+size（來源計算的內容指紋）、sftp/generic
+//! 一律重讀。
+//!
 //! 面對 GC：
 //! - 開始時列 `gc/`：被標記的 pack **不拿來去重**，裡面的 chunk 重寫一份。backup 因此不需要
 //!   刪標記（維持 Put-only），prune 第二階段看到新 snapshot 引用會自己撤銷標記。
@@ -27,10 +34,10 @@
 //!   prune 單次 HEAD→DELETE TOCTOU 視窗的防線（平常是空集合，零成本）。
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use kist_backend::source::{LocalSource, Source, SourceItem, SourceItemKind};
 use kist_backend::{Backend, BackendError};
 use kist_chunker::Chunker;
 use kist_crypto::RepoKeys;
@@ -59,6 +66,44 @@ const MAX_INFLIGHT_UPLOADS: usize = 1;
 /// GC 標記到真正刪除之間的最短時間（與 `prune` 的預設一致）。
 pub const DEFAULT_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
 
+/// 備份來源的指定（[`BackupOptions::source`]）。
+#[derive(Default)]
+pub enum SourceSpec {
+    /// `paths` 是本機檔案系統路徑（可多個；預設）。
+    #[default]
+    LocalPaths,
+    /// 單一遠端 URL（`sftp://`、`s3://`）：`backup`/`backup_prepare` 的
+    /// `paths` 必須正好是這個 URL——整個 backup 只有這一個 root。
+    Url(String),
+    /// 直接注入來源（測試與程式內嵌用）：給定 `Source` 與 `Root.path` 的
+    /// 定位 bytes，不經 `open_source`；`paths` 被忽略。
+    Injected(Arc<dyn Source>, Vec<u8>),
+}
+
+// `Arc<dyn Source>` 沒有 Debug（trait object 不帶），手動把定位印出來。
+impl std::fmt::Debug for SourceSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalPaths => f.write_str("LocalPaths"),
+            Self::Url(url) => f.debug_tuple("Url").field(url).finish(),
+            Self::Injected(_, locator) => f
+                .debug_tuple("Injected")
+                .field(&String::from_utf8_lossy(locator))
+                .finish(),
+        }
+    }
+}
+
+impl Clone for SourceSpec {
+    fn clone(&self) -> Self {
+        match self {
+            Self::LocalPaths => Self::LocalPaths,
+            Self::Url(url) => Self::Url(url.clone()),
+            Self::Injected(source, locator) => Self::Injected(Arc::clone(source), locator.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupOptions {
     pub client_id: [u8; 16],
@@ -73,6 +118,8 @@ pub struct BackupOptions {
     pub parity: u8,
     /// 進度回報（給 UI 顯示）；`None` = 不回報。
     pub progress: Option<ProgressCallback>,
+    /// 備份來源（預設 [`SourceSpec::LocalPaths`]：`paths` 是本機路徑）。
+    pub source: SourceSpec,
 }
 
 /// **過程計數**（v3 起不在格式裡——它們依 GC 狀態與去重順序而變，兩個實作
@@ -147,6 +194,122 @@ struct ChunkState<R: std::io::Read> {
     reused: Vec<(ChunkId, ObjectId)>,
 }
 
+/// 走訪端看到的檔案事實（Source 的 list 回報）：快速路徑與硬連結判別用。
+/// `size` 是 list 當下的大小；切塊後 size 用實際讀到的長度。
+struct FileFacts {
+    size: u64,
+    /// 本機來源才有（§8.2 的 ctime/inode 證明、§8.3 的硬連結）。
+    posix: Option<kist_backend::fsmeta::PosixMeta>,
+    /// s3 來源的內容指紋（§8.2 的快速路徑）。
+    etag: Option<Vec<u8>>,
+}
+
+/// 一個 root 的走訪環境：每個 root 各自的來源，與（本機來源時）把 rel
+/// 對應回本機路徑的根——xattr 讀取與進度顯示用；遠端來源 = `None`。
+struct SourceCtx {
+    source: Arc<dyn Source>,
+    local_root: Option<PathBuf>,
+}
+
+impl SourceCtx {
+    /// 進度/警告用的顯示路徑：本機 = 根 + rel 的完整路徑；遠端 = rel 的 lossy 字串。
+    fn display_path(&self, rel: &[u8]) -> String {
+        match self.join_local(rel) {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => String::from_utf8_lossy(rel).into_owned(),
+        }
+    }
+
+    /// rel → 本機絕對路徑（xattr 讀取用）；遠端來源沒有本機根，回 `None`。
+    fn join_local(&self, rel: &[u8]) -> Option<PathBuf> {
+        let mut p = self.local_root.clone()?;
+        for comp in rel.split(|&b| b == b'/') {
+            if !comp.is_empty() {
+                p.push(kist_backend::fsmeta::bytes_to_os(comp));
+            }
+        }
+        Some(p)
+    }
+}
+
+/// rel 路徑 join：來源層的路徑一律以 `/` 分隔的 bytes。
+fn join_rel(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(dir.len() + name.len() + 1);
+    v.extend_from_slice(dir);
+    if !dir.is_empty() {
+        v.push(b'/');
+    }
+    v.extend_from_slice(name);
+    v
+}
+
+/// posix 欄位（§8.1）：mode/uid/gid/mtime 必填（uid 0 = root 是真實值）；
+/// ctime 有才記；dev/ino/nlink 只在檔案且 nlink>1 時記（§8.3 的硬連結識別）。
+fn fill_posix_meta(entry: &mut Entry, posix: &kist_backend::fsmeta::PosixMeta, is_file: bool) {
+    entry.mode = Some(posix.mode);
+    entry.uid = Some(posix.uid);
+    entry.gid = Some(posix.gid);
+    entry.mtime_ns = Some(posix.mtime_ns);
+    entry.ctime_ns = Some(posix.ctime_ns).filter(|v| *v != 0);
+    if is_file && posix.nlink > 1 {
+        entry.dev = Some(posix.dev);
+        entry.inode = Some(posix.inode);
+        entry.nlink = Some(posix.nlink);
+    }
+}
+
+/// 本機單一檔案/symlink root 的 [`SourceItem`]：直接 lstat 這個路徑，
+/// 不列整個父目錄——大目錄與兄弟項目的讀取錯誤都不該擋住這個 root。
+fn local_file_item(path: &Path, name: &[u8]) -> Result<SourceItem> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
+    let posix = kist_backend::fsmeta::capture(&meta);
+    let kind = if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|e| CoreError::io(path, e))?;
+        SourceItemKind::Symlink {
+            target: fsmeta::path_to_bytes(&target)?,
+        }
+    } else {
+        SourceItemKind::File {
+            size: meta.len(),
+            mtime_ns: posix.mtime_ns,
+            etag: None,
+            vern: None,
+        }
+    };
+    Ok(SourceItem {
+        name: name.to_vec(),
+        kind,
+        posix: Some(posix),
+    })
+}
+
+/// 備份來源的規劃結果（`backup_prepare` 決定好，走訪端照做）。
+enum RootPlan {
+    /// 本機目錄：來源根在該目錄，rel 從空字串開始。
+    LocalDir(PathBuf),
+    /// 本機檔案/symlink：來源根在其父目錄，root tree 只有最後元件一個 entry。
+    LocalFile(PathBuf),
+    /// 遠端/注入來源：root 型態（目錄或單一檔案）走訪前用 `list(b"")` 判別。
+    Remote(Arc<dyn Source>),
+}
+
+/// 檔案 root 的 parent entry（parent snapshot 同 path root 的 tree 裡、
+/// 同名檔案的節點）；讀不到就沒有快速路徑，重讀。
+async fn parent_file_entry(
+    repo: &Repository,
+    parent_roots: &[(Vec<u8>, TreeId)],
+    pb: &[u8],
+    name: &[u8],
+) -> Option<Entry> {
+    match parent_roots.iter().find(|(pp, _)| pp.as_slice() == pb) {
+        Some((_, t)) => match ParentStream::open(repo, t).await {
+            Ok(mut s) => s.take_name(name).await,
+            Err(_) => None,
+        },
+        None => None,
+    }
+}
+
 struct Backup {
     repo: Repository,
     chunker: Chunker,
@@ -186,19 +349,20 @@ struct Backup {
 }
 
 /// 呼叫進度 callback（有設才做）。stats/report 是幾個 u64 的 copy，成本可忽略。
+/// `current` 是目前處理路徑的顯示字串（本機 = 絕對路徑，遠端 = rel 的 lossy）。
 fn report_progress(
     progress: Option<&ProgressCallback>,
     phase: &'static str,
     stats: SnapshotStats,
     report: BackupReport,
-    current: Option<&Path>,
+    current: Option<String>,
 ) {
     if let Some(cb) = progress {
         (cb.0)(&BackupProgress {
             phase,
             stats,
             report,
-            current: current.map(|p| p.to_string_lossy().into_owned()),
+            current,
         });
     }
 }
@@ -531,31 +695,67 @@ impl Repository {
     ) -> Result<PreparedBackup> {
         // snapshot 的時間 = 開始時間：任何在這之後改動的檔案，下一次都必須重讀
         let started = opts.now.unwrap_or_else(time::OffsetDateTime::now_utc);
-        let mut abs_paths = Vec::new();
-        for p in paths {
-            let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
-            abs_paths.push(abs);
-        }
-        // roots 依 path bytes 排序（format-v3-draft §9），不是 PathBuf 的順序
-        let mut with_bytes = Vec::new();
-        for p in abs_paths {
-            with_bytes.push((fsmeta::path_to_bytes(&p)?, p));
-        }
-        with_bytes.sort();
-        with_bytes.dedup();
-        // `/a` 與 `/a/b` 同時給：只留 `/a`，否則 b 會備份兩次、restore 時重建同一條路徑
-        let mut kept: Vec<(Vec<u8>, PathBuf)> = Vec::new();
-        for (bytes, path) in with_bytes {
-            if kept.iter().any(|(_, outer)| path.starts_with(outer)) {
-                tracing::warn!(
-                    "{}: already covered by another source path; skipped",
-                    path.display()
-                );
-                continue;
+
+        // 來源規劃。遠端 URL/注入 = 單一 root；本機 = 多路徑：canonicalize、
+        // 依 path bytes 排序去重、`/a` 蓋掉 `/a/b`。
+        let plans: Vec<(Vec<u8>, RootPlan)> = match &opts.source {
+            SourceSpec::LocalPaths => {
+                let mut abs_paths = Vec::new();
+                for p in paths {
+                    let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
+                    abs_paths.push(abs);
+                }
+                // roots 依 path bytes 排序（format-v3-draft §9），不是 PathBuf 的順序
+                let mut with_bytes = Vec::new();
+                for p in abs_paths {
+                    with_bytes.push((fsmeta::path_to_bytes(&p)?, p));
+                }
+                with_bytes.sort();
+                with_bytes.dedup();
+                // `/a` 與 `/a/b` 同時給：只留 `/a`，否則 b 會備份兩次、restore 時重建同一條路徑
+                let mut kept: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+                for (bytes, path) in with_bytes {
+                    if kept.iter().any(|(_, outer)| path.starts_with(outer)) {
+                        tracing::warn!(
+                            "{}: already covered by another source path; skipped",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    kept.push((bytes, path));
+                }
+                kept.into_iter()
+                    .map(|(bytes, path)| {
+                        // 檔案（或 symlink）當 root：root tree 含單一 entry
+                        // （名稱 = 路徑的最後元件）——mount/restore 瀏覽成
+                        // `base/<name>`。root 必須讀得到，錯了就失敗。
+                        let meta = std::fs::symlink_metadata(&path)
+                            .map_err(|e| CoreError::io(&path, e))?;
+                        let plan = if meta.is_dir() {
+                            RootPlan::LocalDir(path)
+                        } else {
+                            RootPlan::LocalFile(path)
+                        };
+                        Ok((bytes, plan))
+                    })
+                    .collect::<Result<Vec<_>>>()?
             }
-            kept.push((bytes, path));
-        }
-        let (path_bytes, abs_paths): (Vec<Vec<u8>>, Vec<PathBuf>) = kept.into_iter().unzip();
+            SourceSpec::Url(url) => {
+                // 遠端：paths 必須正好是這個 URL（單一 root，不做去巢——
+                // URL 是不透明定位）。
+                if paths.len() != 1 || paths[0] != Path::new(url.as_str()) {
+                    return Err(CoreError::Usage(format!(
+                        "a remote source URL backs up exactly one root: pass only {url:?} as the path"
+                    )));
+                }
+                let source: Arc<dyn Source> = kist_backend::source::open_source(url).await?.into();
+                vec![(url.as_bytes().to_vec(), RootPlan::Remote(source))]
+            }
+            SourceSpec::Injected(source, locator) => {
+                vec![(locator.clone(), RootPlan::Remote(Arc::clone(source)))]
+            }
+        };
+        let path_bytes: Vec<Vec<u8>> = plans.iter().map(|(b, _)| b.clone()).collect();
 
         // 標記先於 index（與 Go 版同一個 load-bearing 順序）：backup 的
         // index 合併需要標記集合（未標記 pack 優先，規格 §10）。
@@ -613,49 +813,98 @@ impl Repository {
         // 檔案（或 symlink）當來源：root tree 含單一 entry（名稱 = 路徑的
         // 最後元件）——mount/restore 瀏覽成 `base/<name>`。
         let mut roots = Vec::new();
-        for (path, pb) in abs_paths.iter().zip(path_bytes.iter()) {
+        for (pb, plan) in plans {
             let parent_subtree = parent_roots
                 .iter()
                 .find(|(pp, _)| pp.as_slice() == pb.as_slice())
                 .map(|(_, t)| *t);
-            let meta = std::fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
-            let tree = if meta.is_dir() {
-                b.walk_dir(path, parent_subtree).await?
-            } else {
-                let name = pb
-                    .rsplit(|&b| b == b'/')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
+            let tree = match plan {
+                RootPlan::LocalDir(path) => {
+                    let ctx = SourceCtx {
+                        source: Arc::new(LocalSource::new(path.clone())?),
+                        local_root: Some(path.clone()),
+                    };
+                    b.walk_dir(&ctx, b"", parent_subtree).await?
+                }
+                RootPlan::LocalFile(path) => {
+                    let name = pb
+                        .rsplit(|&b| b == b'/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            CoreError::Usage(format!(
+                                "cannot derive a name for source path {}",
+                                path.display()
+                            ))
+                        })?
+                        .to_vec();
+                    let parent = path.parent().ok_or_else(|| {
                         CoreError::Usage(format!(
-                            "cannot derive a name for source path {}",
+                            "cannot derive a parent directory for source path {}",
                             path.display()
                         ))
-                    })?
-                    .to_vec();
-                let parent_entry = match parent_roots
-                    .iter()
-                    .find(|(pp, _)| pp.as_slice() == pb.as_slice())
-                {
-                    Some((_, t)) => match ParentStream::open(self, t).await {
-                        Ok(mut s) => s.take_name(&name).await,
-                        Err(_) => None,
-                    },
-                    None => None,
-                };
-                let Some(entry) = b
-                    .process_entry(path, name, &meta, parent_entry.as_ref())
-                    .await?
-                else {
-                    return Err(CoreError::Usage(format!(
-                        "{}: source could not be read",
-                        path.display()
-                    )));
-                };
-                b.write_tree(Tree::new(vec![entry], None)).await?
+                    })?;
+                    let ctx = SourceCtx {
+                        source: Arc::new(LocalSource::new(parent.to_path_buf())?),
+                        local_root: Some(parent.to_path_buf()),
+                    };
+                    let item = local_file_item(&path, &name)?;
+                    let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
+                    let Some(entry) = b
+                        .process_entry(&ctx, &name, item, parent_entry.as_ref())
+                        .await?
+                    else {
+                        return Err(CoreError::Usage(format!(
+                            "{}: source could not be read",
+                            path.display()
+                        )));
+                    };
+                    b.write_tree(Tree::new(vec![entry], None)).await?
+                }
+                RootPlan::Remote(source) => {
+                    let ctx = SourceCtx {
+                        source,
+                        local_root: None,
+                    };
+                    // 遠端 root 的型態要靠列根判別：「恰好一個 File 且名稱＝
+                    // 定位的最後元件」→ 檔案來源（與 restore 的 file-root
+                    // 規則一致，format-v3-draft §9）。這合約要求 Source 在
+                    // 根指向單一檔案時，`list(b"")` 列得出那個檔案本身；
+                    // 列不出來的來源會被當成目錄走訪（SFTP 上列一個檔案路徑
+                    // 會直接失敗 → backup 失敗，不會悄悄留下空樹）。列根失
+                    // 敗＝來源本身進不去，直接失敗——這不是「某個項目讀不
+                    // 到」，不適合部分備份。
+                    let items = ctx.source.list(b"")?;
+                    let last = pb.rsplit(|&b| b == b'/').next().filter(|s| !s.is_empty());
+                    let file_root = match (items.as_slice(), last) {
+                        ([item], Some(last))
+                            if matches!(&item.kind, SourceItemKind::File { .. })
+                                && item.name == last =>
+                        {
+                            Some(item.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(item) = file_root {
+                        let name = item.name.clone();
+                        let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
+                        let Some(entry) = b
+                            .process_entry(&ctx, &name, item, parent_entry.as_ref())
+                            .await?
+                        else {
+                            return Err(CoreError::Usage(format!(
+                                "{}: source could not be read",
+                                String::from_utf8_lossy(&pb)
+                            )));
+                        };
+                        b.write_tree(Tree::new(vec![entry], None)).await?
+                    } else {
+                        b.walk_dir(&ctx, b"", parent_subtree).await?
+                    }
+                }
             };
             roots.push(Root {
-                path: serde_bytes::ByteBuf::from(pb.clone()),
+                path: serde_bytes::ByteBuf::from(pb),
                 tree,
             });
         }
@@ -768,7 +1017,7 @@ impl Repository {
 
 impl Backup {
     /// 回報目前進度（有 callback 才做）。
-    fn report_phase(&self, phase: &'static str, current: Option<&Path>) {
+    fn report_phase(&self, phase: &'static str, current: Option<String>) {
         report_progress(
             self.progress.as_ref(),
             phase,
@@ -778,45 +1027,46 @@ impl Backup {
         );
     }
 
-    /// 處理一個目錄項目，回傳它的 tree 節點；不支援的類型回 `None`（略過並警告）。
+    /// 處理一個目錄項目，回傳它的 tree 節點；讀不到的回 `None`（略過並警告）。
     /// 不論結果如何（寫進 tree、略過、記成錯誤），做完都回報一次進度。
     async fn process_entry(
         &mut self,
-        path: &Path,
-        name: Vec<u8>,
-        meta: &std::fs::Metadata,
+        ctx: &SourceCtx,
+        rel: &[u8],
+        item: SourceItem,
         parent: Option<&Entry>,
     ) -> Result<Option<Entry>> {
-        let node = self.process_entry_inner(path, name, meta, parent).await?;
-        self.report_phase("files", Some(path));
+        let node = self.process_entry_inner(ctx, rel, item, parent).await?;
+        let display = ctx.display_path(rel);
+        self.report_phase("files", Some(display));
         Ok(node)
     }
 
     async fn process_entry_inner(
         &mut self,
-        path: &Path,
-        name: Vec<u8>,
-        meta: &std::fs::Metadata,
+        ctx: &SourceCtx,
+        rel: &[u8],
+        item: SourceItem,
         parent: Option<&Entry>,
     ) -> Result<Option<Entry>> {
-        let ft = meta.file_type();
-        let fs = fsmeta::capture(meta);
-        // v3：本機走訪一律是 posix kind（mode/uid/gid/mtime 必填——uid 0 = root
-        // 是真實值；ctime/dev/ino/nlink 有才記）。
+        let mk = ctx.source.meta_kind();
+        // 來源能證明什麼就記什麼（format-v3-draft §8 的 metadata 聯集）：
+        // posix 記全套；sftp 只有 mtime（mode/uid/gid 來源有才記）；s3 只有
+        // mtime/etag/vern。缺席欄位一律 `None`（＝來源未知，不是 0）。
         let mut entry = Entry {
-            name,
+            name: item.name.clone(),
             kind: 0,
-            meta_kind: meta_kind::POSIX,
+            meta_kind: mk,
             size: 0,
             target: Vec::new(),
             content: content_type::DIRECT,
             chunks: Vec::new(),
             subtree: TreeId::ZERO,
-            mode: Some(fs.mode),
-            uid: Some(fs.uid),
-            gid: Some(fs.gid),
-            mtime_ns: Some(fs.mtime_ns),
-            ctime_ns: Some(fs.ctime_ns).filter(|v| *v != 0),
+            mode: None,
+            uid: None,
+            gid: None,
+            mtime_ns: None,
+            ctime_ns: None,
             dev: None,
             inode: None,
             nlink: None,
@@ -824,45 +1074,97 @@ impl Backup {
             etag: None,
             vern: None,
         };
-        if ft.is_symlink() {
-            let target = match std::fs::read_link(path) {
-                Ok(t) => t,
-                Err(e) => return Ok(self.skip(path, &e.to_string())),
-            };
-            self.stats.symlinks += 1;
-            entry.kind = node_type::SYMLINK;
-            entry.target = fsmeta::path_to_bytes(&target)?;
-        } else if ft.is_dir() {
-            let parent_subtree = match parent {
-                Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
-                _ => None,
-            };
-            let subtree = self.walk_dir(path, parent_subtree).await?;
-            self.stats.dirs += 1;
-            entry.kind = node_type::DIR;
-            entry.subtree = subtree;
-        } else if ft.is_file() {
-            let Some((size, chunks, content)) =
-                self.process_file(path, &fs, meta.len(), parent).await?
-            else {
-                return Ok(None); // 讀不到，已記錄
-            };
-            self.stats.files += 1;
-            entry.kind = node_type::FILE;
-            entry.size = size;
-            entry.chunks = chunks;
-            entry.content = content;
-            // 硬連結：記下識別，restore 才能重建連結而不是第二份複本。
-            if fs.nlink > 1 {
-                entry.dev = Some(fs.dev);
-                entry.inode = Some(fs.inode);
-                entry.nlink = Some(fs.nlink);
+        match item.kind {
+            SourceItemKind::Symlink { target } => {
+                // 只有本機（posix）來源有 symlink（source.rs 的合約）。
+                self.stats.symlinks += 1;
+                entry.kind = node_type::SYMLINK;
+                entry.target = target;
+                if let Some(posix) = &item.posix {
+                    fill_posix_meta(&mut entry, posix, false);
+                }
             }
-        } else {
-            tracing::warn!("{}: unsupported file type, skipped", path.display());
-            return Ok(None);
+            SourceItemKind::Dir => {
+                let parent_subtree = match parent {
+                    Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
+                    _ => None,
+                };
+                let subtree = self.walk_dir(ctx, rel, parent_subtree).await?;
+                self.stats.dirs += 1;
+                entry.kind = node_type::DIR;
+                entry.subtree = subtree;
+                match mk {
+                    meta_kind::POSIX => {
+                        if let Some(posix) = &item.posix {
+                            fill_posix_meta(&mut entry, posix, false);
+                        }
+                    }
+                    meta_kind::SFTP => {
+                        // §8.1 的 sftp 必填 mtime，但 object_store 的 common
+                        // prefix 沒有時間——目錄改記 generic（保守 kind：欄位
+                        // 全空），讀取端驗證才會過，restore 也不會把目錄時間
+                        // 設成 epoch。s3 目錄本來就全選填，維持 s3 + 空欄位。
+                        entry.meta_kind = meta_kind::GENERIC;
+                    }
+                    _ => {}
+                }
+            }
+            SourceItemKind::File {
+                size,
+                mtime_ns,
+                etag,
+                vern,
+            } => {
+                let facts = FileFacts {
+                    size,
+                    posix: item.posix,
+                    etag: etag.clone(),
+                };
+                let Some((fsize, chunks, content)) =
+                    self.process_file(ctx, rel, &facts, parent).await?
+                else {
+                    return Ok(None); // 讀不到，已記錄
+                };
+                self.stats.files += 1;
+                entry.kind = node_type::FILE;
+                entry.size = fsize;
+                entry.chunks = chunks;
+                entry.content = content;
+                entry.mtime_ns = Some(mtime_ns);
+                if mk == meta_kind::S3 {
+                    // etag/vern 只在 s3 記（§8.1：sftp/generic 必須缺席）。
+                    entry.etag = etag.map(serde_bytes::ByteBuf::from);
+                    entry.vern = vern.map(serde_bytes::ByteBuf::from);
+                }
+                match mk {
+                    meta_kind::POSIX => match facts.posix {
+                        Some(posix) => fill_posix_meta(&mut entry, &posix, true),
+                        None => {
+                            // posix 來源卻沒有 posix metadata：來源不合約，略過。
+                            let display = ctx.display_path(rel);
+                            self.skip(&display, "posix source did not provide metadata");
+                            return Ok(None);
+                        }
+                    },
+                    meta_kind::SFTP => {
+                        // mode/uid/gid：來源有就記（object_store 沒有 → 缺席＝
+                        // 未知）；ctime/dev/ino/nlink/etag/vern 一律缺席。
+                        if let Some(posix) = &facts.posix {
+                            entry.mode = Some(posix.mode);
+                            entry.uid = Some(posix.uid);
+                            entry.gid = Some(posix.gid);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-        entry.xattrs = fsmeta::read_xattrs(path);
+        // xattrs 只有本機（posix）來源：讀 rel 對應的本機路徑。
+        if mk == meta_kind::POSIX {
+            if let Some(path) = ctx.join_local(rel) {
+                entry.xattrs = fsmeta::read_xattrs(&path);
+            }
+        }
         Ok(Some(entry))
     }
 
@@ -871,7 +1173,8 @@ impl Backup {
     /// `Send`：讓整個 backup 的 future 能被 `tokio::spawn`（daemon 在別的 task 上跑工作）。
     fn walk_dir<'a>(
         &'a mut self,
-        path: &'a Path,
+        ctx: &'a SourceCtx,
+        dir_rel: &'a [u8],
         parent_subtree: Option<TreeId>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TreeId>> + Send + 'a>> {
         Box::pin(async move {
@@ -888,54 +1191,30 @@ impl Backup {
                 None => None,
             };
 
-            // 只留名稱 bytes，完整路徑處理到該項目時才 join：1M 檔的平面
-            // 目錄，名稱 bytes ≈ 45 MiB；存 (bytes, OsString, PathBuf) 之類
-            // 的重複欄位會多出上百 MiB。
-            let mut names: Vec<Vec<u8>> = Vec::new();
-            match std::fs::read_dir(path) {
-                Ok(rd) => {
-                    for entry in rd {
-                        let entry = match entry {
-                            Ok(e) => e,
-                            Err(e) => {
-                                self.skip(path, &e.to_string());
-                                continue;
-                            }
-                        };
-                        match fsmeta::name_to_bytes(&entry.file_name()) {
-                            Ok(name) => names.push(name),
-                            Err(e) => {
-                                self.skip(&entry.path(), &e.to_string());
-                            }
-                        }
-                    }
-                }
+            let items = match ctx.source.list(dir_rel) {
+                Ok(items) => items,
                 Err(e) => {
                     // 讀不到的目錄：記錄並以空目錄寫出，其他部分照常備份
-                    self.skip(path, &e.to_string());
+                    let display = ctx.display_path(dir_rel);
+                    self.skip(&display, &e.to_string());
+                    return self.write_tree(Tree::new(Vec::new(), None)).await;
                 }
-            }
-            names.sort();
+            };
+            // Source 合約說條目已依名稱 bytes 排序；再排一次是便宜的保險——
+            // 讀取端強制 entries 依名稱升冪（format-v3-draft §8）。
+            let mut items = items;
+            items.sort_by(|a, b| a.name.cmp(&b.name));
 
             let mut children: Vec<Entry> = Vec::new();
             let mut prev = None;
-            for name in names {
-                let child_name = fsmeta::bytes_to_name(&name)?;
-                let child_path = path.join(&child_name);
-                let meta = match std::fs::symlink_metadata(&child_path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        // 走訪途中被刪掉的檔案：略過，不讓整個 backup 失敗
-                        tracing::warn!("{}: {e}, skipped", child_path.display());
-                        continue;
-                    }
-                };
+            for item in items {
+                let child_rel = join_rel(dir_rel, &item.name);
                 let parent_entry = match parent_stream.as_mut() {
-                    Some(s) => s.take_name(&name).await,
+                    Some(s) => s.take_name(&item.name).await,
                     None => None,
                 };
                 let entry = self
-                    .process_entry(&child_path, name, &meta, parent_entry.as_ref())
+                    .process_entry(ctx, &child_rel, item, parent_entry.as_ref())
                     .await?;
                 if let Some(entry) = entry {
                     children.push(entry);
@@ -1002,8 +1281,9 @@ impl Backup {
     }
 
     /// 記錄一個讀不到的項目：警告、計數、不寫進 tree。回傳 `None` 方便呼叫端直接 return。
-    fn skip(&mut self, path: &Path, reason: &str) -> Option<Entry> {
-        tracing::warn!("{}: {reason}; skipped", path.display());
+    ///（參數名避開 `display`：tracing 巨集把它保留給欄位包裝函式。）
+    fn skip(&mut self, what: &str, reason: &str) -> Option<Entry> {
+        tracing::warn!("{what}: {reason}; skipped");
         self.report.errors += 1;
         None
     }
@@ -1012,44 +1292,48 @@ impl Backup {
     /// 回傳 (size, chunks, content 型態)；`None` 表示讀不到、已記錄略過。
     async fn process_file(
         &mut self,
-        path: &Path,
-        fs: &fsmeta::FsMeta,
-        current_size: u64,
+        ctx: &SourceCtx,
+        rel: &[u8],
+        f: &FileFacts,
         parent: Option<&Entry>,
     ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
-        if let Some(reused) = self.try_reuse(fs, current_size, parent).await? {
+        if let Some(reused) = self.try_reuse(f, parent).await? {
             self.report.files_reused += 1;
             return Ok(Some(reused));
         }
-        // 硬連結：同一個 (dev, inode) 在這次 backup 已經讀過 → 直接沿用 chunk 清單。
-        if fs.nlink > 1 {
-            if let Some((size, chunks, content)) = self.hardlinks.get(&(fs.dev, fs.inode)).cloned()
-            {
+        // 硬連結（只有本機來源有）：同一個 (dev, inode) 在這次 backup 已經
+        // 讀過 → 直接沿用 chunk 清單。
+        let hl_key = f.posix.filter(|p| p.nlink > 1).map(|p| (p.dev, p.inode));
+        if let Some(key) = hl_key {
+            if let Some((size, chunks, content)) = self.hardlinks.get(&key).cloned() {
                 return Ok(Some((size, chunks, content)));
             }
         }
 
-        let file = match File::open(path) {
-            Ok(f) => f,
+        let reader = match ctx.source.read(rel) {
+            Ok(r) => r,
             Err(e) => {
-                self.skip(path, &e.to_string());
+                let display = ctx.display_path(rel);
+                self.skip(&display, &e.to_string());
                 return Ok(None);
             }
         };
-        // 直接把 File 交給 chunker：fill() 會讀滿自己的 2×max 緩衝，
+        // 直接把來源的 Read 串流交給 chunker：fill() 會讀滿自己的 2×max 緩衝，
         // BufReader 只是多一層 1 MiB 的 memcpy 與每檔一次的大配置。
-        let Some(result) = self.chunk_reader(file, path.to_path_buf()).await? else {
+        let display = ctx.display_path(rel);
+        let Some(result) = self.chunk_reader(reader, display).await? else {
             return Ok(None);
         };
-        // size 用實際讀到的長度，不用讀檔前的 metadata：備份途中被 append 的檔案兩者會不同
+        // size 用實際讀到的長度，不用 list 回報的大小：備份途中被 append 的檔案兩者會不同
         let size = result.bytes_total;
-        if fs.nlink > 1 {
-            // bytes 對同一份硬連結內容只算一次（§9.1；跨 roots）。
-            if self.counted_hardlinks.insert((fs.dev, fs.inode)) {
-                self.stats.bytes += result.bytes_total;
+        // bytes 對同一份硬連結內容只算一次（§9.1；跨 roots）。遠端沒有硬連結。
+        match hl_key {
+            Some(key) => {
+                if self.counted_hardlinks.insert(key) {
+                    self.stats.bytes += result.bytes_total;
+                }
             }
-        } else {
-            self.stats.bytes += result.bytes_total;
+            None => self.stats.bytes += result.bytes_total,
         }
         self.report.bytes_stored += result.bytes_new;
         self.report.chunks_new += result.chunks_new;
@@ -1060,26 +1344,28 @@ impl Backup {
             // 大檔：chunk 清單本身當資料存
             let list_bytes = cbor::encode(&ChunkList::new(result.chunks))?;
             let list_result = self
-                .chunk_reader(
-                    std::io::Cursor::new(list_bytes),
-                    PathBuf::from("<chunk list>"),
-                )
+                .chunk_reader(std::io::Cursor::new(list_bytes), "<chunk list>".to_owned())
                 .await?
                 .ok_or_else(|| CoreError::Join("chunk list read failed".into()))?;
             self.report.chunks_new += list_result.chunks_new;
             (size, list_result.chunks, content_type::INDIRECT)
         };
-        if fs.nlink > 1 {
-            self.hardlinks.insert((fs.dev, fs.inode), out.clone());
+        if let Some(key) = hl_key {
+            self.hardlinks.insert(key, out.clone());
         }
         Ok(Some(out))
     }
 
-    /// parent 快速路徑：metadata 沒變、而且它引用的**資料** chunk 全都在 index 裡才沿用。
+    /// parent 快速路徑，依 §8.2 分級（內容可證明 > kernel 可證明 > 來源聲稱）：
+    /// - posix：size + mtime + ctime + inode 都沒變（kernel 維護，含 racy guard）。
+    /// - s3：etag bytes + size 相同（etag 是來源**計算**的內容指紋，不需要
+    ///   時間 guard——mtime 再怎麼變都證明不了內容變過）。
+    /// - sftp/generic：沒有安全快速路徑，一律重讀，靠 chunk 去重吸收。
+    ///
+    /// 沿用還要求引用的**資料** chunk 全都在 index 裡。
     async fn try_reuse(
         &mut self,
-        fs: &fsmeta::FsMeta,
-        current_size: u64,
+        f: &FileFacts,
         parent: Option<&Entry>,
     ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
         let Some(pentry) = parent else {
@@ -1088,8 +1374,33 @@ impl Backup {
         if pentry.kind != node_type::FILE {
             return Ok(None);
         }
-        let pmeta = fsmeta::meta_of_entry(pentry);
-        if !fsmeta::file_unchanged(&pmeta, pentry.size, fs, current_size, self.parent_start_ns) {
+        let proven = match (f.posix.as_ref(), pentry.meta_kind) {
+            // 兩邊都要 posix：parent 若是別種來源寫的，ctime/inode 證明不成立。
+            (Some(posix), meta_kind::POSIX) => {
+                let pmeta = fsmeta::meta_of_entry(pentry);
+                let now = fsmeta::FsMeta {
+                    mode: posix.mode,
+                    uid: posix.uid,
+                    gid: posix.gid,
+                    mtime_ns: posix.mtime_ns,
+                    ctime_ns: posix.ctime_ns,
+                    inode: posix.inode,
+                    dev: posix.dev,
+                    nlink: posix.nlink,
+                };
+                fsmeta::file_unchanged(&pmeta, pentry.size, &now, f.size, self.parent_start_ns)
+            }
+            // s3：etag 是內容證明，bytes 與 size 相同即可沿用。
+            (None, meta_kind::S3) => match (&f.etag, &pentry.etag) {
+                (Some(etag), Some(petag)) => {
+                    petag.as_ref() == etag.as_slice() && pentry.size == f.size
+                }
+                _ => false,
+            },
+            // sftp/generic 一律重讀；kind 對不上（同一條路徑換了來源種類）也重讀。
+            _ => false,
+        };
+        if !proven {
             return Ok(None);
         }
         let content = pentry.content;
@@ -1133,10 +1444,10 @@ impl Backup {
         }
         self.record_referenced(packs);
         // bytes：非硬連結每個名字都算；硬連結同一份內容只算一次（§9.1）。
-        let count_bytes = if fs.nlink > 1 {
-            self.counted_hardlinks.insert((fs.dev, fs.inode))
-        } else {
-            true
+        // 遠端沒有硬連結（nlink 缺席），一律照算。
+        let count_bytes = match f.posix.filter(|p| p.nlink > 1) {
+            Some(p) => self.counted_hardlinks.insert((p.dev, p.inode)),
+            None => true,
         };
         if count_bytes {
             self.stats.bytes += pentry.size;
@@ -1158,7 +1469,8 @@ impl Backup {
     /// 切塊、去重、打包。每輪 blocking 最多封一個 pack 就回到 async 端上傳，
     /// 所以不管檔案多大，在飛的 pack 數都受 `MAX_INFLIGHT_UPLOADS` 限制。
     /// 讀取途中出錯回 `None`（已記錄略過；已寫進 pack 的 chunk 留著無害）。
-    async fn chunk_reader<R>(&mut self, reader: R, path: PathBuf) -> Result<Option<FileResult>>
+    /// `display` 只用於讀取失敗時的警告與進度顯示。
+    async fn chunk_reader<R>(&mut self, reader: R, display: String) -> Result<Option<FileResult>>
     where
         R: std::io::Read + Send + 'static,
     {
@@ -1271,7 +1583,7 @@ impl Backup {
             }
             if let Some(reason) = read_error {
                 self.chunk_bufs.push(state.chunks.take_buf());
-                self.skip(&path, &reason);
+                self.skip(&display, &reason);
                 return Ok(None);
             }
             if done {

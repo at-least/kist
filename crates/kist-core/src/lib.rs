@@ -29,7 +29,7 @@ pub mod restore;
 pub mod snapshots;
 
 pub use backup::{
-    BackupOptions, BackupProgress, BackupSummary, PreparedBackup, ProgressCallback,
+    BackupOptions, BackupProgress, BackupSummary, PreparedBackup, ProgressCallback, SourceSpec,
     DEFAULT_GC_GRACE,
 };
 pub use check::{CheckOptions, CheckReport};

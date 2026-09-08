@@ -24,7 +24,7 @@ use clap::{Args, Parser, Subcommand};
 use kist_backend::{Backend, RepoLocation};
 use kist_core::{
     BackupOptions, CheckOptions, ForgetOptions, ForgetSummary, InitOptions, PruneOptions,
-    PruneReport, Repository, RestoreOptions, RetentionPolicy,
+    PruneReport, Repository, RestoreOptions, RetentionPolicy, SourceSpec,
 };
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
@@ -131,11 +131,13 @@ enum Command {
         #[arg(long, value_name = "BYTES", default_value_t = 8 * 1024 * 1024)]
         chunker_max: u32,
     },
-    /// Back up one or more paths into a new snapshot.
+    /// Back up one or more paths into a new snapshot. A single `sftp://` or
+    /// `s3://` URL backs up that remote source directly (the client reads,
+    /// chunks and encrypts; keys never leave this machine).
     Backup {
         #[command(flatten)]
         repo: RepoArgs,
-        /// Files or directories to back up.
+        /// Files or directories to back up, or one remote source URL.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// File holding this machine's client id (created on first use).
@@ -443,6 +445,25 @@ async fn run(cli: Cli) -> Result<()> {
             if parity > 8 {
                 anyhow::bail!("--parity must be 0..=8");
             }
+            // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
+            // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
+            if paths.len() > 1
+                && paths
+                    .first()
+                    .and_then(|p| p.to_str())
+                    .is_some_and(|u| u.starts_with("sftp://") || u.starts_with("s3://"))
+            {
+                anyhow::bail!(
+                    "a remote source URL (sftp:// or s3://) is the only path a remote backup takes"
+                );
+            }
+            let (source, paths) = match paths.first().and_then(|p| p.to_str()) {
+                Some(url) if url.starts_with("sftp://") || url.starts_with("s3://") => {
+                    let url = url.to_owned();
+                    (SourceSpec::Url(url.clone()), vec![PathBuf::from(url)])
+                }
+                _ => (SourceSpec::LocalPaths, paths),
+            };
             let r = open_repo(&repo).await?;
             let client_id = client_id::load_or_create(client_id_file.as_deref())?;
             let _lock = client_id::lock(client_id_file.as_deref())?;
@@ -454,6 +475,7 @@ async fn run(cli: Cli) -> Result<()> {
                 gc_grace,
                 parity,
                 progress: None,
+                source,
             };
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;

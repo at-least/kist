@@ -41,6 +41,7 @@ pub fn backup_options() -> BackupOptions {
         gc_grace: kist_core::DEFAULT_GC_GRACE,
         parity: 0,
         progress: None,
+        source: kist_core::SourceSpec::default(),
     }
 }
 

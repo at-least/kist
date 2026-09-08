@@ -27,7 +27,9 @@ use object_store::path::Path as StorePath;
 use object_store::prefix::PrefixStore;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 
+pub mod fsmeta;
 pub mod sftp;
+pub mod source;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
@@ -59,6 +61,8 @@ pub enum BackendError {
     Store(#[from] object_store::Error),
     #[error("object {0} has an unrepresentable timestamp")]
     BadTimestamp(String),
+    #[error("backup source: {0}")]
+    Source(String),
 }
 
 /// russh 的 client::Handler 規定 handler 錯誤要能從 `russh::Error` 轉換。
@@ -223,22 +227,10 @@ impl Backend {
     }
 
     fn s3_with(bucket: &str, prefix: &str, credentials: Option<(&str, &str)>) -> Result<Self> {
-        install_tls_provider();
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-        if let Some((key, secret)) = credentials {
-            builder = builder
-                .with_access_key_id(key)
-                .with_secret_access_key(secret);
-        }
-        let s3 = builder.build()?;
+        let store = s3_store(bucket, prefix, credentials)?;
         let location = RepoLocation::S3 {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
-        };
-        let store: Arc<dyn ObjectStore> = if prefix.is_empty() {
-            Arc::new(s3)
-        } else {
-            Arc::new(PrefixStore::new(s3, Self::path(prefix)?))
         };
         Ok(Self { store, location })
     }
@@ -271,7 +263,7 @@ impl Backend {
         Self { store, location }
     }
 
-    fn path(key: &str) -> Result<StorePath> {
+    pub(crate) fn path(key: &str) -> Result<StorePath> {
         StorePath::parse(key).map_err(|e| BackendError::InvalidKey(key.to_owned(), e.to_string()))
     }
 
@@ -383,4 +375,27 @@ impl Backend {
 /// 公開給其他用 reqwest 的地方（webhook）用：不安裝的話 reqwest 會 panic。
 pub fn install_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// S3 store（bucket + 可選 prefix）的共用構造：`Backend::s3_with` 與
+/// 備份來源（`source::ObjectStoreSource`）都用它。`credentials` 給明確值時
+/// 蓋過環境變數（測試用；來源端一律走環境變數，傳 `None`）。
+pub(crate) fn s3_store(
+    bucket: &str,
+    prefix: &str,
+    credentials: Option<(&str, &str)>,
+) -> Result<Arc<dyn ObjectStore>> {
+    install_tls_provider();
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Some((key, secret)) = credentials {
+        builder = builder
+            .with_access_key_id(key)
+            .with_secret_access_key(secret);
+    }
+    let s3 = builder.build()?;
+    Ok(if prefix.is_empty() {
+        Arc::new(s3)
+    } else {
+        Arc::new(PrefixStore::new(s3, Backend::path(prefix)?))
+    })
 }

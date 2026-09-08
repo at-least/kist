@@ -21,6 +21,7 @@ fn client(id: u8) -> BackupOptions {
         gc_grace: std::time::Duration::from_secs(72 * 3600),
         parity: 0,
         progress: None,
+        source: kist_core::SourceSpec::default(),
     }
 }
 

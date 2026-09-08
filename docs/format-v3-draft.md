@@ -264,7 +264,12 @@ Root {
   失）；`paths` 欄位刪除（roots 取代）。
 - restore 映射（兩實作必須一致）：root `path` 去掉 scheme 後以 `/` 切
   段、映射到 `<target>/` 之下（`/srv/data` → `target/srv/data`；
-  `s3://bucket/prefix` → `target/bucket/prefix`）。鎖進向量。
+  `s3://bucket/prefix` → `target/bucket/prefix`）。**檔案/symlink 來源**
+  （root tree 恰好一個非目錄 entry、名稱＝定位末段）落在
+  `target/<定位去掉末段>/<名稱>`——與 v2 絕對路徑還原的落點一致；「目錄
+  恰好只含一個同名檔案」的還原結果也相同，判別沒有歧義代價。定位切不
+  出組件（`/`、`s3://bucket/`）時，內容直接落在 `target`（mount 對應
+  攤平到頂層）。鎖進向量。
 - parent 快速路徑資格：parent 存在且 **roots 清單（path 集合與順序）相同**。
 
 ### 9.1 stats 口徑（只留資料事實；依 mk 定義）
