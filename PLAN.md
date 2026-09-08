@@ -237,14 +237,32 @@ kist/
   落點。gate：fmt/clippy -D warnings/270 測試零失敗/deny 四項 ok。
   過程中修掉：snapshot 列表未排除 `.r1`、commit 檢查誤比 write-once 樹的
   mtime、檔案來源被丟棄。
-- 遠端來源（Source 抽象）【進行中】：`kist-backend::source`（Local/
-  ObjectStore-backed SFTP/S3，blocking Read 橋接）已完成；walker 接線與
-  etag 快速路徑測試進行中。
-- kist-go 鏡射 v3【進行中】：對齊 Rust 端錄製的 v3 向量（金鑰、tree
-  canonical CBOR、parity）。
-- 待辦：gc_race 200-case 在 touch 語意下重跑（含 V3-GC-5 時間線）、
-  雙向 E2E、規格正式取代＋CI 逐 byte 同步檢查、replica 專門測試、
-  大 repo 記憶體重審（SourceItem 進走訪清單後的峰值）。
+- 遠端來源（Source 抽象）【完成 2026-09-09，commit 9785c86】：
+  `kist-backend::source`（Local/ObjectStore-backed SFTP/S3，async 串流
+  橋接 blocking Read）；walker 走 Source；CLI `kist backup sftp://…`／
+  `s3://…`；FakeSource 測試 7 案（etag 快速路徑、sftp 不重用、檔案來源
+  落點等）。replicas 預設依後端（本機 1、遠端 0），InitOptions 可覆寫。
+- kist-go 鏡射 v3【完成 2026-09-09，kist-go commit e0b7c63】：全部結構、
+  金鑰（wrapped Invariants）、touch 復活、.r1 副本、壓縮觸發、快速路徑
+  分級、遠端來源介面；interop 向量對齊 Rust 端錄製的 v3（金鑰逐 byte、
+  tree canonical CBOR 611 bytes、parity golden）。gate：build/vet/
+  golangci-lint 0 issues/CGO=0 全套件 ok（mount 兩案為沙箱 fusermount
+  權限限制）。移植中修掉兩個真 bug：writeTree 對「剛寫入但帶過期標記」
+  的主體樹補 touch（commit gate 誤拒）；backupRoots 檔案來源 err 遮蔽。
+- gc race 測試在 touch 語意下重跑【完成 2026-09-09】：兩邊各補 V3-GC-5
+  時間線釘死測試（標記後重用的樹經 touch 復活、snapshot 完整可還原）；
+  Go 側 race 測試期望全面更新為「樹也參與標記/持有/刪除」。
+- 規格正式化【完成 2026-09-09，commit c8ad826】：`docs/format.md` 升格
+  為 v3 權威規格（單一副本）；kist-rs CI interop job 檢查 kist-go 拷貝
+  逐 byte 一致（commit 22b3411）。
+- 跨語言雙向 E2E【完成 2026-09-09】：Go init/backup → Rust check
+  --read-data ✓ + restore 逐 byte 相同 ✓；Rust 對 Go repo 再備份
+  0 新 chunk（跨實作去重 100%）✓；Rust init/backup → Go check ✓ +
+  restore 逐 byte 相同 ✓；Rust prune → Go check ✓；Go forget+prune →
+  Rust check ✓ + 最終還原逐 byte 相同 ✓。
+- 待辦（後續）：cargo-fuzz seeds 隨 v3 結構重生成（現有 targets 編譯
+  通過、斷言仍有效）；大 repo 記憶體重審（SourceItem 進走訪清單後的
+  峰值，ADR 011 門檻重測）；SFTP/S3 來源的實機 E2E（需環境）。
 
 ## 已接受的限制（非待辦）
 
