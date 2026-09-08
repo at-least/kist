@@ -35,7 +35,7 @@ pub use backup::{
 pub use check::{CheckOptions, CheckReport};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
-pub use prune::{PruneOptions, PrunePlan, PruneReport};
+pub use prune::{PruneOptions, PrunePlan, PruneReport, MAX_EFFECTIVE_BLOBS};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
 pub use restore::{ReloadableIndex, RestoreOptions, RestoreSummary};
