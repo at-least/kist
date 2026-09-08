@@ -24,7 +24,8 @@ func backedUpRepo(t *testing.T, seed string) (*Repository, string, snapshot.Hand
 	source := t.TempDir()
 	writeTree(t, source, sampleFiles(t))
 
-	_, handle, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}

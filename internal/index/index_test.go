@@ -388,9 +388,12 @@ func TestRebuildReconstructsTheIndexFromPacksAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	fromBlob, _, err := LoadAll(ctx, b, keys)
+	fromBlob, loadErrors, err := LoadAll(ctx, b, keys)
 	if err != nil {
 		t.Fatalf("load all: %v", err)
+	}
+	if len(loadErrors) != 0 {
+		t.Fatalf("load all reported %d errors: %v", len(loadErrors), loadErrors)
 	}
 
 	// Delete the blob: the packs alone must be enough.

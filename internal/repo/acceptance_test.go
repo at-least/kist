@@ -70,18 +70,20 @@ func TestAcceptance(t *testing.T) {
 	// heap). The bar is judged on Sys: that is what the machine sees.
 	stopSampling, peak := samplePeakHeap()
 	start = time.Now()
-	first, handle, err := r.Backup(ctx, []string{source}, BackupOptions{
+	summary, err := r.Backup(ctx, []string{source}, BackupOptions{
 		SpoolDir: workDir,
 		Warnf:    func(format string, args ...any) { t.Logf("warning: "+format, args...) },
 	})
 	if err != nil {
 		t.Fatalf("first backup: %v", err)
 	}
+	first := summary
+	handle := summary.Handle
 	elapsed := time.Since(start)
 	t.Logf("first backup: %d files, %s read, %s stored in %d packs, %d new chunks, in %v (%s/s)",
-		first.Stats.Files, human(int64(first.Stats.Bytes)), human(int64(first.Stats.BytesStored)),
-		first.Stats.PacksAdded, first.Stats.ChunksNew, elapsed.Round(time.Second),
-		human(int64(float64(first.Stats.Bytes)/elapsed.Seconds())))
+		first.Snapshot.Stats.Files, human(int64(first.Snapshot.Stats.Bytes)), human(int64(first.Report.BytesStored)),
+		first.Report.PacksNew, first.Report.ChunksNew, elapsed.Round(time.Second),
+		human(int64(float64(first.Snapshot.Stats.Bytes)/elapsed.Seconds())))
 	stopSampling()
 	heapPeak, sysPeak := peak()
 	t.Logf("peak during backup (20 ms samples): heap in use %s, process Sys %s; heap in use after: %s",
@@ -90,24 +92,24 @@ func TestAcceptance(t *testing.T) {
 		t.Errorf("peak Sys %s exceeds the limit %s", human(int64(sysPeak)), human(limit))
 	}
 
-	if first.Stats.Files != uint64(files) {
-		t.Errorf("backed up %d files, want %d", first.Stats.Files, files)
+	if first.Snapshot.Stats.Files != uint64(files) {
+		t.Errorf("backed up %d files, want %d", first.Snapshot.Stats.Files, files)
 	}
 
 	// --- second backup, nothing changed -------------------------------
 	second := reopenAt(t, repoDir, "acceptance-2")
 	start = time.Now()
-	again, _, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: workDir})
+	again, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: workDir})
 	if err != nil {
 		t.Fatalf("second backup: %v", err)
 	}
-	t.Logf("second backup: %d new chunks, %d new packs, in %v", again.Stats.ChunksNew, again.Stats.PacksAdded, time.Since(start).Round(time.Second))
+	t.Logf("second backup: %d new chunks, %d new packs, in %v", again.Report.ChunksNew, again.Report.PacksNew, time.Since(start).Round(time.Second))
 
-	if again.Stats.ChunksNew != 0 {
-		t.Errorf("second backup of unchanged data stored %d new chunks, want 0", again.Stats.ChunksNew)
+	if again.Report.ChunksNew != 0 {
+		t.Errorf("second backup of unchanged data stored %d new chunks, want 0", again.Report.ChunksNew)
 	}
-	if again.Stats.PacksAdded != 0 {
-		t.Errorf("second backup of unchanged data wrote %d packs, want 0", again.Stats.PacksAdded)
+	if again.Report.PacksNew != 0 {
+		t.Errorf("second backup of unchanged data wrote %d packs, want 0", again.Report.PacksNew)
 	}
 
 	// --- restore ------------------------------------------------------

@@ -257,29 +257,44 @@ func (n *clientNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		n.fs.opts.warn("%s: %v", key, err)
 		return nil, errno(err)
 	}
-	// The snapshot's root: its entries are named by absolute source
-	// paths ("/tmp/x/src"), which are not single directory components.
-	// expandRoots turns them into a virtual hierarchy of intermediate
-	// directories; real subtrees appear at the leaves.
-	rootEntries, err := n.fs.repo.LoadTreeChain(ctx, snap.Root)
+	// The snapshot's roots: their locators ("/tmp/x/src", "s3://b/p")
+	// are not single directory components. expandRoots turns them into a
+	// virtual hierarchy of intermediate directories; the leaves are the
+	// roots' own trees (a synthetic dir entry carrying the subtree), a
+	// file or symlink source's single entry, or -- for a locator with no
+	// components at all -- the root's entries flattened to the top level.
+	top, table, err := expandRoots(ctx, n.fs.repo, snap.Roots, snap.TimeNs)
 	if err != nil {
 		n.fs.opts.warn("%s: %v", key, err)
 		return nil, errno(err)
 	}
-	top, table := expandRoots(rootEntries, snap.TimeNs)
-	root := tree.Entry{Type: uint8(tree.TypeDir), Mode: uint32(iofs.ModeDir | 0o555), MTimeNs: snap.TimeNs, CTimeNs: snap.TimeNs}
+	root := tree.Entry{
+		Type: uint8(tree.TypeDir), MetaKind: uint8(tree.MetaPOSIX),
+		Mode: tree.Ptr(uint32(iofs.ModeDir | 0o555)), MTimeNs: tree.Ptr(snap.TimeNs),
+		CTimeNs: tree.Ptr(snap.TimeNs),
+	}
 	setAttr(&out.Attr, root)
 	immutable(out)
 	return n.NewInode(ctx, &dirNode{fs: n.fs, entry: root, synthetic: top, table: table}, fs.StableAttr{Mode: syscall.S_IFDIR}), 0
 }
 
-// expandRoots converts the root tree's absolute-path entries into a
-// one-level entry list plus a table of deeper synthetic levels. A source
-// backed up as "/tmp/x/src" is browsed as tmp -> x -> src; "tmp" and "x"
-// do not exist in the repository, so they are synthesized here. Real
-// entries (which have a subtree or are files) always win over synthetic
-// ones at the same name.
-func expandRoots(entries []tree.Entry, mtimeNs int64) ([]tree.Entry, map[string][]tree.Entry) {
+// expandRoots converts a snapshot's roots into a one-level entry list
+// plus a table of deeper synthetic levels, mirroring the restore
+// mapping's component rules (format-v3-draft.md §9): the locator loses
+// its scheme and splits on "/" (empty and "." components dropped). All
+// but the last component are synthesized directories; the last one is
+// the leaf, whose shape the root tree decides:
+//
+//   - a directory source: a synthetic DIR entry carrying the root tree
+//     as its subtree (children load lazily);
+//   - a file or symlink source -- exactly one non-dir entry named like
+//     the locator's last component: that entry itself;
+//   - a locator with no components ("/" or a bare bucket): the root
+//     tree's entries flattened onto the level the parents ended at --
+//     the top level, since there are none.
+//
+// Real entries always win over synthetic ones at the same name.
+func expandRoots(ctx context.Context, r *repo.Repository, roots []snapshot.Root, mtimeNs int64) ([]tree.Entry, map[string][]tree.Entry, error) {
 	table := make(map[string][]tree.Entry)
 	hasName := func(level []tree.Entry, name string) bool {
 		for _, e := range level {
@@ -289,36 +304,91 @@ func expandRoots(entries []tree.Entry, mtimeNs int64) ([]tree.Entry, map[string]
 		}
 		return false
 	}
-	for _, e := range entries {
-		name := string(e.Name)
-		if !strings.HasPrefix(name, "/") {
-			// A single-component root name (defensive: writers use
-			// absolute paths) passes straight through.
-			table[""] = append(table[""], e)
+	push := func(key string, e tree.Entry) {
+		level := table[key]
+		if i := slices.IndexFunc(level, func(x tree.Entry) bool {
+			return x.Subtree == nil && string(x.Name) == string(e.Name)
+		}); i >= 0 {
+			level[i] = e // a real entry replaces the synthetic placeholder
+		} else {
+			table[key] = append(level, e)
+		}
+	}
+	synthetic := func(name string) tree.Entry {
+		// Subtree nil marks a synthetic directory whose children live in
+		// the table, not in the repository.
+		return tree.Entry{
+			Name: []byte(name), Type: uint8(tree.TypeDir),
+			Mode: tree.Ptr(uint32(iofs.ModeDir | 0o555)), MTimeNs: tree.Ptr(mtimeNs),
+		}
+	}
+
+	for _, root := range roots {
+		comps, err := locatorComponents(root.Path)
+		if err != nil {
+			return nil, nil, err
+		}
+		entries, err := r.LoadTreeChain(ctx, root.Tree)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(comps) == 0 {
+			// No components at all: flatten the root's contents onto the
+			// top level. A file or symlink source cannot happen here (a
+			// single entry would still flatten to that entry).
+			for _, e := range entries {
+				push("", e)
+			}
 			continue
 		}
-		comps := strings.Split(strings.Trim(name, "/"), "/")
+		last := comps[len(comps)-1]
+		leaf := synthetic(last)
+		if len(entries) == 1 && tree.NodeType(entries[0].Type) != tree.TypeDir &&
+			string(entries[0].Name) == last {
+			leaf = entries[0] // a file or symlink source: the entry itself
+		} else {
+			id := root.Tree
+			leaf.Subtree = &id
+		}
 		parent := ""
 		for _, comp := range comps[:len(comps)-1] {
 			if !hasName(table[parent], comp) {
-				table[parent] = append(table[parent], tree.Entry{
-					Name: []byte(comp), Type: uint8(tree.TypeDir),
-					Mode: uint32(iofs.ModeDir | 0o555), MTimeNs: mtimeNs,
-					// Subtree nil marks the synthetic directories whose
-					// children live in the table, not in the repository.
-				})
+				table[parent] = append(table[parent], synthetic(comp))
 			}
 			parent = parent + "/" + comp
 		}
-		e.Name = []byte(comps[len(comps)-1])
-		table[parent] = append(table[parent], e)
+		push(parent, leaf)
 	}
 	for path, lvl := range table {
 		// Sort each level by name: Lookuper binary-searches.
 		slices.SortFunc(lvl, func(a, b tree.Entry) int { return bytes.Compare(a.Name, b.Name) })
 		table[path] = lvl
 	}
-	return table[""], table
+	return table[""], table, nil
+}
+
+// locatorComponents turns a snapshot root's locator into the path
+// components the restore mapping defines: scheme stripped (a "scheme://"
+// prefix), split on "/", empty and "." components dropped.
+func locatorComponents(path []byte) ([]string, error) {
+	rest := path
+	if i := bytes.IndexByte(path, ':'); i >= 0 && len(path) >= i+3 && path[i+1] == '/' && path[i+2] == '/' {
+		rest = path[i+3:]
+	}
+	var comps []string
+	for _, c := range strings.Split(string(rest), "/") {
+		switch c {
+		case "", ".":
+		case "..":
+			comps = append(comps, "__parent__") // hostile locator: literal name, no escape
+		default:
+			if strings.ContainsAny(c, "/\x00") {
+				return nil, fmt.Errorf("mount: %w: locator component %q is not a path component", iofs.ErrInvalid, c)
+			}
+			comps = append(comps, c)
+		}
+	}
+	return comps, nil
 }
 
 // dirNode is a directory inside a snapshot: immutable, loaded once.
@@ -620,24 +690,36 @@ func listxattr(e tree.Entry, dest []byte) (uint32, syscall.Errno) {
 	return uint32(n), 0
 }
 
-// setAttr fills a FUSE attribute block from a tree entry. Hard links
-// come out as separate files with one link each: the mount serves
-// bytes and modes, not inode identity.
+// setAttr fills a FUSE attribute block from a tree entry. Fields the
+// source did not record leave the attribute at its zero: absent must not
+// become a fabricated value. Hard links come out as separate files with
+// one link each: the mount serves bytes and modes, not inode identity.
 func setAttr(a *fuse.Attr, e tree.Entry) {
 	a.Mode = fuseMode(e.FileMode())
 	a.Size = e.Size
 	a.Nlink = 1
-	a.Uid = e.UID
-	a.Gid = e.GID
-	mtime := time.Unix(0, e.MTimeNs)
+	if e.UID != nil {
+		a.Uid = *e.UID
+	}
+	if e.GID != nil {
+		a.Gid = *e.GID
+	}
+	mtime := time.Unix(0, deref64s(e.MTimeNs))
 	ctime := mtime
-	if e.CTimeNs != 0 {
-		ctime = time.Unix(0, e.CTimeNs)
+	if e.CTimeNs != nil {
+		ctime = time.Unix(0, *e.CTimeNs)
 	}
 	a.SetTimes(&mtime, &mtime, &ctime)
 	if tree.NodeType(e.Type) == tree.TypeFile {
 		a.Blocks = (e.Size + 511) / 512
 	}
+}
+
+func deref64s(p *int64) int64 {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 // typeBits is the file-type part of a mode, for directory entries and

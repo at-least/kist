@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -16,10 +17,16 @@ import (
 )
 
 // Version is the snapshot object schema version.
-const Version = 2
+const Version = 3
 
 // Prefix is the repository prefix snapshots live under.
 const Prefix = "snapshots/"
+
+// ReplicaSuffix is appended to a snapshot's key for its .r1 replica. The
+// replica is written BEFORE the primary: the primary's appearance is the
+// commit, so a replica can never announce a backup that did not finish
+// (format-v3-draft.md §13.5).
+const ReplicaSuffix = ".r1"
 
 // A snapshot's key timestamp is YYYYMMDDTHHMMSSnnnnnnnnnZ: fixed width
 // so that lexical order is chronological order, no colons (Windows), and
@@ -89,51 +96,65 @@ var ErrCorrupt = errors.New("snapshot object is corrupt")
 // filled deliberately -- and failing is better than looping.
 const maxTimestampRetries = 1000
 
-// Stats summarise what a backup did. They are reporting, not structure:
-// nothing reads them back to make a decision. The field set is the union
-// of the two v1 implementations.
+// Stats summarise what a backup saved. They are DATA FACTS only, counted
+// the same way by any client walking the same source
+// (format-v3-draft.md §9.1): files and symlinks count each name (both
+// names of a hard link count); dirs count directory ENTRIES (the roots
+// themselves are paths, not entries, and do not count); bytes count a
+// hard link group's content once across the whole snapshot. Process
+// counters -- new chunks, new packs, revived packs -- depend on GC state
+// and dedup order, so they live in the backup run's report, never in the
+// format.
 type Stats struct {
-	Files        uint64 `cbor:"files,omitempty"`
-	Dirs         uint64 `cbor:"dirs,omitempty"`
-	Symlinks     uint64 `cbor:"symlinks,omitempty"`
-	Bytes        uint64 `cbor:"bytes,omitempty"`
-	ChunksNew    uint64 `cbor:"chunks_new,omitempty"`
-	ChunksRead   uint64 `cbor:"chunks_read,omitempty"`
-	PacksAdded   uint64 `cbor:"packs_new,omitempty"`
-	PacksRevived uint64 `cbor:"packs_revived,omitempty"`
-	BytesStored  uint64 `cbor:"bytes_stored,omitempty"`
-	Errors       uint64 `cbor:"errors,omitempty"`
-	FilesReused  uint64 `cbor:"files_reused,omitempty"`
+	Files    uint64 `cbor:"files,omitempty"`
+	Dirs     uint64 `cbor:"dirs,omitempty"`
+	Symlinks uint64 `cbor:"symlinks,omitempty"`
+	Bytes    uint64 `cbor:"bytes,omitempty"`
+}
+
+// A Root is one backup source: an opaque locator plus the tree of the
+// source directory's CONTENTS. The locator is a local absolute path, an
+// sftp://host/path URL or an s3://bucket/prefix URL -- anything a client
+// can resolve -- and never appears inside a tree: v3 has no synthetic
+// root, entry names are always single path components.
+//
+// Field order is the spec table: path, tree.
+type Root struct {
+	// Path is the source locator as raw bytes.
+	Path []byte `cbor:"path"`
+
+	// Tree is the tree of the source directory's contents (the last
+	// segment when the source directory was split). A file source's tree
+	// holds the one file's entry.
+	Tree crypto.ID `cbor:"tree"`
 }
 
 // A Snapshot is one completed backup.
 type Snapshot struct {
 	Version uint64 `cbor:"v"`
 
-	// Root is the tree the backup produced (its last segment if the root
-	// directory was split).
-	Root crypto.ID `cbor:"root"`
+	// Roots are the backup's sources: at least one, sorted by path bytes
+	// with no duplicates (verified on load).
+	Roots []Root `cbor:"roots"`
 
 	// TimeNs is when the backup started, in UTC nanoseconds. The key
 	// carries the same instant; this field is what a reader trusts,
 	// because the key is only a name.
 	TimeNs int64 `cbor:"time"`
 
-	// Host, User and Paths describe where the data came from, for a human
-	// choosing which snapshot to restore. Paths are byte strings: on Unix
-	// they are the raw OS bytes of the backed-up paths.
-	Host  string   `cbor:"host"`
-	User  string   `cbor:"user,omitempty"`
-	Paths [][]byte `cbor:"paths"`
+	// Host, User and Roots describe where the data came from, for a human
+	// choosing which snapshot to restore. Root paths are byte strings: on
+	// Unix they are the raw OS bytes of the backed-up paths.
+	Host string `cbor:"host"`
+	User string `cbor:"user,omitempty"`
 
 	// ClientID is the 16-byte identity of the client that wrote this
 	// snapshot. It duplicates the key's namespace so that a snapshot
 	// moved to another namespace fails to agree with itself.
 	ClientID []byte `cbor:"client"`
 
-	// Parent is this client's previous snapshot for the same paths. It is
-	// an accelerator only (the Rust implementation uses it for a
-	// metadata-unchanged fast path); readers must not depend on it.
+	// Parent is this client's previous snapshot for the same roots. It is
+	// an accelerator only; readers must not depend on it.
 	Parent *string `cbor:"parent,omitempty"`
 
 	Stats Stats `cbor:"stats"`
@@ -144,6 +165,9 @@ func Key(clientID []byte, at time.Time) string {
 	return Prefix + hex.EncodeToString(clientID) + "/" + formatKeyTime(at)
 }
 
+// ReplicaKey returns the key of a snapshot's .r1 replica.
+func ReplicaKey(key string) string { return key + ReplicaSuffix }
+
 // A Handle names a stored snapshot without loading it.
 type Handle struct {
 	// ClientID is the hex form, which is what appears in the key.
@@ -152,7 +176,8 @@ type Handle struct {
 	Key      string
 }
 
-// ParseKey splits a snapshot key back into its parts.
+// ParseKey splits a snapshot key back into its parts. A replica key is
+// not a snapshot key: its timestamp part does not parse.
 func ParseKey(key string) (Handle, error) {
 	rest, ok := strings.CutPrefix(key, Prefix)
 	if !ok {
@@ -170,17 +195,21 @@ func ParseKey(key string) (Handle, error) {
 	return Handle{ClientID: clientID, Time: at, Key: key}, nil
 }
 
-// Save commits the snapshot.
+// Save commits the snapshot. When replicas is 1, the .r1 replica is
+// written (PutIfAbsent, AlreadyExists tolerated) BEFORE each primary
+// attempt, so the primary's appearance stays the one commit point.
 //
 // This is the only write in a repository whose ordering matters, and the
 // only one that must not silently replace what is there: two clients that
 // happen to pick the same nanosecond are two different backups, not one.
 // A collision advances the timestamp and retries, and the returned handle
-// says where the snapshot actually landed.
+// says where the snapshot actually landed. A collided attempt leaves an
+// orphan replica behind; the GC refuses to collect orphan replicas, so it
+// survives as a second copy of an uncommitted snapshot.
 //
 // The AAD is the full key, so a snapshot object moved into another
 // client's namespace, or renamed to another time, no longer opens.
-func (s *Snapshot) Save(ctx context.Context, b backend.Backend, keys *crypto.Keys, nonceSource io.Reader) (Handle, error) {
+func (s *Snapshot) Save(ctx context.Context, b backend.Backend, keys *crypto.Keys, nonceSource io.Reader, replicas int) (Handle, error) {
 	if err := s.validate(); err != nil {
 		return Handle{}, err
 	}
@@ -196,6 +225,12 @@ func (s *Snapshot) Save(ctx context.Context, b backend.Backend, keys *crypto.Key
 		sealed, err := crypto.Seal(&keys.Meta, []byte(key), encoded, nonceSource)
 		if err != nil {
 			return Handle{}, fmt.Errorf("save snapshot %s: %w", key, err)
+		}
+
+		if replicas > 0 {
+			if err := backend.PutBytesIfAbsent(ctx, b, ReplicaKey(key), sealed); err != nil && !errors.Is(err, backend.ErrExists) {
+				return Handle{}, fmt.Errorf("save snapshot %s: write replica: %w", key, err)
+			}
 		}
 
 		switch err := backend.PutBytesIfAbsent(ctx, b, key, sealed); {
@@ -229,7 +264,7 @@ func Load(ctx context.Context, b backend.Backend, keys *crypto.Keys, key string)
 
 	var s Snapshot
 	if err := crypto.Unmarshal(encoded, &s); err != nil {
-		return nil, fmt.Errorf("load snapshot %s: %w", key, err)
+		return nil, fmt.Errorf("load snapshot %s: %w: %w", key, ErrCorrupt, err)
 	}
 	if s.Version != Version {
 		return nil, fmt.Errorf("load snapshot %s: %w: object declares version %d, this build reads %d", key, ErrCorrupt, s.Version, Version)
@@ -249,7 +284,9 @@ func Load(ctx context.Context, b backend.Backend, keys *crypto.Keys, key string)
 }
 
 // List returns every snapshot in the repository, oldest first. Passing an
-// empty clientID lists them all.
+// empty clientID lists them all. A key ending in the replica suffix is
+// the .r1 copy of a snapshot, not a snapshot of its own, and is excluded
+// (format-v3-draft.md §13.5).
 func List(ctx context.Context, b backend.Backend, clientID string) ([]Handle, error) {
 	prefix := Prefix
 	if clientID != "" {
@@ -258,6 +295,9 @@ func List(ctx context.Context, b backend.Backend, clientID string) ([]Handle, er
 
 	var handles []Handle
 	err := b.List(ctx, prefix, func(fi backend.FileInfo) error {
+		if strings.HasSuffix(fi.Key, ReplicaSuffix) {
+			return nil
+		}
 		handle, err := ParseKey(fi.Key)
 		if err != nil {
 			return err
@@ -280,16 +320,26 @@ func List(ctx context.Context, b backend.Backend, clientID string) ([]Handle, er
 
 func (s *Snapshot) validate() error {
 	switch {
-	case s.Root.IsZero():
-		return fmt.Errorf("%w: no root tree", ErrCorrupt)
-	case len(s.ClientID) != 16:
+	case len(s.Roots) == 0:
+		return fmt.Errorf("%w: no roots", ErrCorrupt)
+	case s.ClientID == nil || len(s.ClientID) != 16:
 		return fmt.Errorf("%w: client ID is %d bytes, want 16", ErrCorrupt, len(s.ClientID))
 	case strings.ContainsAny(hex.EncodeToString(s.ClientID), "/"):
 		return fmt.Errorf("%w: client ID %q contains a slash", ErrCorrupt, s.ClientID)
 	case s.TimeNs == 0:
 		return fmt.Errorf("%w: no timestamp", ErrCorrupt)
-	case len(s.Paths) == 0:
-		return fmt.Errorf("%w: no source paths", ErrCorrupt)
+	}
+	var previous []byte
+	for _, r := range s.Roots {
+		switch {
+		case len(r.Path) == 0:
+			return fmt.Errorf("%w: empty root path", ErrCorrupt)
+		case r.Tree.IsZero():
+			return fmt.Errorf("%w: root %q has no tree", ErrCorrupt, r.Path)
+		case previous != nil && bytes.Compare(r.Path, previous) <= 0:
+			return fmt.Errorf("%w: roots must be sorted by path with no duplicates", ErrCorrupt)
+		}
+		previous = slices.Clone(r.Path)
 	}
 	return nil
 }

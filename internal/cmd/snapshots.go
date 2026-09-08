@@ -9,6 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/at-least/kist/internal/snapshot"
+
 	"github.com/at-least/kist/internal/repo"
 	"github.com/at-least/kist/internal/report"
 )
@@ -36,7 +38,7 @@ func newSnapshotsCommand() *cobra.Command {
 						if snap, err := r.LoadSnapshot(ctx, handle.Key); err != nil {
 							row.Error = err.Error()
 						} else {
-							row.Host, row.Paths, row.Files, row.Bytes = snap.Host, pathsOf(snap.Paths), snap.Stats.Files, snap.Stats.Bytes
+							row.Host, row.Roots, row.Files, row.Bytes = snap.Host, rootsOf(snap.Roots), snap.Stats.Files, snap.Stats.Bytes
 						}
 						rows = append(rows, row)
 					}
@@ -61,7 +63,7 @@ func newSnapshotsCommand() *cobra.Command {
 						snap.Host,
 						snap.Stats.Files,
 						humanBytes(snap.Stats.Bytes),
-						strings.Join(pathsOf(snap.Paths), ","),
+						strings.Join(rootsOf(snap.Roots), ","),
 						handle.Key)
 				}
 				return w.Flush()
@@ -74,10 +76,10 @@ func newSnapshotsCommand() *cobra.Command {
 	return cmd
 }
 
-func pathsOf(raw [][]byte) []string {
-	out := make([]string, len(raw))
-	for i, p := range raw {
-		out[i] = string(p)
+func rootsOf(roots []snapshot.Root) []string {
+	out := make([]string, 0, len(roots))
+	for _, r := range roots {
+		out = append(out, string(r.Path))
 	}
 	return out
 }

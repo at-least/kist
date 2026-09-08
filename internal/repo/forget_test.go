@@ -111,12 +111,12 @@ func TestForgetAppliesThePolicyPerClient(t *testing.T) {
 	// Client A backs up three times, client B once. Last=2 must keep two
 	// of A's and B's only one.
 	for range 3 {
-		if _, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+		if _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 			t.Fatalf("backup A: %v", err)
 		}
 	}
 	other := reopenAs(t, dir, "forget-clients-b", "ffffffffffffffffffffffffffffffff")
-	if _, _, err := other.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+	if _, err := other.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 		t.Fatalf("backup B: %v", err)
 	}
 

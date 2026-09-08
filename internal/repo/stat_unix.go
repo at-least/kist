@@ -17,11 +17,18 @@ import (
 func fillOwnership(entry *tree.Entry, info fs.FileInfo) {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
+		// No stat_t: record zero ownership (a real value under the posix
+		// rules) and no ctime, rather than an entry the v3 validation
+		// would reject for missing required fields.
+		entry.UID = tree.Ptr(uint32(0))
+		entry.GID = tree.Ptr(uint32(0))
 		return
 	}
-	entry.UID = st.Uid
-	entry.GID = st.Gid
-	entry.CTimeNs = ctimeNs(st)
+	entry.UID = tree.Ptr(st.Uid)
+	entry.GID = tree.Ptr(st.Gid)
+	if c := ctimeNs(st); c != 0 {
+		entry.CTimeNs = tree.Ptr(c)
+	}
 }
 
 // hardLinkOf identifies the inode behind a path, so that a file reachable

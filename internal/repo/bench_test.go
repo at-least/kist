@@ -43,7 +43,7 @@ func BenchmarkBackupSmallFiles(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
-		if _, _, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: b.TempDir()}); err != nil {
+		if _, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: b.TempDir()}); err != nil {
 			b.Fatal(err)
 		}
 		b.StopTimer()

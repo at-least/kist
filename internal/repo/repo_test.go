@@ -26,12 +26,15 @@ func cheapKDF() *crypto.KDFParams {
 	return &p
 }
 
+func ptrUint8(v uint8) *uint8 { return &v }
+
 func testOptions(t *testing.T, seed string) Options {
 	t.Helper()
 
 	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	return Options{
 		Password:    []byte(testPassword),
+		Replicas:    ptrUint8(0),
 		ClientID:    "00112233445566778899aabbccddeeff",
 		StateDir:    t.TempDir(),
 		CacheDir:    t.TempDir(),
@@ -159,10 +162,12 @@ func TestOpenRejectsTheWrongPassword(t *testing.T) {
 	}
 }
 
-// v2 binds the chunker parameters into the master-key AAD: a repository
-// whose plaintext config lies about them (they are in the validated range,
-// so validation alone would accept) fails the unwrap rather than silently
-// returning keys that deduplicate against nothing.
+// v3 carries the chunker parameters inside the wrapped key's
+// authenticated plaintext. A repository whose plaintext config lies about
+// them (they are in the validated range, so validation alone would
+// accept) unwraps fine -- and is then caught by the comparison against
+// the decrypted invariants, which are the authority. A wrong-password
+// open never gets that far: the unwrap itself fails.
 func TestOpenRejectsTamperedChunkerParameters(t *testing.T) {
 	ctx := context.Background()
 	r, dir := initRepo(t, "chunker")
@@ -185,8 +190,8 @@ func TestOpenRejectsTamperedChunkerParameters(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open backend: %v", err)
 		}
-		if _, err := Open(ctx, b, testOptions(t, "tampered")); !errors.Is(err, crypto.ErrWrongPassword) {
-			t.Fatalf("open: err = %v, want ErrWrongPassword (the AAD no longer matches)", err)
+		if _, err := Open(ctx, b, testOptions(t, "tampered")); !errors.Is(err, ErrConfigTampered) {
+			t.Fatalf("open: err = %v, want ErrConfigTampered (the decrypted invariants disagree with the config)", err)
 		}
 	})
 

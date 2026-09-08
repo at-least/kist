@@ -30,7 +30,7 @@ import (
 const Prefix = "parity/"
 
 // Version is the parity object schema version.
-const Version = 2
+const Version = 3
 
 // DataShards is the fixed number of data shards a pack is split into.
 // Fixed, so that the overhead of M parity shards is exactly M/16 and a

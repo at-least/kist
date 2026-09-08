@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/pack"
 	"github.com/at-least/kist/internal/snapshot"
+	"github.com/at-least/kist/internal/tree"
 )
 
 // A clock is shared by every repository in a scenario, so that the
@@ -81,6 +83,7 @@ func newScenario(t *testing.T) *scenario {
 func (s *scenario) options(seed, clientID string) Options {
 	return Options{
 		Password:    []byte(testPassword),
+		Replicas:    ptrUint8(0),
 		ClientID:    clientID,
 		StateDir:    s.t.TempDir(),
 		CacheDir:    s.t.TempDir(),
@@ -116,11 +119,18 @@ func (s *scenario) pruner() *Repository { return s.open("fffffffffffffffffffffff
 
 func (s *scenario) backup(r *Repository, source string) snapshot.Handle {
 	s.t.Helper()
-	_, handle, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: s.t.TempDir()})
+	summary, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: s.t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		s.t.Fatalf("backup as %s: %v", r.ClientID(), err)
 	}
 	s.sources[handle.Key] = source
+	// The pre-delete revive check treats a same-second object as
+	// rewritten (the safe side). Real mtimes here all fall in the same
+	// second, so age the repo's data objects to keep the protocol
+	// observable -- the data objects end up older than every mark and
+	// touch, which is where the protocol writes them.
+	ageAll(s.t, s.dir, 10)
 	return handle
 }
 
@@ -189,10 +199,11 @@ func (s *scenario) packs() int {
 func (s *scenario) marks() []crypto.ID {
 	s.t.Helper()
 	r := s.pruner()
-	marks, _, err := r.listMarks(context.Background())
+	marks, stale, err := r.listMarks(context.Background())
 	if err != nil {
 		s.t.Fatalf("list marks: %v", err)
 	}
+	_ = stale
 	return sortedMarkIDs(marks)
 }
 
@@ -221,6 +232,41 @@ const (
 	clientB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
+// ageAll sets every object's real mtime in the repo `secs` into the past,
+// except under gc/ and touch/: a mark's mtime IS its age and a touch's
+// mtime IS the revival signal, and both are written after the data
+// objects they refer to. Aging them too would drop a mark into the same
+// second as its object, where prune's safe-side comparisons (same second
+// counts as rewritten / touched) can no longer tell the protocol state
+// from a rewrite. The mark-then-sweep protocol compares REAL backend
+// mtimes (the injected clock only drives snapshot timestamps), so a test
+// that wants an object to be older than its mark must move the file times
+// itself.
+func ageAll(t *testing.T, dir string, secs int) {
+	t.Helper()
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		sep := string(filepath.Separator)
+		if rel == "gc" || rel == "touch" || strings.HasPrefix(rel, "gc"+sep) || strings.HasPrefix(rel, "touch"+sep) {
+			return nil
+		}
+		past := time.Now().Add(-time.Duration(secs) * time.Second)
+		return os.Chtimes(path, past, past)
+	})
+	if err != nil {
+		t.Fatalf("age objects: %v", err)
+	}
+}
+
 // shortGrace makes the two phases observable in one test without a
 // three-day sleep; the clock still has to be moved past it explicitly.
 var shortGrace = PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew}
@@ -232,43 +278,48 @@ func TestPruneMarksThenSweepsAfterTheGrace(t *testing.T) {
 	h := s.backup(a, src)
 	s.forget(a, h)
 
+	// Real mtimes must differ from the mark's: the pre-delete revive check
+	// treats a same-second object as rewritten (the safe side).
+	ageAll(s.t, s.dir, 10)
 	p := s.pruner()
 	first := s.prune(p, shortGrace)
-	if len(first.Marked) != 1 || len(first.Deleted) != 0 || len(first.Held) != 0 {
-		t.Fatalf("first run: marked %d deleted %d held %d, want 1 0 0", len(first.Marked), len(first.Deleted), len(first.Held))
+	if len(first.Marked) != 1 || len(first.TreesMarked) != 1 || len(first.Deleted) != 0 || len(first.Held) != 0 {
+		t.Fatalf("first run: marked %d/%d trees deleted %d held %d, want 1 1 0 0",
+			len(first.Marked), len(first.TreesMarked), len(first.Deleted), len(first.Held))
 	}
 
-	// Too soon: held by age, not by any client.
+	// Too soon: held by age, not by any client. v3 holds the pack AND its
+	// tree: both are garbage now that the only snapshot is forgotten.
 	second := s.prune(p, shortGrace)
-	if len(second.Held) != 1 || len(second.Deleted) != 0 || len(second.Marked) != 0 {
+	if len(second.Held) != 2 || len(second.Deleted) != 0 || len(second.Marked) != 0 {
 		t.Fatalf("second run: %+v", second)
 	}
 
-	// After the grace the pack goes: the client's only snapshot was
-	// forgotten, and v2 has no client registry -- a client with no
+	// After the grace the pack and its tree go: the client's only snapshot
+	// was forgotten, and there is no client registry -- a client with no
 	// snapshots is not waited for. Its first backup is protected by the
 	// backup-side commit gate instead, not by the sweep.
 	s.clock.advance(2 * time.Hour)
 	third := s.prune(p, shortGrace)
-	if len(third.Deleted) != 1 || third.BytesReclaimed == 0 {
+	if len(third.Deleted) != 1 || len(third.TreesDeleted) != 1 || third.BytesReclaimed == 0 {
 		t.Fatalf("third run: %+v", third)
 	}
 	if s.packs() != 0 {
 		t.Errorf("%d packs stored, want 0", s.packs())
 	}
-	// The mark of a deleted pack outlives the deletion by one run: a
+	// The marks of deleted objects outlive the deletion by one run: a
 	// client listing the marks in the instant after the delete must still
-	// see it.
-	if len(s.marks()) != 1 {
-		t.Fatal("mark removed with the pack; it must outlive it")
+	// see them (pack + tree).
+	if len(s.marks()) != 2 {
+		t.Fatal("mark removed with the object; it must outlive it")
 	}
 	if len(p.Index().Packs()) != 0 {
 		t.Errorf("index names %d packs, want 0", len(p.Index().Packs()))
 	}
 
 	fourth := s.prune(p, shortGrace)
-	if len(fourth.Unmarked) != 1 || len(s.marks()) != 0 {
-		t.Fatalf("fourth run did not clear the orphaned mark: %+v", fourth)
+	if len(fourth.Unmarked) != 2 || len(s.marks()) != 0 {
+		t.Fatalf("fourth run did not clear the orphaned marks (pack + tree): %+v", fourth)
 	}
 	s.healthy()
 }
@@ -284,24 +335,27 @@ func TestPruneHoldsForAClientWithNoSnapshotNewerThanTheMark(t *testing.T) {
 	s.backup(a, s.source("two", 10<<10)) // client active, but before the mark
 	p := s.pruner()
 	first := s.prune(p, shortGrace)
-	if len(first.Marked) != 1 {
-		t.Fatalf("first run: %+v", first)
+	if len(first.Marked) != 1 || len(first.TreesMarked) != 1 {
+		t.Fatalf("first run: marked %v, trees %v, want the dead pack and its tree", first.Marked, first.TreesMarked)
 	}
 
 	s.clock.advance(2 * time.Hour)
 	third := s.prune(p, shortGrace)
-	if len(third.Held) != 1 || len(third.Deleted) != 0 {
-		t.Fatalf("after the grace: %+v", third)
+	if len(third.Held) != 2 || len(third.Deleted) != 0 {
+		t.Fatalf("after the grace (pack + tree both held): %+v", third)
 	}
 	want := "client " + clientA + " has no snapshot newer than the mark plus clock skew (1h0m0s)"
-	if third.Held[0].Reason != want {
-		t.Errorf("hold reason = %q, want %q", third.Held[0].Reason, want)
+	for _, held := range third.Held {
+		if held.Reason != want {
+			t.Errorf("hold reason = %q, want %q", held.Reason, want)
+		}
 	}
 
-	// A snapshot newer than the mark releases the hold.
+	// A snapshot newer than the mark releases the hold. Both objects go:
+	// the tree has no touch signal, so nothing revived it.
 	s.backup(a, s.source("three", 10<<10))
 	fourth := s.prune(p, shortGrace)
-	if len(fourth.Deleted) != 1 {
+	if len(fourth.Deleted) != 1 || len(fourth.TreesDeleted) != 1 {
 		t.Fatalf("after the client became active: %+v", fourth)
 	}
 	s.healthy()
@@ -314,7 +368,7 @@ func TestPruneDryRunChangesNothing(t *testing.T) {
 	s.forget(a, h)
 
 	report := s.prune(s.pruner(), PruneOptions{DryRun: true, ClockSkew: DefaultClockSkew})
-	if len(report.Marked) != 1 {
+	if len(report.Marked) != 1 || len(report.TreesMarked) != 1 {
 		t.Fatalf("dry run reported %+v", report)
 	}
 	if len(s.marks()) != 0 {
@@ -350,8 +404,8 @@ func TestPruneDoesNotRefreshAnExistingMark(t *testing.T) {
 	// pinned by the backend conformance suite.)
 	s.clock.advance(30 * time.Minute)
 	again := s.prune(p, shortGrace)
-	if len(again.Held) != 1 || len(again.Marked) != 0 || len(again.Unmarked) != 0 {
-		t.Fatalf("second run: %+v", again)
+	if len(again.Held) != 2 || len(again.Marked) != 0 || len(again.Unmarked) != 0 {
+		t.Fatalf("second run (pack + tree both held): %+v", again)
 	}
 	if got := markMtime(); !got.Equal(at) {
 		t.Errorf("mark was rewritten: mtime %s -> %s", at, got)
@@ -389,11 +443,11 @@ func TestPruneForgetsAClientNotHeardFromInLong(t *testing.T) {
 	s.prune(p, opts)
 
 	s.clock.advance(2 * time.Hour)
-	if r := s.prune(p, opts); len(r.Held) != 1 {
-		t.Fatalf("client still within its window: %+v", r)
+	if r := s.prune(p, opts); len(r.Held) != 2 {
+		t.Fatalf("client still within its window (pack + tree both held): %+v", r)
 	}
 	s.clock.advance(10 * time.Hour) // past forget-clients-after since the client's last snapshot
-	if r := s.prune(p, opts); len(r.Deleted) != 1 {
+	if r := s.prune(p, opts); len(r.Deleted) != 1 || len(r.TreesDeleted) != 1 {
 		t.Fatalf("client forgotten: %+v", r)
 	}
 	s.healthy()
@@ -448,20 +502,24 @@ func TestPruneRaceSnapshotLandsAfterMark(t *testing.T) {
 	}
 	defer func() { backupHooks.afterMarks = nil }()
 	s.backup(client, src)
-	if len(marked.Marked) != 1 {
-		t.Fatalf("prune inside the backup marked %d packs, want 1", len(marked.Marked))
+	if len(marked.Marked) != 1 || len(marked.TreesMarked) != 1 {
+		t.Fatalf("prune inside the backup marked %d packs and %d trees, want 1 1",
+			len(marked.Marked), len(marked.TreesMarked))
 	}
 	if s.packs() != 1 {
 		t.Fatalf("the client uploaded again although it saw no mark: %d packs", s.packs())
 	}
-	// The backup is Put-only: the mark survives the commit.
-	if len(s.marks()) != 1 {
-		t.Fatal("the backup removed a gc mark; v2 backups never remove marks")
+	// The backup is Put-only: both marks -- the pack's and the tree's --
+	// survive the commit.
+	if len(s.marks()) != 2 {
+		t.Fatal("the backup removed a gc mark; backups never remove marks")
 	}
 
 	s.clock.advance(2 * time.Hour)
 	second := s.prune(p, shortGrace)
-	if len(second.Deleted) != 0 || len(second.Marked) != 0 || len(second.Unmarked) != 1 || second.Live != 1 {
+	// Both are live again: the committed snapshot reaches the tree and
+	// resolves its chunks into the pack, so both marks are cancelled.
+	if len(second.Deleted) != 0 || len(second.Marked) != 0 || len(second.Unmarked) != 2 || second.Live != 1 {
 		t.Fatalf("second run: %+v", second)
 	}
 	if s.packs() != 1 {
@@ -491,7 +549,7 @@ func TestPruneRaceBackupInFlightAtSweepRefusesToCommit(t *testing.T) {
 		sweep = s.prune(p, shortGrace)
 	}
 	defer func() { backupHooks.afterMarks = nil }()
-	_, _, err := client.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	_, err := client.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
 	if err == nil {
 		t.Fatal("the backup committed although the pack it referenced was swept")
 	}
@@ -506,12 +564,13 @@ func TestPruneRaceBackupInFlightAtSweepRefusesToCommit(t *testing.T) {
 	}
 
 	// Re-running re-uploads everything and commits.
-	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("re-run: %v", err)
 	}
+	h := summary.Handle
 	s.sources[h.Key] = src
-	if snap.Stats.PacksAdded == 0 {
+	if summary.Report.PacksNew == 0 {
 		t.Error("the re-run uploaded nothing")
 	}
 	s.healthy()
@@ -529,19 +588,22 @@ func TestPruneRaceRevival(t *testing.T) {
 	p := s.pruner()
 	s.prune(p, shortGrace)
 
-	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	summaryA, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	h := summaryA.Handle
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.sources[h.Key] = src
-	if len(s.marks()) != 1 {
-		t.Fatal("the mark was removed by a backup; v2 backups never remove marks")
+	// The backup is Put-only: both marks -- the pack's and the tree's --
+	// survive (the tree was reused, so its fresh touch earned its keep).
+	if len(s.marks()) != 2 {
+		t.Fatal("a mark was removed by a backup; backups never remove marks")
 	}
 	// Both of the source's chunks (data.bin and note.txt) live in the
 	// marked pack, so both miss: PacksRevived counts chunk-level
 	// re-uploads out of marked packs.
-	if snap.Stats.PacksRevived != 2 || snap.Stats.PacksAdded != 1 || s.packs() != 2 {
-		t.Errorf("revived %d added %d stored %d, want 2 1 2", snap.Stats.PacksRevived, snap.Stats.PacksAdded, s.packs())
+	if summaryA.Report.PacksRevived != 2 || summaryA.Report.PacksNew != 1 || s.packs() != 2 {
+		t.Errorf("revived %d added %d stored %d, want 2 1 2", summaryA.Report.PacksRevived, summaryA.Report.PacksNew, s.packs())
 	}
 	s.healthy()
 
@@ -602,12 +664,12 @@ func TestPruneRaceDuplicatePacksFromConcurrentBackups(t *testing.T) {
 	}
 	s.healthy()
 
-	again, _, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	again, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again.Stats.ChunksNew != 0 {
-		t.Errorf("backup after prune uploaded %d chunks, want 0", again.Stats.ChunksNew)
+	if again.Report.ChunksNew != 0 {
+		t.Errorf("backup after prune uploaded %d chunks, want 0", again.Report.ChunksNew)
 	}
 }
 
@@ -631,7 +693,10 @@ func TestPruneRaceRevivalDuringSweep(t *testing.T) {
 	}
 	defer func() { pruneHooks.beforeDelete = nil }()
 	sweep := s.prune(p, shortGrace)
-	if len(sweep.Deleted) != 1 {
+	// The pack went; the tree stayed: the revival backup overwrote the
+	// tree's touch after the mark, so the sweep cancelled the tree's mark
+	// instead of deleting out from under the snapshot that just landed.
+	if len(sweep.Deleted) != 1 || len(sweep.Unmarked) != 1 || len(sweep.TreesDeleted) != 0 {
 		t.Fatalf("sweep: %+v", sweep)
 	}
 	s.healthy()
@@ -651,7 +716,7 @@ func TestBackupRefusesToCommitAfterTheGracePeriod(t *testing.T) {
 	}
 	defer func() { backupHooks.afterMarks = nil }()
 
-	_, _, err := client.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	_, err := client.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
 	if !errors.Is(err, ErrBackupTooLong) {
 		t.Fatalf("backup across the grace: err = %v, want ErrBackupTooLong", err)
 	}
@@ -685,16 +750,17 @@ func TestBackupSurvivesBeingUnableToUnmark(t *testing.T) {
 	}
 	t.Cleanup(restore)
 
-	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	summaryA, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	h := summaryA.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 	s.sources[h.Key] = src
-	if snap.Stats.PacksAdded != 1 {
-		t.Errorf("chunks were not re-uploaded: %+v", snap.Stats)
+	if summaryA.Report.PacksNew != 1 {
+		t.Errorf("chunks were not re-uploaded: %+v", summaryA.Snapshot.Stats)
 	}
-	if len(s.marks()) != 1 {
-		t.Fatal("the mark did not survive; it must, backups are Put-only")
+	if len(s.marks()) != 2 {
+		t.Fatal("a mark did not survive; marks must, backups are Put-only")
 	}
 	restore()
 	s.healthy()
@@ -710,11 +776,13 @@ func TestPruneRewritesTheIndexAfterACrashedSweep(t *testing.T) {
 	a := s.open(clientA)
 	s.forget(a, s.backup(a, src))
 	p := s.pruner()
-	s.prune(p, shortGrace)
+	first := s.prune(p, shortGrace)
 	s.clock.advance(2 * time.Hour)
 
-	// The crash state: pack gone, mark present, blobs untouched.
-	packID := s.marks()[0]
+	// The crash state: pack gone, mark present, blobs untouched. v3 also
+	// marked the snapshot's tree; the pack's ID comes from the report so
+	// the mark set's ordering cannot hand the tree's ID over here.
+	packID := first.Marked[0]
 	if err := p.Backend().Delete(context.Background(), pack.Key(packID)); err != nil {
 		t.Fatal(err)
 	}
@@ -729,12 +797,13 @@ func TestPruneRewritesTheIndexAfterACrashedSweep(t *testing.T) {
 			t.Fatalf("a fresh open still sees pack %s in the index after the mark was removed", packID)
 		}
 	}
-	snap, h, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	summaryA, err := s.open(clientA).Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	h := summaryA.Handle
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.sources[h.Key] = src
-	if snap.Stats.PacksAdded == 0 {
+	if summaryA.Report.PacksNew == 0 {
 		t.Error("the client trusted the stale index and uploaded nothing")
 	}
 	s.healthy()
@@ -757,12 +826,94 @@ func TestPruneHoldsWithinTheClockSkew(t *testing.T) {
 	s.clock.advance(2 * time.Hour)
 
 	held := s.prune(p, PruneOptions{Grace: time.Hour, ClockSkew: time.Hour})
-	if len(held.Deleted) != 0 || len(held.Held) != 1 {
+	// v3 holds the tree on the same rule as the pack: both marks predate
+	// the client's newest snapshot plus the skew.
+	if len(held.Deleted) != 0 || len(held.Held) != 2 {
 		t.Fatalf("with a one-hour skew: %+v", held)
 	}
 	swept := s.prune(p, PruneOptions{Grace: time.Hour, ClockSkew: time.Minute})
-	if len(swept.Deleted) != 1 {
+	if len(swept.Deleted) != 1 || len(swept.TreesDeleted) != 1 {
 		t.Fatalf("with a one-minute skew: %+v", swept)
+	}
+	s.healthy()
+}
+
+// V3-GC-5. A tree the pruner marked is revived when a later backup
+// reuses it: the backup overwrites touch/<tree> after the mark, the
+// sweep reads the fresh signal and cancels the mark instead of deleting,
+// and the backup -- whose chunk re-uploads already sit in a pack of its
+// own -- commits. The prune runs inside beforeIndex: the tree is stored
+// and touched by then, but the snapshot is not, so the sweep must decide
+// from the touch alone.
+func TestPruneRevivesAMarkedTreeTouchedByALaterBackup(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+	a := s.open(clientA)
+	h := s.backup(a, src)
+	s.forget(a, h)
+
+	p := s.pruner()
+	marked := s.prune(p, shortGrace)
+	if len(marked.Marked) != 1 || len(marked.TreesMarked) != 1 {
+		t.Fatalf("mark run: %+v", marked)
+	}
+	packID, treeID := marked.Marked[0], marked.TreesMarked[0]
+
+	// The sweep needs marks older than the grace, but the backup may not
+	// run longer than it: move the REAL mtimes instead of the shared
+	// clock. Objects first, marks on top of them -- the order the
+	// protocol writes them in. The touch is left alone: backup2's
+	// overwriting Put below is what must out-rank the mark.
+	ageObject := func(key string, secs int) {
+		t.Helper()
+		past := time.Now().Add(-time.Duration(secs) * time.Second)
+		if err := os.Chtimes(filepath.Join(s.dir, key), past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ageObject(pack.Key(packID), 3*3600)
+	ageObject(tree.Key(treeID), 3*3600)
+	ageObject(gcKey(packID), 2*3600)
+	ageObject(gcKey(treeID), 2*3600)
+
+	// Opened after the marks: the client sees them and re-uploads the
+	// marked pack's chunks into a pack of its own.
+	client := s.open(clientA)
+	var revival PruneReport
+	backupHooks.beforeIndex = func() {
+		backupHooks.beforeIndex = nil
+		revival = s.prune(p, shortGrace)
+	}
+	defer func() { backupHooks.beforeIndex = nil }()
+	summary, err := client.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("backup2: %v", err)
+	}
+	s.sources[summary.Handle.Key] = src
+
+	// The sweep saw no snapshot (this one was not committed yet) and an
+	// expired mark on the tree -- and still kept the tree, on the
+	// strength of its fresh touch. The pack had no such signal and went.
+	// Held is empty: the pack this run just marked (backup2's own) is
+	// recorded in Marked only, and first comes up for the age gate on
+	// the next run.
+	if len(revival.Unmarked) != 1 || len(revival.TreesDeleted) != 0 || len(revival.Deleted) != 1 || len(revival.Held) != 0 {
+		t.Fatalf("revival run: %+v", revival)
+	}
+	if revival.Unmarked[0] != treeID || revival.Deleted[0] != packID {
+		t.Fatalf("revival run unmarked %v deleted %v, want the tree revived and the pack swept", revival.Unmarked, revival.Deleted)
+	}
+	if summary.Report.PacksRevived != 2 || summary.Report.PacksNew != 1 {
+		t.Errorf("backup2 re-uploaded out of the marked pack: %+v", summary.Report)
+	}
+
+	// The outlived marks clear on the next run, and what is left is the
+	// new snapshot's data -- the revived tree included.
+	if r := s.prune(p, shortGrace); len(r.Unmarked) != 2 {
+		t.Fatalf("final run: %+v", r)
+	}
+	if n := countKeys(t, p.Backend(), tree.Prefix); n != 1 {
+		t.Errorf("%d trees stored, want the revived one", n)
 	}
 	s.healthy()
 }

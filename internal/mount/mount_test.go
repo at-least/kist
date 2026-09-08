@@ -105,7 +105,7 @@ func mounted(t *testing.T) (*repo.Repository, string, string, []byte) {
 	})
 
 	src, blob := fixture(t)
-	if _, _, err := r.Backup(ctx, []string{src}, repo.BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+	if _, err := r.Backup(ctx, []string{src}, repo.BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,7 +288,8 @@ func TestMountSeesANewSnapshot(t *testing.T) {
 			t.Errorf("close: %v", err)
 		}
 	}()
-	_, handle, err := writer.Backup(ctx, []string{other}, repo.BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := writer.Backup(ctx, []string{other}, repo.BackupOptions{SpoolDir: t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatal(err)
 	}

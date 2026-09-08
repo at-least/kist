@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -76,14 +77,16 @@ func sample(t *testing.T, clientID string, at time.Time) *Snapshot {
 	t.Helper()
 
 	return &Snapshot{
-		Version:  Version,
-		Root:     rootID(0x42),
+		Version: Version,
+		Roots: []Root{
+			{Path: []byte("/etc"), Tree: rootID(0x42)},
+			{Path: []byte("/home/newlix"), Tree: rootID(0x42)},
+		},
 		TimeNs:   at.UnixNano(),
 		Host:     "workstation",
 		User:     "newlix",
-		Paths:    [][]byte{[]byte("/home/newlix"), []byte("/etc")},
 		ClientID: clientBytes(t, clientID),
-		Stats:    Stats{Files: 12, Dirs: 3, Bytes: 4096, ChunksNew: 5, PacksAdded: 1},
+		Stats:    Stats{Files: 12, Dirs: 3, Bytes: 4096},
 	}
 }
 
@@ -108,7 +111,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	keys, b := testKeys(t), testBackend(t)
 
 	original := sample(t, goldenClient, goldenTime)
-	handle, err := original.Save(ctx, b, keys, crypto.DeterministicReader("snap"))
+	handle, err := original.Save(ctx, b, keys, crypto.DeterministicReader("snap"), 0)
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -120,21 +123,24 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if loaded.Root != original.Root || loaded.Host != original.Host || loaded.User != original.User ||
+	if !rootsEqual(loaded.Roots, original.Roots) || loaded.Host != original.Host || loaded.User != original.User ||
 		!strings.EqualFold(hex.EncodeToString(loaded.ClientID), goldenClient) ||
 		loaded.TimeNs != original.TimeNs ||
-		pathsJoined(loaded.Paths) != pathsJoined(original.Paths) ||
 		loaded.Stats != original.Stats {
 		t.Errorf("loaded = %+v, want %+v", loaded, original)
 	}
 }
 
-func pathsJoined(paths [][]byte) string {
-	parts := make([]string, len(paths))
-	for i, p := range paths {
-		parts[i] = string(p)
+func rootsEqual(a, b []Root) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return strings.Join(parts, ",")
+	for i := range a {
+		if !bytes.Equal(a[i].Path, b[i].Path) || a[i].Tree != b[i].Tree {
+			return false
+		}
+	}
+	return true
 }
 
 // The key format must sort chronologically and must be legal on Windows,
@@ -201,14 +207,14 @@ func TestSaveNeverOverwrites(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	first, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("a"))
+	first, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("a"), 0)
 	if err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
 	other := sample(t, goldenClient, goldenTime)
-	other.Root = rootID(0x99)
-	second, err := other.Save(ctx, b, keys, crypto.DeterministicReader("b"))
+	other.Roots = []Root{{Path: []byte("/different"), Tree: rootID(0x99)}}
+	second, err := other.Save(ctx, b, keys, crypto.DeterministicReader("b"), 0)
 	if err != nil {
 		t.Fatalf("second save: %v", err)
 	}
@@ -224,8 +230,10 @@ func TestSaveNeverOverwrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load first: %v", err)
 	}
-	if original.Root != rootID(0x42) {
-		t.Error("the first snapshot was overwritten")
+	for i, r := range original.Roots {
+		if r.Tree != rootID(0x42) {
+			t.Errorf("root %d was overwritten: tree %s", i, r.Tree)
+		}
 	}
 }
 
@@ -235,7 +243,7 @@ func TestSnapshotIsBoundToItsKey(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	handle, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("bind"))
+	handle, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("bind"), 0)
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -268,7 +276,7 @@ func TestListIsOldestFirst(t *testing.T) {
 		if i%2 == 0 {
 			client = client1
 		}
-		if _, err := sample(t, client, at).Save(ctx, b, keys, crypto.DeterministicReader(fmt.Sprintf("list-%d", i))); err != nil {
+		if _, err := sample(t, client, at).Save(ctx, b, keys, crypto.DeterministicReader(fmt.Sprintf("list-%d", i)), 0); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 	}
@@ -315,16 +323,16 @@ func TestSaveRejectsIncompleteSnapshots(t *testing.T) {
 	keys, b := testKeys(t), testBackend(t)
 
 	for name, mutate := range map[string]func(*Snapshot){
-		"no root":      func(s *Snapshot) { s.Root = crypto.ID{} },
+		"no root":      func(s *Snapshot) { s.Roots = nil },
 		"no client":    func(s *Snapshot) { s.ClientID = nil },
 		"short client": func(s *Snapshot) { s.ClientID = []byte("short") },
 		"no time":      func(s *Snapshot) { s.TimeNs = 0 },
-		"no paths":     func(s *Snapshot) { s.Paths = nil },
+		"no paths":     func(s *Snapshot) { s.Roots = nil },
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := sample(t, goldenClient, goldenTime)
 			mutate(s)
-			if _, err := s.Save(ctx, b, keys, crypto.DeterministicReader("bad")); !errors.Is(err, ErrCorrupt) {
+			if _, err := s.Save(ctx, b, keys, crypto.DeterministicReader("bad"), 0); !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("save: err = %v, want ErrCorrupt", err)
 			}
 		})
@@ -361,7 +369,7 @@ func TestGoldenSnapshot(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	handle, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("golden-snapshot"))
+	handle, err := sample(t, goldenClient, goldenTime).Save(ctx, b, keys, crypto.DeterministicReader("golden-snapshot"), 0)
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}

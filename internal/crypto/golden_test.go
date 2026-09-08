@@ -99,7 +99,7 @@ func TestGoldenKeySlot(t *testing.T) {
 	// are exercised by TestDefaultKDFParamsMatchRFC9106.
 	params.Time, params.MemoryKiB, params.Threads = 1, 8, 1
 
-	slot, err := NewKeySlot([]byte("correct horse battery staple"), goldenAAD(), goldenMaster, params, goldenTime, DeterministicReader("golden-slot"))
+	slot, err := NewKeySlot([]byte("correct horse battery staple"), goldenMaster, goldenInvariants(), params, goldenTime, DeterministicReader("golden-slot"))
 	if err != nil {
 		t.Fatalf("new key slot: %v", err)
 	}
@@ -115,7 +115,8 @@ func TestGoldenKeySlot(t *testing.T) {
 	if err := Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	master, err := decoded.Unwrap([]byte("correct horse battery staple"), goldenAAD())
+	master, invariants, err := decoded.Unwrap([]byte("correct horse battery staple"))
+	_ = invariants
 	if err != nil {
 		t.Fatalf("unwrap: %v", err)
 	}

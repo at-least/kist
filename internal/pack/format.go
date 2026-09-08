@@ -13,12 +13,12 @@ import (
 // what an existing repository means, which is what the version byte in
 // the magic exists to negotiate.
 const (
-	// Version is the pack format version. It is carried in two places
-	// that must agree: the last two bytes of the magic, so a reader can
-	// reject a future pack before parsing one, and the trailer's own v
-	// field, so a trailer cannot be lifted from a pack of one version
-	// onto the tail of another.
-	Version = 2
+	// Version is the pack format version. It is carried in THREE places
+	// that must agree: the last two bytes of the magic at the head and at
+	// the tail, so a reader can reject a future pack before parsing one,
+	// and the trailer's own v field, so a trailer cannot be lifted from a
+	// pack of one version onto the tail of another.
+	Version = 3
 
 	// TargetSize is the size a writer aims for before flushing. Large
 	// enough that per-object overhead on object storage disappears, small

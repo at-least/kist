@@ -16,7 +16,7 @@ import (
 )
 
 // Version is the index blob schema version.
-const Version = 2
+const Version = 3
 
 // Encoding bytes for the plaintext framing of an index blob: the
 // algorithm byte that leads the plaintext (0 raw, 1 zstd), matching the
@@ -147,28 +147,57 @@ func Key(id crypto.ID) string { return "indexes/" + id.String() }
 // Prefix is the repository prefix index blobs live under.
 const Prefix = "indexes/"
 
-// Save writes the given packs as one index blob and returns its ID.
+// PackInfo is one pack as recorded in a blob: its entries and its total
+// size, so `check` can catch a truncated or swapped pack with a HEAD.
+type PackInfo struct {
+	Size    uint64       `cbor:"-"`
+	Entries []pack.Entry `cbor:"-"`
+}
+
+// A NamedPack pairs a pack ID with its index information, in an order
+// the caller chose. SaveOrdered writes them in exactly that order; Save
+// sorts by ID.
+type NamedPack struct {
+	ID   crypto.ID
+	Info PackInfo
+}
+
+// Save writes the given packs as one index blob and returns its ID,
+// ordered by pack ID. See SaveOrdered for why the order is a parameter
+// at all.
+func Save(ctx context.Context, b backend.Backend, keys *crypto.Keys, packs map[crypto.ID]PackInfo, supersedes []crypto.ID, nonceSource io.Reader) (crypto.ID, error) {
+	named := make([]NamedPack, 0, len(packs))
+	for id, info := range packs {
+		named = append(named, NamedPack{ID: id, Info: info})
+	}
+	// Map iteration order is randomised, so without this the same set of
+	// packs would encode differently on every run and two clients writing
+	// the same index would collide instead of deduplicating.
+	slices.SortFunc(named, func(a, b NamedPack) int { return bytes.Compare(a.ID[:], b.ID[:]) })
+	return SaveOrdered(ctx, b, keys, named, supersedes, nonceSource)
+}
+
+// SaveOrdered writes the given packs as one index blob, keeping the
+// caller's order.
 //
 // It is called once at the end of a backup, after the last pack is
 // uploaded and before the snapshot is committed. A crash between the
 // packs and this call leaves orphaned packs, not a broken repository.
 // supersedes lists the blobs this one replaces (prune and rebuild-index);
 // readers ignore any blob another effective blob supersedes.
-func Save(ctx context.Context, b backend.Backend, keys *crypto.Keys, packs map[crypto.ID]PackInfo, supersedes []crypto.ID, nonceSource io.Reader) (crypto.ID, error) {
+//
+// Order matters to readers that take a chunk's first position: prune
+// puts unmarked packs ahead of marked ones so a chunk is never resolved
+// into a pack that is on its way out.
+func SaveOrdered(ctx context.Context, b backend.Backend, keys *crypto.Keys, packs []NamedPack, supersedes []crypto.ID, nonceSource io.Reader) (crypto.ID, error) {
 	if len(packs) == 0 {
 		return crypto.ID{}, errors.New("save index: no packs to record")
 	}
 
 	doc := blob{Version: Version, Packs: make([]blobPack, 0, len(packs)), Supersedes: supersedes}
-	for id, info := range packs {
-		doc.Packs = append(doc.Packs, blobPack{ID: id, Size: info.Size, Entries: info.Entries})
+	for _, np := range packs {
+		doc.Packs = append(doc.Packs, blobPack{ID: np.ID, Size: np.Info.Size, Entries: np.Info.Entries})
 	}
-	// Map iteration order is randomised, so without this the same set of
-	// packs would encode differently on every run and two clients writing
-	// the same index would collide instead of deduplicating.
-	slices.SortFunc(doc.Packs, func(a, b blobPack) int {
-		return bytes.Compare(a.ID[:], b.ID[:])
-	})
 
 	encoded, err := crypto.Marshal(doc)
 	if err != nil {
@@ -191,13 +220,6 @@ func Save(ctx context.Context, b backend.Backend, keys *crypto.Keys, packs map[c
 	default:
 		return crypto.ID{}, fmt.Errorf("save index %s: %w", id, err)
 	}
-}
-
-// PackInfo is one pack as recorded in a blob: its entries and its total
-// size, so `check` can catch a truncated or swapped pack with a HEAD.
-type PackInfo struct {
-	Size    uint64       `cbor:"-"`
-	Entries []pack.Entry `cbor:"-"`
 }
 
 func frame(plain []byte) []byte {

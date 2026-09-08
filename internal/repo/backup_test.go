@@ -195,11 +195,12 @@ func TestBackupRestoreIsByteForByte(t *testing.T) {
 		}
 	}
 
-	snap, handle, err := r.Backup(ctx, []string{source}, BackupOptions{Host: "testhost", SpoolDir: t.TempDir()})
+	summary, err := r.Backup(ctx, []string{source}, BackupOptions{Host: "testhost", SpoolDir: t.TempDir()})
+	snap, handle := summary.Snapshot, summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	if snap.Stats.Files == 0 || snap.Stats.PacksAdded == 0 {
+	if snap.Stats.Files == 0 || summary.Report.PacksNew == 0 {
 		t.Errorf("stats look empty: %+v", snap.Stats)
 	}
 	if snap.Host != "testhost" {
@@ -231,27 +232,27 @@ func TestSecondBackupOfUnchangedDataWritesNoPacks(t *testing.T) {
 	source := t.TempDir()
 	writeTree(t, source, sampleFiles(t))
 
-	first, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	first, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("first backup: %v", err)
 	}
-	if first.Stats.PacksAdded == 0 {
+	if first.Report.PacksNew == 0 {
 		t.Fatal("the first backup wrote no packs")
 	}
 	packsAfterFirst := countKeys(t, r.Backend(), pack.Prefix)
 	treesAfterFirst := countKeys(t, r.Backend(), "trees/")
 
 	second := reopen(t, dir, "incremental-2")
-	stats, _, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	stats, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("second backup: %v", err)
 	}
 
-	if stats.Stats.ChunksNew != 0 {
-		t.Errorf("second backup stored %d new chunks, want 0", stats.Stats.ChunksNew)
+	if stats.Report.ChunksNew != 0 {
+		t.Errorf("second backup stored %d new chunks, want 0", stats.Report.ChunksNew)
 	}
-	if stats.Stats.PacksAdded != 0 {
-		t.Errorf("second backup wrote %d packs, want 0", stats.Stats.PacksAdded)
+	if stats.Report.PacksNew != 0 {
+		t.Errorf("second backup wrote %d packs, want 0", stats.Report.PacksNew)
 	}
 	if got := countKeys(t, second.Backend(), pack.Prefix); got != packsAfterFirst {
 		t.Errorf("repository now holds %d packs, want the original %d", got, packsAfterFirst)
@@ -273,7 +274,7 @@ func TestIncrementalBackupOnlyRewritesTheChangedPath(t *testing.T) {
 
 	source := t.TempDir()
 	writeTree(t, source, sampleFiles(t))
-	if _, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+	if _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 		t.Fatalf("first backup: %v", err)
 	}
 	treesAfterFirst := countKeys(t, r.Backend(), "trees/")
@@ -281,19 +282,19 @@ func TestIncrementalBackupOnlyRewritesTheChangedPath(t *testing.T) {
 	writeTree(t, source, []fileSpec{{path: "docs/deep/small.bin", data: randomBytes(t, "changed", 1024)}})
 
 	second := reopen(t, dir, "changed-2")
-	stats, _, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	stats, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("second backup: %v", err)
 	}
-	if stats.Stats.ChunksNew != 1 {
-		t.Errorf("stored %d new chunks for one changed 1 KiB file, want 1", stats.Stats.ChunksNew)
+	if stats.Report.ChunksNew != 1 {
+		t.Errorf("stored %d new chunks for one changed 1 KiB file, want 1", stats.Report.ChunksNew)
 	}
 
-	// source/, docs/, deep/ and the synthetic root are on the path from
-	// the changed file up; docs/deep/nested/ is not.
+	// v3 has no synthetic root: source/, docs/ and deep/ are on the path
+	// from the changed file up; docs/deep/nested/ is not.
 	newTrees := countKeys(t, second.Backend(), "trees/") - treesAfterFirst
-	if newTrees != 4 {
-		t.Errorf("wrote %d new trees, want 4 (root, source, docs, deep)", newTrees)
+	if newTrees != 3 {
+		t.Errorf("wrote %d new trees, want 3 (source, docs, deep)", newTrees)
 	}
 }
 
@@ -311,15 +312,15 @@ func TestBackupSkipsUnsupportedFileTypes(t *testing.T) {
 	}
 
 	var warnings []string
-	snap, _, err := r.Backup(ctx, []string{source}, BackupOptions{
+	summary, err := r.Backup(ctx, []string{source}, BackupOptions{
 		SpoolDir: t.TempDir(),
 		Warnf:    func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) },
 	})
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	if snap.Stats.Files != 1 {
-		t.Errorf("backed up %d files, want 1", snap.Stats.Files)
+	if summary.Snapshot.Stats.Files != 1 {
+		t.Errorf("backed up %d files, want 1", summary.Snapshot.Stats.Files)
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "pipe") {
 		t.Errorf("warnings = %v, want one naming the FIFO", warnings)
@@ -340,13 +341,14 @@ func TestHardLinksAreStoredOnceAndRestoredAsLinks(t *testing.T) {
 		t.Fatalf("link: %v", err)
 	}
 
-	snap, handle, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 	// One chunk of data, stored once, even though two names point at it.
-	if snap.Stats.ChunksNew != 1 {
-		t.Errorf("stored %d chunks for one file under two names, want 1", snap.Stats.ChunksNew)
+	if summary.Report.ChunksNew != 1 {
+		t.Errorf("stored %d chunks for one file under two names, want 1", summary.Report.ChunksNew)
 	}
 
 	target := filepath.Join(t.TempDir(), "out")
@@ -370,7 +372,8 @@ func TestRestoreRefusesANonEmptyTarget(t *testing.T) {
 
 	source := t.TempDir()
 	writeTree(t, source, []fileSpec{{path: "a.txt", data: []byte("a")}})
-	_, handle, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
@@ -393,16 +396,17 @@ func TestBackupOfSeveralPaths(t *testing.T) {
 	writeTree(t, first, []fileSpec{{path: "one.txt", data: []byte("one")}})
 	writeTree(t, second, []fileSpec{{path: "two.txt", data: []byte("two")}})
 
-	snap, handle, err := r.Backup(ctx, []string{second, first}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := r.Backup(ctx, []string{second, first}, BackupOptions{SpoolDir: t.TempDir()})
+	snap, handle := summary.Snapshot, summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	if len(snap.Paths) != 2 {
-		t.Errorf("snapshot records %d paths, want 2", len(snap.Paths))
+	if len(snap.Roots) != 2 {
+		t.Errorf("snapshot records %d roots, want 2", len(snap.Roots))
 	}
 	var pathStrings []string
-	for _, p := range snap.Paths {
-		pathStrings = append(pathStrings, string(p))
+	for _, p := range snap.Roots {
+		pathStrings = append(pathStrings, string(p.Path))
 	}
 	if !sort.StringsAreSorted(pathStrings) {
 		t.Errorf("snapshot paths are not sorted: %v", pathStrings)
@@ -423,7 +427,7 @@ func TestBackupOfSeveralPaths(t *testing.T) {
 func TestBackupRejectsNoPaths(t *testing.T) {
 	r, _ := initRepo(t, "nopaths")
 
-	if _, _, err := r.Backup(context.Background(), nil, BackupOptions{}); err == nil {
+	if _, err := r.Backup(context.Background(), nil, BackupOptions{}); err == nil {
 		t.Fatal("backup with no paths: got nil error")
 	}
 }
@@ -477,12 +481,13 @@ func TestDuplicateContentWithinOnePackIsStoredOnce(t *testing.T) {
 		{path: "c/third.bin", data: payload},
 	})
 
-	snap, handle, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	if snap.Stats.ChunksNew != 1 {
-		t.Errorf("stored %d chunks for three copies of one payload, want 1", snap.Stats.ChunksNew)
+	if summary.Report.ChunksNew != 1 {
+		t.Errorf("stored %d chunks for three copies of one payload, want 1", summary.Report.ChunksNew)
 	}
 
 	// The pack must be readable, and the restore must produce all three.
@@ -513,7 +518,8 @@ func TestBackupOfASingleFileRestores(t *testing.T) {
 	if err := os.WriteFile(src, []byte("single file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, handle, err := r.Backup(ctx, []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := r.Backup(ctx, []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
@@ -550,25 +556,23 @@ func TestBackupSegmentsHugeDirectories(t *testing.T) {
 	}
 	writeTree(t, source, specs)
 
-	snap, handle, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	summary, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	if snap.Stats.Files != uint64(total) {
-		t.Fatalf("backed up %d files, want %d", snap.Stats.Files, total)
+	if summary.Snapshot.Stats.Files != uint64(total) {
+		t.Fatalf("backed up %d files, want %d", summary.Snapshot.Stats.Files, total)
+	}
+	if len(summary.Snapshot.Roots) != 1 {
+		t.Fatalf("snapshot records %d roots, want 1", len(summary.Snapshot.Roots))
 	}
 
-	// The source directory's tree is the chain of both segments.
-	entries, err := r.LoadTreeChain(ctx, snap.Root)
+	// v3: the root tree IS the source directory's contents — the chain of
+	// both segments holds every entry directly (no synthetic root).
+	all, err := r.LoadTreeChain(ctx, summary.Snapshot.Roots[0].Tree)
 	if err != nil {
 		t.Fatalf("root chain: %v", err)
-	}
-	if len(entries) != 1 || string(entries[0].Name) != source || entries[0].Subtree == nil {
-		t.Fatalf("root holds %+v, want the one source %q", entries[0], source)
-	}
-	all, err := r.LoadTreeChain(ctx, *entries[0].Subtree)
-	if err != nil {
-		t.Fatalf("dir chain: %v", err)
 	}
 	if len(all) != total {
 		t.Fatalf("chain reassembled %d entries, want %d", len(all), total)
@@ -582,7 +586,7 @@ func TestBackupSegmentsHugeDirectories(t *testing.T) {
 	// A second, unchanged backup writes no new segments.
 	treesAfterFirst := countKeys(t, r.Backend(), "trees/")
 	second := reopen(t, dir, "segments-2")
-	if _, _, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+	if _, err := second.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 		t.Fatalf("second backup: %v", err)
 	}
 	if got := countKeys(t, second.Backend(), "trees/"); got != treesAfterFirst {
@@ -665,32 +669,31 @@ func TestRestoreFollowsIndirectChunkLists(t *testing.T) {
 	listID := crypto.ContentID(&r.keys.Hash, encoded)
 	listChunks := store(map[crypto.ID][]byte{listID: encoded})
 
-	// The snapshot root holds one absolute-path directory entry -- the
-	// shape a directory-source backup produces -- with the indirect file
-	// inside it.
+	// v3: the root tree holds the source directory's children directly
+	// (single-component names), with the indirect file inside it.
 	dirTree := tree.New([]tree.Entry{{
-		Name: []byte("big.bin"), Type: uint8(tree.TypeFile), Mode: 0o644,
-		Size: uint64(len(payload)), MTimeNs: 1767225845000000000,
-		Chunks: listChunks, ContentType: uint8(tree.ContentIndirect),
+		Name: []byte("big.bin"), Type: uint8(tree.TypeFile), MetaKind: 2,
+		MTimeNs: func() *int64 { v := int64(1767225845000000000); return &v }(),
+		Size:    uint64(len(payload)), Chunks: listChunks, ContentType: uint8(tree.ContentIndirect),
 	}})
-	dirID, err := dirTree.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("dir"))
+	dirID, encoded, err := dirTree.Encode(&r.keys.Hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := tree.New([]tree.Entry{{
-		Name: []byte("/virtual"), Type: uint8(tree.TypeDir), Mode: 0o755 | uint32(os.ModeDir),
-		MTimeNs: 1767225845000000000, Subtree: &dirID,
-	}})
-	rootID, err := root.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("root"))
+	sealed, err := crypto.Seal(&r.keys.Meta, dirID[:], encoded, crypto.DeterministicReader("indirect-restore-dir"))
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	if err := r.Backend().Put(ctx, tree.Key(dirID), bytes.NewReader(sealed), int64(len(sealed))); err != nil {
+		t.Fatal(err)
+	}
 	snap := &snapshot.Snapshot{
-		Version: snapshot.Version, Root: rootID, TimeNs: 1767225845000000001,
-		Host: "t", Paths: [][]byte{[]byte("/virtual")}, ClientID: r.clientID,
+		Version: snapshot.Version,
+		Roots:   []snapshot.Root{{Path: []byte("/virtual"), Tree: dirID}},
+		TimeNs:  1767225845000000001,
+		Host:    "t", ClientID: r.clientID,
 	}
-	handle, err := snap.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("snap"))
+	handle, err := snap.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("snap"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,15 +722,16 @@ func logTreeDifferences(t *testing.T, r *Repository) {
 		t.Logf("cannot diff snapshots: %v", err)
 		return
 	}
-	var roots [2]crypto.ID
+	var rootLists [2][]snapshot.Root
 	for i, h := range handles[len(handles)-2:] {
 		snap, err := r.LoadSnapshot(ctx, h.Key)
 		if err != nil {
 			t.Logf("load %s: %v", h.Key, err)
 			return
 		}
-		roots[i] = snap.Root
+		rootLists[i] = snap.Roots
 	}
+	// Pair up roots by locator; unpaired roots are logged whole.
 	var walk func(path string, a, b crypto.ID)
 	walk = func(path string, a, b crypto.ID) {
 		if a == b {
@@ -757,13 +761,23 @@ func logTreeDifferences(t *testing.T, r *Repository) {
 			}
 		}
 	}
-	walk("", roots[0], roots[1])
+	byPath := map[string][2]crypto.ID{}
+	for i, roots := range rootLists {
+		for _, r := range roots {
+			pair := byPath[string(r.Path)]
+			pair[i] = r.Tree
+			byPath[string(r.Path)] = pair
+		}
+	}
+	for path, pair := range byPath {
+		walk(path, pair[0], pair[1])
+	}
 }
 
-// docs/format.md §9 pins how stats count: dirs includes the source
-// directory itself but not the synthetic root tree; files counts every
-// name, hard links included; bytes counts hard-linked content once.
-// kist-rs asserts the same numbers (kist-core/tests/backup_restore.rs).
+// docs/format.md §9 (v3) pins how stats count: dirs counts directory
+// ENTRIES (roots are paths, not entries); files counts every name, hard
+// links included; bytes counts hard-linked content once. kist-rs asserts
+// the same numbers (kist-core/tests/backup_restore.rs).
 func TestSnapshotStatsFollowTheSpecCounting(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("hard links are not tracked on Windows")
@@ -784,12 +798,15 @@ func TestSnapshotStatsFollowTheSpecCounting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	snap, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	want := snapshot.Stats{Files: 3, Dirs: 3, Symlinks: 1, Bytes: uint64(len(payload)) + 1}
-	got := snapshot.Stats{Files: snap.Stats.Files, Dirs: snap.Stats.Dirs, Symlinks: snap.Stats.Symlinks, Bytes: snap.Stats.Bytes}
+	// v3 口徑（§9.1）：dirs 只數目錄 entry（sub、empty；root 是 path 不是
+	// entry），bytes 的 hard link 內容只算一次（a.bin + 1 byte 的 c.txt）。
+	want := snapshot.Stats{Files: 3, Dirs: 2, Symlinks: 1, Bytes: uint64(len(payload)) + 1}
+	got := snapshot.Stats{Files: snap.Snapshot.Stats.Files, Dirs: snap.Snapshot.Stats.Dirs,
+		Symlinks: snap.Snapshot.Stats.Symlinks, Bytes: snap.Snapshot.Stats.Bytes}
 	if got != want {
 		t.Errorf("stats = %+v, want %+v", got, want)
 	}

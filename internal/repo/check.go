@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/crypto"
@@ -68,6 +69,10 @@ type CheckReport struct {
 	// check with any problem is a failure, whatever else it managed to
 	// verify.
 	Problems []string
+
+	// Warnings are findings that do not make the repository unhealthy: a
+	// missing replica when replicas are configured, for instance.
+	Warnings []string
 }
 
 // OK reports whether the repository is intact.
@@ -202,9 +207,42 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 			problem("snapshot %s: %v", handle.Key, err)
 			continue
 		}
-		r.walkTree(ctx, snap.Root, handle.Key, rebuilt, seenTrees, usedPacks, checkChunks, problem)
+		for _, root := range snap.Roots {
+			r.walkTree(ctx, root.Tree, handle.Key, rebuilt, seenTrees, usedPacks, checkChunks, problem)
+		}
 	}
 	report.Trees = len(seenTrees)
+
+	// 3b. Replica health (format-v3-draft.md §13.5). An orphan replica --
+	// ".r1" present, primary tree gone -- is the disaster signal the
+	// replica exists to catch, and prune deliberately never cleans one
+	// up: it is reported here as a problem. When the repository keeps
+	// replicas, a live tree without its replica is only a warning: the
+	// data is safe, the redundancy is repairable by re-running a backup.
+	err = r.backend.List(ctx, tree.Prefix, func(fi backend.FileInfo) error {
+		name, ok := strings.CutSuffix(fi.Key, tree.ReplicaSuffix)
+		if !ok {
+			return nil
+		}
+		id, err := crypto.ParseID(strings.TrimPrefix(name, tree.Prefix))
+		if err != nil {
+			return nil //nolint:nilerr // not a replica key; not a replica problem
+		}
+		if _, err := r.backend.Stat(ctx, tree.Key(id)); err != nil {
+			problem("%s: replica exists but its primary tree is missing (possible data-loss event; data can be recovered from the replica)", fi.Key)
+		}
+		return nil
+	})
+	if err != nil {
+		return report, fmt.Errorf("check: %w", err)
+	}
+	if r.config.Replicas > 0 {
+		for _, id := range sortedTrees(seenTrees) {
+			if _, err := r.backend.Stat(ctx, tree.ReplicaKey(id)); err != nil {
+				report.Warnings = append(report.Warnings, fmt.Sprintf("%s: tree replica is missing (repairable)", tree.ReplicaKey(id)))
+			}
+		}
+	}
 
 	// 4. Optionally, read everything. This is the only step that can see
 	// a flipped bit inside a chunk.
@@ -288,7 +326,7 @@ func (r *Repository) walkTree(
 	}
 	seenTrees[id] = struct{}{}
 
-	t, err := tree.Load(ctx, r.backend, r.keys, id)
+	t, err := r.readTree(ctx, id)
 	if err != nil {
 		problem("%s: tree %s: %v", origin, id, err)
 		return
@@ -345,3 +383,13 @@ func (r *Repository) walkTree(
 
 // ErrCheckFailed is what a caller gets when a check found problems.
 var ErrCheckFailed = errors.New("repository check found problems")
+
+// sortedTrees returns a tree set in a stable order.
+func sortedTrees(trees map[crypto.ID]struct{}) []crypto.ID {
+	ids := make([]crypto.ID, 0, len(trees))
+	for id := range trees {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b crypto.ID) int { return bytes.Compare(a[:], b[:]) })
+	return ids
+}

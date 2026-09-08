@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"slices"
 	"testing"
 	"time"
@@ -75,23 +74,34 @@ func TestPruneKeepsDataOfIndirectChunkLists(t *testing.T) {
 		t.Fatal(err)
 	}
 	listID := crypto.ContentID(&r.keys.Hash, encoded)
+
+	// v3 helpers for hand-built trees.
+	ptrInt64 := func(v int64) *int64 { return &v }
+	mustEncode := func(t2 *tree.Tree) []byte {
+		_, enc, err := t2.Encode(&r.keys.Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return enc
+	}
 	listPack, listEntries := store(map[crypto.ID][]byte{listID: encoded})
 
+	// v3：root tree 直接持有來源目錄的 children（單一元件名稱、s3-kind
+	// 間接檔案），root 定位在 snapshot.Roots。
 	dirTree := tree.New([]tree.Entry{{
-		Name: []byte("big.bin"), Type: uint8(tree.TypeFile), Mode: 0o644,
-		Size: uint64(len(payload)), MTimeNs: 1767225845000000000,
+		Name: []byte("big.bin"), Type: uint8(tree.TypeFile), MetaKind: uint8(tree.MetaS3),
+		Size: uint64(len(payload)), MTimeNs: ptrInt64(1767225845000000000),
 		Chunks: listEntriesIDs(listEntries), ContentType: uint8(tree.ContentIndirect),
 	}})
-	dirID, err := dirTree.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("indirect-prune-dir"))
+	dirID, _, err := dirTree.Encode(&r.keys.Hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := tree.New([]tree.Entry{{
-		Name: []byte("/virtual"), Type: uint8(tree.TypeDir), Mode: 0o755 | uint32(os.ModeDir),
-		MTimeNs: 1767225845000000000, Subtree: &dirID,
-	}})
-	rootID, err := root.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("indirect-prune-root"))
+	sealedDir, err := crypto.Seal(&r.keys.Meta, dirID[:], mustEncode(dirTree), crypto.DeterministicReader("indirect-prune-dir"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Backend().Put(ctx, tree.Key(dirID), bytes.NewReader(sealedDir), int64(len(sealedDir))); err != nil {
 		t.Fatal(err)
 	}
 	// 真實 backup 會寫 index blob；prune 從 blobs 載入 index。
@@ -100,10 +110,12 @@ func TestPruneKeepsDataOfIndirectChunkLists(t *testing.T) {
 	}
 
 	snap := &snapshot.Snapshot{
-		Version: snapshot.Version, Root: rootID, TimeNs: 1767225845000000001,
-		Host: "t", Paths: [][]byte{[]byte("/virtual")}, ClientID: r.clientID,
+		Version: snapshot.Version,
+		Roots:   []snapshot.Root{{Path: []byte("/virtual"), Tree: dirID}},
+		TimeNs:  1767225845000000001,
+		Host:    "t", ClientID: r.clientID,
 	}
-	_, err = snap.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("indirect-prune-snap"))
+	_, err = snap.Save(ctx, r.Backend(), r.keys, crypto.DeterministicReader("indirect-prune-snap"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

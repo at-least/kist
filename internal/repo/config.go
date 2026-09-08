@@ -18,19 +18,30 @@ import (
 // checks for it first.
 const ConfigKey = "config"
 
-// ConfigVersion is the schema version of the config object.
-const ConfigVersion = 2
+// ConfigVersion is the schema version of the config object. It is also
+// this build's format version: the min_reader gate compares a
+// repository's requirement against it.
+const ConfigVersion = 3
 
 // ErrCorrupt means a repository's config is unusable.
 var ErrCorrupt = errors.New("repository config is corrupt")
 
+// ErrConfigTampered means the decrypted invariants disagree with the
+// plaintext config: someone edited repo_id or the chunker parameters
+// after the repository was created. The authenticated copy is the
+// authority; the failure is explicit because a silent one would change
+// what every content address means.
+var ErrConfigTampered = errors.New("plaintext config does not match the authenticated invariants (repo_id or chunker parameters were tampered)")
+
+// ErrReaderTooOld means the repository requires a newer reader than this
+// build (config.min_reader is above the version this build reads).
+var ErrReaderTooOld = errors.New("repository requires a newer kist reader")
+
 // ChunkerParams records the chunk sizes a repository was created with.
 //
-// v2 reads them as parameters, not constants: a repository's clients must
-// agree on them (they are bound into the master-key AAD, so tampering
-// with the plaintext config fails the unwrap rather than silently
-// breaking deduplication), but different repositories may differ within
-// the validated ranges.
+// v3 treats them as invariants: they are bound into the wrapped master
+// key's authenticated payload, and a plaintext config that disagrees
+// with what was decrypted fails the open with an explicit tamper error.
 type ChunkerParams struct {
 	MinSize uint32 `cbor:"min"`
 	AvgSize uint32 `cbor:"avg"`
@@ -49,6 +60,12 @@ const DefaultPackTargetSize uint64 = 64 << 20
 // chunkerParams converts to the chunker package's type.
 func (c ChunkerParams) chunkerParams() chunker.Params {
 	return chunker.Params{Min: c.MinSize, Avg: c.AvgSize, Max: c.MaxSize}
+}
+
+// invariantsChunker is the view of the parameters the wrapped key
+// carries.
+func (c ChunkerParams) invariantsChunker() crypto.InvariantsChunker {
+	return crypto.InvariantsChunker{Min: c.MinSize, Avg: c.AvgSize, Max: c.MaxSize}
 }
 
 // validate rejects plaintext parameters that are nonsense before any of
@@ -80,7 +97,12 @@ func (c ChunkerParams) validate() error {
 // It is plaintext on purpose. The KDF parameters and salt must be
 // readable before any key exists, and everything else here -- the
 // repository ID, the chunk sizes, the creation time -- is already
-// derivable by anyone who can list the repository.
+// derivable by anyone who can list the repository. The repo_id and the
+// chunker parameters are ALSO in the wrapped key's authenticated
+// payload; this copy is a hint that must match it.
+//
+// Field order is the spec table (format-v3-draft.md §4.1): v, repo_id,
+// created, chunker, pack_target, min_reader, replicas, slot.
 type Config struct {
 	Version uint64 `cbor:"v"`
 
@@ -91,9 +113,20 @@ type Config struct {
 	Chunker ChunkerParams `cbor:"chunker"`
 
 	// PackTargetSize is how large a pack grows before it is flushed. It
-	// is adjustable per repository (not bound into any AAD) because it
-	// changes no content address, only batching.
+	// is adjustable per repository (not an invariant) because it changes
+	// no content address, only batching.
 	PackTargetSize uint64 `cbor:"pack_target"`
+
+	// MinReader is the lowest format version that can safely read this
+	// repository. A client whose version is lower refuses at open with an
+	// explicit error instead of half-reading through ignored fields. It
+	// only ever goes up.
+	MinReader uint16 `cbor:"min_reader"`
+
+	// Replicas is 1 when trees and snapshots are also stored at "<key>.r1"
+	// (identical bytes, PutIfAbsent), 0 otherwise. It is write-side
+	// policy, not an invariant.
+	Replicas uint8 `cbor:"replicas"`
 
 	Slot crypto.KeySlot `cbor:"slot"`
 }
@@ -122,7 +155,34 @@ func LoadConfig(ctx context.Context, b backend.Backend) (*Config, error) {
 	if cfg.PackTargetSize < minPack || cfg.PackTargetSize > maxPack || cfg.PackTargetSize < uint64(cfg.Chunker.MaxSize) {
 		return nil, fmt.Errorf("%w: pack_target %d is outside %d..=%d or below chunker.max", ErrCorrupt, cfg.PackTargetSize, minPack, maxPack)
 	}
+	// The min_reader gate (format-v3-draft.md §11): a repository written
+	// by a newer format says so, and this build refuses rather than
+	// guessing. The range check keeps a corrupted value from being
+	// meaningless in the other direction too.
+	if cfg.MinReader < ConfigVersion || uint64(cfg.MinReader) > cfg.Version {
+		return nil, fmt.Errorf("%w: min_reader %d is outside %d..=%d", ErrCorrupt, cfg.MinReader, ConfigVersion, cfg.Version)
+	}
+	if cfg.MinReader > ConfigVersion {
+		return nil, fmt.Errorf("%w: repository requires a reader of format v%d or newer; this build reads v%d", ErrReaderTooOld, cfg.MinReader, ConfigVersion)
+	}
+	if cfg.Replicas > 1 {
+		return nil, fmt.Errorf("%w: replicas %d is outside 0..=1", ErrCorrupt, cfg.Replicas)
+	}
 	return &cfg, nil
+}
+
+// checkMatches compares the decrypted invariants with this config. Any
+// mismatch is a tampered config, and must fail loudly: the invariants
+// decide what every content address means.
+func (c *Config) checkMatches(inv crypto.Invariants) error {
+	if err := inv.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrCorrupt, err)
+	}
+	sameRepo := len(inv.RepoID) == len(c.RepoID) && string(inv.RepoID) == string(c.RepoID[:])
+	if !sameRepo || inv.Chunker != c.Chunker.invariantsChunker() {
+		return ErrConfigTampered
+	}
+	return nil
 }
 
 // saveConfig writes the config object.
@@ -137,13 +197,15 @@ func saveConfig(ctx context.Context, b backend.Backend, cfg *Config) error {
 	return nil
 }
 
-func newConfig(repoID crypto.RepoID, slot *crypto.KeySlot, now time.Time) *Config {
+func newConfig(repoID crypto.RepoID, slot *crypto.KeySlot, now time.Time, replicas uint8) *Config {
 	return &Config{
 		Version:        ConfigVersion,
 		RepoID:         repoID,
 		CreatedUnixNs:  now.UTC().UnixNano(),
 		Chunker:        DefaultChunkerParams(),
 		PackTargetSize: DefaultPackTargetSize,
+		MinReader:      ConfigVersion,
+		Replicas:       replicas,
 		Slot:           *slot,
 	}
 }

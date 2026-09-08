@@ -195,11 +195,11 @@ func (r *Runner) backup(ctx context.Context, b *config.Backup) error {
 			return err
 		}
 		defer r.closeRepo(rp)
-		snap, handle, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Parity: r.Config.Repository.Parity, Warnf: warn})
+		summary, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Parity: r.Config.Repository.Parity, Warnf: warn})
 		if err != nil {
 			return err
 		}
-		ev.Backup = report.FromBackup(snap, handle)
+		ev.Backup = report.FromBackup(summary)
 		return nil
 	}()
 	return r.finish(ctx, &ev, err)
@@ -260,8 +260,8 @@ func (r *Runner) finish(ctx context.Context, ev *report.Event, err error) error 
 		return err
 	}
 	if ev.Backup != nil {
-		r.logf("%s: snapshot %s: %d files, %s read, %s stored in %d new packs, %s",
-			ev.Job, ev.Backup.Snapshot, ev.Backup.Files, human(ev.Backup.Bytes), human(ev.Backup.BytesStored), ev.Backup.PacksAdded, ev.Duration().Round(time.Millisecond))
+		r.logf("%s: snapshot %s: %d files, %s read, %s stored in %d new packs, %d error(s), %s",
+			ev.Job, ev.Backup.Snapshot, ev.Backup.Files, human(ev.Backup.Bytes), human(ev.Backup.Report.BytesStored), ev.Backup.Report.PacksNew, ev.Backup.Errors, ev.Duration().Round(time.Millisecond))
 	}
 	return nil
 }
@@ -279,8 +279,8 @@ func (r *Runner) record(ev *report.Event) {
 		labels := map[string]string{"job": ev.Job}
 		reg.Set("kist_last_backup_files", "Files in the last successful backup.", labels, float64(b.Files))
 		reg.Set("kist_last_backup_bytes", "Bytes read by the last successful backup.", labels, float64(b.Bytes))
-		reg.Set("kist_last_backup_bytes_stored", "Bytes uploaded by the last successful backup.", labels, float64(b.BytesStored))
-		reg.Set("kist_last_backup_packs_added", "Packs written by the last successful backup.", labels, float64(b.PacksAdded))
+		reg.Set("kist_last_backup_bytes_stored", "Bytes uploaded by the last successful backup.", labels, float64(b.Report.BytesStored))
+		reg.Set("kist_last_backup_packs_added", "Packs written by the last successful backup.", labels, float64(b.Report.PacksNew))
 	}
 	if p := ev.Prune; p != nil {
 		reg.Set("kist_last_prune_packs_stored", "Packs in the repository at the last prune.", nil, float64(p.PacksStored))

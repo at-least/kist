@@ -6,11 +6,16 @@ import (
 	"github.com/at-least/kist/internal/tree"
 )
 
-// fillOwnership is a no-op on Windows: there is no uid/gid to record, and
-// the ACLs that take their place are not something M1 represents. A tree
-// entry written here simply has no owner, which restores as "owned by
-// whoever ran the restore" -- the honest answer.
-func fillOwnership(*tree.Entry, fs.FileInfo) {}
+// fillOwnership records ownership on Windows as uid/gid 0: v3 posix
+// entries carry ownership unconditionally (uid 0 is a real value, not
+// "not recorded"), and Windows has nothing better to say -- the ACLs that
+// take its place are not something the format represents. A restore
+// applies nothing for uid/gid 0, which lands the file with the
+// restorer's identity -- the honest answer.
+func fillOwnership(entry *tree.Entry, _ fs.FileInfo) {
+	entry.UID = tree.Ptr(uint32(0))
+	entry.GID = tree.Ptr(uint32(0))
+}
 
 // hardLinkOf reports no hard links on Windows. NTFS has them, but the
 // file index that identifies one is not exposed through fs.FileInfo, so

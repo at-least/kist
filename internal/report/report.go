@@ -42,45 +42,56 @@ type InitResult struct {
 	ClientID string `json:"client_id"`
 }
 
-// SnapshotSummary is one row of `kist snapshots --json`.
+// SnapshotSummary is one row of `kist snapshots --json`. Roots are the
+// backup sources as recorded (lossy UTF-8): v3 snapshots carry roots,
+// not a root tree plus paths.
 type SnapshotSummary struct {
 	Snapshot string    `json:"snapshot"`
 	ClientID string    `json:"client_id"`
 	Time     time.Time `json:"time"`
 	Host     string    `json:"host,omitempty"`
-	Paths    []string  `json:"paths,omitempty"`
+	Roots    []string  `json:"roots,omitempty"`
 	Files    uint64    `json:"files"`
+	Dirs     uint64    `json:"dirs"`
+	Symlinks uint64    `json:"symlinks"`
 	Bytes    uint64    `json:"bytes"`
 	Error    string    `json:"error,omitempty"`
 }
 
-// BackupResult is a committed snapshot.
+// BackupResult is a committed snapshot. The Stats fields are the data
+// facts the snapshot itself carries; the Report fields are this run's
+// process counters, which depend on GC state and dedup order and so live
+// here, never in the snapshot (format-v3-draft.md §9.1).
 type BackupResult struct {
-	Snapshot     string   `json:"snapshot"`
-	Host         string   `json:"host"`
-	Paths        []string `json:"paths"`
-	Files        uint64   `json:"files"`
-	Dirs         uint64   `json:"dirs"`
-	Symlinks     uint64   `json:"symlinks"`
-	Bytes        uint64   `json:"bytes"`
-	BytesStored  uint64   `json:"bytes_stored"`
-	ChunksNew    uint64   `json:"chunks_new"`
-	PacksAdded   uint64   `json:"packs_added"`
-	PacksRevived uint64   `json:"packs_revived"`
+	Snapshot string   `json:"snapshot"`
+	Host     string   `json:"host"`
+	Roots    []string `json:"roots"`
+	Files    uint64   `json:"files"`
+	Dirs     uint64   `json:"dirs"`
+	Symlinks uint64   `json:"symlinks"`
+	Bytes    uint64   `json:"bytes"`
+	Errors   uint64   `json:"errors"`
+
+	Report repo.BackupReport `json:"report"`
 }
 
 // FromBackup builds the result of a backup.
-func FromBackup(snap *snapshot.Snapshot, handle snapshot.Handle) *BackupResult {
-	paths := make([]string, len(snap.Paths))
-	for i, p := range snap.Paths {
-		paths[i] = string(p)
-	}
+func FromBackup(summary repo.BackupSummary) *BackupResult {
+	snap := summary.Snapshot
 	return &BackupResult{
-		Snapshot: handle.Key, Host: snap.Host, Paths: paths,
+		Snapshot: summary.Handle.Key, Host: snap.Host, Roots: rootsOf(snap.Roots),
 		Files: snap.Stats.Files, Dirs: snap.Stats.Dirs, Symlinks: snap.Stats.Symlinks,
-		Bytes: snap.Stats.Bytes, BytesStored: snap.Stats.BytesStored, ChunksNew: snap.Stats.ChunksNew,
-		PacksAdded: snap.Stats.PacksAdded, PacksRevived: snap.Stats.PacksRevived,
+		Bytes: snap.Stats.Bytes, Errors: summary.Report.Errors,
+		Report: summary.Report,
 	}
+}
+
+func rootsOf(roots []snapshot.Root) []string {
+	out := make([]string, len(roots))
+	for i, r := range roots {
+		out[i] = string(r.Path)
+	}
+	return out
 }
 
 // ForgetResult lists what forget removed and kept.
@@ -112,15 +123,19 @@ type PruneResult struct {
 	Marked         []string   `json:"marked"`
 	Unmarked       []string   `json:"unmarked"`
 	Deleted        []string   `json:"deleted"`
+	TreesMarked    []string   `json:"trees_marked"`
+	TreesDeleted   []string   `json:"trees_deleted"`
+	OrphanTouches  int        `json:"orphan_touches_removed"`
 	Locked         []string   `json:"locked,omitempty"`
 	Held           []HeldPack `json:"held"`
 	BytesReclaimed uint64     `json:"bytes_reclaimed"`
 }
 
-// HeldPack is a marked pack not deleted, and why.
+// HeldPack is a marked object not deleted, and why.
 type HeldPack struct {
 	Pack   string `json:"pack"`
 	Reason string `json:"reason"`
+	Kind   string `json:"kind"`
 }
 
 // FromPrune builds the result of a prune.
@@ -128,10 +143,12 @@ func FromPrune(r repo.PruneReport, dryRun bool) *PruneResult {
 	out := &PruneResult{
 		DryRun: dryRun, PacksStored: r.Stored, PacksLive: r.Live,
 		Marked: idStrings(r.Marked), Unmarked: idStrings(r.Unmarked), Deleted: idStrings(r.Deleted),
-		Locked: idStrings(r.Locked), Held: make([]HeldPack, 0, len(r.Held)), BytesReclaimed: r.BytesReclaimed,
+		TreesMarked: idStrings(r.TreesMarked), TreesDeleted: idStrings(r.TreesDeleted),
+		OrphanTouches: r.OrphanTouches,
+		Locked:        idStrings(r.Locked), Held: make([]HeldPack, 0, len(r.Held)), BytesReclaimed: r.BytesReclaimed,
 	}
 	for _, h := range r.Held {
-		out.Held = append(out.Held, HeldPack{Pack: h.Pack.String(), Reason: h.Reason})
+		out.Held = append(out.Held, HeldPack{Pack: h.Pack.String(), Reason: h.Reason, Kind: h.Kind})
 	}
 	return out
 }
@@ -152,6 +169,7 @@ type CheckResult struct {
 	Chunks    int      `json:"chunks"`
 	Packs     int      `json:"packs"`
 	Problems  []string `json:"problems"`
+	Warnings  []string `json:"warnings,omitempty"`
 
 	ParityPacks  int      `json:"parity_packs"`
 	Repaired     []string `json:"repaired,omitempty"`
@@ -165,7 +183,7 @@ func FromCheck(r repo.CheckReport, readData bool) *CheckResult {
 		problems = []string{}
 	}
 	return &CheckResult{
-		ReadData: readData, Snapshots: r.Snapshots, Trees: r.Trees, Chunks: r.Chunks, Packs: r.Packs, Problems: problems,
+		ReadData: readData, Snapshots: r.Snapshots, Trees: r.Trees, Chunks: r.Chunks, Packs: r.Packs, Problems: problems, Warnings: r.Warnings,
 		ParityPacks: r.ParityPacks, Repaired: idStrings(r.Repaired), Unrepairable: idStrings(r.Unrepairable),
 	}
 }

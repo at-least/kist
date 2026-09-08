@@ -134,6 +134,12 @@ func TestInteropKeyDerivation(t *testing.T) {
 	}
 }
 
+func u32p(v uint32) *uint32 { return &v }
+
+func u64p(v uint64) *uint64 { return &v }
+
+func i64p(v int64) *int64 { return &v }
+
 func TestInteropTreeCanonicalCBOR(t *testing.T) {
 	// A tree exercising every field kind: bytes name, all optional
 	// fields, indirect content, xattrs. Both implementations must
@@ -147,25 +153,36 @@ func TestInteropTreeCanonicalCBOR(t *testing.T) {
 	for i := range sub {
 		sub[i] = byte(0xA0 + i)
 	}
+	// Same tree as the Rust recorder (kist-format/tests/interop.rs): every
+	// field family AND every metadata kind, byte-identical canonical CBOR.
 	t1 := tree.New([]tree.Entry{
 		{
-			Name: []byte("a.txt"), Type: 0, Mode: 0o100644,
-			UID: 1000, GID: 100, MTimeNs: 1788605504101452995, CTimeNs: 1788605504000000001,
+			Name: []byte("a.txt"), Type: 0, MetaKind: 0, Mode: u32p(0o100644),
+			UID: u32p(1000), GID: u32p(100), MTimeNs: i64p(1788605504101452995), CTimeNs: i64p(1788605504000000001),
 			Size: 4096, Chunks: []crypto.ID{id1}, ContentType: 0,
 		},
 		{
-			Name: []byte("dir"), Type: 1, Mode: 0o040755, MTimeNs: 1788605500000000000,
+			Name: []byte("big.bin"), Type: 0, MetaKind: 0, Mode: u32p(0o100600),
+			UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1788605500000000000),
+			Chunks: []crypto.ID{id1, sub}, ContentType: 1,
+			Device: u64p(8), Inode: u64p(999), Links: u64p(3),
+			Xattrs: tree.Xattrs{{Name: []byte("user.k"), Value: []byte("v")}},
+		},
+		{
+			Name: []byte("dir"), Type: 1, MetaKind: 0, Mode: u32p(0o040755),
+			UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1788605500000000000),
 			Subtree: &sub,
 		},
 		{
-			Name: []byte("link"), Type: 2, Mode: 0o120777, MTimeNs: 1788605500000000000,
+			Name: []byte("link"), Type: 2, MetaKind: 0, Mode: u32p(0o120777),
+			UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1788605500000000000),
 			Target: []byte("../a.txt"),
 		},
 		{
-			Name: []byte("big.bin"), Type: 0, Mode: 0o100600, MTimeNs: 1788605500000000000,
-			Chunks: []crypto.ID{id1, sub}, ContentType: 1,
-			Device: 8, Inode: 999, Links: 3,
-			Xattrs: tree.Xattrs{{Name: []byte("user.k"), Value: []byte("v")}},
+			Name: []byte("z-s3.bin"), Type: 0, MetaKind: 2, MTimeNs: i64p(1788605500000000000),
+			Size: 777, Chunks: []crypto.ID{sub},
+			Etag: []byte(`"5e6f80a1c9de4c2b95e6f81a03cf8f4d"`),
+			Vern: []byte("3sL4k1JtX9qZ7wR2.noS3vId8UuM5pQ0"),
 		},
 	})
 	var keys crypto.Key

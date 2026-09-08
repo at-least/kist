@@ -21,7 +21,8 @@ func parityRepo(t *testing.T, seed string) (*Repository, string, snapshot.Handle
 	r, dir := initRepo(t, seed)
 	source := t.TempDir()
 	writeTree(t, source, sampleFiles(t))
-	_, handle, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: t.TempDir(), Parity: 2})
+	summary, err := r.Backup(context.Background(), []string{source}, BackupOptions{SpoolDir: t.TempDir(), Parity: 2})
+	handle := summary.Handle
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
@@ -188,10 +189,11 @@ func TestPruneRemovesParityWithThePack(t *testing.T) {
 	s := newScenario(t)
 	src := s.source("one", 300<<10)
 	a := s.open(clientA)
-	_, h, err := a.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir(), Parity: 1})
+	summaryP, err := a.Backup(context.Background(), []string{src}, BackupOptions{SpoolDir: t.TempDir(), Parity: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	h := summaryP.Handle
 	s.sources[h.Key] = src
 	if countKeys(t, a.Backend(), parity.Prefix) != 1 {
 		t.Fatal("no parity written")

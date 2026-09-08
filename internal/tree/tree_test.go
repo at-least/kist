@@ -57,16 +57,34 @@ func chunkID(b byte) crypto.ID {
 // omitempty needs a pointer to tell "absent" from "the zero ID".
 func idPtr(id crypto.ID) *crypto.ID { return &id }
 
+func u32p(v uint32) *uint32 { return &v }
+
+func i64p(v int64) *int64 { return &v }
+
 func file(name string, chunks ...crypto.ID) Entry {
-	return Entry{Name: []byte(name), Type: uint8(TypeFile), Mode: 0o644, Chunks: chunks}
+	return Entry{
+		Name: []byte(name), Type: uint8(TypeFile), MetaKind: 0,
+		Mode: u32p(0o644), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1767225845000000000),
+		Chunks: chunks,
+	}
+}
+
+// metaEq compares pointer-valued metadata by value.
+func metaEq(a, b Entry) bool {
+	ptrEq := func(x, y *uint32) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
+	i64Eq := func(x, y *int64) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
+	u64Eq := func(x, y *uint64) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
+	return ptrEq(a.Mode, b.Mode) && ptrEq(a.UID, b.UID) && ptrEq(a.GID, b.GID) &&
+		i64Eq(a.MTimeNs, b.MTimeNs) && i64Eq(a.CTimeNs, b.CTimeNs) &&
+		u64Eq(a.Device, b.Device) && u64Eq(a.Inode, b.Inode) && u64Eq(a.Links, b.Links)
 }
 
 func sampleEntries() []Entry {
 	return []Entry{
-		{Name: []byte("notes.txt"), Type: uint8(TypeFile), Mode: 0o644, UID: 1000, GID: 1000, MTimeNs: 1767225845000000000, Size: 12, Chunks: []crypto.ID{chunkID(1), chunkID(2)}},
-		{Name: []byte("docs"), Type: uint8(TypeDir), Mode: 0o755 | uint32(os.ModeDir), Subtree: idPtr(chunkID(9))},
-		{Name: []byte("link"), Type: uint8(TypeSymlink), Mode: 0o777 | uint32(os.ModeSymlink), Target: []byte("notes.txt")},
-		{Name: []byte("empty"), Type: uint8(TypeFile), Mode: 0o600},
+		{Name: []byte("notes.txt"), Type: uint8(TypeFile), MetaKind: 0, Mode: u32p(0o644), UID: u32p(1000), GID: u32p(1000), MTimeNs: i64p(1767225845000000000), Size: 12, Chunks: []crypto.ID{chunkID(1), chunkID(2)}},
+		{Name: []byte("docs"), Type: uint8(TypeDir), MetaKind: 0, Mode: u32p(0o755 | uint32(os.ModeDir)), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1767225845000000000), Subtree: idPtr(chunkID(9))},
+		{Name: []byte("link"), Type: uint8(TypeSymlink), MetaKind: 0, Mode: u32p(0o777 | uint32(os.ModeSymlink)), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1767225845000000000), Target: []byte("notes.txt")},
+		{Name: []byte("empty"), Type: uint8(TypeFile), MetaKind: 0, Mode: u32p(0o600), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1767225845000000000)},
 	}
 }
 
@@ -96,6 +114,25 @@ func TestNewSortsEntries(t *testing.T) {
 	}
 }
 
+// saveTree stores a tree with the v3 discipline (encode → seal → put) and
+// returns its ID. The repo layer owns the PutIfAbsent/heal/touch protocol;
+// these tests only need the bytes to be findable.
+func saveTree(ctx context.Context, t *testing.T, b backend.Backend, keys *crypto.Keys, tr *Tree, nonce string) crypto.ID {
+	t.Helper()
+	id, encoded, err := tr.Encode(&keys.Hash)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	sealed, err := crypto.Seal(&keys.Meta, id[:], encoded, crypto.DeterministicReader(nonce))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if err := backend.PutBytes(ctx, b, Key(id), sealed); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	return id
+}
+
 func namesJoined(entries []Entry) string {
 	names := make([]string, len(entries))
 	for i, e := range entries {
@@ -109,9 +146,18 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	keys, b := testKeys(t), testBackend(t)
 
 	original := New(sampleEntries())
-	id, err := original.Save(ctx, b, keys, crypto.DeterministicReader("tree"))
+	// v3: tree writing is Encode → seal → PutIfAbsent (the repo's writeTree
+	// discipline); the tree package itself only encodes and verifies.
+	id, encoded, err := original.Encode(&keys.Hash)
 	if err != nil {
-		t.Fatalf("save: %v", err)
+		t.Fatalf("encode: %v", err)
+	}
+	sealed, err := crypto.Seal(&keys.Meta, id[:], encoded, crypto.DeterministicReader("tree"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if err := backend.PutBytes(ctx, b, Key(id), sealed); err != nil {
+		t.Fatalf("put: %v", err)
 	}
 
 	loaded, err := Load(ctx, b, keys, id)
@@ -123,10 +169,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	for i := range original.Entries {
 		got, want := loaded.Entries[i], original.Entries[i]
-		if !bytes.Equal(got.Name, want.Name) || got.Type != want.Type || got.Mode != want.Mode ||
+		if !bytes.Equal(got.Name, want.Name) || got.Type != want.Type ||
 			got.Size != want.Size || !bytes.Equal(got.Target, want.Target) ||
 			!equalPtrs(got.Subtree, want.Subtree) ||
-			got.MTimeNs != want.MTimeNs || len(got.Chunks) != len(want.Chunks) {
+			!metaEq(got, want) || len(got.Chunks) != len(want.Chunks) {
 			t.Errorf("entry %d: got %+v, want %+v", i, got, want)
 		}
 	}
@@ -142,20 +188,19 @@ func equalPtrs(a, b *crypto.ID) bool {
 // A tree is named by its plaintext, not its ciphertext. Otherwise every
 // nightly backup would rename every unchanged directory.
 func TestUnchangedTreeKeepsItsName(t *testing.T) {
-	ctx := context.Background()
-	keys, b := testKeys(t), testBackend(t)
+	keys := testKeys(t)
 
-	first, err := New(sampleEntries()).Save(ctx, b, keys, crypto.DeterministicReader("first"))
+	first, _, err := New(sampleEntries()).Encode(&keys.Hash)
 	if err != nil {
-		t.Fatalf("save: %v", err)
+		t.Fatalf("encode: %v", err)
 	}
 	// A different nonce source means different ciphertext entirely.
-	second, err := New(sampleEntries()).Save(ctx, b, keys, crypto.DeterministicReader("second-and-very-different"))
+	secondID, _, err := New(sampleEntries()).Encode(&keys.Hash)
 	if err != nil {
-		t.Fatalf("save: %v", err)
+		t.Fatalf("encode: %v", err)
 	}
-	if first != second {
-		t.Fatalf("the same directory got two names: %s and %s", first, second)
+	if first != secondID {
+		t.Fatalf("the same directory got two names: %s and %s", first, secondID)
 	}
 }
 
@@ -169,17 +214,17 @@ func TestAChangedEntryChangesTheName(t *testing.T) {
 
 	for name, mutate := range map[string]func([]Entry) []Entry{
 		"renamed":     func(e []Entry) []Entry { e[0].Name = []byte("notes2.txt"); return e },
-		"remoded":     func(e []Entry) []Entry { e[0].Mode = 0o600; return e },
+		"remoded":     func(e []Entry) []Entry { v := uint32(0o600); e[0].Mode = &v; return e },
 		"resized":     func(e []Entry) []Entry { e[0].Size = 13; return e },
 		"rechunked":   func(e []Entry) []Entry { e[0].Chunks[1] = chunkID(3); return e },
-		"retimed":     func(e []Entry) []Entry { e[0].MTimeNs++; return e },
+		"retimed":     func(e []Entry) []Entry { *e[0].MTimeNs++; return e },
 		"new subtree": func(e []Entry) []Entry { e[1].Subtree = idPtr(chunkID(8)); return e },
 		"new target":  func(e []Entry) []Entry { e[2].Target = []byte("docs"); return e },
 		"entry gone":  func(e []Entry) []Entry { return e[1:] },
 		"entry added": func(e []Entry) []Entry {
-			return append(e, Entry{Name: []byte("extra"), Type: uint8(TypeFile), Mode: 0o644})
+			return append(e, file("extra"))
 		},
-		"owner change": func(e []Entry) []Entry { e[0].UID = 1001; return e },
+		"owner change": func(e []Entry) []Entry { v := uint32(1001); e[0].UID = &v; return e },
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, _, err := New(mutate(sampleEntries())).Encode(&keys.Hash)
@@ -197,10 +242,7 @@ func TestLoadRejectsDamage(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	id, err := New(sampleEntries()).Save(ctx, b, keys, crypto.DeterministicReader("damage"))
-	if err != nil {
-		t.Fatalf("save: %v", err)
-	}
+	id := saveTree(ctx, t, b, keys, New(sampleEntries()), "damage")
 	sealed, err := backend.GetAll(ctx, b, Key(id))
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -223,10 +265,7 @@ func TestTreeCannotBeServedUnderAnotherName(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	realID, err := New(sampleEntries()).Save(ctx, b, keys, crypto.DeterministicReader("real"))
-	if err != nil {
-		t.Fatalf("save: %v", err)
-	}
+	realID := saveTree(ctx, t, b, keys, New(sampleEntries()), "real")
 	sealed, err := backend.GetAll(ctx, b, Key(realID))
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -243,11 +282,11 @@ func TestTreeCannotBeServedUnderAnotherName(t *testing.T) {
 
 func TestValidateRejectsImpossibleTrees(t *testing.T) {
 	cases := map[string][]Entry{
-		"empty name":           {{Name: nil, Type: uint8(TypeFile), Mode: 0o644}},
-		"dot":                  {{Name: []byte("."), Type: uint8(TypeFile), Mode: 0o644}},
-		"dotdot":               {{Name: []byte(".."), Type: uint8(TypeFile), Mode: 0o644}},
-		"path separator":       {{Name: []byte("a/b"), Type: uint8(TypeFile), Mode: 0o644}},
-		"embedded NUL":         {{Name: []byte("a\x00b"), Type: uint8(TypeFile), Mode: 0o644}},
+		"empty name":           {{Name: nil, Type: uint8(TypeFile), Mode: u32p(0o644), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1)}},
+		"dot":                  {{Name: []byte("."), Type: uint8(TypeFile), Mode: u32p(0o644), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1)}},
+		"dotdot":               {{Name: []byte(".."), Type: uint8(TypeFile), Mode: u32p(0o644), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1)}},
+		"path separator":       {{Name: []byte("a/b"), Type: uint8(TypeFile), Mode: u32p(0o644), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1)}},
+		"embedded NUL":         {{Name: []byte("a\x00b"), Type: uint8(TypeFile), Mode: u32p(0o644), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1)}},
 		"duplicate name":       {{Name: []byte("a"), Type: uint8(TypeFile)}, {Name: []byte("a"), Type: uint8(TypeFile)}},
 		"dir without subtree":  {{Name: []byte("d"), Type: uint8(TypeDir)}},
 		"dir with chunks":      {{Name: []byte("d"), Type: uint8(TypeDir), Subtree: idPtr(chunkID(1)), Chunks: []crypto.ID{chunkID(2)}}},
@@ -278,29 +317,30 @@ func TestValidateRejectsImpossibleTrees(t *testing.T) {
 	}
 }
 
-// A root-level entry is named by its full absolute path (the v2 rule, so
-// the Go and Rust implementations agree on the root tree's name), and a
-// file whose chunk list would run past MaxInlineChunks must be indirect.
-func TestValidateAcceptsAbsoluteRootNames(t *testing.T) {
+// v3 removed the synthetic root: entry names are ALWAYS single path
+// components (the source locator lives in the snapshot's roots). A file
+// whose chunk list would run past MaxInlineChunks must be indirect.
+func TestValidateRejectsPathNamesAndEnforcesIndirect(t *testing.T) {
 	keys := testKeys(t)
 
 	entries := []Entry{
-		{Name: []byte("/srv/data"), Type: uint8(TypeDir), Mode: 0o755, Subtree: idPtr(chunkID(9))},
-		{Name: []byte("/tmp/poc/go2-data"), Type: uint8(TypeFile), Mode: 0o644, Chunks: []crypto.ID{chunkID(1)}},
+		{Name: []byte("srv"), Type: uint8(TypeDir), Mode: u32p(0o755), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1), Subtree: idPtr(chunkID(9))},
+		{Name: []byte("/srv/data"), Type: uint8(TypeDir), Mode: u32p(0o755), Subtree: idPtr(chunkID(9))},
+		{Name: []byte("/tmp/poc/go2-data"), Type: uint8(TypeFile), Mode: u32p(0o644), UID: u32p(0), GID: u32p(0), MTimeNs: i64p(1), Chunks: []crypto.ID{chunkID(1)}},
 	}
-	if _, _, err := (&Tree{Version: Version, Entries: entries}).Encode(&keys.Hash); err != nil {
-		t.Fatalf("encode a root tree with absolute names: %v", err)
+	if _, _, err := (&Tree{Version: Version, Entries: entries}).Encode(&keys.Hash); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("encode a tree with path-like names: err = %v, want ErrCorrupt", err)
 	}
 
 	var many []crypto.ID
 	for i := range MaxInlineChunks + 1 {
 		many = append(many, chunkID(byte(i)))
 	}
-	direct := []Entry{{Name: []byte("big"), Type: uint8(TypeFile), Chunks: many}}
+	direct := []Entry{file("big", many...)}
 	if _, _, err := (&Tree{Version: Version, Entries: direct}).Encode(&keys.Hash); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("encode an over-long inline chunk list: err = %v, want ErrCorrupt", err)
 	}
-	indirect := []Entry{{Name: []byte("big"), Type: uint8(TypeFile), Chunks: many, ContentType: uint8(ContentIndirect)}}
+	indirect := []Entry{func() Entry { e := file("big", many...); e.ContentType = uint8(ContentIndirect); return e }()}
 	if _, _, err := (&Tree{Version: Version, Entries: indirect}).Encode(&keys.Hash); err != nil {
 		t.Fatalf("encode an indirect chunk list: %v", err)
 	}
@@ -309,8 +349,8 @@ func TestValidateAcceptsAbsoluteRootNames(t *testing.T) {
 func TestValidateRejectsUnsortedEntries(t *testing.T) {
 	keys := testKeys(t)
 	tr := &Tree{Version: Version, Entries: []Entry{
-		{Name: []byte("b"), Type: uint8(TypeFile), Mode: 0o644},
-		{Name: []byte("a"), Type: uint8(TypeFile), Mode: 0o644},
+		{Name: []byte("b"), Type: uint8(TypeFile), Mode: u32p(0o644)},
+		{Name: []byte("a"), Type: uint8(TypeFile), Mode: u32p(0o644)},
 	}}
 
 	if _, _, err := tr.Encode(&keys.Hash); !errors.Is(err, ErrCorrupt) {
@@ -325,17 +365,11 @@ func TestLoadChainReassemblesSegments(t *testing.T) {
 	keys, b := testKeys(t), testBackend(t)
 
 	older := New([]Entry{file("a"), file("b")})
-	first, err := older.Save(ctx, b, keys, crypto.DeterministicReader("chain-1"))
-	if err != nil {
-		t.Fatalf("save segment 1: %v", err)
-	}
+	first := saveTree(ctx, t, b, keys, older, "chain-1")
 
 	newer := New([]Entry{file("c"), file("d")})
 	newer.Prev = &first
-	last, err := newer.Save(ctx, b, keys, crypto.DeterministicReader("chain-2"))
-	if err != nil {
-		t.Fatalf("save segment 2: %v", err)
-	}
+	last := saveTree(ctx, t, b, keys, newer, "chain-2")
 
 	entries, err := LoadChain(ctx, b, keys, last)
 	if err != nil {
@@ -347,10 +381,7 @@ func TestLoadChainReassemblesSegments(t *testing.T) {
 
 	// An unsegmented tree is the chain of length one: Prev nil, entries as
 	// they were saved.
-	single, err := New([]Entry{file("solo")}).Save(ctx, b, keys, crypto.DeterministicReader("chain-0"))
-	if err != nil {
-		t.Fatalf("save single: %v", err)
-	}
+	single := saveTree(ctx, t, b, keys, New([]Entry{file("solo")}), "chain-0")
 	solo, err := LoadChain(ctx, b, keys, single)
 	if err != nil {
 		t.Fatalf("load single: %v", err)
@@ -437,14 +468,10 @@ func TestXattrsInTreeRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	keys, b := testKeys(t), testBackend(t)
 
-	entries := []Entry{
-		{Name: []byte("f"), Type: uint8(TypeFile), Mode: 0o644,
-			Xattrs: Xattrs{{Name: []byte("user.comment"), Value: []byte("hello")}}},
-	}
-	id, err := New(entries).Save(ctx, b, keys, crypto.DeterministicReader("xattrs"))
-	if err != nil {
-		t.Fatalf("save: %v", err)
-	}
+	e := file("f")
+	e.Xattrs = Xattrs{{Name: []byte("user.comment"), Value: []byte("hello")}}
+	entries := []Entry{e}
+	id := saveTree(ctx, t, b, keys, New(entries), "xattrs")
 	loaded, err := Load(ctx, b, keys, id)
 	if err != nil {
 		t.Fatalf("load: %v", err)

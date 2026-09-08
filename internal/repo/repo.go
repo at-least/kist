@@ -41,6 +41,11 @@ type Repository struct {
 
 	// now is time.Now in production; tests replace it.
 	now func() time.Time
+
+	// warn receives non-fatal problems noticed while the repository is
+	// open -- a tree served from its .r1 replica, for instance. Nil means
+	// discard.
+	warn func(format string, args ...any)
 }
 
 // Options configure Init and Open.
@@ -61,11 +66,17 @@ type Options struct {
 	KDF *crypto.KDFParams
 
 	// Chunker sets the chunk sizes for Init. Nil means
-	// config.DefaultChunkerParams. The values are written to the config
-	// and bound into the master-key AAD: every client of the repository
-	// must agree, and a tampered config fails the unwrap rather than
-	// silently breaking deduplication.
+	// config.DefaultChunkerParams. The values are invariants: they are
+	// written into the wrapped master key's authenticated payload, and
+	// every open compares the plaintext config against them.
 	Chunker *ChunkerParams
+
+	// Replicas is 1 to store trees and snapshots also at "<key>.r1", 0 to
+	// store them once. Nil means the backend decides: a local directory
+	// gets a replica (one disk, no redundancy of its own), object storage
+	// does not (the backend already replicates, and the bytes would be
+	// paid for twice).
+	Replicas *uint8
 
 	// NonceSource seeds the nonces of everything this repository writes.
 	// Production leaves it nil, meaning crypto/rand.
@@ -144,13 +155,20 @@ func Init(ctx context.Context, b backend.Backend, opts Options) (*Repository, er
 	if err := sizes.validate(); err != nil {
 		return nil, fmt.Errorf("init repository: %w", err)
 	}
-	aad := crypto.MasterAAD(repoID, sizes.MinSize, sizes.AvgSize, sizes.MaxSize)
-	slot, err := crypto.NewKeySlot(opts.Password, aad, master, params, now, opts.NonceSource)
+	replicas, err := defaultReplicas(b, opts.Replicas)
+	if err != nil {
+		return nil, fmt.Errorf("init repository: %w", err)
+	}
+	slot, err := crypto.NewKeySlot(opts.Password, master, crypto.Invariants{
+		Version: crypto.FormatVersion,
+		RepoID:  append([]byte(nil), repoID[:]...),
+		Chunker: sizes.invariantsChunker(),
+	}, params, now, opts.NonceSource)
 	if err != nil {
 		return nil, fmt.Errorf("init repository: %w", err)
 	}
 
-	cfg := newConfig(repoID, slot, now)
+	cfg := newConfig(repoID, slot, now, replicas)
 	cfg.Chunker = sizes
 	if err := saveConfig(ctx, b, cfg); err != nil {
 		return nil, fmt.Errorf("init repository: %w", err)
@@ -159,16 +177,38 @@ func Init(ctx context.Context, b backend.Backend, opts Options) (*Repository, er
 	return open(ctx, b, cfg, master, opts)
 }
 
+// defaultReplicas resolves the Init replica count: the explicit option
+// wins; otherwise a local directory (one disk, nothing watching it)
+// takes a replica and a remote backend does not.
+func defaultReplicas(b backend.Backend, explicit *uint8) (uint8, error) {
+	if explicit != nil {
+		if *explicit > 1 {
+			return 0, fmt.Errorf("replicas %d is outside 0..=1", *explicit)
+		}
+		return *explicit, nil
+	}
+	if _, local := b.(*backend.Local); local {
+		return 1, nil
+	}
+	return 0, nil
+}
+
 // Open unlocks an existing repository.
+//
+// The slot's decrypted invariants are the authority on repo_id and the
+// chunker parameters; this plaintext config must agree with them, or the
+// repository has been tampered with and the open fails explicitly.
 func Open(ctx context.Context, b backend.Backend, opts Options) (*Repository, error) {
 	cfg, err := LoadConfig(ctx, b)
 	if err != nil {
 		return nil, err
 	}
 
-	aad := crypto.MasterAAD(cfg.RepoID, cfg.Chunker.MinSize, cfg.Chunker.AvgSize, cfg.Chunker.MaxSize)
-	master, err := cfg.Slot.Unwrap(opts.Password, aad)
+	master, inv, err := cfg.Slot.Unwrap(opts.Password)
 	if err != nil {
+		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
+	}
+	if err := cfg.checkMatches(inv); err != nil {
 		return nil, fmt.Errorf("open repository at %s: %w", b.Location(), err)
 	}
 	return open(ctx, b, cfg, master, opts)
@@ -259,6 +299,7 @@ func open(ctx context.Context, b backend.Backend, cfg *Config, master crypto.Key
 		indexSource: source,
 		nonceSource: nonces,
 		now:         opts.clock(),
+		warn:        opts.Warnf,
 	}, nil
 }
 
@@ -311,7 +352,7 @@ func (r *Repository) RebuildIndex(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := r.replaceIndex(ctx, stale, unusable, packs); err != nil {
+	if err := r.replaceIndex(ctx, stale, unusable, packs, nil); err != nil {
 		return 0, fmt.Errorf("rebuild index: %w", err)
 	}
 	return r.index.Len(), nil

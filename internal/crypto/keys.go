@@ -2,7 +2,6 @@ package crypto
 
 import (
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"time"
@@ -32,24 +31,67 @@ type RepoID [RepoIDSize]byte
 // path.
 const (
 	// AADPackTrailer binds a pack trailer to its role.
-	AADPackTrailer = "kist/v2/pack-trailer"
+	AADPackTrailer = "kist/v3/pack-trailer"
 	// AADIndexBlob binds an index blob to its role.
-	AADIndexBlob = "kist/v2/index"
-	// AADMasterKey prefixes the AAD wrapping the master key; the
-	// repository ID and the chunker parameters follow, so a key slot
-	// cannot be transplanted into another repository and a tampered
-	// plaintext config cannot silently break deduplication.
-	AADMasterKey = "kist/v2/master\x00"
+	AADIndexBlob = "kist/v3/index"
+	// AADMasterKey is the whole AAD wrapping the master key. In v3 it is
+	// a constant: the invariants (repository ID, chunker parameters)
+	// travel INSIDE the authenticated plaintext -- master(32) ‖ Invariants
+	// CBOR -- so adding an invariant field never changes the AAD layout,
+	// and a tampered plaintext config is detected by comparing it with
+	// the decrypted invariants, not by a failed unwrap.
+	AADMasterKey = "kist/v3/master"
 )
 
 // HKDF is gone in v2: subkeys are BLAKE3 DeriveKey outputs, one context
-// per purpose. The strings are frozen format (docs/format.md §3).
+// per purpose. The strings are frozen format (format-v3-draft.md §3).
 const (
-	infoHashKey  = "kist/v2/hash"
-	infoChunkKey = "kist/v2/chunk"
-	infoMetaKey  = "kist/v2/meta"
-	infoIndexKey = "kist/v2/index"
+	infoHashKey  = "kist/v3/hash"
+	infoChunkKey = "kist/v3/chunk"
+	infoMetaKey  = "kist/v3/meta"
+	infoIndexKey = "kist/v3/index"
 )
+
+// FormatVersion is the format version this build reads and writes. Every
+// schema version field, the pack magic and the DeriveKey contexts carry
+// it.
+const FormatVersion = 3
+
+// InvariantsChunker mirrors the chunker parameter block inside the
+// wrapped master payload. It is struct-by-struct identical to
+// repo.ChunkerParams, which crypto cannot import.
+type InvariantsChunker struct {
+	Min uint32 `cbor:"min"`
+	Avg uint32 `cbor:"avg"`
+	Max uint32 `cbor:"max"`
+}
+
+// Invariants are the parameters the wrapped master key carries in its
+// authenticated plaintext. Unlocking yields them with the master key;
+// the caller must compare them with the plaintext config and treat any
+// mismatch as an explicit "config tampered" error, never as a silent
+// deduplication change.
+//
+// Field order is the spec table (format-v3-draft.md §4.1): v, repo_id,
+// chunker. New fields go here with the zero-omit + ignore-unknown rules;
+// the AAD stays a constant.
+type Invariants struct {
+	Version uint64            `cbor:"v"`
+	RepoID  []byte            `cbor:"repo_id"`
+	Chunker InvariantsChunker `cbor:"chunker"`
+}
+
+// Validate rejects invariants that cannot mean anything before their
+// values reach the chunker or a comparison.
+func (inv Invariants) Validate() error {
+	if inv.Version != FormatVersion {
+		return fmt.Errorf("key invariants: version %d is not supported, want %d", inv.Version, FormatVersion)
+	}
+	if len(inv.RepoID) != RepoIDSize {
+		return fmt.Errorf("key invariants: repo_id is %d bytes, want %d", len(inv.RepoID), RepoIDSize)
+	}
+	return nil
+}
 
 // Keys is the unwrapped key material for an open repository.
 //
@@ -76,13 +118,6 @@ func DeriveKeys(master Key) *Keys {
 	blake3.DeriveKey(keys.Meta[:], infoMetaKey, master[:])
 	blake3.DeriveKey(keys.Index[:], infoIndexKey, master[:])
 	return keys
-}
-
-// ContentIDv2 is the keyed content address of chunk plaintext under the hash
-// key (crypto.ID keyed mode). Trees use the same function over their
-// encoded bytes: see tree.Encode.
-func ContentIDv2(keys *Keys, plaintext []byte) ID {
-	return ContentID(&keys.Hash, plaintext)
 }
 
 // KDFAlgArgon2id is the only password KDF this format defines.
@@ -125,12 +160,16 @@ func DefaultKDFParams() KDFParams {
 	}
 }
 
-// A KeySlot wraps the master key under a key-encryption key derived from
-// one password. A repository has one slot in its config object and may
-// have more under keys/<id>, so several passwords can open one repository
-// without any of them being able to reach another's.
-// Field order is the spec table (docs/format.md §4): v, name, created,
-// kdf, wrapped. Reordering changes every byte it feeds.
+// A KeySlot wraps the master key -- and, in v3, the repository
+// invariants -- under a key-encryption key derived from one password. A
+// repository has one slot in its config object and may have more under
+// keys/<id>, so several passwords can open one repository without any of
+// them being able to reach another's.
+//
+// The wrapped payload is master(32) ‖ Invariants CBOR, sealed under the
+// constant AADMasterKey. Field order is the spec table
+// (format-v3-draft.md §4.1): v, name, created, kdf, wrapped. Reordering
+// changes every byte it feeds.
 type KeySlot struct {
 	Version       uint64    `cbor:"v"`
 	Name          string    `cbor:"name,omitempty"`
@@ -140,16 +179,20 @@ type KeySlot struct {
 }
 
 // KeySlotVersion is the schema version written by this implementation.
-const KeySlotVersion = 2
+const KeySlotVersion = 3
 
-// NewKeySlot wraps master under a key derived from password.
+// NewKeySlot wraps master and invariants under a key derived from
+// password.
 //
 // randSource supplies the salt and the envelope nonce; production callers
 // pass nil for crypto/rand. now is the creation timestamp, injected so
 // that golden files are reproducible.
-func NewKeySlot(password []byte, aad []byte, master Key, params KDFParams, now time.Time, randSource io.Reader) (*KeySlot, error) {
+func NewKeySlot(password []byte, master Key, inv Invariants, params KDFParams, now time.Time, randSource io.Reader) (*KeySlot, error) {
 	if params.Alg != KDFAlgArgon2id {
 		return nil, fmt.Errorf("key slot: unsupported kdf %q, want %q", params.Alg, KDFAlgArgon2id)
+	}
+	if err := inv.Validate(); err != nil {
+		return nil, fmt.Errorf("key slot: %w", err)
 	}
 	if randSource == nil {
 		randSource = rand.Reader
@@ -165,7 +208,7 @@ func NewKeySlot(password []byte, aad []byte, master Key, params KDFParams, now t
 		return nil, err
 	}
 
-	wrapped, err := Seal(&kek, aad, master[:], randSource)
+	wrapped, err := Seal(&kek, []byte(AADMasterKey), WrappedPayload(master, inv), randSource)
 	if err != nil {
 		return nil, fmt.Errorf("key slot: wrap master key: %w", err)
 	}
@@ -178,50 +221,57 @@ func NewKeySlot(password []byte, aad []byte, master Key, params KDFParams, now t
 	}, nil
 }
 
+// WrappedPayload renders the plaintext a key slot seals: the master key
+// followed by the canonical CBOR of the invariants.
+func WrappedPayload(master Key, inv Invariants) []byte {
+	encoded, err := Marshal(inv)
+	if err != nil {
+		// A fixed-shape struct: the only failure mode is a broken build.
+		panic(fmt.Sprintf("kist/crypto: encode invariants: %v", err))
+	}
+	payload := make([]byte, 0, KeySize+len(encoded))
+	payload = append(payload, master[:]...)
+	return append(payload, encoded...)
+}
+
 // ErrWrongPassword is returned when a slot will not open under the given
 // password. It wraps ErrDecrypt: a wrong password and a corrupted slot
 // are indistinguishable by construction, and this is the friendlier of
 // the two explanations to lead with.
 var ErrWrongPassword = fmt.Errorf("wrong password or damaged key slot: %w", ErrDecrypt)
 
-// Unwrap recovers the master key from the slot.
-func (s *KeySlot) Unwrap(password []byte, aad []byte) (Key, error) {
-	var master Key
+// Unwrap recovers the master key and the invariants from the slot. The
+// invariants come out of ciphertext that passed Poly1305 authentication,
+// which makes them the authority the plaintext config must be compared
+// against (the caller's "config tampered" check).
+func (s *KeySlot) Unwrap(password []byte) (Key, Invariants, error) {
+	var (
+		master Key
+		inv    Invariants
+	)
 
 	if s.Version != KeySlotVersion {
-		return master, fmt.Errorf("key slot: version %d is not supported, want %d", s.Version, KeySlotVersion)
+		return master, inv, fmt.Errorf("key slot: version %d is not supported, want %d", s.Version, KeySlotVersion)
 	}
 
 	kek, err := deriveKEK(password, s.KDF)
 	if err != nil {
-		return master, err
+		return master, inv, err
 	}
 
-	plain, err := Open(&kek, aad, s.WrappedMaster)
+	plain, err := Open(&kek, []byte(AADMasterKey), s.WrappedMaster)
 	if err != nil {
-		return master, ErrWrongPassword
+		return master, inv, ErrWrongPassword
 	}
-	if len(plain) != KeySize {
-		return master, fmt.Errorf("key slot: wrapped master key is %d bytes, want %d", len(plain), KeySize)
+	if len(plain) < KeySize {
+		return master, inv, fmt.Errorf("key slot: wrapped payload is %d bytes, want at least %d", len(plain), KeySize)
 	}
 
-	copy(master[:], plain)
-	return master, nil
-}
-
-// MasterAAD builds the AAD that binds a wrapped master key to its
-// repository: prefix ‖ repo_id(16) ‖ chunker min/avg/max (u32 LE).
-// The chunker parameters are part of it because the config that carries
-// them is plaintext: tampering must fail the unwrap, not silently break
-// deduplication.
-func MasterAAD(repoID RepoID, minSize, avgSize, maxSize uint32) []byte {
-	aad := make([]byte, 0, len(AADMasterKey)+16+12)
-	aad = append(aad, AADMasterKey...)
-	aad = append(aad, repoID[:]...)
-	aad = binary.LittleEndian.AppendUint32(aad, minSize)
-	aad = binary.LittleEndian.AppendUint32(aad, avgSize)
-	aad = binary.LittleEndian.AppendUint32(aad, maxSize)
-	return aad
+	copy(master[:], plain[:KeySize])
+	if err := Unmarshal(plain[KeySize:], &inv); err != nil {
+		return master, inv, fmt.Errorf("key slot: decode invariants: %w", err)
+	}
+	return master, inv, nil
 }
 
 func deriveKEK(password []byte, params KDFParams) (Key, error) {

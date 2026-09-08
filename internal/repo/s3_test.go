@@ -17,6 +17,7 @@ import (
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/pack"
 	"github.com/at-least/kist/internal/parity"
+	"github.com/at-least/kist/internal/snapshot"
 )
 
 // The S3 tests in this package share one MinIO with the backend package's
@@ -192,7 +193,7 @@ func TestS3ConcurrentBackups(t *testing.T) {
 						errs[i] = fmt.Errorf("client %s open: %w", id, err)
 						return
 					}
-					if _, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+					if _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 						errs[i] = fmt.Errorf("client %s backup: %w", id, err)
 					}
 					if err := r.Close(); err != nil && errs[i] == nil {
@@ -243,12 +244,12 @@ func TestS3ConcurrentBackups(t *testing.T) {
 
 			// The sharp assertion: the third client's index merged both
 			// clients' blobs, so it already has every chunk.
-			again, _, err := third.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+			again, err := third.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 			if err != nil {
 				t.Fatalf("third backup: %v", err)
 			}
-			if again.Stats.ChunksNew != 0 {
-				t.Errorf("a third client stored %d new chunks after two identical backups; the index blobs did not merge", again.Stats.ChunksNew)
+			if again.Report.ChunksNew != 0 {
+				t.Errorf("a third client stored %d new chunks after two identical backups; the index blobs did not merge", again.Report.ChunksNew)
 			}
 
 			// Expected, and worth stating: both clients packed the same
@@ -383,11 +384,11 @@ func TestS3BackupPolicy(t *testing.T) {
 			}
 		}()
 
-		snap, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+		summary, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 		if err != nil {
 			t.Fatalf("backup with the backup policy: %v", err)
 		}
-		if snap.Stats.PacksAdded == 0 {
+		if summary.Report.PacksNew == 0 {
 			t.Fatal("backup wrote no packs")
 		}
 	})
@@ -547,7 +548,7 @@ func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
 					errs[i] = err
 					return
 				}
-				if _, _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+				if _, err := r.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 					errs[i] = err
 				}
 				if err := r.Close(); err != nil && errs[i] == nil {
@@ -621,7 +622,7 @@ func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(snap.Paths) == 0 || string(snap.Paths[0]) != source {
+		if len(rootsPathsOf(snap)) == 0 || string(rootsPathsOf(snap)[0]) != source {
 			continue
 		}
 		target := filepath.Join(t.TempDir(), "out")
@@ -634,12 +635,12 @@ func TestS3PruneReclaimsDuplicatePacks(t *testing.T) {
 	if restored != 2 {
 		t.Errorf("restored %d snapshots of the source, want 2", restored)
 	}
-	again, _, err := third.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	again, err := third.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again.Stats.ChunksNew != 0 {
-		t.Errorf("backup after prune stored %d new chunks, want 0", again.Stats.ChunksNew)
+	if again.Report.ChunksNew != 0 {
+		t.Errorf("backup after prune stored %d new chunks, want 0", again.Report.ChunksNew)
 	}
 }
 
@@ -692,25 +693,25 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 	source := t.TempDir()
 	writeTree(t, source, sampleFiles(t))
 	client := open("11111111111111111111111111111111")
-	_, first, err := client.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
+	first, err := client.Backup(ctx, []string{source}, BackupOptions{SpoolDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 	keep := t.TempDir()
 	writeTree(t, keep, []fileSpec{{path: "keep.txt", data: []byte("kept\n")}})
-	if _, _, err := client.Backup(ctx, []string{keep}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+	if _, err := client.Backup(ctx, []string{keep}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 
 	pruner := open("ffffffffffffffffffffffffffffffff")
-	forgot, err := pruner.Forget(ctx, ForgetOptions{Keys: []string{first.Key}})
+	forgot, err := pruner.Forget(ctx, ForgetOptions{Keys: []string{first.Handle.Key}})
 	if err != nil {
 		t.Fatalf("forget: %v", err)
 	}
 	if len(forgot.Locked) != 1 {
 		t.Fatalf("forget on a lock bucket: locked %d, want 1: %+v", len(forgot.Locked), forgot)
 	}
-	if _, err := backend.GetAll(ctx, root, first.Key); !errors.Is(err, backend.ErrNotFound) {
+	if _, err := backend.GetAll(ctx, root, first.Handle.Key); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("forgotten snapshot still reads on the lock bucket: %v", err)
 	}
 
@@ -722,7 +723,7 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 		t.Fatalf("first prune: %+v", marked)
 	}
 	clk.advance(2 * time.Hour)
-	if _, _, err := client.Backup(ctx, []string{keep}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
+	if _, err := client.Backup(ctx, []string{keep}, BackupOptions{SpoolDir: t.TempDir()}); err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 	sweep, err := pruner.Prune(ctx, PruneOptions{Grace: time.Hour, ClockSkew: DefaultClockSkew})
@@ -763,7 +764,7 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 	withParity := open("33333333333333333333333333333333")
 	parityDir := t.TempDir()
 	writeTree(t, parityDir, []fileSpec{{path: "p.bin", data: randomBytes(t, "lockparity", 200<<10)}})
-	_, _, err = withParity.Backup(ctx, []string{parityDir}, BackupOptions{SpoolDir: t.TempDir(), Parity: 2})
+	_, err = withParity.Backup(ctx, []string{parityDir}, BackupOptions{SpoolDir: t.TempDir(), Parity: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,4 +796,12 @@ func TestS3ObjectLockIsReportedNotFought(t *testing.T) {
 	if err != nil || !bytes.Equal(got, original) {
 		t.Fatalf("pack after repair: %v, identical=%v", err, bytes.Equal(got, original))
 	}
+}
+
+func rootsPathsOf(snap *snapshot.Snapshot) [][]byte {
+	out := make([][]byte, 0, len(snap.Roots))
+	for _, r := range snap.Roots {
+		out = append(out, r.Path)
+	}
+	return out
 }

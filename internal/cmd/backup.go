@@ -32,7 +32,7 @@ func newBackupCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ev := event("backup")
 			return finish(cmd, ev, flags.withRepository(cmd, func(ctx context.Context, r *repo.Repository) error {
-				snap, handle, err := r.Backup(ctx, args, repo.BackupOptions{
+				summary, err := r.Backup(ctx, args, repo.BackupOptions{
 					Host:     host,
 					SpoolDir: spoolDir,
 					Parity:   parity,
@@ -42,16 +42,17 @@ func newBackupCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				ev.Backup = report.FromBackup(snap, handle)
+				ev.Backup = report.FromBackup(summary)
 				if jsonMode(cmd) {
 					return nil
 				}
 
+				snap, handle := summary.Snapshot, summary.Handle
 				out := cmd.OutOrStdout()
 				fmt.Fprintf(out, "snapshot %s\n", handle.Key)
 				fmt.Fprintf(out, "  %d files, %d directories, %d symlinks\n", snap.Stats.Files, snap.Stats.Dirs, snap.Stats.Symlinks)
-				fmt.Fprintf(out, "  %s read, %s stored in %d new packs\n",
-					humanBytes(snap.Stats.Bytes), humanBytes(snap.Stats.BytesStored), snap.Stats.PacksAdded)
+				fmt.Fprintf(out, "  %s stored in %d new chunks, %d new packs\n",
+					humanBytes(summary.Report.BytesStored), summary.Report.ChunksNew, summary.Report.PacksNew)
 				return nil
 			}))
 		},

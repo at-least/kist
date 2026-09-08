@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"slices"
 
@@ -17,10 +16,28 @@ import (
 )
 
 // Version is the tree object schema version.
-const Version = 2
+const Version = 3
 
 // Prefix is the repository prefix tree objects live under.
 const Prefix = "trees/"
+
+// ReplicaSuffix is appended to a tree's key for its .r1 replica, stored
+// when the repository was created with replicas=1 (format-v3-draft.md
+// §13.5). The replica's bytes are identical to the primary's; it is a
+// second copy of one object, not a second object.
+const ReplicaSuffix = ".r1"
+
+// TouchPrefix is the repository prefix of a tree's revival signal. The
+// 8-byte object is written with an OVERWRITING Put on every backup that
+// reuses the tree: the refreshed backend mtime IS the signal
+// (format-v3-draft.md §13.1). A PutIfAbsent here would silently keep the
+// old mtime on the second reuse and open the deletion race the overwrite
+// exists to close.
+const TouchPrefix = "touch/"
+
+// TouchMagic is the entire content of a touch object: 8 fixed bytes that
+// carry no information.
+var TouchMagic = []byte("KISTTC3\n")
 
 // MaxNodesPerTree is how many entries one tree object holds before it is
 // split into a chain linked by Prev. A directory that has not changed in
@@ -35,6 +52,12 @@ const MaxInlineChunks = 256
 
 // Key returns the repository key a tree is stored under.
 func Key(id crypto.ID) string { return Prefix + id.String() }
+
+// ReplicaKey returns the repository key of a tree's .r1 replica.
+func ReplicaKey(id crypto.ID) string { return Prefix + id.String() + ReplicaSuffix }
+
+// TouchKey returns the repository key of a tree's revival signal.
+func TouchKey(id crypto.ID) string { return TouchPrefix + id.String() }
 
 // ErrCorrupt means a tree object is structurally invalid.
 var ErrCorrupt = errors.New("tree object is corrupt")
@@ -63,6 +86,33 @@ const (
 	ContentDirect ContentType = iota
 	ContentIndirect
 )
+
+// A MetaKind says which metadata family an entry carries. v3 entries are
+// a kind union: a source records what it can prove about a file, and the
+// per-kind rules (Validate, format-v3-draft.md §8.1) pin which fields are
+// required, optional, or must be absent for each kind.
+type MetaKind uint8
+
+// The metadata kinds.
+const (
+	// MetaPOSIX is a local filesystem source: the kernel maintains mode,
+	// ownership and times, so they are required. UID 0 is root -- a real
+	// value, not "not recorded".
+	MetaPOSIX MetaKind = iota
+	// MetaSFTP is an SFTP source: only the modification time is required;
+	// mode and ownership are optional (absent means the source did not
+	// say).
+	MetaSFTP
+	// MetaS3 is an object-storage source: mtime, etag and vern are
+	// optional; mode/uid/gid have no meaning and are never recorded.
+	MetaS3
+	// MetaGeneric is the conservative kind for future sources: an mtime
+	// and nothing else.
+	MetaGeneric
+)
+
+// Valid reports whether v is a metadata kind this format defines.
+func (k MetaKind) Valid() bool { return k <= MetaGeneric }
 
 // Xattrs are extended attributes: byte-string keys and values, kept in
 // canonical (sorted) order on the wire. Go maps cannot key on []byte, so
@@ -199,28 +249,19 @@ func (x *Xattrs) UnmarshalCBOR(data []byte) error {
 
 // An Entry is one name in a directory.
 //
-// Every optional field is omitempty, so a plain file costs nothing for
-// the symlink target or the extended attributes it does not have. The
-// set of omitted-at-zero fields is format: both implementations must
-// drop exactly the same fields, or two encoders would produce two names
-// for one directory. ID-valued fields use pointers because Go's omitempty
-// does not consider a zero array empty; Xattrs is handled by the custom
-// marshaler below, because omitempty cannot see through a type with its
-// own MarshalCBOR.
+// v3 metadata fields are POINTERS: nil means the source did not record
+// the field, and a nil field is absent on the wire. That is the v3 kind
+// union -- an S3 object has no mode, and "no mode" must not encode as
+// mode 0. A non-nil pointer to zero is a real zero (uid 0 is root) and
+// is encoded. The field order below is the spec table
+// (format-v3-draft.md §4.1); it is the wire order and it feeds every
+// tree ID.
 type Entry struct {
 	Name []byte `cbor:"n"`
 	Type uint8  `cbor:"t"` // NodeType
 
-	Mode uint32 `cbor:"mode"`
-	UID  uint32 `cbor:"uid,omitempty"`
-	GID  uint32 `cbor:"gid,omitempty"`
-
-	// MTimeNs and CTimeNs are Unix nanoseconds. CTimeNs is the fast-path
-	// signal: the kernel updates it on every write and it cannot be set
-	// by a user, so a copy that preserves mtime is still caught. Zero
-	// means "not recorded on this platform"; it is never compared.
-	MTimeNs int64 `cbor:"mtime"`
-	CTimeNs int64 `cbor:"ctime,omitempty"`
+	// MetaKind: which metadata family the fields below belong to.
+	MetaKind uint8 `cbor:"mk"` // MetaKind
 
 	// Size is the file's length in bytes; zero for other types.
 	Size uint64 `cbor:"size,omitempty"`
@@ -240,48 +281,75 @@ type Entry struct {
 	// directory spans several trees.
 	Subtree *crypto.ID `cbor:"tree,omitempty"`
 
+	// Mode carries permission and type bits for posix and sftp sources.
+	Mode *uint32 `cbor:"mode,omitempty"`
+	UID  *uint32 `cbor:"uid,omitempty"`
+	GID  *uint32 `cbor:"gid,omitempty"`
+
+	// MTimeNs and CTimeNs are Unix nanoseconds. CTimeNs is the posix
+	// fast-path signal: the kernel updates it on every write and it
+	// cannot be set by a user, so a copy that preserves mtime is still
+	// caught. Remote sources have second precision (the nanoseconds are
+	// zero).
+	MTimeNs *int64 `cbor:"mtime,omitempty"`
+	CTimeNs *int64 `cbor:"ctime,omitempty"`
+
 	// Device and Inode identify a hard link. They are recorded only when
 	// Links is above one, and are used by restore to recreate the link
 	// rather than a second copy of the data.
-	Device uint64 `cbor:"dev,omitempty"`
-	Inode  uint64 `cbor:"ino,omitempty"`
-	Links  uint64 `cbor:"nlink,omitempty"`
+	Device *uint64 `cbor:"dev,omitempty"`
+	Inode  *uint64 `cbor:"ino,omitempty"`
+	Links  *uint64 `cbor:"nlink,omitempty"`
 
 	// Xattrs are extended attributes. M1-era restores reported what they
 	// did not apply rather than pretending they did; applying them is
 	// later work, but the format records them from day one.
 	Xattrs Xattrs `cbor:"xattrs,omitempty"`
+
+	// Etag is a content fingerprint the source computed and vouches for
+	// (an S3 ETag, for instance); Vern is the source object's version ID.
+	// Both are what the next backup's fast path compares
+	// (format-v3-draft.md §8.2).
+	Etag []byte `cbor:"etag,omitempty"`
+	Vern []byte `cbor:"vern,omitempty"`
 }
 
 // entryWire is Entry with Xattrs as a pre-encoded message, so the field
 // is really absent (not an empty map) when there are none. A nil
-// RawMessage is a nil slice: omitempty drops it.
+// RawMessage is a nil slice: omitempty drops it. The field order is the
+// spec table: n, t, mk, size, target, ct, chunks, tree, mode, uid, gid,
+// mtime, ctime, dev, ino, nlink, xattrs, etag, vern.
 type entryWire struct {
 	Name        []byte          `cbor:"n"`
 	Type        uint8           `cbor:"t"`
-	Mode        uint32          `cbor:"mode"`
-	UID         uint32          `cbor:"uid,omitempty"`
-	GID         uint32          `cbor:"gid,omitempty"`
-	MTimeNs     int64           `cbor:"mtime"`
-	CTimeNs     int64           `cbor:"ctime,omitempty"`
+	MetaKind    uint8           `cbor:"mk"`
 	Size        uint64          `cbor:"size,omitempty"`
 	Target      []byte          `cbor:"target,omitempty"`
-	Chunks      []crypto.ID     `cbor:"chunks,omitempty"`
 	ContentType uint8           `cbor:"ct,omitempty"`
+	Chunks      []crypto.ID     `cbor:"chunks,omitempty"`
 	Subtree     *crypto.ID      `cbor:"tree,omitempty"`
-	Device      uint64          `cbor:"dev,omitempty"`
-	Inode       uint64          `cbor:"ino,omitempty"`
-	Links       uint64          `cbor:"nlink,omitempty"`
+	Mode        *uint32         `cbor:"mode,omitempty"`
+	UID         *uint32         `cbor:"uid,omitempty"`
+	GID         *uint32         `cbor:"gid,omitempty"`
+	MTimeNs     *int64          `cbor:"mtime,omitempty"`
+	CTimeNs     *int64          `cbor:"ctime,omitempty"`
+	Device      *uint64         `cbor:"dev,omitempty"`
+	Inode       *uint64         `cbor:"ino,omitempty"`
+	Links       *uint64         `cbor:"nlink,omitempty"`
 	Xattrs      cbor.RawMessage `cbor:"xattrs,omitempty"`
+	Etag        []byte          `cbor:"etag,omitempty"`
+	Vern        []byte          `cbor:"vern,omitempty"`
 }
 
 // MarshalCBOR renders the entry, omitting an empty Xattrs entirely.
 func (e Entry) MarshalCBOR() ([]byte, error) {
 	w := entryWire{
-		Name: e.Name, Type: e.Type, Mode: e.Mode, UID: e.UID, GID: e.GID,
-		MTimeNs: e.MTimeNs, CTimeNs: e.CTimeNs, Size: e.Size, Target: e.Target,
+		Name: e.Name, Type: e.Type, MetaKind: e.MetaKind, Size: e.Size, Target: e.Target,
 		Chunks: e.Chunks, ContentType: e.ContentType, Subtree: e.Subtree,
+		Mode: e.Mode, UID: e.UID, GID: e.GID,
+		MTimeNs: e.MTimeNs, CTimeNs: e.CTimeNs,
 		Device: e.Device, Inode: e.Inode, Links: e.Links,
+		Etag: e.Etag, Vern: e.Vern,
 	}
 	if len(e.Xattrs) > 0 {
 		raw, err := e.Xattrs.MarshalCBOR()
@@ -290,23 +358,28 @@ func (e Entry) MarshalCBOR() ([]byte, error) {
 		}
 		w.Xattrs = cbor.RawMessage(raw)
 	}
-	// crypto.Marshal (not the raw cbor package): the Core Deterministic
-	// encoder mode is what sorts the map keys; the bare package default
-	// would emit them in field order and fork the tree ID.
 	return crypto.Marshal(&w)
 }
 
-// UnmarshalCBOR decodes the entry, tolerating a missing Xattrs.
+// UnmarshalCBOR decodes the entry, tolerating a missing Xattrs. A
+// decoded all-zero subtree is normalised to nil: on the wire "tree" and
+// "no tree" both mean no subtree, and a zero ID is never a valid
+// content address.
 func (e *Entry) UnmarshalCBOR(data []byte) error {
 	var w entryWire
 	if err := crypto.Unmarshal(data, &w); err != nil {
 		return err
 	}
+	if w.Subtree != nil && w.Subtree.IsZero() {
+		w.Subtree = nil
+	}
 	*e = Entry{
-		Name: w.Name, Type: w.Type, Mode: w.Mode, UID: w.UID, GID: w.GID,
-		MTimeNs: w.MTimeNs, CTimeNs: w.CTimeNs, Size: w.Size, Target: w.Target,
+		Name: w.Name, Type: w.Type, MetaKind: w.MetaKind, Size: w.Size, Target: w.Target,
 		Chunks: w.Chunks, ContentType: w.ContentType, Subtree: w.Subtree,
+		Mode: w.Mode, UID: w.UID, GID: w.GID,
+		MTimeNs: w.MTimeNs, CTimeNs: w.CTimeNs,
 		Device: w.Device, Inode: w.Inode, Links: w.Links,
+		Etag: w.Etag, Vern: w.Vern,
 	}
 	if len(w.Xattrs) > 0 {
 		var x Xattrs
@@ -318,8 +391,14 @@ func (e *Entry) UnmarshalCBOR(data []byte) error {
 	return nil
 }
 
-// FileMode returns the entry's permission and type bits.
-func (e Entry) FileMode() fs.FileMode { return fs.FileMode(e.Mode) }
+// FileMode returns the entry's permission and type bits, or 0 when the
+// source did not record a mode.
+func (e Entry) FileMode() fs.FileMode {
+	if e.Mode == nil {
+		return 0
+	}
+	return fs.FileMode(*e.Mode)
+}
 
 // A Tree is one segment of a directory.
 type Tree struct {
@@ -370,46 +449,27 @@ func (t *Tree) Encode(hashKey *crypto.Key) (crypto.ID, []byte, error) {
 	return crypto.ContentID(hashKey, encoded), encoded, nil
 }
 
-// Save encodes, seals and stores the tree, returning its ID.
-//
-// The AAD is the tree's own ID, so a sealed tree cannot be served in
-// place of another one. Storing is an unconditional Put, deliberately:
-// same name means same bytes, so re-putting is a no-op that (a) repairs
-// a damaged tree on the next backup and (b) refreshes the object's
-// modification time, which the gc mark protocol on the writer side
-// compares against (a PutIfAbsent would leave an old mtime on the
-// already-exists path and lose that signal).
-func (t *Tree) Save(ctx context.Context, b backend.Backend, keys *crypto.Keys, nonceSource io.Reader) (crypto.ID, error) {
-	id, encoded, err := t.Encode(&keys.Hash)
-	if err != nil {
-		return crypto.ID{}, err
-	}
-
-	sealed, err := crypto.Seal(&keys.Meta, id[:], encoded, nonceSource)
-	if err != nil {
-		return crypto.ID{}, fmt.Errorf("save tree %s: %w", id, err)
-	}
-
-	if err := backend.PutBytes(ctx, b, Key(id), sealed); err != nil {
-		return crypto.ID{}, fmt.Errorf("save tree %s: %w", id, err)
-	}
-	return id, nil
-}
-
-// Load fetches and verifies a tree.
+// Load fetches and verifies a tree stored at its canonical key.
 //
 // The recovered plaintext is re-hashed and compared to the name it was
 // fetched under. The AEAD tag already proves nobody edited the bytes; the
 // re-hash proves the name was honest when it was written.
 func Load(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.ID) (*Tree, error) {
-	sealed, err := backend.GetAll(ctx, b, Key(id))
+	return LoadAt(ctx, b, keys, Key(id), id)
+}
+
+// LoadAt fetches and verifies a tree from an explicit key. It is how a
+// .r1 replica is read: same object, same name verification, different
+// storage location.
+func LoadAt(ctx context.Context, b backend.Backend, keys *crypto.Keys, key string, id crypto.ID) (*Tree, error) {
+	sealed, err := backend.GetAll(ctx, b, key)
 	if err != nil {
 		return nil, fmt.Errorf("load tree %s: %w", id, err)
 	}
 
 	encoded, err := crypto.Open(&keys.Meta, id[:], sealed)
 	if err != nil {
-		return nil, fmt.Errorf("load tree %s: %w", id, err)
+		return nil, fmt.Errorf("load tree %s: %w: %w", id, ErrCorrupt, err)
 	}
 	if got := crypto.ContentID(&keys.Hash, encoded); got != id {
 		return nil, fmt.Errorf("load tree %s: %w: contents hash to %s", id, ErrCorrupt, got)
@@ -417,7 +477,7 @@ func Load(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.I
 
 	var t Tree
 	if err := crypto.Unmarshal(encoded, &t); err != nil {
-		return nil, fmt.Errorf("load tree %s: %w", id, err)
+		return nil, fmt.Errorf("load tree %s: %w: %w", id, ErrCorrupt, err)
 	}
 	if t.Version != Version {
 		return nil, fmt.Errorf("load tree %s: %w: object declares version %d, this build reads %d", id, ErrCorrupt, t.Version, Version)
@@ -454,38 +514,33 @@ func LoadChain(ctx context.Context, b backend.Backend, keys *crypto.Keys, last c
 	return all, nil
 }
 
-// validAbsolutePath reports whether name is an absolute path made of
-// clean components -- the form the synthetic root tree's entries use.
-func validAbsolutePath(name []byte) bool {
-	if len(name) == 0 || name[0] != '/' {
-		return false
-	}
-	for _, comp := range bytes.Split(name[1:], []byte("/")) {
-		if len(comp) == 0 || bytes.Equal(comp, []byte(".")) || bytes.Equal(comp, []byte("..")) {
-			return false
-		}
-	}
-	return true
+// Ptr returns a pointer to v. Entry metadata fields are pointers, and a
+// non-nil pointer to zero is a real zero (uid 0 is root), so builders
+// need an ergonomic way to say "recorded, and it is 0".
+func Ptr[T any](v T) *T { return &v }
+
+// singleComponent reports whether name is exactly one clean path
+// component. v3 has no synthetic root, so EVERY entry name obeys this --
+// the v2 exception for the root tree's absolute-path names is gone.
+func singleComponent(name []byte) bool {
+	return len(name) > 0 && !bytes.ContainsRune(name, '/') && !bytes.ContainsRune(name, 0) &&
+		!bytes.Equal(name, []byte(".")) && !bytes.Equal(name, []byte(".."))
 }
 
-// Validate rejects trees that are decodable but cannot mean anything.
+// Validate rejects trees that are decodable but cannot mean anything,
+// including the per-kind field matrix (format-v3-draft.md §8.1): a
+// reader must refuse an entry whose metadata fields contradict the kind
+// that claims them.
 func (t *Tree) Validate() error {
+	if t.Version != Version {
+		return fmt.Errorf("%w: object declares version %d, this build reads %d", ErrCorrupt, t.Version, Version)
+	}
 	var previous []byte
 	for i, e := range t.Entries {
-		switch {
-		case len(e.Name) == 0:
-			return fmt.Errorf("%w: entry %d has an empty name", ErrCorrupt, i)
-		case bytes.Equal(e.Name, []byte(".")) || bytes.Equal(e.Name, []byte("..")):
-			return fmt.Errorf("%w: entry %d is named %q", ErrCorrupt, i, e.Name)
-		case bytes.ContainsAny(e.Name, "\x00"):
-			return fmt.Errorf("%w: entry %q contains NUL", ErrCorrupt, e.Name)
-		case bytes.Contains(e.Name, []byte("/")) && !validAbsolutePath(e.Name):
-			// An absolute path is the naming rule for the entries of the
-			// synthetic ROOT tree (one entry per backup source). A '/'
-			// anywhere else means a child entry that is not a single
-			// component; restore refuses those independently.
-			return fmt.Errorf("%w: entry %q is neither a single component nor an absolute path", ErrCorrupt, e.Name)
-		case i > 0 && bytes.Compare(e.Name, previous) <= 0:
+		if !singleComponent(e.Name) {
+			return fmt.Errorf("%w: entry %d is not a single clean path component", ErrCorrupt, i)
+		}
+		if i > 0 && bytes.Compare(e.Name, previous) <= 0 {
 			// Out of order means the object was not produced by New, and
 			// its ID is therefore not a function of its contents.
 			return fmt.Errorf("%w: entry %q follows %q; entries must be sorted and unique", ErrCorrupt, e.Name, previous)
@@ -497,31 +552,76 @@ func (t *Tree) Validate() error {
 		}
 		switch NodeType(e.Type) {
 		case TypeFile:
-			if e.Subtree != nil {
-				return fmt.Errorf("%w: file %q has a subtree", ErrCorrupt, e.Name)
-			}
 			if len(e.Target) > 0 {
 				return fmt.Errorf("%w: file %q has a symlink target", ErrCorrupt, e.Name)
 			}
-			if len(e.Chunks) > MaxInlineChunks && ContentType(e.ContentType) == ContentDirect {
-				return fmt.Errorf("%w: file %q has %d inline chunks, over the %d limit (must be indirect)", ErrCorrupt, e.Name, len(e.Chunks), MaxInlineChunks)
+			if e.Subtree != nil {
+				return fmt.Errorf("%w: file %q has a subtree", ErrCorrupt, e.Name)
 			}
 		case TypeDir:
-			if e.Subtree == nil || e.Subtree.IsZero() {
-				return fmt.Errorf("%w: directory %q has no subtree", ErrCorrupt, e.Name)
+			if e.Size != 0 {
+				return fmt.Errorf("%w: directory %q has a size", ErrCorrupt, e.Name)
+			}
+			if len(e.Target) > 0 {
+				return fmt.Errorf("%w: directory %q has a symlink target", ErrCorrupt, e.Name)
 			}
 			if len(e.Chunks) > 0 {
 				return fmt.Errorf("%w: directory %q has chunks", ErrCorrupt, e.Name)
+			}
+			if e.Subtree == nil {
+				return fmt.Errorf("%w: directory %q has no subtree", ErrCorrupt, e.Name)
 			}
 		case TypeSymlink:
 			if len(e.Target) == 0 {
 				return fmt.Errorf("%w: symlink %q has no target", ErrCorrupt, e.Name)
 			}
+			if e.Size != 0 {
+				return fmt.Errorf("%w: symlink %q has a size", ErrCorrupt, e.Name)
+			}
 			if len(e.Chunks) > 0 {
 				return fmt.Errorf("%w: symlink %q has chunks", ErrCorrupt, e.Name)
 			}
+			if e.Subtree != nil {
+				return fmt.Errorf("%w: symlink %q has a subtree", ErrCorrupt, e.Name)
+			}
 		default:
 			return fmt.Errorf("%w: entry %q has unknown type %d", ErrCorrupt, e.Name, e.Type)
+		}
+		if NodeType(e.Type) != TypeFile && len(e.Chunks) > 0 {
+			return fmt.Errorf("%w: entry %q has chunks but is not a file", ErrCorrupt, e.Name)
+		}
+		if len(e.Chunks) > MaxInlineChunks && ContentType(e.ContentType) == ContentDirect {
+			return fmt.Errorf("%w: file %q has %d inline chunks, over the %d limit (must be indirect)", ErrCorrupt, e.Name, len(e.Chunks), MaxInlineChunks)
+		}
+		if !MetaKind(e.MetaKind).Valid() {
+			return fmt.Errorf("%w: entry %q has unknown metadata kind %d", ErrCorrupt, e.Name, e.MetaKind)
+		}
+		switch MetaKind(e.MetaKind) {
+		case MetaPOSIX:
+			if e.Mode == nil || e.UID == nil || e.GID == nil || e.MTimeNs == nil {
+				// uid/gid are REQUIRED: uid 0 is root, a real value, so
+				// "not recorded" does not exist for a posix source.
+				return fmt.Errorf("%w: posix entry %q requires mode/uid/gid/mtime", ErrCorrupt, e.Name)
+			}
+		case MetaSFTP:
+			if e.MTimeNs == nil {
+				return fmt.Errorf("%w: sftp entry %q requires mtime", ErrCorrupt, e.Name)
+			}
+			if e.CTimeNs != nil || e.Device != nil || e.Inode != nil || e.Links != nil ||
+				len(e.Xattrs) > 0 || len(e.Etag) > 0 || len(e.Vern) > 0 {
+				return fmt.Errorf("%w: sftp entry %q must not carry posix/s3 fields", ErrCorrupt, e.Name)
+			}
+		case MetaS3:
+			if e.Mode != nil || e.UID != nil || e.GID != nil || e.CTimeNs != nil ||
+				e.Device != nil || e.Inode != nil || e.Links != nil || len(e.Xattrs) > 0 {
+				return fmt.Errorf("%w: s3 entry %q must not carry posix fields", ErrCorrupt, e.Name)
+			}
+		case MetaGeneric:
+			if e.Mode != nil || e.UID != nil || e.GID != nil || e.CTimeNs != nil ||
+				e.Device != nil || e.Inode != nil || e.Links != nil ||
+				len(e.Xattrs) > 0 || len(e.Etag) > 0 || len(e.Vern) > 0 {
+				return fmt.Errorf("%w: generic entry %q carries mtime only", ErrCorrupt, e.Name)
+			}
 		}
 	}
 	return nil

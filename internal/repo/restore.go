@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"time"
 
 	"github.com/at-least/kist/internal/crypto"
-	"github.com/at-least/kist/internal/snapshot"
 	"github.com/at-least/kist/internal/tree"
 )
 
@@ -43,8 +43,17 @@ type RestoreStats struct {
 //
 // target must not already exist, or must be an empty directory. Restoring
 // over live data is not something a backup tool should do by inference.
+//
+// The v3 mapping (format-v3-draft.md §9): each root's locator loses its
+// scheme and is split on "/" (empty components dropped), and the source's
+// entries land under target/<relative path>. A root whose tree holds
+// exactly one non-directory entry named like the locator's last
+// component is a file or symlink SOURCE: it lands at
+// target/<locator-minus-last>/<name>, the same place the v2
+// absolute-path restore put it. Hard-link identity is snapshot-wide:
+// two names of one inode are re-linked even across roots.
 func (r *Repository) Restore(ctx context.Context, key, target string, opts RestoreOptions) (RestoreStats, error) {
-	snap, err := snapshot.Load(ctx, r.backend, r.keys, key)
+	snap, err := r.LoadSnapshot(ctx, key)
 	if err != nil {
 		return RestoreStats{}, err
 	}
@@ -69,10 +78,90 @@ func (r *Repository) Restore(ctx context.Context, key, target string, opts Resto
 		chunks: r.NewChunkSource(),
 		links:  make(map[hardLinkKey]string),
 	}
-	if err := run.restoreTree(ctx, snap.Root, abs); err != nil {
-		return run.stats, err
+	for _, root := range snap.Roots {
+		if err := ctx.Err(); err != nil {
+			return run.stats, err
+		}
+		rel, err := locatorComponents(root.Path)
+		if err != nil {
+			return run.stats, err
+		}
+		entries, err := r.LoadTreeChain(ctx, root.Tree)
+		if err != nil {
+			return run.stats, fmt.Errorf("restore: %w", err)
+		}
+		base, err := run.rootBase(abs, rel, entries)
+		if err != nil {
+			return run.stats, err
+		}
+		if err := os.MkdirAll(base, 0o700); err != nil {
+			return run.stats, fmt.Errorf("restore: %w", err)
+		}
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return run.stats, err
+			}
+			path, err := safeJoin(base, string(entry.Name))
+			if err != nil {
+				return run.stats, err
+			}
+			if err := run.restoreNode(ctx, entry, path); err != nil {
+				return run.stats, err
+			}
+		}
 	}
 	return run.stats, nil
+}
+
+// locatorComponents turns a root's locator bytes into the components of
+// its path under the restore target: the "scheme://" prefix goes, the
+// rest splits on "/", empty and "." components disappear, and a ".."
+// component cannot mean anything hostile here, so it becomes a literal
+// name -- the mapping is locked by cross-language vectors and must not
+// escape the target.
+func locatorComponents(locator []byte) ([]string, error) {
+	rest := locator
+	if i := bytes.IndexByte(locator, ':'); i >= 0 && len(locator) >= i+3 && locator[i+1] == '/' && locator[i+2] == '/' {
+		rest = locator[i+3:]
+	}
+	var comps []string
+	for _, c := range strings.Split(string(rest), "/") {
+		switch c {
+		case "", ".":
+		case "..":
+			comps = append(comps, "__parent__")
+		default:
+			if strings.ContainsAny(c, "/\x00") {
+				return nil, fmt.Errorf("restore: %w: locator component %q is not a path component", tree.ErrCorrupt, c)
+			}
+			comps = append(comps, c)
+		}
+	}
+	return comps, nil
+}
+
+// rootBase decides where one root's entries land, mirroring the
+// cross-language restore mapping: a directory source's entries go under
+// target/<locator>; a file or symlink source -- the root tree holds
+// exactly one non-directory entry named like the locator's last
+// component -- lands one level up, so the file's path is
+// target/<locator>/<name> either way.
+func (run *restoreRun) rootBase(target string, comps []string, entries []tree.Entry) (string, error) {
+	fileRoot := len(comps) > 0 &&
+		len(entries) == 1 &&
+		tree.NodeType(entries[0].Type) != tree.TypeDir &&
+		string(entries[0].Name) == comps[len(comps)-1]
+	if fileRoot {
+		comps = comps[:len(comps)-1]
+	}
+	path := target
+	for _, c := range comps {
+		var err error
+		if path, err = safeJoin(path, c); err != nil {
+			return "", err
+		}
+	}
+	return path, nil
 }
 
 type restoreRun struct {
@@ -83,94 +172,80 @@ type restoreRun struct {
 
 	// links maps an inode seen in the snapshot to the first path it was
 	// restored to, so the second name becomes a hard link rather than a
-	// second copy.
+	// second copy. The map lives on the run, not per root: hard-link
+	// identity is snapshot-wide across roots (format-v3-draft.md §8.3).
 	links map[hardLinkKey]string
 
 	stats RestoreStats
 }
 
-func (run *restoreRun) restoreTree(ctx context.Context, id crypto.ID, dir string) error {
-	t, err := tree.Load(ctx, run.repo.backend, run.repo.keys, id)
-	if err != nil {
-		return fmt.Errorf("restore: %w", err)
-	}
-	run.stats.Dirs++
-
-	if t.Prev != nil {
-		// A segmented directory: earlier segments come first on disk, so
-		// they are restored before this one's entries.
-		if err := run.restoreTree(ctx, *t.Prev, dir); err != nil {
-			return err
+// restoreNode restores one tree entry to path. Errors abort: a missing
+// chunk inside a snapshot means the snapshot is not restorable as a
+// whole, and pretending otherwise would be worse than stopping.
+func (run *restoreRun) restoreNode(ctx context.Context, entry tree.Entry, path string) error {
+	switch tree.NodeType(entry.Type) {
+	case tree.TypeDir:
+		if entry.Subtree == nil {
+			return fmt.Errorf("restore: %w: entry %q has no subtree", tree.ErrCorrupt, entry.Name)
 		}
-	}
-
-	for _, entry := range t.Entries {
-		if err := ctx.Err(); err != nil {
-			return err
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return fmt.Errorf("restore: %w", err)
 		}
-		path, err := entryPath(dir, entry.Name)
+		children, err := run.repo.LoadTreeChain(ctx, *entry.Subtree)
 		if err != nil {
+			return fmt.Errorf("restore: %w", err)
+		}
+		for _, child := range children {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			childPath, err := safeJoin(path, string(child.Name))
+			if err != nil {
+				return err
+			}
+			if err := run.restoreNode(ctx, child, childPath); err != nil {
+				return err
+			}
+		}
+		run.stats.Dirs++
+		// Permissions last: a read-only directory cannot be filled.
+		return run.applyMetadata(path, entry, false)
+
+	case tree.TypeSymlink:
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("restore: %w", err)
+		}
+		if err := os.Symlink(string(entry.Target), path); err != nil {
+			return fmt.Errorf("restore: %w", err)
+		}
+		run.stats.Symlinks++
+		return run.applyMetadata(path, entry, true)
+
+	case tree.TypeFile:
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("restore: %w", err)
+		}
+		if err := run.restoreFile(ctx, entry, path); err != nil {
 			return err
 		}
+		return run.applyMetadata(path, entry, false)
 
-		switch tree.NodeType(entry.Type) {
-		case tree.TypeDir:
-			if entry.Subtree == nil {
-				return fmt.Errorf("restore: %w: entry %q has no subtree", tree.ErrCorrupt, entry.Name)
-			}
-			if err := os.MkdirAll(path, 0o700); err != nil {
-				return fmt.Errorf("restore: %w", err)
-			}
-			if err := run.restoreTree(ctx, *entry.Subtree, path); err != nil {
-				return err
-			}
-			// Permissions last: a read-only directory cannot be filled.
-			if err := run.applyMetadata(path, entry, false); err != nil {
-				return err
-			}
-
-		case tree.TypeSymlink:
-			// A root-level entry's name is an absolute path; its parents
-			// do not exist yet under the target.
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-				return fmt.Errorf("restore: %w", err)
-			}
-			if err := os.Symlink(string(entry.Target), path); err != nil {
-				return fmt.Errorf("restore: %w", err)
-			}
-			run.stats.Symlinks++
-			if err := run.applyMetadata(path, entry, true); err != nil {
-				return err
-			}
-
-		case tree.TypeFile:
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-				return fmt.Errorf("restore: %w", err)
-			}
-			if err := run.restoreFile(ctx, entry, path); err != nil {
-				return err
-			}
-			if err := run.applyMetadata(path, entry, false); err != nil {
-				return err
-			}
-
-		default:
-			return fmt.Errorf("restore: %w: entry %q has unknown type %d", tree.ErrCorrupt, entry.Name, entry.Type)
-		}
+	default:
+		return fmt.Errorf("restore: %w: entry %q has unknown type %d", tree.ErrCorrupt, entry.Name, entry.Type)
 	}
-	return nil
 }
 
 // safeJoin builds a path for one tree entry inside dir, refusing anything
 // that would land outside it.
 //
-// tree.validate already rejects names containing a separator, a NUL, "."
-// or "..", so a tree that reached here cannot carry a traversal. This
-// checks again anyway, because the two guards protect against different
-// things: that one keeps kist from *writing* a bad tree, this one keeps a
-// repository someone else controls from making a restore write outside
-// the directory the user named. A restore is the moment an attacker who
-// owns the repository gets to choose filenames on the victim's machine.
+// tree.Validate already rejects names containing a separator, ".",
+// ".." or the empty name, so a tree that reached here cannot carry a
+// traversal. This checks again anyway, because the two guards protect
+// against different things: that one keeps kist from *writing* a bad
+// tree, this one keeps a repository someone else controls from making a
+// restore write outside the directory the user named. A restore is the
+// moment an attacker who owns the repository gets to choose filenames on
+// the victim's machine.
 func safeJoin(dir, name string) (string, error) {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") || strings.ContainsRune(name, os.PathSeparator) {
 		return "", fmt.Errorf("restore: %w: entry name %q is not a single path component", tree.ErrCorrupt, name)
@@ -184,29 +259,9 @@ func safeJoin(dir, name string) (string, error) {
 	return path, nil
 }
 
-// entryPath places one tree entry under dir. Child entries are single
-// components. A root-tree entry's name is the backup source's absolute
-// path -- that is the v2 naming rule -- and lands under dir component by
-// component, each component checked exactly as a child name is.
-func entryPath(dir string, name []byte) (string, error) {
-	if len(name) > 0 && name[0] == '/' {
-		clean := strings.Trim(string(name), "/")
-		path := dir
-		for _, comp := range strings.Split(clean, "/") {
-			var err error
-			path, err = safeJoin(path, comp)
-			if err != nil {
-				return "", err
-			}
-		}
-		return path, nil
-	}
-	return safeJoin(dir, string(name))
-}
-
 func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path string) error {
-	if entry.Links > 1 {
-		key := hardLinkKey{device: entry.Device, inode: entry.Inode}
+	if entry.Links != nil && *entry.Links > 1 {
+		key := hardLinkKey{device: deref64(entry.Device), inode: deref64(entry.Inode)}
 		if first, seen := run.links[key]; seen {
 			if err := os.Link(first, path); err == nil {
 				run.stats.Links++
@@ -259,6 +314,20 @@ func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path s
 	return nil
 }
 
+func deref64(p *uint64) uint64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func deref32(p *uint32) uint32 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
 // chunk fetches one chunk, reusing an open pack reader when it can.
 func (run *restoreRun) chunk(ctx context.Context, id crypto.ID) ([]byte, error) {
 	return run.chunks.Chunk(ctx, id)
@@ -285,7 +354,9 @@ func (run *restoreRun) resolveChunkList(ctx context.Context, chunks []crypto.ID)
 }
 
 // applyMetadata restores mode, times and ownership, warning about what it
-// cannot do rather than failing the restore over it.
+// cannot do rather than failing the restore over it. A field the source
+// did not record (a nil pointer, or mode 0 from a mode-less platform) is
+// left alone: absent must not become zero.
 func (run *restoreRun) applyMetadata(path string, entry tree.Entry, isSymlink bool) error {
 	if len(entry.Xattrs) > 0 {
 		run.opts.warn("%s had %d extended attributes; restoring them is not implemented", path, len(entry.Xattrs))
@@ -304,24 +375,31 @@ func (run *restoreRun) applyMetadata(path string, entry tree.Entry, isSymlink bo
 	//
 	// A restored binary that quietly lost its setuid bit is a system that
 	// does not work and does not say why.
-	if entry.UID != 0 || entry.GID != 0 {
-		if err := chown(path, entry.UID, entry.GID); err != nil {
-			run.opts.warn("could not restore ownership of %s (uid %d gid %d): %v", path, entry.UID, entry.GID, err)
+	uid, gid := deref32(entry.UID), deref32(entry.GID)
+	if entry.UID != nil || entry.GID != nil {
+		if uid != 0 || gid != 0 {
+			if err := chown(path, uid, gid); err != nil {
+				run.opts.warn("could not restore ownership of %s (uid %d gid %d): %v", path, uid, gid, err)
+			}
 		}
 	}
 
 	// Perm() alone would drop the same three bits for a different reason.
-	mode := entry.FileMode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky)
-	// path came from safeJoin, which rejects anything that is not a
-	// single component inside the parent directory.
-	if err := os.Chmod(path, mode); err != nil { //nolint:gosec // path is bounded by safeJoin
-		return fmt.Errorf("restore: set mode on %s: %w", path, err)
+	// Mode 0 means "not recorded" as much as nil does (Rust restores
+	// nothing for it either).
+	if mode := entry.FileMode(); mode != 0 {
+		mode &= fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+		// path came from safeJoin, which rejects anything that is not a
+		// single component inside the parent directory.
+		if err := os.Chmod(path, mode); err != nil { //nolint:gosec // path is bounded by safeJoin
+			return fmt.Errorf("restore: set mode on %s: %w", path, err)
+		}
 	}
 
 	// Times last: chmod does not touch them, but chown updates ctime and
 	// a future writer here would.
-	if entry.MTimeNs != 0 {
-		at := time.Unix(0, entry.MTimeNs)
+	if entry.MTimeNs != nil && *entry.MTimeNs != 0 {
+		at := time.Unix(0, *entry.MTimeNs)
 		if err := os.Chtimes(path, at, at); err != nil {
 			run.opts.warn("could not set the modification time of %s: %v", path, err)
 		}
