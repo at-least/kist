@@ -1275,6 +1275,15 @@ impl Backup {
             if !primary {
                 // 沿用的既有樹：touch（覆寫式 Put，mtime 必須刷新）。
                 self.repo.touch_tree(&id).await?;
+            } else if self
+                .marks_at_start
+                .contains_key(&ObjectId::from_bytes(*id.as_bytes()))
+            {
+                // 本 run 剛寫出的主體，卻帶著 run 開始時就存在的標記：
+                // 前一輪已刪過同內容的樹、標記按語意多活一輪。補一個
+                // touch，否則 commit gate 會因 touch 缺席而安全失敗一次
+                // （Go 端同樣處理，兩實作行為一致）。
+                self.repo.touch_tree(&id).await?;
             }
         }
         Ok(id)
