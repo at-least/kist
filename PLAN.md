@@ -134,3 +134,21 @@ fuzz、parity、mount、race test 均已落地；剩餘硬化項隨產品端排�
 
 ## 開始
 先做 M0，完成後列出你對 M1 格式的疑問，等我回覆再動手。
+
+## M7：v3 格式移植（2026-09-09）【完成】
+
+對齊 kist-rs 的 v3 權威規格（`docs/format.md` 為其逐 byte 拷貝，由
+kist-rs 的 CI interop job 檢查同步）：Snapshot.Roots 取代合成根、
+Entry.mk metadata 聯集（etag/vern）、wrapped master 攜帶 Invariants、
+config 加 min_reader/replicas、樹 write-once＋touch 復活、.r1 副本、
+有效 index blob > 64 強制合併、快速路徑分級。interop 向量對齊 Rust
+端錄製的 v3（金鑰逐 byte、tree canonical CBOR、parity golden）。
+gc race 測試在 touch 語意下重跑，補 V3-GC-5 時間線釘死測試（標記後
+重用的樹經 touch 復活）。移植中修掉兩個真 bug：writeTree 對「剛寫入
+但帶過期標記」的主體樹補 touch（commit gate 誤拒）；backupRoots 檔案
+來源的 err 遮蔽。
+
+**已知未移植（跟隨產品端排程）**：遠端「來源」介面（kist-rs 的
+`kist-backend::source`，`kist backup sftp://…`／`s3://…`）——本 repo 目前
+只能當 repo 端；格式層已完全支援遠端來源（Entry.mk 聯集、etag/vern、
+快速路徑分級），移植 Source 介面時不需要再動格式。
