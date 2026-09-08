@@ -252,6 +252,9 @@ kist/
 - gc race 測試在 touch 語意下重跑【完成 2026-09-09】：兩邊各補 V3-GC-5
   時間線釘死測試（標記後重用的樹經 touch 復活、snapshot 完整可還原）；
   Go 側 race 測試期望全面更新為「樹也參與標記/持有/刪除」。
+  200-case 深度重跑【完成 2026-09-09】：
+  `PROPTEST_CASES=200 cargo test -p kist-core --test gc_race`——proptest
+  全綠零失敗，313.64s（v2 的 200-case 同基準 381s）。
 - 規格正式化【完成 2026-09-09，commit c8ad826】：`docs/format.md` 升格
   為 v3 權威規格（單一副本）；kist-rs CI interop job 檢查 kist-go 拷貝
   逐 byte 一致（commit 22b3411）。
