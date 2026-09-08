@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/crypto"
+	"github.com/at-least/kist/internal/index"
 	"github.com/at-least/kist/internal/pack"
 	"github.com/at-least/kist/internal/snapshot"
 	"github.com/at-least/kist/internal/tree"
@@ -916,4 +918,38 @@ func TestPruneRevivesAMarkedTreeTouchedByALaterBackup(t *testing.T) {
 		t.Errorf("%d trees stored, want the revived one", n)
 	}
 	s.healthy()
+}
+
+// docs/format.md §10 (v3) makes compaction MANDATORY: when the effective
+// (non-superseded) index blob count passes maxEffectiveIndexBlobs, prune
+// must merge them into one. 65 one-file backups produce 65 blobs; the
+// next prune must collapse them.
+func TestPruneCompactsTheIndexPastTheThreshold(t *testing.T) {
+	s := newScenario(t)
+	a := s.open(clientA)
+
+	for i := range maxEffectiveIndexBlobs + 1 {
+		src := s.source("blob-"+strconv.Itoa(i), 1<<10)
+		s.backup(a, src)
+	}
+	pre, _, err := index.List(context.Background(), a.Backend())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pre) <= maxEffectiveIndexBlobs {
+		t.Fatalf("precondition: only %d effective blobs, want more than %d", len(pre), maxEffectiveIndexBlobs)
+	}
+
+	// Nothing was forgotten: the only trigger is the blob count itself.
+	s.clock.advance(2 * time.Hour)
+	if r := s.prune(a, shortGrace); len(r.Deleted) != 0 {
+		t.Fatalf("nothing was forgotten; deleted %d objects", len(r.Deleted))
+	}
+	post, _, err := index.List(context.Background(), a.Backend())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(post) != 1 {
+		t.Fatalf("prune left %d effective index blobs, want 1 (compaction is mandatory)", len(post))
+	}
 }
