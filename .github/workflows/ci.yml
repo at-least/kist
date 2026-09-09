@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # The floor declared in go.mod, and whatever is current. Both must
+        # stay green or the go directive is a lie.
+        go: ["1.26.x", "stable"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      # The shipped binary must build without cgo on every platform.
+      - name: build
+        run: go build ./...
+        env:
+          CGO_ENABLED: "0"
+
+      - name: vet
+        run: go vet ./...
+
+      # A release build refuses a dirty tree, so go.mod and go.sum have
+      # to be tidy before a tag, not discovered untidy by the tag.
+      - name: go.mod is tidy
+        if: runner.os == 'Linux'
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+
+      - name: test
+        run: go test ./...
+        env:
+          CGO_ENABLED: "0"
+
+      # -race requires cgo, so this is a test-only build, never a shipped
+      # artifact -- which is why it does not conflict with the no-cgo rule
+      # for the binary. A data race in Go is silent memory corruption, and
+      # in a backup tool that is silent data corruption, so every platform
+      # runs it.
+      - name: test (race)
+        run: go test -race ./...
+        env:
+          CGO_ENABLED: "1"
+
+      # A short fuzz pass on every target: not a campaign, a guard that the
+      # targets still build and their seed corpora still pass. The 24-hour
+      # campaign is make fuzz-long, run by hand.
+      - name: fuzz smoke
+        if: runner.os == 'Linux'
+        run: make fuzz FUZZTIME=10s
+
+      # The FUSE cases skip where /dev/fuse cannot be opened (macOS without
+      # macFUSE). Verbose, so the log says which it was.
+      - name: mount test, verbosely
+        if: runner.os != 'Windows'
+        shell: bash
+        run: go test -count=1 -v ./internal/mount/ 2>&1 | grep -E "^(--- |\s+mount_test.go|ok|FAIL)"
+
+  # Lint on all three, not just Linux: golangci-lint only analyses files
+  # whose build constraints match the runner's GOOS, so a Linux-only job
+  # would silently skip the _windows.go and FUSE code M4 adds.
+  lint:
+    name: lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned in lockstep with the Makefile. Bump both together.
+          version: v2.13.2
+
+  # The S3 backend against a real MinIO, on Linux only: the tests start
+  # the container themselves and need a Docker daemon.
+  sftp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - run: make test-sftp
+
+  s3:
+    name: s3 (minio)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: test against minio
+        run: make test-s3

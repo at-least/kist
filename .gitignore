@@ -1,0 +1,8 @@
+# Built binary (see `make build`).
+/kist-go
+/kist-go.exe
+
+# Go test artifacts.
+*.test
+*.out
+dist/

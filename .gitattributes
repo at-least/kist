@@ -1,0 +1,5 @@
+# Sources and goldens are byte-exact on every platform: gofmt rejects
+# CRLF, and the golden tests compare bytes.
+* text=auto eol=lf
+*.hex text eol=lf
+*.txt text eol=lf
