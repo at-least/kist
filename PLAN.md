@@ -263,9 +263,18 @@ kist/
   0 新 chunk（跨實作去重 100%）✓；Rust init/backup → Go check ✓ +
   restore 逐 byte 相同 ✓；Rust prune → Go check ✓；Go forget+prune →
   Rust check ✓ + 最終還原逐 byte 相同 ✓。
-- 待辦（後續）：cargo-fuzz seeds 隨 v3 結構重生成（現有 targets 編譯
-  通過、斷言仍有效）；大 repo 記憶體重審（SourceItem 進走訪清單後的
-  峰值，ADR 011 門檻重測）；SFTP/S3 來源的實機 E2E（需環境）。
+- fuzz seeds 隨 v3 重生成【完成 2026-09-09，commit 8fb2450】：cbor 五結構、
+  pack 排版、parity golden 全部由 v3 golden 機器產生；4 targets 煙霧全過。
+- 大 repo 記憶體重審【完成 2026-09-09】：重審**抓到回歸**——SourceItem
+  整批物化讓 100 萬條目平鋪目錄的清單多 ~150-250 MiB，B 集首備頂到
+  512 MiB 硬門檻被殺（v2 可存活）。修法：`Source::list` 改惰性迭代器
+  （本機來源只常駐排序後名稱 ~45 MiB，metadata 逐條 lstat；commit
+  72530c0）。重測結果（MemoryMax=512M 硬門檻，release，N≥1）：
+  A 集首/次備份 ex-file-slab 峰值 283 MiB（優於 v2 的 373–431）、
+  B 集 450 MiB（在 v2 的 442–524 帶內）、prune ×3 ~230 MiB——全部
+  通過硬門檻不被殺。
+- 待辦（後續）：SFTP/S3 來源的實機 E2E（需環境）；Go 端 Source 介面
+  移植（kist-go PLAN 已記錄）。
 
 ## 已接受的限制（非待辦）
 
