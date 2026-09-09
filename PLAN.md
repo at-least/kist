@@ -290,8 +290,18 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   SFTP 來源雙重前綴（列出 0 條目）、S3 檔案來源的 store 前綴處理
   （裸 bucket + root 拼接 + rel="" 根讀取契約；三種來源形狀——檔案/
   目錄/含子目錄——實機全數驗證）。
-- 待辦（後續）：Go 端 Source 介面移植（kist-go PLAN 已記錄；
-  格式層無需再動）。
+- Go 端 Source 介面移植【完成 2026-09-09，kist-go commit d6a1bdb：
+  `internal/source`（Source 介面、Local/Memory/SFTP/S3、OpenSource）；
+  詳見 go/PLAN.md「遠端「來源」介面」節】。
+- mount 測試修復【2026-09-09】：`TestMountServesTheSnapshot` 連 snapshot
+  根葉節點也比對來源 dir 的 mode。v3 Root 只帶 {path, tree}，root 自身
+  的 mode 格式上不存在，兩端都刻意讓葉節點呈現唯讀合成目錄 0555
+  （Rust `root_leaf_entry` 的 `0o040_555` 同形）；測試改為對 "." 釘
+  合成形狀、其餘條目維持逐 byte 比對。此前沙箱 fusermount 不可用時
+  mount 測試提前失敗，這條斷言未被走到。修後 gate 全綠：Go build/vet/
+  CGO=0 全套件/-race 全套件；Rust fmt/`clippy -D warnings`/
+  `test --workspace`/deny 四項 ok；根 `docs/format.md` 與
+  `go/docs/format.md` 逐 byte 一致。
 
 ## 已接受的限制（非待辦）
 
