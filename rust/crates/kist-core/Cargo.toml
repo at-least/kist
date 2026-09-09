@@ -1,0 +1,37 @@
+[package]
+name = "kist-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kist-backend.workspace = true
+kist-chunker.workspace = true
+kist-crypto.workspace = true
+kist-format.workspace = true
+
+blake3.workspace = true
+filetime.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+zstd.workspace = true
+
+# xattr crate 只有 Unix 實作（Windows 連編譯都不過）；kist-core 的 xattr
+# 讀取本來就是 cfg(unix) 分支 + 非 Unix 的空實作（fsmeta.rs read_xattrs）。
+[target.'cfg(unix)'.dependencies]
+xattr.workspace = true
+
+[dev-dependencies]
+filetime.workspace = true
+proptest.workspace = true
+serde.workspace = true
+rand.workspace = true
+tempfile.workspace = true

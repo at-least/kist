@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/newlix/kist"
+publish = false
+
+[workspace.dependencies]
+kist-backend = { path = "crates/kist-backend" }
+kist-chunker = { path = "crates/kist-chunker" }
+kist-core = { path = "crates/kist-core" }
+kist-crypto = { path = "crates/kist-crypto" }
+kist-format = { path = "crates/kist-format" }
+kist-mount = { path = "crates/kist-mount" }
+kist-app = { path = "crates/kist-app" }
+
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+croner = "4"
+argon2 = "0.6"
+blake3 = "1.8"
+chacha20poly1305 = "0.11"
+ciborium = "0.2"
+dirs = "6"
+clap = { version = "4", features = ["derive", "env"] }
+filetime = "0.2"
+futures = "0.3"
+gethostname = "1"
+getrandom = "0.4"
+hex = "0.4"
+sha2 = "0.10"
+xattr = "1"
+maud = { version = "0.27", features = ["axum"] }
+object_store = { version = "0.14", default-features = false, features = ["fs", "aws-base", "reqwest", "ring"] }
+prometheus-client = "0.25"
+proptest = "1"
+# reqwest 用「不帶 provider」的 rustls，TLS 的 crypto provider 由 rustls/ring 提供並在後端建構時安裝：
+# 這樣就不會拉進 aws-lc-sys（Windows 上要 CMake + NASM 才編得起來）。
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rand = "0.10"
+reed-solomon-erasure = "6"
+rpassword = "7"
+rust-embed = { version = "8", features = ["debug-embed"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+# "process"：rclone 橋接要 spawn `rclone serve sftp --stdio`
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal", "net", "process"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+zeroize = { version = "1", features = ["derive"] }
+zstd = "0.13"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -1,0 +1,32 @@
+[package]
+name = "kist-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kist-format.workspace = true
+# SFTP 後端：russh（SSH 傳輸+認證；ring backend 避免 aws-lc-sys 在 Windows
+# 要 CMake+NASM）+ openssh-sftp-client（SFTP 協議層，含管線化寫入與
+# hardlink/posix-rename/fsync 擴充偵測）。
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+object_store.workspace = true
+openssh-sftp-client = "0.15"
+reqwest.workspace = true
+russh = { version = "0.63", default-features = false, features = ["ring"] }
+rustls.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+time.workspace = true

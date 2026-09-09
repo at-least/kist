@@ -1,0 +1,13 @@
+# Rust
+/target/
+# fuzz：產物與 corpus（corpus 會無限長大，seed 進版控就夠）
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+**/*.rs.bk
+*.pdb
+__pycache__/
+dhat-heap.json
+
+# dist 產物（./dist.sh）
+/dist/

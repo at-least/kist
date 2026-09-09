@@ -1,0 +1,51 @@
+[package]
+name = "kist-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kist"
+path = "src/main.rs"
+
+[dependencies]
+kist-app.workspace = true
+kist-backend.workspace = true
+kist-core.workspace = true
+kist-crypto.workspace = true
+kist-format.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+gethostname.workspace = true
+hex.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# 診斷用（bench/memory 歸因）：--features dhat 跑完會在 cwd 寫 dhat.json。
+# 暫時加入，歸因完移除。
+dhat = { version = "0.3", optional = true }
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+# FUSE 掛載（kist mount）：fuser 在 Windows 上不存在，依賴與命令一起閘在 unix。
+[target.'cfg(unix)'.dependencies]
+kist-mount.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true
+
+[features]
+dhat = ["dep:dhat"]
+
+# publish=false 會讓 dist（cargo-dist）跳過這個 binary；顯式標記要發佈。
+[package.metadata.dist]
+dist = true

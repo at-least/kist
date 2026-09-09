@@ -1,0 +1,47 @@
+# cargo-deny 設定：CI 會用它檢查相依套件的漏洞與授權。
+# 文件：https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# 有已知漏洞就讓 CI 紅燈。
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2024-0384：instant 已停止維護（unmaintained，非已知漏洞）。
+    # 它是 reed-solomon-erasure 6.0.0 → parking_lot 0.11 的傳遞依賴，6.0.0 即最新版，
+    # 上游無升級路徑；instant 本身只是 std::time 的 web 相容 shim，無 unsafe，
+    # 經 parking_lot 的 Mutex 間接使用，實際風險為零。
+    # 移除條件：reed-solomon-erasure 發新版脫離 parking_lot 0.11，
+    # 或本專案更換 RS crate；若 instant 日後出現真正的漏洞 advisory 則需重新評估。
+    { id = "RUSTSEC-2024-0384", reason = "unmaintained 傳遞依賴，無升級路徑，見上方說明" },
+]
+
+[licenses]
+version = 2
+# 只允許這些寬鬆授權；出現其他授權要先討論再加進來。
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    # webpki-root-certs：Mozilla 根憑證資料，CDLA-Permissive-2.0 是給資料用的寬鬆授權
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# 自家 crate 之間用 path 相依（沒有版本號），cargo-deny 預設把它算成 wildcard；
+# 這個 workspace 不發布到 crates.io，所以放行 path 相依，外部套件仍禁止 wildcard。
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

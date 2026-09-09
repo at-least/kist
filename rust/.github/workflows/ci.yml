@@ -1,0 +1,96 @@
+name: CI
+
+# 只手動觸發：所有驗證都在本機跑（cargo fmt/clippy/test/deny + tests/minio-setup.sh），
+# 這支只留著給偶爾想看三平台結果時用，避免吃 GitHub Actions 配額。
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: start MinIO (S3 integration tests)
+        if: runner.os == 'Linux'
+        run: sh tests/minio-setup.sh | sed "s/^export //" >> "$GITHUB_ENV"
+        shell: bash
+      - name: cargo test
+        run: cargo test --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # 跨語言 interop：同一份向量，Go 參考實作與 Rust（cargo test 的 interop 測試）
+  # 必須一致。一樣只手動觸發；本機的快速 gate：
+  #   cd ../kist && go test ./internal/interop/...
+  interop:
+    name: go interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      # at-least/kist 是 private repo：同 repo 的 github.token 看不到它，
+      # 第一次 dispatch 前要先在 repo secrets 放一顆可讀該 repo 的 PAT
+      #（secret 名 GO_REF_TOKEN），並把下面改成 token: ${{ secrets.GO_REF_TOKEN }}。
+      - name: checkout the Go reference implementation
+        uses: actions/checkout@v7
+        with:
+          repository: at-least/kist
+          path: kist-go
+      - name: go test ./internal/interop/...
+        working-directory: kist-go
+        run: go test ./internal/interop/...
+      # v3 起規格只有一份權威副本（本 repo 的 docs/format.md）；Go 端的
+      # 拷貝必須逐 byte 一致（format-v3 §0.9）。漂移 = 格式分歧的前兆。
+      - name: verify the Go repo carries a byte-identical format.md
+        run: |
+          if ! cmp -s docs/format.md kist-go/docs/format.md; then
+            echo "::error::kist-go/docs/format.md differs from the authoritative docs/format.md"
+            diff docs/format.md kist-go/docs/format.md || true
+            exit 1
+          fi
+          echo "format.md copies are byte-identical"
+
+  # 短煙霧（每 target 60 秒）：確保 fuzz target 不會腐化到編不過或斷言失效。
+  # 長跑（24h）仍在手動本機跑，見 fuzz/README.md。CI 本身也是手動觸發，
+  # 不 dispatch 就零成本。
+  fuzz-smoke:
+    name: fuzz smoke (60s × 4 targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: smoke each target
+        run: |
+          for t in pack cbor chunker parity; do
+            sh fuzz/smoke.sh "$t" 60
+          done
