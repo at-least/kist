@@ -127,7 +127,13 @@ impl Source for FakeSource {
     }
 
     fn read(&self, file: &[u8]) -> Result<Box<dyn Read + Send>, BackendError> {
-        match self.files.get(file) {
+        // 檔案來源契約：根物件以 rel = ""（來源根本身）讀取。
+        let key: &[u8] = if file.is_empty() {
+            self.locator.rsplit(|&b| b == b'/').next().unwrap_or(file)
+        } else {
+            file
+        };
+        match self.files.get(key) {
             Some(content) => Ok(Box::new(std::io::Cursor::new(content.clone()))),
             None => Err(BackendError::NotFound(
                 String::from_utf8_lossy(file).into_owned(),

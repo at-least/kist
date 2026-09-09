@@ -878,10 +878,13 @@ impl Repository {
                         _ => None,
                     };
                     if let Some(item) = file_root {
+                        // 檔案來源：根物件就是這顆檔案本身 → 走訪用的 rel
+                        // 是**空字串**（read/讀 xattr 都落在來源根本身）；
+                        // entry 名稱維持最後元件。
                         let name = item.name.clone();
                         let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
                         let Some(entry) = b
-                            .process_entry(&ctx, &name, item, parent_entry.as_ref())
+                            .process_entry(&ctx, b"", item, parent_entry.as_ref())
                             .await?
                         else {
                             return Err(CoreError::Usage(format!(

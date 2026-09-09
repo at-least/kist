@@ -281,12 +281,57 @@ impl ObjectStoreSource {
         };
         object_store::path::Path::from(joined.as_str())
     }
+
+    /// HEAD prefix 本身（僅根列舉用）：存在 → 它是一顆「檔案來源」物件，
+    /// 包成單一 File 條目；404 → None（目錄前綴，正常走清單）。
+    fn head_root_file(&self) -> std::result::Result<Option<SourceItem>, BackendError> {
+        // 來源的 store 是**裸 bucket**（無 PrefixStore）：root 就是完整前綴。
+        // HEAD 完整前綴路徑——目錄來源 404（→ None，正常走清單）；檔案來源
+        // 200（→ 單一 File 條目，走檔案來源分支）。
+        let path = self.to_store_path(b"");
+        let path_for_err = path.to_string();
+        let store = Arc::clone(&self.store);
+        let head_path = path.clone();
+        let meta = match self
+            .handle
+            .block_on(async move { store.head(&head_path).await })
+        {
+            Ok(m) => m,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(BackendError::Source(format!("{}: {e}", path_for_err))),
+        };
+        let name = path
+            .to_string()
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("root")
+            .as_bytes()
+            .to_vec();
+        Ok(Some(SourceItem {
+            name,
+            kind: SourceItemKind::File {
+                size: meta.size,
+                mtime_ns: meta
+                    .last_modified
+                    .timestamp()
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(i64::from(meta.last_modified.timestamp_subsec_nanos())),
+                etag: meta.e_tag.as_ref().map(|e| e.as_bytes().to_vec()),
+                vern: meta.version.as_ref().map(|v| v.as_bytes().to_vec()),
+            },
+        }))
+    }
 }
 
 /// S3 store（bucket + 可選 prefix）；與 `Backend::s3_with` 同一構造。
 /// 來源端的憑證走環境變數（與 repo 端的預設一致）。
 fn s3_store_for_prefix(bucket: &str, prefix: &str) -> Result<Arc<dyn ObjectStore>> {
-    crate::s3_store(bucket, prefix, None)
+    // 來源端用**裸 bucket**（不掛 PrefixStore）：前綴由 self.root 負責拼接
+    // （to_store_path 會 join root+rel）。若再包 PrefixStore 會雙重前綴
+    // （實機 E2E 抓到：讀檔變成 prefix/prefix/key）。
+    let _ = prefix;
+    crate::s3_store(bucket, "", None)
 }
 
 impl Source for ObjectStoreSource {
@@ -301,6 +346,17 @@ impl Source for ObjectStoreSource {
     fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError> {
         let prefix = self.to_store_path(dir);
         let store = Arc::clone(&self.store);
+        // 根列舉時先 HEAD prefix 本身：若它是「檔案來源」（prefix 即一顆
+        // 物件），list_with_delimiter 會把同名物件藏起來、回傳空清單——
+        // 實機測試（MinIO）證實。此時回傳該物件單一條目，走訪端即可走
+        // 檔案來源分支（與 Go 實作一致）。
+        if dir.is_empty() {
+            if let Some(item) = self.head_root_file()? {
+                return Ok(Box::new(StoreListing {
+                    items: vec![item].into_iter(),
+                }));
+            }
+        }
         let result = self.handle.block_on(async move {
             store
                 .list_with_delimiter(Some(&prefix))
