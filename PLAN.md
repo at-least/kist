@@ -309,6 +309,12 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   同檔三處 rust/ 時代的過時註解一併更新。本機鏡射驗證：
   `cd go && go test ./internal/interop/...` ok、兩份 format.md
   逐 byte 一致。
+- 完成 gate 全量重驗【2026-09-09】：本機補齊 CI 同款 lint 工具後——
+  golangci-lint（v2.13.2）`run ./...` 0 issues、actionlint 三個
+  workflow 乾淨、MinIO S3 整合測試重跑（contract 3 + s3 4，七案全過，
+  測畢容器已清）。至此完成審計的每一個 gate（Go build/vet/CGO=0/
+  -race/lint、Rust fmt/clippy/test --workspace/deny、MinIO 整合、
+  format.md 同步）皆在本 session 以實機重驗綠燈。
 
 ## 已接受的限制（非待辦）
 
