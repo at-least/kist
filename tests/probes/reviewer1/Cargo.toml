@@ -1,0 +1,17 @@
+[package]
+name = "probe"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+kist-core = { path = "../../../crates/kist-core" }
+kist-backend = { path = "../../../crates/kist-backend" }
+kist-format = { path = "../../../crates/kist-format" }
+kist-crypto = { path = "../../../crates/kist-crypto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
+filetime = "0.2"
+rand = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }

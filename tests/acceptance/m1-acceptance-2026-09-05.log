@@ -1,0 +1,42 @@
+source: 100000 files, 9.75 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist init
+  -> exit 0, 0.1s, child peak RSS so far 69 MiB
+  repository initialized at /home/newlix/github/at-least/kist-acceptance/repo
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 54.3s, child peak RSS so far 186 MiB
+  snapshot 8ec4aa04/20260904T171018836405001Z
+    100000 files, 1101 dirs, 0 symlinks, 9.7 GiB total
+    new: 9.4 GiB in 71076 chunks, 77 packs written
+after backup 1: 77 packs, 1102 trees, repo 4.90 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 0.8s, child peak RSS so far 186 MiB
+  snapshot 8ec4aa04/20260904T171019678076476Z
+    100000 files, 1101 dirs, 0 symlinks, 9.7 GiB total
+    new: 0 B in 0 chunks, 0 packs written
+after backup 2: 77 packs
+$ /home/newlix/github/at-least/kist-rs/target/release/kist restore latest /home/newlix/github/at-least/kist-acceptance/out
+  -> exit 0, 40.7s, child peak RSS so far 186 MiB
+  restored 8ec4aa04/20260904T171019678076476Z to /home/newlix/github/at-least/kist-acceptance/out: 100000 files, 1101 dirs, 0 symlinks
+$ diff -r /home/newlix/github/at-least/kist-acceptance/src /home/newlix/github/at-least/kist-acceptance/out/home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 53.1s, child peak RSS so far 186 MiB
+diff -r: identical
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check
+  -> exit 0, 0.3s, child peak RSS so far 186 MiB
+  checked 2 snapshots, 1102 trees, 77 packs, 71076 chunks
+  no errors found
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check --read-data
+  -> exit 0, 16.9s, child peak RSS so far 194 MiB
+  checked 2 snapshots, 1102 trees, 77 packs, 71076 chunks (data read)
+  no errors found
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check --read-data
+  -> exit 1, 15.1s, child peak RSS so far 194 MiB
+  checked 2 snapshots, 1102 trees, 77 packs, 71076 chunks (data read)
+  stderr: error: packs/01694732826d3c10e92b616ab24c999a1fabdf10f1f8dbc2f7efbff800a647ef: content hash does not match its name
+  error: 1 error(s) found
+corruption detected in 01694732826d3c10e92b616ab24c999a1fabdf10f1f8dbc2f7efbff800a647ef
+
+=== SUMMARY ===
+files: 100000, source 9.75 GiB, repo 4.90 GiB, packs 77, trees 1102
+backup 1: 54s  backup 2: 1s  restore: 41s  check: 0s  check --read-data: 17s
+peak RSS (max over all child processes, dominated by backup 1): 186 MiB
+ALL ACCEPTANCE CHECKS PASSED

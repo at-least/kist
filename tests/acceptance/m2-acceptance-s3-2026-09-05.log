@@ -1,0 +1,50 @@
+source: 100000 files, 9.75 GiB -> s3://kist-test/acceptance
+$ /home/newlix/github/at-least/kist-rs/target/release/kist init
+  -> exit 0, 0.3s, child peak RSS so far 73 MiB
+  repository initialized at s3://kist-test/acceptance
+  stderr: note: enable bucket versioning or Object Lock so that `config` cannot be overwritten or deleted, and keep a copy of the `config` object somewhere safe
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 157.5s, child peak RSS so far 242 MiB
+  snapshot 461ff836/20260904T185340978770220Z
+    100000 files, 1101 dirs, 0 symlinks, 9.7 GiB total
+    new: 9.4 GiB in 71040 chunks, 77 packs written
+after backup 1: 77 packs, 1102 trees, repo 4.90 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 34.7s, child peak RSS so far 242 MiB
+  snapshot 461ff836/20260904T185621024690073Z
+    100000 files, 1101 dirs, 0 symlinks, 9.7 GiB total
+    new: 0 B in 0 chunks, 0 packs written
+after backup 2: 77 packs
+$ /home/newlix/github/at-least/kist-rs/target/release/kist restore latest /home/newlix/github/at-least/kist-acceptance/out
+  -> exit 0, 212.6s, child peak RSS so far 242 MiB
+  restored 461ff836/20260904T185621024690073Z to /home/newlix/github/at-least/kist-acceptance/out: 100000 files, 1101 dirs, 0 symlinks
+$ diff -r /home/newlix/github/at-least/kist-acceptance/src /home/newlix/github/at-least/kist-acceptance/out/home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 65.2s, child peak RSS so far 242 MiB
+diff -r: identical
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check
+  -> exit 0, 1.7s, child peak RSS so far 242 MiB
+  checked 2 snapshots, 1102 trees, 77 packs, 71040 chunks
+  no errors found
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check --read-data
+  -> exit 0, 27.7s, child peak RSS so far 242 MiB
+  checked 2 snapshots, 1102 trees, 77 packs, 71040 chunks (data read)
+  no errors found
+$ /home/newlix/github/at-least/kist-rs/target/release/kist rebuild-index
+  -> exit 0, 0.4s, child peak RSS so far 242 MiB
+  rebuilt index from 77 packs (71040 chunks); 1 old index object(s) superseded
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check
+  -> exit 0, 1.5s, child peak RSS so far 242 MiB
+  checked 2 snapshots, 1102 trees, 77 packs, 71040 chunks
+  no errors found
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check --read-data
+  -> exit 1, 20.1s, child peak RSS so far 242 MiB
+  checked 2 snapshots, 1102 trees, 77 packs, 71040 chunks (data read)
+  stderr: error: packs/fc6925662f62153cf393b939cee59aec29e11b598259d84f17c89c3e7e75c0f9: content hash does not match its name
+  error: 1 error(s) found
+corruption detected in fc6925662f62153cf393b939cee59aec29e11b598259d84f17c89c3e7e75c0f9
+
+=== SUMMARY (S3/MinIO) ===
+files: 100000, source 9.75 GiB, repo 4.90 GiB, packs 77, trees 1102
+backup 1: 157s  backup 2: 35s  restore: 213s  check: 2s  check --read-data: 28s  rebuild-index: 0s  check after rebuild: 2s
+peak RSS (max over all child processes, dominated by backup 1): 242 MiB
+ALL ACCEPTANCE CHECKS PASSED

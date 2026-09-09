@@ -176,7 +176,15 @@ func TestMountServesTheSnapshot(t *testing.T) {
 			t.Errorf("%s: %v", rel, err)
 			return nil
 		}
-		if wantInfo.Mode() != gotInfo.Mode() {
+		// The snapshot's root leaf is a synthetic read-only dir: the v3
+		// Root carries only {path, tree}, so the source dir's own mode is
+		// not representable anywhere (Rust's root_leaf_entry builds the
+		// same 0o555 shape).
+		if rel == "." {
+			if want := iofs.ModeDir | 0o555; gotInfo.Mode() != want {
+				t.Errorf(".: mode %v, want synthetic %v", gotInfo.Mode(), want)
+			}
+		} else if wantInfo.Mode() != gotInfo.Mode() {
 			t.Errorf("%s: mode %v, want %v", rel, gotInfo.Mode(), wantInfo.Mode())
 		}
 		switch {

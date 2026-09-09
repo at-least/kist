@@ -1,0 +1,83 @@
+source: 100000 files, 9.75 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist init
+  -> exit 0, 0.3s, child peak RSS so far 71 MiB
+  repository initialized at /home/newlix/github/at-least/kist-acceptance/repo-gc
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 108.4s, child peak RSS so far 227 MiB
+  snapshot 461ff836/20260904T212440169219962Z
+    100000 files, 1101 dirs, 0 symlinks, 9.7 GiB total
+    new: 9.4 GiB in 71075 chunks, 77 packs written
+after backup 1: 77 packs, repo 4.90 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 4.4s, child peak RSS so far 227 MiB
+  snapshot 461ff836/20260904T212629499229353Z
+    90000 files, 991 dirs, 0 symlinks, 8.8 GiB total
+    new: 0 B in 0 chunks, 0 packs written
+$ /home/newlix/github/at-least/kist-rs/target/release/kist snapshots
+  -> exit 0, 0.2s, child peak RSS so far 227 MiB
+  CLIENT   TIMESTAMP                 TIME (UTC)          HOST            FILES       SIZE  PATHS
+  461ff836 20260904T212440169219962Z 2026-09-04 21:24:40 lab            100000    9.7 GiB  /home/newlix/github/at-least/kist-acceptance/src
+  461ff836 20260904T212629499229353Z 2026-09-04 21:26:29 lab             90000    8.8 GiB  /home/newlix/github/at-least/kist-acceptance/src
+$ /home/newlix/github/at-least/kist-rs/target/release/kist forget 20260904T212440169219962Z
+  -> exit 0, 0.2s, child peak RSS so far 227 MiB
+  removed 461ff836/20260904T212440169219962Z
+  removed 1 snapshot(s), kept 0
+  run `kist prune` to reclaim the space
+$ /home/newlix/github/at-least/kist-rs/target/release/kist prune --grace 0s
+  -> exit 0, 2.8s, child peak RSS so far 227 MiB
+  1 snapshots, 992 live trees, 77 live packs
+  marked 120 object(s) (525.6 MiB) for deletion; 0 marker(s) revived, 0 stale
+  deleted 0 object(s) (0 B); 0 waiting for the grace period, 0 held back by active clients
+  repacked 8 pack(s) (24.0 MiB of live data moved into 1 new pack(s))
+after prune 1: 120 markers, 78 packs, repo 4.92 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 5.0s, child peak RSS so far 227 MiB
+  snapshot 461ff836/20260904T212637182537918Z
+    90000 files, 991 dirs, 0 symlinks, 8.8 GiB total
+    new: 0 B in 0 chunks, 0 packs written
+$ /home/newlix/github/at-least/kist-rs/target/release/kist prune --grace 0s
+  -> exit 0, 1.0s, child peak RSS so far 227 MiB
+  2 snapshots, 992 live trees, 70 live packs
+  marked 1 object(s) (2.9 MiB) for deletion; 0 marker(s) revived, 0 stale
+  deleted 120 object(s) (525.6 MiB); 0 waiting for the grace period, 0 held back by active clients
+  repacked 0 pack(s) (0 B of live data moved into 0 new pack(s))
+after prune 2: 1 markers, 70 packs, repo 4.41 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 4.7s, child peak RSS so far 227 MiB
+  snapshot 461ff836/20260904T212643187086787Z
+    90000 files, 991 dirs, 0 symlinks, 8.8 GiB total
+    new: 0 B in 0 chunks, 0 packs written
+$ /home/newlix/github/at-least/kist-rs/target/release/kist prune --grace 0s
+  -> exit 0, 0.9s, child peak RSS so far 227 MiB
+  3 snapshots, 992 live trees, 70 live packs
+  marked 1 object(s) (3.0 MiB) for deletion; 0 marker(s) revived, 0 stale
+  deleted 1 object(s) (2.9 MiB); 0 waiting for the grace period, 0 held back by active clients
+  repacked 0 pack(s) (0 B of live data moved into 0 new pack(s))
+$ /home/newlix/github/at-least/kist-rs/target/release/kist backup /home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 4.3s, child peak RSS so far 227 MiB
+  snapshot 461ff836/20260904T212648679709042Z
+    90000 files, 991 dirs, 0 symlinks, 8.8 GiB total
+    new: 0 B in 0 chunks, 0 packs written
+$ /home/newlix/github/at-least/kist-rs/target/release/kist prune --grace 0s
+  -> exit 0, 0.9s, child peak RSS so far 227 MiB
+  4 snapshots, 992 live trees, 70 live packs
+  marked 0 object(s) (0 B) for deletion; 0 marker(s) revived, 0 stale
+  deleted 1 object(s) (3.0 MiB); 0 waiting for the grace period, 0 held back by active clients
+  repacked 0 pack(s) (0 B of live data moved into 0 new pack(s))
+final: 0 markers, 70 packs, 1 indexes, repo 4.41 GiB
+$ /home/newlix/github/at-least/kist-rs/target/release/kist check --read-data
+  -> exit 0, 23.6s, child peak RSS so far 227 MiB
+  checked 4 snapshots, 992 trees, 70 packs, 65310 chunks (data read)
+  no errors found
+$ /home/newlix/github/at-least/kist-rs/target/release/kist restore latest /home/newlix/github/at-least/kist-acceptance/out-gc
+  -> exit 0, 51.1s, child peak RSS so far 227 MiB
+  restored 461ff836/20260904T212648679709042Z to /home/newlix/github/at-least/kist-acceptance/out-gc: 90000 files, 991 dirs, 0 symlinks
+$ diff -r /home/newlix/github/at-least/kist-acceptance/src /home/newlix/github/at-least/kist-acceptance/out-gc/home/newlix/github/at-least/kist-acceptance/src
+  -> exit 0, 58.4s, child peak RSS so far 227 MiB
+diff -r: identical
+
+=== SUMMARY (GC) ===
+backup 1: 108s (4.90 GiB)  backup 2 (-10%): 4s  prune 1 (mark+repack): 3s  backup 3: 5s  prune 2 (delete): 1s  check --read-data: 24s  restore: 51s
+repo: 4.90 GiB → 4.41 GiB after prune 2 → 4.41 GiB after prune 3-4 (prune 3: 1s)
+peak RSS (max over all child processes): 227 MiB
+ALL GC ACCEPTANCE CHECKS PASSED

@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    working-directory: go
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest

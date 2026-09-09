@@ -1,0 +1,26 @@
+[package]
+name = "kist-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kist-core = { path = "../kist-core" }
+kist-format = { path = "../kist-format" }
+fuser = "0.18"
+bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+kist-backend.workspace = true
+kist-crypto.workspace = true
+hex.workspace = true
+serde_bytes.workspace = true
+tempfile.workspace = true
+time.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+xattr.workspace = true
