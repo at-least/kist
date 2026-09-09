@@ -47,6 +47,10 @@ pub enum SourceItemKind {
 /// 記憶體（排序所需），每條目多幾十 bytes 就是上百 MiB（大 repo 記憶體
 /// 門檻的回歸教訓）。本地來源的 ctime/inode/mode 等由走訪端在處理該
 /// 條目時對路徑再 lstat 一次取得——每檔一次系統呼叫，與 v2 相同。
+/// 已知極小視窗：條目的 kind 在 yield 時判定，走訪端第二次 lstat 之間
+/// 檔案被換成別種型別的話，會以「當下的 metadata + 讀到的內容」收尾
+/// （content 已驗 size 與 chunk；racy 變更由下一次備份的 ctime guard
+/// 兜底）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceItem {
     /// 名稱（單一路徑元件；Unix = 原 OS bytes）。
