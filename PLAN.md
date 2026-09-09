@@ -302,6 +302,13 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   CGO=0 全套件/-race 全套件；Rust fmt/`clippy -D warnings`/
   `test --workspace`/deny 四項 ok；根 `docs/format.md` 與
   `go/docs/format.md` 逐 byte 一致。
+- CI interop job 修復【2026-09-09】：`ci-rust.yml` 的
+  `go test ./internal/interop/...` 沒帶 `working-directory: go`——M8
+  重排後根目錄已無 go.mod，這個跨語言 gate 在 CI 上必失敗；補上
+  step 層級設定（format.md 的 cmp 步驟用根相對路徑，維持在根），
+  同檔三處 rust/ 時代的過時註解一併更新。本機鏡射驗證：
+  `cd go && go test ./internal/interop/...` ok、兩份 format.md
+  逐 byte 一致。
 
 ## 已接受的限制（非待辦）
 

@@ -1,6 +1,6 @@
 name: CI (rust)
 
-# kist-rs（產品，rust/ 子目錄）的驗證。只手動觸發：所有驗證都在本機跑
+# Rust 產品（M8 重排後在 repo 根）的驗證。只手動觸發：所有驗證都在本機跑
 # （cargo fmt/clippy/test/deny + tests/minio-setup.sh），這支只留著給偶爾
 # 想看三平台結果時用，避免吃 GitHub Actions 配額。
 on:
@@ -42,9 +42,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # 跨語言 interop：monorepo 之後 Go（根目錄）與 Rust（rust/）就在同一棵
+  # 跨語言 interop：monorepo 之後 Rust（根）與 Go（go/）就在同一棵
   # 樹裡，interop 向量與 format.md 同步檢查不再需要跨 repo checkout。
-  # 一樣只手動觸發；本機的快速 gate：go test ./internal/interop/...
+  # 一樣只手動觸發；本機的快速 gate：cd go && go test ./internal/interop/...
   interop:
     name: go interop
     runs-on: ubuntu-latest
@@ -54,6 +54,7 @@ jobs:
         with:
           go-version: stable
       - name: go test ./internal/interop/...
+        working-directory: go
         run: go test ./internal/interop/...
       # v3 起規格只有一份權威副本（docs/format.md，Rust 升根後在根）；
       # go/ 的拷貝必須逐 byte 一致（§0.9）。
@@ -67,7 +68,7 @@ jobs:
           echo "format.md copies are byte-identical"
 
   # 短煙霧（每 target 60 秒）：確保 fuzz target 不會腐化到編不過或斷言失效。
-  # 長跑（24h）仍在手動本機跑，見 rust/fuzz/README.md。CI 本身也是手動觸發，
+  # 長跑（24h）仍在手動本機跑，見 fuzz/README.md。CI 本身也是手動觸發，
   # 不 dispatch 就零成本。
   fuzz-smoke:
     name: fuzz smoke (60s × 4 targets)
