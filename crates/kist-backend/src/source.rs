@@ -228,10 +228,9 @@ impl ObjectStoreSource {
             let cfg = sftp::parse_sftp_url(spec)
                 .map_err(|e| BackendError::Source(format!("{}: {e}", spec.to_owned())))?;
             let store = sftp::SftpStore::open(&cfg, &sftp::auth_from_env()).await?;
-            // root 目錄 = URL 的 path 部分（SftpStore 內部已帶 cfg.root 的
-            // 語意不同——這裡的 root 是「來源」的前綴，相對路徑從它算）。
-            let url_path = sftp_url_path(rest);
-            let root = object_store::path::Path::from(url_path.as_str());
+            // SftpStore 內部已把 cfg.root（URL 的 path）當根：key 相對於它。
+            // 來源的 root 因此是空（避免雙重前綴；rel 直接是 store key）。
+            let root = object_store::path::Path::default();
             (
                 Arc::new(store) as Arc<dyn ObjectStore>,
                 root,

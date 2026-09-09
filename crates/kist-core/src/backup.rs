@@ -861,7 +861,12 @@ impl Repository {
                     // 會直接失敗 → backup 失敗，不會悄悄留下空樹）。列根失
                     // 敗＝來源本身進不去，直接失敗——這不是「某個項目讀不
                     // 到」，不適合部分備份。
-                    let mut items = ctx.source.list(b"")?;
+                    // list 內部可能 block_on 遠端 API：必須離開 async 執行緒。
+                    let probe_source = Arc::clone(&ctx.source);
+                    let mut items = crate::blocking(move || {
+                        probe_source.list(b"").map_err(CoreError::from)
+                    })
+                    .await?;
                     let last = pb.rsplit(|&b| b == b'/').next().filter(|s| !s.is_empty());
                     let first = items.next_item();
                     let file_root = match (first, last) {
@@ -935,12 +940,16 @@ impl Repository {
         paths: &[Vec<u8>],
     ) -> Result<Option<(String, Snapshot)>> {
         let prefix = keys::snapshot_prefix(client_id);
+        // `.r1` 副本不是 snapshot（它的 bytes 用主體的 key 路徑封裝，用
+        // 副本 key 讀必然 AEAD 失敗），不得進 parent 候選——這正是
+        // snapshots.rs 列表排除 `.r1` 的同一件事，這裡是第二處列表點。
         let mut keys: Vec<String> = self
             .backend()
             .list(&prefix)
             .await?
             .into_iter()
             .map(|o| o.key)
+            .filter(|k| !k.ends_with(keys::REPLICA_SUFFIX))
             .collect();
         keys.sort();
         let Some(latest) = keys.pop() else {
@@ -1189,7 +1198,15 @@ impl Backup {
                 None => None,
             };
 
-            let mut listing = match ctx.source.list(dir_rel) {
+            // list 內部可能 block_on 遠端 API（ObjectStoreSource 的橋接），
+            // 必須在 blocking 執行緒上跑：同一 runtime 的 async 工作執行緒
+            // 不能 block_on。
+            let list_source = Arc::clone(&ctx.source);
+            let list_dir = dir_rel.to_vec();
+            let mut listing = match crate::blocking(move || {
+                list_source.list(&list_dir).map_err(CoreError::from)
+            })
+            .await {
                 Ok(l) => l,
                 Err(e) => {
                     // 讀不到的目錄：記錄並以空目錄寫出，其他部分照常備份
