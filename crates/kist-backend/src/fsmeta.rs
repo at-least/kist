@@ -76,7 +76,7 @@ pub fn os_to_bytes(name: OsString) -> Vec<u8> {
     name_to_bytes(&name).unwrap_or_else(|| name.to_string_lossy().into_owned().into_bytes())
 }
 
-fn mtime_ns_of(meta: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_ns_of(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())

@@ -66,7 +66,6 @@ impl FakeSource {
                 etag: self.etags.get(meta_key).cloned(),
                 vern: None,
             },
-            posix: None,
             name,
         }
     }
@@ -93,7 +92,6 @@ impl FakeSource {
         for name in dirs {
             files.push(SourceItem {
                 kind: SourceItemKind::Dir,
-                posix: None,
                 name,
             });
         }
@@ -111,8 +109,21 @@ impl Source for FakeSource {
         self.mk
     }
 
-    fn list(&self, dir: &[u8]) -> Result<Vec<SourceItem>, BackendError> {
-        Ok(self.items_at(dir))
+    fn list(
+        &self,
+        dir: &[u8],
+    ) -> Result<Box<dyn kist_backend::source::SortedItems + Send>, BackendError> {
+        struct Items {
+            iter: std::vec::IntoIter<SourceItem>,
+        }
+        impl kist_backend::source::SortedItems for Items {
+            fn next_item(&mut self) -> Option<Result<SourceItem, BackendError>> {
+                self.iter.next().map(Ok)
+            }
+        }
+        Ok(Box::new(Items {
+            iter: self.items_at(dir).into_iter(),
+        }))
     }
 
     fn read(&self, file: &[u8]) -> Result<Box<dyn Read + Send>, BackendError> {

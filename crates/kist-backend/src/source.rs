@@ -25,7 +25,7 @@ use crate::{sftp, BackendError, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceItemKind {
     Dir,
-    /// `posix` 只在本地來源出現（ctime/inode 等由 [`SourceItem::posix`] 帶）。
+    /// 本地來源會另帶完整 POSIX metadata（由走訪端處理條目時 lstat 取得）。
     File {
         size: u64,
         /// 秒精度（遠端來源只有秒；本地是奈秒）。
@@ -42,13 +42,24 @@ pub enum SourceItemKind {
 }
 
 /// 目錄裡的一個條目。
+///
+/// 刻意**不**攜帶完整 metadata：list 會把整個目錄（可能 100 萬條目）常駐
+/// 記憶體（排序所需），每條目多幾十 bytes 就是上百 MiB（大 repo 記憶體
+/// 門檻的回歸教訓）。本地來源的 ctime/inode/mode 等由走訪端在處理該
+/// 條目時對路徑再 lstat 一次取得——每檔一次系統呼叫，與 v2 相同。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceItem {
     /// 名稱（單一路徑元件；Unix = 原 OS bytes）。
     pub name: Vec<u8>,
     pub kind: SourceItemKind,
-    /// 本機來源的完整 POSIX metadata（快速路徑用）；遠端來源 = None。
-    pub posix: Option<crate::fsmeta::PosixMeta>,
+}
+
+/// 一次目錄列舉：`list` 回傳的惰性迭代器，條目依名稱 bytes 排序。
+/// 記憶體合約（大 repo 門檻，ADR 011）：實作**不得**在迭代開始前把
+/// 條目 metadata 整批物化——本機來源只常駐排序後的名稱，每個條目的
+/// 其餘欄位在 yield 當下取得。
+pub trait SortedItems: Send {
+    fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>>;
 }
 
 /// 備份來源。名稱一律 bytes；`list` 回傳的條目依名稱 bytes 排序。
@@ -57,10 +68,15 @@ pub trait Source: Send + Sync + 'static {
     fn locator(&self) -> &[u8];
     /// [`kist_format::tree::meta_kind`] 的值。
     fn meta_kind(&self) -> u8;
-    /// 列一個目錄（`[]` = 根）；回傳名稱排序的條目。
-    fn list(&self, dir: &[u8]) -> std::result::Result<Vec<SourceItem>, BackendError>;
+    /// 列一個目錄（`[]` = 根）；回傳名稱排序的惰性條目迭代器。
+    fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError>;
     /// 串流讀取一個檔案。
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError>;
+    /// rel 路徑 → 本機檔案系統路徑。只有本機來源會有（走訪端處理條目時
+    /// 對路徑 lstat 取得 posix metadata、讀 xattr）；遠端來源回 None。
+    fn local_path(&self, _rel: &[u8]) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,66 +117,31 @@ impl Source for LocalSource {
         &self.locator
     }
 
+    fn local_path(&self, rel: &[u8]) -> Option<std::path::PathBuf> {
+        Some(self.join(rel))
+    }
+
     fn meta_kind(&self) -> u8 {
         kist_format::tree::meta_kind::POSIX
     }
 
-    fn list(&self, dir: &[u8]) -> std::result::Result<Vec<SourceItem>, BackendError> {
+    fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError> {
         let path = self.join(dir);
         let rd = std::fs::read_dir(&path)
             .map_err(|e| BackendError::Source(format!("{}: {e}", path.display())))?;
-        let mut out = Vec::new();
+        // 只常駐名稱（排序所需）；metadata 在 yield 時逐條 lstat——
+        // 100 萬條目的目錄，名稱 ~45 MiB，條目結構會是它的數倍。
+        let mut names: Vec<Vec<u8>> = Vec::new();
         for entry in rd {
             let entry =
                 entry.map_err(|e| BackendError::Source(format!("{}: {e}", path.display())))?;
-            let name = crate::fsmeta::os_to_bytes(entry.file_name());
-            let meta = match std::fs::symlink_metadata(entry.path()) {
-                Ok(m) => m,
-                // 走訪途中消失：略過這一個條目，其他兄弟照常列出。
-                Err(_) => {
-                    tracing::debug!(
-                        "{}: vanished during listing, skipped",
-                        entry.path().display()
-                    );
-                    continue;
-                }
-            };
-            let ft = meta.file_type();
-            let kind = if ft.is_symlink() {
-                // readlink 讀不到（競態刪除、權限）：同樣只略過這一個條目，
-                // 不讓整個目錄的列舉失敗（與走訪端「單一項目讀不到不擋整個
-                // 目錄」同一語意）。
-                let Ok(target) = std::fs::read_link(entry.path()) else {
-                    tracing::warn!("{}: cannot read symlink, skipped", entry.path().display());
-                    continue;
-                };
-                SourceItemKind::Symlink {
-                    target: crate::fsmeta::path_to_bytes(&target).map_err(|_| {
-                        BackendError::Source(format!(
-                            "{}: unrepresentable symlink target",
-                            entry.path().display()
-                        ))
-                    })?,
-                }
-            } else if ft.is_dir() {
-                SourceItemKind::Dir
-            } else {
-                let fs = crate::fsmeta::capture(&meta);
-                SourceItemKind::File {
-                    size: meta.len(),
-                    mtime_ns: fs.mtime_ns,
-                    etag: None,
-                    vern: None,
-                }
-            };
-            // posix 來源的每個條目（symlink 也不例外）都帶 lstat 的完整
-            // metadata：§8.1 的 posix kind 必填 mode/uid/gid/mtime，缺了會被
-            // 讀取端的 Entry::validate 拒絕。symlink 的 posix 是連結本身的。
-            let posix = Some(crate::fsmeta::capture(&meta));
-            out.push(SourceItem { name, kind, posix });
+            names.push(crate::fsmeta::os_to_bytes(entry.file_name()));
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        names.sort();
+        Ok(Box::new(LocalListing {
+            root: path,
+            names: names.into_iter(),
+        }))
     }
 
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
@@ -168,6 +149,52 @@ impl Source for LocalSource {
         let f = std::fs::File::open(&path)
             .map_err(|e| BackendError::Source(format!("{}: {e}", path.display())))?;
         Ok(Box::new(f))
+    }
+}
+
+/// 本機列舉：排序後的名稱 → 逐條 lstat 產生 SourceItem。
+/// 走訪途中消失的條目被略過（與 backup 的容錯同一語意）。
+struct LocalListing {
+    root: std::path::PathBuf,
+    names: std::vec::IntoIter<Vec<u8>>,
+}
+
+impl SortedItems for LocalListing {
+    fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
+        for name in self.names.by_ref() {
+            let path = self.root.join(crate::fsmeta::bytes_to_os(&name));
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue; // 走訪途中消失：略過
+            };
+            let ft = meta.file_type();
+            let kind = if ft.is_symlink() {
+                match std::fs::read_link(&path) {
+                    Ok(target) => match crate::fsmeta::path_to_bytes(&target) {
+                        Ok(t) => SourceItemKind::Symlink { target: t },
+                        Err(_) => {
+                            continue; // 無法表示的連結目標：略過
+                        }
+                    },
+                    Err(e) => {
+                        return Some(Err(BackendError::Source(format!(
+                            "{}: {e}",
+                            path.display()
+                        ))))
+                    }
+                }
+            } else if ft.is_dir() {
+                SourceItemKind::Dir
+            } else {
+                SourceItemKind::File {
+                    size: meta.len(),
+                    mtime_ns: crate::fsmeta::mtime_ns_of(&meta),
+                    etag: None,
+                    vern: None,
+                }
+            };
+            return Some(Ok(SourceItem { name, kind }));
+        }
+        None
     }
 }
 
@@ -276,7 +303,7 @@ impl Source for ObjectStoreSource {
         self.meta_kind
     }
 
-    fn list(&self, dir: &[u8]) -> std::result::Result<Vec<SourceItem>, BackendError> {
+    fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError> {
         let prefix = self.to_store_path(dir);
         let store = Arc::clone(&self.store);
         let result = self.handle.block_on(async move {
@@ -298,7 +325,6 @@ impl Source for ObjectStoreSource {
             out.push(SourceItem {
                 name,
                 kind: SourceItemKind::Dir,
-                posix: None,
             });
         }
         for meta in &result.objects {
@@ -322,11 +348,13 @@ impl Source for ObjectStoreSource {
                     etag: meta.e_tag.as_ref().map(|e| e.as_bytes().to_vec()),
                     vern: meta.version.as_ref().map(|v| v.as_bytes().to_vec()),
                 },
-                posix: None,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        // 遠端清單已整批在記憶體（伺服器回應的形狀）；迭代器只是包裝。
+        Ok(Box::new(StoreListing {
+            items: out.into_iter(),
+        }))
     }
 
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
@@ -362,6 +390,17 @@ impl Source for ObjectStoreSource {
             buf: bytes::Bytes::new(),
             pos: 0,
         }))
+    }
+}
+
+/// 遠端列舉的迭代器包裝（清單已在 `list_with_delimiter` 回應裡整批到齊）。
+struct StoreListing {
+    items: std::vec::IntoIter<SourceItem>,
+}
+
+impl SortedItems for StoreListing {
+    fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
+        self.items.next().map(Ok)
     }
 }
 
@@ -410,7 +449,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_source_lists_sorted_with_posix_metadata() {
+    fn local_source_lists_sorted() {
         let dir = std::env::temp_dir().join(format!("kist-source-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("zsub")).unwrap();
         std::fs::write(dir.join("a.txt"), b"hello").unwrap();
@@ -419,19 +458,29 @@ mod tests {
         assert!(src.locator().starts_with(b"/"), "locator 是絕對路徑");
         assert_eq!(src.meta_kind(), kist_format::tree::meta_kind::POSIX);
 
-        let items = src.list(b"").unwrap();
-        let names: Vec<&[u8]> = items.iter().map(|i| i.name.as_slice()).collect();
-        assert_eq!(names, vec![b"a.txt".as_slice(), b"m.bin", b"zsub"]);
+        let mut items = src.list(b"").unwrap();
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut file_kind = None;
+        while let Some(item) = items.next_item() {
+            let item = item.unwrap();
+            if item.name == b"a.txt" {
+                file_kind = Some(item.kind.clone());
+            }
+            names.push(item.name);
+        }
+        assert_eq!(
+            names,
+            vec![b"a.txt".to_vec(), b"m.bin".to_vec(), b"zsub".to_vec()]
+        );
 
-        let file = items.iter().find(|i| i.name == b"a.txt").unwrap();
-        match &file.kind {
+        let file_kind = file_kind.expect("a.txt must be listed");
+        match &file_kind {
             SourceItemKind::File { size, mtime_ns, .. } => {
                 assert_eq!(*size, 5);
                 assert!(*mtime_ns != 0);
             }
             other => panic!("expected file, got {other:?}"),
         }
-        assert!(file.posix.is_some(), "本地來源要帶 posix metadata");
 
         let mut content = String::new();
         src.read(b"a.txt")
@@ -444,20 +493,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_source_symlinks_carry_posix_metadata() {
+    fn local_source_reports_symlinks_with_targets() {
         let dir = std::env::temp_dir().join(format!("kist-source-symlink-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink("target.txt", dir.join("link")).unwrap();
         let src = LocalSource::new(dir.clone()).unwrap();
-        let items = src.list(b"").unwrap();
-        let link = items.iter().find(|i| i.name == b"link").unwrap();
+        let mut items = src.list(b"").unwrap();
+        let link = items
+            .next_item()
+            .map(|r| r.unwrap())
+            .filter(|i| i.name == b"link")
+            .expect("link must be listed");
         match &link.kind {
             SourceItemKind::Symlink { target } => assert_eq!(target, b"target.txt"),
             other => panic!("expected symlink, got {other:?}"),
         }
-        // §8.1：posix kind 的每個條目都要 mode/uid/gid/mtime——缺了會被
-        // 讀取端的 Entry::validate 拒絕。
-        assert!(link.posix.is_some(), "symlink 條目也要帶 posix metadata");
         let _ = std::fs::remove_dir_all(dir);
     }
 

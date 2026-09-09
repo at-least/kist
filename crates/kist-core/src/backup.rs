@@ -208,7 +208,6 @@ struct FileFacts {
 /// 對應回本機路徑的根——xattr 讀取與進度顯示用；遠端來源 = `None`。
 struct SourceCtx {
     source: Arc<dyn Source>,
-    local_root: Option<PathBuf>,
 }
 
 impl SourceCtx {
@@ -222,13 +221,7 @@ impl SourceCtx {
 
     /// rel → 本機絕對路徑（xattr 讀取用）；遠端來源沒有本機根，回 `None`。
     fn join_local(&self, rel: &[u8]) -> Option<PathBuf> {
-        let mut p = self.local_root.clone()?;
-        for comp in rel.split(|&b| b == b'/') {
-            if !comp.is_empty() {
-                p.push(kist_backend::fsmeta::bytes_to_os(comp));
-            }
-        }
-        Some(p)
+        self.source.local_path(rel)
     }
 }
 
@@ -279,7 +272,6 @@ fn local_file_item(path: &Path, name: &[u8]) -> Result<SourceItem> {
     Ok(SourceItem {
         name: name.to_vec(),
         kind,
-        posix: Some(posix),
     })
 }
 
@@ -822,7 +814,6 @@ impl Repository {
                 RootPlan::LocalDir(path) => {
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(path.clone())?),
-                        local_root: Some(path.clone()),
                     };
                     b.walk_dir(&ctx, b"", parent_subtree).await?
                 }
@@ -846,7 +837,6 @@ impl Repository {
                     })?;
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(parent.to_path_buf())?),
-                        local_root: Some(parent.to_path_buf()),
                     };
                     let item = local_file_item(&path, &name)?;
                     let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
@@ -862,10 +852,7 @@ impl Repository {
                     b.write_tree(Tree::new(vec![entry], None)).await?
                 }
                 RootPlan::Remote(source) => {
-                    let ctx = SourceCtx {
-                        source,
-                        local_root: None,
-                    };
+                    let ctx = SourceCtx { source };
                     // 遠端 root 的型態要靠列根判別：「恰好一個 File 且名稱＝
                     // 定位的最後元件」→ 檔案來源（與 restore 的 file-root
                     // 規則一致，format-v3-draft §9）。這合約要求 Source 在
@@ -874,14 +861,15 @@ impl Repository {
                     // 會直接失敗 → backup 失敗，不會悄悄留下空樹）。列根失
                     // 敗＝來源本身進不去，直接失敗——這不是「某個項目讀不
                     // 到」，不適合部分備份。
-                    let items = ctx.source.list(b"")?;
+                    let mut items = ctx.source.list(b"")?;
                     let last = pb.rsplit(|&b| b == b'/').next().filter(|s| !s.is_empty());
-                    let file_root = match (items.as_slice(), last) {
-                        ([item], Some(last))
+                    let first = items.next_item();
+                    let file_root = match (first, last) {
+                        (Some(Ok(item)), Some(last))
                             if matches!(&item.kind, SourceItemKind::File { .. })
                                 && item.name == last =>
                         {
-                            Some(item.clone())
+                            Some(item)
                         }
                         _ => None,
                     };
@@ -1053,6 +1041,16 @@ impl Backup {
         // 來源能證明什麼就記什麼（format-v3-draft §8 的 metadata 聯集）：
         // posix 記全套；sftp 只有 mtime（mode/uid/gid 來源有才記）；s3 只有
         // mtime/etag/vern。缺席欄位一律 `None`（＝來源未知，不是 0）。
+        // posix 的 metadata 在處理條目時對路徑 lstat 取得——清單刻意不攜帶
+        // （100 萬條目的清單常駐記憶體是 512 MiB 門檻的回歸點），每檔一次
+        // lstat 與 v2 相同。
+        let posix = if mk == meta_kind::POSIX {
+            ctx.join_local(rel)
+                .and_then(|p| std::fs::symlink_metadata(&p).ok())
+                .map(|m| kist_backend::fsmeta::capture(&m))
+        } else {
+            None
+        };
         let mut entry = Entry {
             name: item.name.clone(),
             kind: 0,
@@ -1080,7 +1078,7 @@ impl Backup {
                 self.stats.symlinks += 1;
                 entry.kind = node_type::SYMLINK;
                 entry.target = target;
-                if let Some(posix) = &item.posix {
+                if let Some(posix) = &posix {
                     fill_posix_meta(&mut entry, posix, false);
                 }
             }
@@ -1095,7 +1093,7 @@ impl Backup {
                 entry.subtree = subtree;
                 match mk {
                     meta_kind::POSIX => {
-                        if let Some(posix) = &item.posix {
+                        if let Some(posix) = &posix {
                             fill_posix_meta(&mut entry, posix, false);
                         }
                     }
@@ -1117,7 +1115,7 @@ impl Backup {
             } => {
                 let facts = FileFacts {
                     size,
-                    posix: item.posix,
+                    posix,
                     etag: etag.clone(),
                 };
                 let Some((fsize, chunks, content)) =
@@ -1191,8 +1189,8 @@ impl Backup {
                 None => None,
             };
 
-            let items = match ctx.source.list(dir_rel) {
-                Ok(items) => items,
+            let mut listing = match ctx.source.list(dir_rel) {
+                Ok(l) => l,
                 Err(e) => {
                     // 讀不到的目錄：記錄並以空目錄寫出，其他部分照常備份
                     let display = ctx.display_path(dir_rel);
@@ -1200,14 +1198,20 @@ impl Backup {
                     return self.write_tree(Tree::new(Vec::new(), None)).await;
                 }
             };
-            // Source 合約說條目已依名稱 bytes 排序；再排一次是便宜的保險——
-            // 讀取端強制 entries 依名稱升冪（format-v3-draft §8）。
-            let mut items = items;
-            items.sort_by(|a, b| a.name.cmp(&b.name));
+            // Source 合約說條目已依名稱 bytes 排序且**惰性**yield（清單不整批
+            // 常駐記憶體——100 萬條目目錄的門檻，ADR 011）。
 
             let mut children: Vec<Entry> = Vec::new();
             let mut prev = None;
-            for item in items {
+            while let Some(item) = listing.next_item() {
+                let item = match item {
+                    Ok(i) => i,
+                    Err(e) => {
+                        let display = ctx.display_path(dir_rel);
+                        self.skip(&display, &e.to_string());
+                        continue;
+                    }
+                };
                 let child_rel = join_rel(dir_rel, &item.name);
                 let parent_entry = match parent_stream.as_mut() {
                     Some(s) => s.take_name(&item.name).await,
