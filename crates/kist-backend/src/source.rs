@@ -224,7 +224,7 @@ impl ObjectStoreSource {
                 "object-store source requires a tokio runtime context".to_owned()
             ))
         })?;
-        let (store, root, locator, meta_kind) = if let Some(rest) = spec.strip_prefix("sftp://") {
+        let (store, root, locator, meta_kind) = if spec.starts_with("sftp://") {
             let cfg = sftp::parse_sftp_url(spec)
                 .map_err(|e| BackendError::Source(format!("{}: {e}", spec.to_owned())))?;
             let store = sftp::SftpStore::open(&cfg, &sftp::auth_from_env()).await?;
@@ -276,14 +276,6 @@ impl ObjectStoreSource {
             format!("{}/{}", self.root, String::from_utf8_lossy(rel))
         };
         object_store::path::Path::from(joined.as_str())
-    }
-}
-
-/// `sftp://` URL 的 path 部分（host[:port] 之後）。
-fn sftp_url_path(after_host: &str) -> String {
-    match after_host.find('/') {
-        Some(i) => after_host[i..].to_owned(),
-        None => "/".to_owned(),
     }
 }
 

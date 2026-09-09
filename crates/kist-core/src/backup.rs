@@ -863,10 +863,9 @@ impl Repository {
                     // 到」，不適合部分備份。
                     // list 內部可能 block_on 遠端 API：必須離開 async 執行緒。
                     let probe_source = Arc::clone(&ctx.source);
-                    let mut items = crate::blocking(move || {
-                        probe_source.list(b"").map_err(CoreError::from)
-                    })
-                    .await?;
+                    let mut items =
+                        crate::blocking(move || probe_source.list(b"").map_err(CoreError::from))
+                            .await?;
                     let last = pb.rsplit(|&b| b == b'/').next().filter(|s| !s.is_empty());
                     let first = items.next_item();
                     let file_root = match (first, last) {
@@ -1203,18 +1202,18 @@ impl Backup {
             // 不能 block_on。
             let list_source = Arc::clone(&ctx.source);
             let list_dir = dir_rel.to_vec();
-            let mut listing = match crate::blocking(move || {
-                list_source.list(&list_dir).map_err(CoreError::from)
-            })
-            .await {
-                Ok(l) => l,
-                Err(e) => {
-                    // 讀不到的目錄：記錄並以空目錄寫出，其他部分照常備份
-                    let display = ctx.display_path(dir_rel);
-                    self.skip(&display, &e.to_string());
-                    return self.write_tree(Tree::new(Vec::new(), None)).await;
-                }
-            };
+            let mut listing =
+                match crate::blocking(move || list_source.list(&list_dir).map_err(CoreError::from))
+                    .await
+                {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // 讀不到的目錄：記錄並以空目錄寫出，其他部分照常備份
+                        let display = ctx.display_path(dir_rel);
+                        self.skip(&display, &e.to_string());
+                        return self.write_tree(Tree::new(Vec::new(), None)).await;
+                    }
+                };
             // Source 合約說條目已依名稱 bytes 排序且**惰性**yield（清單不整批
             // 常駐記憶體——100 萬條目目錄的門檻，ADR 011）。
 
