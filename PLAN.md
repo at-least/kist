@@ -148,7 +148,12 @@ gc race 測試在 touch 語意下重跑，補 V3-GC-5 時間線釘死測試（�
 但帶過期標記」的主體樹補 touch（commit gate 誤拒）；backupRoots 檔案
 來源的 err 遮蔽。
 
-**已知未移植（跟隨產品端排程）**：遠端「來源」介面（kist-rs 的
-`kist-backend::source`，`kist backup sftp://…`／`s3://…`）——本 repo 目前
-只能當 repo 端；格式層已完全支援遠端來源（Entry.mk 聯集、etag/vern、
-快速路徑分級），移植 Source 介面時不需要再動格式。
+**遠端「來源」介面（2026-09-09 自 kist-rs 的 `kist-backend::source`
+移植完成）**：新增 `internal/source`（`Source` 介面、LocalSource／
+MemorySource／SFTP／S3 來源、`OpenSource` 分派）；backup 走訪端改吃
+`SourceItem`（kind 聯集、欄位隨 mk 遞減、parent 快速路徑：posix 帶
+racy guard、s3 靠 etag、sftp 無快速路徑靠去重吸收）、`BackupOptions`
+新增 `SourceSpec`（零值維持本機路徑）；CLI 接受單一 `sftp://`／
+`s3://` 路徑參數；snapshot 開始寫入 `parent`。restore／mount 的定位
+字串映射（§9 的 file-root／攤平規則）早已就位，本次補上測試釘死。
+格式層未動、golden 未變。

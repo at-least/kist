@@ -161,51 +161,17 @@ func dialSFTP(ctx context.Context, cfg SFTPConfig) (*SFTP, error) {
 	if port == 0 {
 		port = 22
 	}
-	timeout := cfg.Timeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
-	userName := cfg.User
-	if userName == "" {
-		u, err := user.Current()
-		if err != nil {
-			return nil, fmt.Errorf("open sftp backend: no user given and none found: %w", err)
-		}
-		userName = u.Username
+	userName, err := cfg.user()
+	if err != nil {
+		return nil, fmt.Errorf("open sftp backend: %w", err)
 	}
 	location := fmt.Sprintf("sftp://%s@%s/%s", userName, net.JoinHostPort(cfg.Host, strconv.Itoa(port)), strings.TrimPrefix(cfg.Path, "/"))
 
-	hostKeys, err := hostKeyCallback(cfg.KnownHostsFile)
+	conn, client, err := DialSFTPConn(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("open sftp backend at %s: %w", location, err)
-	}
-	auth, closeAgent, err := authMethods(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("open sftp backend at %s: %w", location, err)
-	}
-	defer closeAgent()
-
-	sshCfg := &ssh.ClientConfig{
-		User:            userName,
-		Auth:            auth,
-		HostKeyCallback: hostKeys,
-		Timeout:         timeout,
-	}
-	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(port))
-	conn, err := sshDial(ctx, addr, sshCfg, timeout)
-	if err != nil {
-		return nil, fmt.Errorf("open sftp backend at %s: %w", location, err)
+		return nil, err
 	}
 
-	// Concurrent writes pipeline the packets of one upload; without them
-	// a 64 MiB pack goes at 61 MiB/s on loopback, with them several
-	// times that. Safe here because nothing links the scratch file into
-	// place until it is closed and synced.
-	client, err := sftp.NewClient(conn, sftp.UseConcurrentWrites(true))
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("open sftp backend at %s: start sftp: %w", location, err)
-	}
 	// Cleaned here as well as in ParseSFTPLocation, for a config built
 	// by hand: List derives keys by trimming the root off each path, and
 	// a root with a trailing slash would trim nothing and list nothing.
@@ -219,6 +185,80 @@ func dialSFTP(ctx context.Context, cfg SFTPConfig) (*SFTP, error) {
 		s.fsync = true
 	}
 	return s, nil
+}
+
+// DialSFTPConn connects to an SFTP server and returns the raw SSH
+// connection and SFTP session, for callers that need the server's
+// filesystem shape rather than a kist object store -- the backup source
+// over sftp:// walks directories and opens files, which the Backend
+// surface does not carry. The caller owns both values and must close
+// them. Authentication and host-key handling are the backend's usual:
+// an SSH agent when one is running, then key file, then password.
+func DialSFTPConn(ctx context.Context, cfg SFTPConfig) (*ssh.Client, *sftp.Client, error) {
+	if cfg.Host == "" {
+		return nil, nil, errors.New("open sftp backend: no host")
+	}
+	if cfg.Path == "" {
+		return nil, nil, errors.New("open sftp backend: no path")
+	}
+	port := cfg.Port
+	if port == 0 {
+		port = 22
+	}
+	timeout := cfg.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	userName, err := cfg.user()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open sftp backend: %w", err)
+	}
+
+	hostKeys, err := hostKeyCallback(cfg.KnownHostsFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open sftp backend: %w", err)
+	}
+	auth, closeAgent, err := authMethods(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open sftp backend: %w", err)
+	}
+	defer closeAgent()
+
+	sshCfg := &ssh.ClientConfig{
+		User:            userName,
+		Auth:            auth,
+		HostKeyCallback: hostKeys,
+		Timeout:         timeout,
+	}
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(port))
+
+	// Concurrent writes pipeline the packets of one upload; without them
+	// a 64 MiB pack goes at 61 MiB/s on loopback, with them several
+	// times that. Safe here because nothing links the scratch file into
+	// place until it is closed and synced.
+	conn, err := sshDial(ctx, addr, sshCfg, timeout)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open sftp backend: %w", err)
+	}
+	client, err := sftp.NewClient(conn, sftp.UseConcurrentWrites(true))
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("open sftp backend: start sftp: %w", err)
+	}
+	return conn, client, nil
+}
+
+// user resolves the account a config connects as. Empty means the
+// current user.
+func (c SFTPConfig) user() (string, error) {
+	if c.User != "" {
+		return c.User, nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("no user given and none found: %w", err)
+	}
+	return u.Username, nil
 }
 
 // sshDial connects and handshakes, once more if the first attempt failed

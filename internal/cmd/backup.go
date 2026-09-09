@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -10,6 +11,19 @@ import (
 	"github.com/at-least/kist/internal/repo"
 	"github.com/at-least/kist/internal/report"
 )
+
+// sourceSpecOf classifies the path arguments: an sftp:// or s3:// URL
+// names a remote source, anything else is local paths. A URL mixed with
+// other paths is rejected by the repository layer with an error that
+// says what a remote backup accepts.
+func sourceSpecOf(args []string) repo.SourceSpec {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "sftp://") || strings.HasPrefix(arg, "s3://") {
+			return repo.SourceSpec{URL: arg}
+		}
+	}
+	return repo.SourceSpec{}
+}
 
 func newBackupCommand() *cobra.Command {
 	var (
@@ -27,7 +41,10 @@ func newBackupCommand() *cobra.Command {
 			"The snapshot is written last, after every pack, tree and index it\n" +
 			"refers to. An interrupted backup therefore leaves no snapshot and no\n" +
 			"damage: the objects it did upload are simply unreferenced, and prune\n" +
-			"reclaims them.",
+			"reclaims them.\n\n" +
+			"A single remote source can be backed up by passing one sftp:// or\n" +
+			"s3:// URL as the path. The client reads the source, chunks and\n" +
+			"encrypts locally, and uploads: no key material leaves this machine.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ev := event("backup")
@@ -38,6 +55,7 @@ func newBackupCommand() *cobra.Command {
 					Parity:   parity,
 					GCGrace:  gcGrace,
 					Warnf:    warnInto(cmd, ev),
+					Source:   sourceSpecOf(args),
 				})
 				if err != nil {
 					return err
@@ -50,7 +68,11 @@ func newBackupCommand() *cobra.Command {
 				snap, handle := summary.Snapshot, summary.Handle
 				out := cmd.OutOrStdout()
 				fmt.Fprintf(out, "snapshot %s\n", handle.Key)
-				fmt.Fprintf(out, "  %d files, %d directories, %d symlinks\n", snap.Stats.Files, snap.Stats.Dirs, snap.Stats.Symlinks)
+				fmt.Fprintf(out, "  %d files, %d directories, %d symlinks", snap.Stats.Files, snap.Stats.Dirs, snap.Stats.Symlinks)
+				if summary.Report.FilesReused > 0 {
+					fmt.Fprintf(out, " (%d reused from the previous snapshot)", summary.Report.FilesReused)
+				}
+				fmt.Fprintf(out, "\n")
 				fmt.Fprintf(out, "  %s stored in %d new chunks, %d new packs\n",
 					humanBytes(summary.Report.BytesStored), summary.Report.ChunksNew, summary.Report.PacksNew)
 				return nil

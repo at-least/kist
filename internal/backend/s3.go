@@ -96,12 +96,13 @@ func ParseS3Location(location string) (S3Config, error) {
 	return cfg, nil
 }
 
-// OpenS3 connects to a bucket. It performs no request: the first
-// operation is what discovers a wrong endpoint or a missing bucket.
-func OpenS3(ctx context.Context, cfg S3Config) (*S3, error) {
-	if cfg.Bucket == "" {
-		return nil, errors.New("open s3 backend: no bucket")
-	}
+// S3ClientFor builds an S3 API client from cfg, applying the same
+// endpoint, region, path-style and credential handling as OpenS3. It
+// exists for callers that need operations the Backend surface does not
+// carry -- the backup source's one-level, delimiter-delimited listing --
+// without a second copy of the environment handling. It performs no
+// request: the first operation is what discovers a wrong endpoint.
+func S3ClientFor(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 	if cfg.Endpoint == "" {
 		cfg.Endpoint = os.Getenv(S3EndpointEnv)
 	}
@@ -124,10 +125,10 @@ func OpenS3(ctx context.Context, cfg S3Config) (*S3, error) {
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("open s3 backend: load aws config: %w", err)
+		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		if cfg.Endpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
@@ -139,7 +140,20 @@ func OpenS3(ctx context.Context, cfg S3Config) (*S3, error) {
 		// hash, so a transport checksum adds nothing.
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
-	})
+	}), nil
+}
+
+// OpenS3 connects to a bucket. It performs no request: the first
+// operation is what discovers a wrong endpoint or a missing bucket.
+func OpenS3(ctx context.Context, cfg S3Config) (*S3, error) {
+	if cfg.Bucket == "" {
+		return nil, errors.New("open s3 backend: no bucket")
+	}
+
+	client, err := S3ClientFor(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("open s3 backend: %w", err)
+	}
 
 	location := "s3://" + cfg.Bucket
 	if cfg.Prefix != "" {
