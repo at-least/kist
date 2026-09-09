@@ -273,8 +273,15 @@ kist/
   A 集首/次備份 ex-file-slab 峰值 283 MiB（優於 v2 的 373–431）、
   B 集 450 MiB（在 v2 的 442–524 帶內）、prune ×3 ~230 MiB——全部
   通過硬門檻不被殺。
-- 待辦（後續）：SFTP/S3 來源的實機 E2E（需環境）；Go 端 Source 介面
-  移植（kist-go PLAN 已記錄）。
+- SFTP/S3 來源的實機 E2E【完成 2026-09-09】：docker 的 MinIO（:19000）
+  與 OpenSSH SFTP（:19222）容器實測——S3 來源備份→還原逐 byte、etag
+  變更偵測（變更→3 新 chunk、無變更→全 reuse）；SFTP 來源備份→還原
+  （落點含 user@host 元件）、無快速路徑語意（重讀但去重吸收）、
+  check --read-data 乾淨。實機測試抓到並修掉三案：list 的 block_on
+  在 async 執行緒 panic、Url 指向本機路徑時 posix 重取無路徑、
+  SFTP 來源雙重前綴（列出 0 條目）。
+- 待辦（後續）：Go 端 Source 介面移植（kist-go PLAN 已記錄；
+  格式層無需再動）。
 
 ## 已接受的限制（非待辦）
 
