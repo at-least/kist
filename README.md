@@ -1,134 +1,328 @@
 # kist
 
-Deduplicating, encrypted backups to object storage, from one binary with no cgo.
+去重、加密、可多台機器共用 repo 的備份工具（Rust）。
 
-> **狀態：儲存格式 v2（Go/Rust 統一版，2026-09-05 定案）。** 本 repo 是參考實作，
-> 產品是 `kist-rs`；兩者讀寫同一種 repo、互為驗證（[`PLAN.md`](PLAN.md)）。
-> 本機 / S3 / SFTP 後端、無鎖 GC（`forget` / `prune`）、排程 `run`、`mount` 都已具備。
+> 目前狀態：**M4 進行中** —— M3（GC、無鎖並發）完成：本機與 S3（含 MinIO）repo 的 `init` /
+> `backup` / `snapshots` / `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，
+> 多台機器可同時備份到同一個 repo，GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
+> M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics 與 Web UI（`kist serve`）、
+> SFTP 後端（[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接
+> （[ADR 014](docs/decisions/014-rclone-bridge.md)）與唯讀 FUSE 掛載
+> （[ADR 015](docs/decisions/015-mount-fuse.md)）；M4 全數完成。
+> 還沒有：Windows VSS。
 
-```console
-$ export KIST_REPOSITORY=/backup/kist KIST_PASSWORD=...
-$ kist-go init
-$ kist-go backup ~/work
-snapshot snapshots/fe2988.../20260904t141955.943279016z
-  3 files, 3 directories, 1 symlinks
-  3.7 MiB read, 2.9 MiB stored in 1 new packs
-$ kist-go backup ~/work         # 沒改東西
-  3.7 MiB read, 0 B stored in 0 new packs
-$ kist-go snapshots
-$ kist-go restore snapshots/fe2988.../20260904t141955.943279016z /tmp/out
-$ kist-go check --read-data
+## 建置
+
+```sh
+cargo build --release
+./target/release/kist --help
 ```
 
-## 它做什麼
+## 使用
 
-- **去重**：FastCDC 內容定義切塊（512 KiB / 2 MiB / 8 MiB）。在檔案開頭插入位元組不會重排後面的邊界。
-- **加密**：一律加密，沒有明文 repo 這個選項。XChaCha20-Poly1305，金鑰從 Argon2id 派生的階層而來。
-- **多機共用一個 repo**：沒有鎖。snapshot 用條件寫入提交，其他所有物件都以內容 hash 命名且不可變。
-- **可修復**：index 只是快取，永遠可以從 pack 重建。壞掉的 index blob 不會讓 repo 打不開。
-- **會說實話**：跳過的檔案、還原不了的中繼資料、`check` 找到的問題，全部會講出來。`check` 有發現就以非零結束。
+```sh
+export KIST_REPO=/path/to/repo          # 或每個命令加 --repo
+export KIST_PASSWORD=...                # 或 --password-file，或互動輸入
 
-## 指令
+kist init                               # 建立 repo
+kist backup ~/Documents ~/Photos        # 備份，產生一個 snapshot
+kist snapshots                          # 列出 snapshot
+kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路徑>
+kist check                              # 檢查一致性（不下載資料）
+kist check --read-data                  # 下載並驗證每個 chunk
+kist rebuild-index                      # index 物件遺失或損壞時，從 pack 重建
+kist forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12   # 依保留政策刪 snapshot
+kist forget latest                      # 或指定 snapshot（id、時間戳前綴、latest）
+kist prune                              # 回收空間（兩階段，見下）
+kist forget --keep-last 10 --prune      # 一次做完
+```
 
-| 指令 | 說明 |
-| --- | --- |
-| `kist-go init` | 建立 repo（密碼問兩次，救不回來） |
-| `kist-go backup [--parity M] <path>...` | 備份並提交一個 snapshot；`--parity 2` 在每個 pack 旁存 12.5% 的 Reed-Solomon 冗餘 |
-| `kist-go snapshots` | 列出 snapshot，舊的在前 |
-| `kist-go restore <snapshot> <target>` | 還原到一個空目錄 |
-| `kist-go check [--read-data] [--repair]` | 驗證 repo；`--repair` 用 parity 修回損壞的 pack |
-| `kist-go forget --keep-daily 7 ...` | 依 retention 規則（或指名）移除 snapshot |
-| `kist-go prune` | 標記沒人引用的 pack，grace（預設 72h）之後的下一次刪掉 |
-| `kist-go rebuild-index` | 從 pack trailer 重建 index |
-| `kist-go run --config kist.toml [--once]` | 依設定檔的排程跑備份與維護工作 |
-| `kist-go mount <dir>` | 把所有 snapshot 掛成唯讀檔案系統（`<client>/<時間戳>/…`，Linux/macOS） |
+結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
+請看警告。
 
-每個指令都接受 `--json`：stdout 只印一個 JSON 物件（`snapshots` 印一個陣列），警告與進度仍在 stderr，失敗仍以非零結束。
+### `--json`
 
-`forget` 與 `prune` 要用持有 Delete 權限的憑證跑；備份用的憑證做不到（[權限表](docs/format.md#10-權限模型)）。`prune` 定期跑：第一次只標記，grace 過後的下一次才刪，中間有 client 引用到被標記的 pack 會自動復活它。
+`backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild-index` / `run` 都支援
+`--json`：結果以 JSON 印到 stdout（錯誤照舊在 stderr、結束碼不變），給腳本和監控消費。
 
-repo 位置：`--repo` 或 `$KIST_REPOSITORY`——本機路徑、`s3://bucket/prefix`、或 `sftp://user@host:port/path`（`/~/path` 表示相對於登入目錄）。SFTP 一定驗 host key（`~/.ssh/known_hosts` 或 `$KIST_SFTP_KNOWN_HOSTS`，先 `ssh-keyscan`）；認證依序試 SSH agent、`$KIST_SFTP_KEY`（`$KIST_SFTP_KEY_PASSPHRASE`）、`$KIST_SFTP_PASSWORD`。
-密碼：`--password-file`、`$KIST_PASSWORD`，或終端機提示，依此順序。
+- 內容 id（`root` 等）在 JSON 裡是 hex 字串（repo 格式不受影響，仍是 bytes）。
+- snapshot 的 `paths` 原本是 OS bytes，JSON 裡以 UTF-8 呈現，非 UTF-8 的位元組會換成 U+FFFD。
+- `forget` / `prune` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個。
+- `run --once --json` 印出 JobOutcome 陣列；常駐模式下每件工作結束印一行 JSON（NDJSON）。
 
-## 設定檔與 `run`
+### 設定檔與排程
 
 ```toml
-[repository]
-location = "s3://bucket/kist"          # 或本機路徑、sftp://user@host/path
-password_file = "/etc/kist/password"   # 或 $KIST_PASSWORD
-parity = 2                             # 可選：每個 pack 的 Reed-Solomon parity shard 數（16 個 data shard）
+# /etc/kist/backup.toml —— backup 主機：只需要 Put/Get/List 權限
+repo = "s3://my-bucket/backups/laptop"
+password_file = "/etc/kist/password"      # 只能用檔案
+timezone = "local"                        # 排程用的時區，或 "utc"
 
-[[backup]]
-name = "home"
+[backup]
 paths = ["/home", "/etc"]
-schedule = "0 2 * * *"                 # 標準 cron 五欄，或 @daily / @hourly
-pre_backup  = ["/usr/local/sbin/lvm-snap", "create"]   # 可選，argv；失敗就不備份
-post_backup = ["/usr/local/sbin/lvm-snap", "release"]  # 可選；一定會跑
+schedule = "0 2 * * *"                    # cron（5 欄；前面可多加一欄秒）
 
-[retention]                            # 由 [prune] 的維護工作套用，因為 forget 是刪除
-keep_daily = 7
-keep_weekly = 4
-keep_monthly = 6
-
-[prune]
-schedule = "0 4 * * 0"
-grace = "72h"
-
-[webhook]                              # 每個工作結束 POST 一個 JSON（跟 --json 同一個格式）
-url = "https://hooks.example/kist"
-
-[metrics]                              # Prometheus 文字格式，/metrics
-listen = "127.0.0.1:9345"
+[notify]
+webhook_url = "https://example.com/hook"  # 每件工作結束 POST 一個 JSON
+on = ["failure", "incomplete"]            # 也可以加 "success"
 ```
 
-未知的 key 是錯誤，不是被忽略的拼字錯。`[[backup]]` 放在被備份的機器上、用只能寫的憑證；`[prune]`（含 `[retention]`）放在維護主機上、用能刪的憑證。一份設定同時有兩者可以跑，但 `run` 會警告：那台機器持有能刪掉自己備份的憑證。工作一次跑一個，不重疊；備份跑過了下一個 tick，tick 延後、不並發。VSS / LVM 快照沒有內建：`pre_backup` / `post_backup` 就是整個機制，知道那台機器怎麼拍快照的腳本是你的。
+```toml
+# /etc/kist/maintenance.toml —— 另一台維護主機：需要 Delete 權限
+repo = "s3://my-bucket/backups/laptop"
+password_file = "/etc/kist/password"
+[forget]
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 12
+schedule = "0 4 * * *"
+[prune]
+schedule = "0 5 * * *"
+```
 
-### `--json` 與 webhook 的欄位
+```sh
+kist run --config /etc/kist/backup.toml          # 常駐，照排程跑（Ctrl-C 等目前工作做完再結束）
+kist run --config /etc/kist/backup.toml --once   # 每件工作各跑一次就結束（給外部 cron / systemd timer）
+kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端口：/metrics 與 Web UI
+```
 
-一個事件：`kind`（`init backup forget prune check restore rebuild_index`）、`job`（run 模式的工作名）、`started`、`finished`、`ok`、`error`、`warnings`，加上一個對應 kind 的子物件：
+`[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
 
-- `backup`：`snapshot host paths files dirs symlinks bytes bytes_stored chunks_new packs_added packs_revived`
-- `forget`：`dry_run removed kept locked`
-- `prune`：`dry_run packs_stored packs_live marked unmarked deleted locked held[{pack,reason}] bytes_reclaimed`
-- `check`：`read_data snapshots trees chunks packs problems parity_packs repaired unrepairable`
-- `restore`：`snapshot target files dirs symlinks hard_links bytes`
-- `init`：`location client_id`；`rebuild_index`：`chunks`
+### Prometheus metrics（`kist serve`）
 
-`snapshots --json` 是陣列：`snapshot client_id time host paths files bytes`（讀不出來的列有 `error`）。
+`kist serve` = `kist run`（照排程跑工作）+ 一個 HTTP 端口（`--http`，預設 `127.0.0.1:9898`）：
 
-Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,result}`、`kist_last_run_duration_seconds{job}`、`kist_last_backup_{files,bytes,bytes_stored,packs_added}{job}`、`kist_last_prune_packs_{stored,live,deleted,held}`、`kist_prune_bytes_reclaimed_total`。
+- `GET /metrics`：OpenMetrics 文字格式，給 Prometheus 抓。
+- `GET /healthz`：活著沒。
 
-## `check` 的兩個層級
+`/metrics` **沒有認證**，預設只綁 loopback；內容含 repo 位置、機器名稱與備份排程——
+不要暴露到不受信任的網路。主要指標：
 
-它們抓的是不同的東西，誰也不包含誰：
+| 指標 | 意義 |
+| --- | --- |
+| `kist_job_runs_total{job,status}` | 每種工作完成次數（success / incomplete / failure） |
+| `kist_job_last_success_timestamp_seconds{job}` | 上次**完全成功**的 Unix 時間（持久化在 `cache_dir/jobstate-<repo hash>-<job>.json`，重啟後種回；incomplete 不算成功） |
+| `kist_job_last_duration_seconds{job}` | 上次執行時長 |
+| `kist_backup_files` / `kist_backup_bytes` | 最後一次 snapshot 的檔案數 / 總 bytes |
+| `kist_backup_bytes_new` / `kist_backup_chunks_new` | 最後一次 backup 上傳的量 |
+| `kist_backup_skipped_items` | 最後一次 backup 略過的項目數 |
+| `kist_prune_deleted_bytes_total` | prune 自 daemon 啟動以來刪掉的 bytes |
+| `kist_prune_marked_objects` / `kist_prune_live_packs` | 最後一次 prune 的標記數 / 活 pack 數 |
 
-- **預設**（只讀中繼資料與 pack trailer）：抓得到不見的 pack、被截斷的 pack、指向不存在 chunk 的 tree——所有從 repo 的「形狀」看得出來的損壞。
-- **`--read-data`**：另外把每個 chunk 讀出來解密驗證。**只有這個層級抓得到 chunk 資料裡被翻轉的位元**，因為別的路徑根本不會去解密那些資料。代價是讀完整個 repo。
+告警請用「多久沒看到成功」（例如 `time() - kist_job_last_success_timestamp_seconds{job="backup"} > 90000`），
+不要用「有沒有成功過」；incomplete（有項目被略過/刪不掉）不算成功，所以要另外對
+`increase(kist_job_runs_total{status="incomplete"}[24h]) > 0` 告警，或用 webhook 即時通知 failure / incomplete。
 
-## 文件
+### Web UI（`kist serve`）
 
-- [`docs/format.md`](docs/format.md) — 儲存格式 v2（Go/Rust 統一版），含「設計決定 × 證據」對照表
-- [`docs/decisions/`](docs/decisions/) — ADR，記錄為什麼這樣設計
-- [`docs/release.md`](docs/release.md) — 版本、平台、release 流程
-- [`PLAN.md`](PLAN.md) — 里程碑與工程規範
+`kist serve` 同時提供一個網頁：開 `http://127.0.0.1:9898/` 就是目前狀態——
+
+- **Status**：正在跑的工作與即時進度（phase、檔案/目錄數、bytes、目前處理的路徑）、
+  排隊中的工作、各工作的排程與下次執行時間、最近的執行紀錄；每 2 秒自動更新。
+- **Snapshots**：按 Refresh 列出 repo 裡的 snapshot（每次列都要重新開 repo，約一秒）。
+- **Run backup now**：手動觸發一次 backup。UI 唯一的寫入操作——forget / prune 刻意不給按。
+
+是否開放這顆按鈕由 `[serve]` 決定：
+
+```toml
+[serve]
+password_file = "/etc/kist/ui-password"           # UI 密碼（跟 repo 密碼是不同的秘密）
+allowed_hosts = ["backup.example.internal:9898"]  # 額外允許的 Host header
+```
+
+- 沒設 `password_file`：UI 唯讀（不用登入），按鈕換成停用說明。
+- 設了：整個 UI（含靜態檔）要 HTTP Basic auth，帳號任意、只比密碼。
+
+安全規則（細節與理由見 [ADR 007](docs/decisions/007-m4-web-ui.md)）：
+
+- `Host` header 不在白名單 → 421。白名單 = 綁定位址與幾種 loopback 寫法（自動允許）
+  加上 `allowed_hosts`；逐字比對，防 DNS rebinding。
+- 改狀態的請求只接受 htmx 送出的（`HX-Request: true`、非 `cross-site`），否則 403。
+- `/metrics`、`/healthz` 不在這些規則內（見上節；既有的 scrape 設定不受影響）。
+
+UI 密碼走明文 HTTP：預設只綁 loopback，要遠端存取請放在有 TLS 的 reverse proxy 後面。
+
+### 空間回收（GC）
+
+`forget` 只刪 snapshot；`prune` 才回收資料，而且分兩階段：第一次執行把沒人引用的 pack / tree / index
+**標記**起來，等超過 grace（預設 72 小時）而且每台活躍的機器在標記後都又備份過一次，
+第二次執行才真的刪。中間任何一台機器重新用到那些資料，標記就撤銷。所以 `prune` 可以跟 backup
+同時跑、可以排程每天跑，不需要鎖；剛 forget 完馬上 prune 不會釋放空間，那是設計。
+
+- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值）。
+  跑得更久的 backup 不會悄悄壞掉，會在最後以錯誤結束，重跑即可。
+- 超過 `--inactive-after`（預設 30 天）沒備份的機器不再擋住刪除；它回來備份時若用到已刪的資料，
+  同樣會在最後失敗、重跑。
+- 活資料比例低於 `--repack-below`（預設 50%）的 pack 會被重新打包。
+- `--dry-run` 只報告。刪不掉的物件（S3 Object Lock、權限）會回報並保留標記，結束碼 3。
+- 同一台機器同時只能跑一個 backup（client id 檔旁邊有鎖）。
+- bucket 有 versioning 時，真的釋放空間還需要 lifecycle 規則清掉舊版本。
+
+細節與安全性論證：[docs/format.md §11](docs/format.md)、[ADR 005](docs/decisions/005-m3-gc.md)。
+
+本地 index 快取放在使用者快取目錄（Linux：`~/.cache/kist/`），可用 `--cache-dir` /
+`KIST_CACHE_DIR` 指定、`--no-cache` 關閉。`check` 永遠不用快取。
+
+### S3 / MinIO
+
+```sh
+export KIST_REPO=s3://my-bucket/backups/laptop
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=us-east-1
+# MinIO 或其他自架的 S3 相容服務：
+export AWS_ENDPOINT=http://minio.local:9000 AWS_ALLOW_HTTP=true
+kist init
+```
+
+`config` 是 repo 裡唯一可覆寫的物件，被蓋掉就打不開 repo：請對 bucket 開 versioning 或
+Object Lock，並把 `config` 另存一份。backup 需要的權限是 `PutObject`、`GetObject`、
+`ListBucket`（不需要 `DeleteObject`）；`forget` / `prune` 另外需要 `DeleteObject`，
+建議用另一組憑證在別台機器跑。
+
+每台機器第一次 backup 時會產生一個 client id（`~/.local/share/kist/client-id`，
+可用 `--client-id-file` 或 `KIST_CLIENT_ID_FILE` 指定）。
+
+### SFTP
+
+```sh
+export KIST_REPO=sftp://user@backup.example.com/srv/backups/laptop
+# 認證：SSH agent → key 檔 → 密碼，擇一：
+export KIST_SFTP_KEY=~/.ssh/id_ed25519            # 可再加 KIST_SFTP_KEY_PASSPHRASE
+export KIST_SFTP_PASSWORD=...                     # 或 SSH_AUTH_SOCK 的 agent
+kist init
+```
+
+Host key **嚴格驗證**：只接受 `~/.ssh/known_hosts`（或 `KIST_SFTP_KNOWN_HOSTS`）裡有的
+key，不做 TOFU——先用 `ssh user@host` 連一次把 key 記進 known_hosts。伺服器必須支援
+`hardlink@openssh.com` 與 `posix-rename@openssh.com`（OpenSSH 的 sftp-server 都有；
+rclone 的 `serve sftp` 會在連線後明確拒絕，見下節）。
+
+### 瀏覽 snapshot：`kist mount`（Linux/macOS）
+
+```sh
+kist mount --repo $KIST_REPO /mnt/snapshots   # 目標目錄需已存在且為空
+ls /mnt/snapshots/<client id>/<timestamp>/    # 備份的樹，唯讀
+cp /mnt/snapshots/<client>/<ts>/tmp/…/report.pdf .
+# Ctrl-C（或 SIGTERM）卸載
+```
+
+隨機讀直接定位 chunk（不解前面資料），適合翻大檔、比對、拷貝少數檔案；整目錄
+還原請用 `restore`（較快）。檔案進 kernel page cache，翻過一次第二次就快。
+掛載時有檔案開著 → 卸載 EBUSY。細節與限制見
+[ADR 015](docs/decisions/015-mount-fuse.md)。
+
+### rclone 橋接（任何 rclone 認得的遠端）
+
+```sh
+rclone config                                     # 設定好遠端，例如 gdrive
+export KIST_REPO=rclone://gdrive/backups/laptop   # 遠端留空 = 本機目錄：rclone:///srv/backups
+kist init
+```
+
+kist 自己 spawn `rclone serve sftp --stdio <remote>:<path>`（restic 同款做法）：不開
+TCP port、不用 known_hosts，rclone 的設定就是全部。`KIST_RCLONE_BIN` 可指定 rclone
+路徑。**語意比 `sftp://` 寬鬆**：rclone 不實做 hardlink 與 O_EXCL 建檔，`put_if_absent`
+退化成「先 stat 再 posix-rename」；kist 用它的 key 都是「同 key 必同內容」或一次性寫入
+（init 另有讀回驗證擋雙重 init），風險分析見
+[ADR 014](docs/decisions/014-rclone-bridge.md)。`sftp://` 維持嚴格語意不變。
 
 ## 開發
 
-```console
-$ make verify        # build + vet + lint + test + test-race，這是「做完了」的判準
-$ make test-s3       # MinIO in Docker；make test-sftp 同理用 OpenSSH
-$ make fuzz          # 每個 Fuzz 目標跑 FUZZTIME（預設 30s）；make fuzz-long 是 24h
-$ make release-snapshot   # 用 goreleaser 在本機建出所有平台的 artifact，不需要 tag
-$ make fuzz          # 跑所有 FuzzXxx target
+所有驗證都在本機跑（GitHub Actions 的 workflow 只留手動觸發，避免吃配額）；四道關卡：
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo deny check          # 需先 cargo install --locked cargo-deny
 ```
 
-大規模驗收測試（10 萬檔 / 10 GiB，預設關閉）：
+S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
-```console
-$ KIST_ACCEPTANCE=1 KIST_ACCEPTANCE_DIR=/somewhere/with/30GiB \
-    go test -v -timeout 180m ./internal/repo/ -run TestAcceptance
-```
+## Workspace 結構
 
-## 不做的事
+| crate | 職責 |
+| --- | --- |
+| `kist-format` | on-disk 格式：結構定義、CBOR 序列化、golden files（改動需負責人確認） |
+| `kist-crypto` | 金鑰階層（Argon2id → KEK → master key → 派生子金鑰）與 XChaCha20-Poly1305 封裝 |
+| `kist-chunker` | 內容定義切塊（FastCDC，512 KiB / 2 MiB / 8 MiB） |
+| `kist-backend` | 儲存後端（本機、S3、SFTP、rclone 橋接）|
+| `kist-core` | backup / restore / check / snapshots 流程 |
+| `kist-cli` | `kist` 執行檔（clap） |
 
-不支援非加密 repo、不做 GUI、不自己實作加密原語。
+格式規格：[docs/format.md](docs/format.md)。設計決策：[docs/decisions/](docs/decisions/)。
+
+## M1 驗收數據
+
+2026-09-05，commit `26637f0`（審查修正後），同一台機器（Ryzen 7 7700、NVMe/btrfs，
+本機目錄後端），release build。資料集：100 000 個檔案、9.75 GiB（一半亂數、一半可壓縮），
+腳本與完整 log 在 `tests/acceptance/`。
+
+| 項目 | 結果 |
+| --- | --- |
+| 第一次 backup | 54 s；寫 77 個 pack（repo 4.90 GiB，可壓縮的那一半被壓掉了） |
+| 第二次 backup（內容未變） | 0.8 s；**0 個新 pack、0 個新 chunk**（含重新 put 1 102 個 tree） |
+| restore | 41 s；`diff -r` 與原始資料**完全相同** |
+| `check` | 0.3 s |
+| `check --read-data` | 17 s |
+| 人為翻轉 pack 中一個 bit | `check --read-data` 以非 0 結束並指名該 pack |
+| 峰值 RSS（backup 期間，`ru_maxrss`） | **186 MiB**（審查修正前 253 MiB） |
+| 512 MiB 單一大檔的 RSS 成長（reviewer 的 probe） | 22 MiB（修正前 736 MiB） |
+
+## M2 驗收數據（S3 / MinIO）
+
+2026-09-05，commit `09f6f82`，同一台機器、同一份資料集，repo 放在本機 Docker 裡的 MinIO
+（`minio/minio:RELEASE.2025-09-07`，HTTP、無 TLS），腳本 `tests/acceptance/run_s3.py`，
+完整 log `tests/acceptance/m2-acceptance-s3-2026-09-05.log`。
+
+| 項目 | 結果 | 對照本機後端 |
+| --- | --- | --- |
+| 第一次 backup | 157 s；77 個 pack（4.90 GiB） | 54 s |
+| 第二次 backup（內容未變） | 35 s；**0 個新 pack、0 個新 chunk** | 0.8 s |
+| restore | 213 s；`diff -r` **完全相同** | 41 s |
+| `check` | 2 s | 0.3 s |
+| `check --read-data` | 28 s | 17 s |
+| `rebuild-index`（77 個 pack，只讀 trailer） | 0.4 s；再 `check` 通過 | — |
+| 人為翻轉 pack 中一個 bit（透過 `mc` 上傳） | `check --read-data` 以非 0 結束並指名該 pack | 同 |
+| 峰值 RSS（backup 期間） | **242 MiB** | 186 MiB |
+
+第二次 backup 與 restore 對 S3 明顯慢：前者每次仍 put 全部 1 102 個 tree 並逐個讀 parent 的 tree，
+後者對每個 chunk 各發一次 range GET（71 040 次）。
+UNVERIFIED（未做 profile，只是從請求數推測）。兩者都列在 M3/M4 待辦（ADR 004「沒做」）。
+
+## M3 驗收數據（GC）
+
+2026-09-05，commit `0d0e107`（兩輪審查修正後），本機目錄後端，同一份資料集，腳本 `tests/acceptance/run_gc.py`，
+完整 log `tests/acceptance/m3-acceptance-gc-2026-09-05.log`。流程：backup → 刪掉一成的目錄再 backup →
+forget 舊 snapshot → `prune --grace 0s`（標記 + repack）→ backup → prune（刪）→ 再兩輪 backup + prune 收尾
+→ `check --read-data` → restore 與 `diff -r`。
+
+| 項目 | 結果 |
+| --- | --- |
+| prune 1（標記 112 個 tree + 8 個被 repack 的 pack，搬 18 MiB 活資料到 1 個新 pack） | 3.3 s |
+| 標記後的 backup（內容未變） | 5 s；**0 個新 chunk**（不會把被標記 pack 裡的資料重傳） |
+| prune 2（刪 120 個物件、520 MiB） | 1.1 s |
+| prune 3–4（清掉被取代的 index blob，之後無事可做） | 1.1 s 各 |
+| repo 大小 | 4.90 GiB → **4.41 GiB**（刪掉的一成資料全部回收） |
+| `check --read-data` 之後 | 26 s，無錯誤、無警告 |
+| restore 最新 snapshot | 57 s，`diff -r` **完全相同** |
+| 峰值 RSS（整個流程） | 233 MiB |
+| 競態 proptest（`tests/gc_race.rs`） | 24 案例進 `cargo test`；200 案例本機跑（見 ADR 005 §10） |
+
+grace 設 0 只是為了驗收能在幾分鐘內走完；實際使用請保留預設 72 h。
+
+## Clean build 時間
+
+機器：AMD Ryzen 7 7700（8C/16T）、Linux 7.2.0、rustc 1.98.1、cargo 1.98.1。
+`cargo clean` 之後、相依套件已在本機 cargo 快取中（不含下載時間）：
+
+| 階段 | `cargo build` | `cargo build --release` |
+| --- | --- | --- |
+| M0 骨架（只有 clap） | 3.9 s | 3.5 s |
+| M1（完整相依） | 8.7 s | 15.8 s |
+
+（CI 從未實際執行；負責人決定所有驗證只在本機跑。）
+
+## 授權
+
+MIT OR Apache-2.0（你可以任選其一）。見 [LICENSE-MIT](LICENSE-MIT) 與
+[LICENSE-APACHE](LICENSE-APACHE)。

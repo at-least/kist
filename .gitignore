@@ -6,3 +6,14 @@
 *.test
 *.out
 dist/
+
+# --- rust/（已升根：以下路徑從 repo 根算）---
+/target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+**/*.rs.bk
+*.pdb
+__pycache__/
+dhat-heap.json
+/dist/

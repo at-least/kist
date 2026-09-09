@@ -10,10 +10,6 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
-defaults:
-  run:
-    working-directory: rust
-
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -28,8 +24,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
@@ -47,8 +41,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          manifest-path: rust/Cargo.toml
 
   # 跨語言 interop：monorepo 之後 Go（根目錄）與 Rust（rust/）就在同一棵
   # 樹裡，interop 向量與 format.md 同步檢查不再需要跨 repo checkout。
@@ -63,13 +55,13 @@ jobs:
           go-version: stable
       - name: go test ./internal/interop/...
         run: go test ./internal/interop/...
-      # v3 起規格只有一份權威副本（rust/docs/format.md）；根目錄的拷貝
-      # （docs/format.md，Go 端文件入口）必須逐 byte 一致（§0.9）。
+      # v3 起規格只有一份權威副本（docs/format.md，Rust 升根後在根）；
+      # go/ 的拷貝必須逐 byte 一致（§0.9）。
       - name: verify docs/format.md copies are byte-identical
         run: |
-          if ! cmp -s rust/docs/format.md docs/format.md; then
-            echo "::error::docs/format.md differs from the authoritative rust/docs/format.md"
-            diff rust/docs/format.md docs/format.md || true
+          if ! cmp -s docs/format.md go/docs/format.md; then
+            echo "::error::go/docs/format.md differs from the authoritative docs/format.md"
+            diff docs/format.md go/docs/format.md || true
             exit 1
           fi
           echo "format.md copies are byte-identical"
@@ -86,12 +78,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            rust
-            rust/fuzz
+            .
+            fuzz
       - run: cargo install cargo-fuzz --locked
       - name: smoke each target
         run: |
-          cd rust
           for t in pack cbor chunker parity; do
             sh fuzz/smoke.sh "$t" 60
           done

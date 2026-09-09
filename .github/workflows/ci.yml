@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: go
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
