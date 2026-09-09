@@ -157,3 +157,21 @@ racy guard、s3 靠 etag、sftp 無快速路徑靠去重吸收）、`BackupOptio
 `s3://` 路徑參數；snapshot 開始寫入 `parent`。restore／mount 的定位
 字串映射（§9 的 file-root／攤平規則）早已就位，本次補上測試釘死。
 格式層未動、golden 未變。
+
+## M8：monorepo（2026-09-09）【完成】
+
+kist-rs（產品）以 git subtree 併入 `rust/` 子目錄——保留 kist-rs 完整
+歷史（merge commit 5a67394）；本 repo 的 Go 留在根目錄不動。單一遠端
+（origin = at-least/kist）同時發布兩個實作。
+
+CI 整合：根 workflows 新增 `ci-rust.yml`（手動觸發；rust/ 的 fmt/
+clippy/test/deny/MinIO 整合/fuzz 煙霧，全數 `working-directory: rust`）；
+interop job 改 **in-tree**——Go 與 Rust 同樹之後，跨 repo checkout 與
+GO_REF_TOKEN secret 都不需要了；format.md 同步檢查改比對
+`rust/docs/format.md` vs `docs/format.md`。cargo-dist 的 release.yml
+不進根 CI（Rust 發布維持本機 dist.sh，ADR 012）。`rust/.github` 移除
+（子目錄內 GitHub 不會讀）。
+
+位置慣例：`docs/format.md` = 根的 Go 端拷貝；`rust/docs/format.md` =
+權威副本（兩份逐 byte 一致，CI 檢查）。Go 文件提到的「docs/format.md」
+從根目錄算；Rust 文件提到的從 `rust/` 算。

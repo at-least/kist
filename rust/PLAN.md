@@ -217,7 +217,14 @@ kist/
 （56 個測試執行檔零失敗）、`cargo deny check` 四項 ok（修復 RUSTSEC-2024-0384
 紅燈後，見已接受的限制）、MinIO S3 整合測試（contract + s3 共七案）全過。
 
-## M7：format v3 ＋ 遠端來源（2026-09-08 起）【進行中】
+## M7：format v3 ＋ 遠端來源（2026-09-08 起）【完成 2026-09-09】
+
+本 repo 已以 git subtree 併入 at-least/kist 的 `rust/` 子目錄（保留完整
+歷史，monorepo merge commit 5a67394）。位置慣例：Rust 文件提到的
+`docs/format.md` 從 `rust/` 算（`rust/docs/format.md` 為權威副本；根
+目錄 `docs/format.md` 是 Go 端拷貝，CI 逐 byte 檢查）。Go 端鏡射與
+Source 介面移植見 kist-go PLAN M7/M8。全部完成項與實機 E2E 證據見
+下方各條。
 
 新輸入兩個：**遠端來源需求**（`kist backup sftp://…`/`s3://…`，client 當
 轉運、金鑰不出機器）與 v1/v2 教訓清單。設計立場：v2 核心全保留（有 PoC
