@@ -11,7 +11,7 @@
 > 另有：唯讀 FUSE 掛載（[ADR 015](docs/decisions/015-mount-fuse.md)）、選配 Reed-Solomon parity
 > （[ADR 009](docs/decisions/009-m5-parity.md)）、設定檔／排程／webhook（`kist run`）、`--json`、
 > Prometheus metrics 與 Web UI（`kist serve`）。Go 參考實作在同一個 repo 的 [go/](go/)（monorepo），
-> 跨語言互通有雙向 E2E 與 CI interop job 背書。
+> 跨語言互通有雙向 E2E 與 `go test ./internal/interop/...`（本機 gate）背書。
 > 已接受的限制：Windows VSS（不在路線圖上，見 [PLAN.md](PLAN.md)）。
 
 ## 建置
@@ -245,7 +245,8 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 
 Go 端（`go/`）的關卡是 `cd go && make verify`（build / vet / lint / test / -race）；
 `ci.yml` 在每次 push 與 PR 上自動跑這些。跨語言 interop（conformance 向量與
-兩份 `format.md` 逐 byte 一致）由 `ci-rust.yml` 的 interop job 檢查。
+兩份 `format.md` 逐 byte 一致）在 `ci-rust.yml` 有對應 job，但同樣只手動觸發；
+本機快速 gate：`cd go && go test ./internal/interop/...`。
 
 ## Workspace 結構
 

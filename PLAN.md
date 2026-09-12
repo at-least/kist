@@ -342,12 +342,14 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   （見 ci.yml interop job 內註解）。未設則該 job 預期失敗，**不影響其餘
   gate**，不要誤判為 regression。另：本機開發環境未設定 git remote，
   commit 均只存在本地，push 需先由負責人加上遠端。
+  【2026-09-12 更新：monorepo（M8）之後 interop job 移到 `ci-rust.yml`、
+  與 Rust 同樹 checkout，不再需要跨 repo PAT——此條僅存歷史。】
 
 - **GitHub Actions 額度：`ci.yml`（Go）push 觸發的 runs 全數未啟動**
   【2026-09-12 記錄】：私有 repo 的 Actions 因帳號「recent account payments
   have failed or your spending limit needs to be increased」無法啟動 job——
   自 2026-09-09 起每個 push 的 run 都瞬間 failure：job 無 steps、無 runner、
-  無 log（2026-09-04 之前 CI 正常，Go repo 時代）。**不是 regression**：
+  無 log（2026-09-04 當天仍有成功的 run，Go repo 時代）。**不是 regression**：
   程式 gate 以本機重驗為準（見上方 2026-09-09 完成 gate 全量重驗）。
   修復途徑擇一：Settings → Billing & plans 補付款／提高 spending limit；
   或把 `ci.yml` 觸發改為 `workflow_dispatch`（與 Rust 端同政策，省配額）。
