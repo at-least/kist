@@ -36,6 +36,21 @@ nohup sh fuzz/longrun.sh $((24*3600)) > /tmp/kist-fuzz-24h.log 2>&1 < /dev/null 
 回來看 log 結尾與 `fuzz/artifacts/`。跑之前確認機器閒置（96h 佔一個核、
 數 GB RSS），也不要跟記憶體量測類的驗收同時跑。
 
+### CPU 讓路（內建 nice）
+
+長跑預設以 nice 19 跑每個 target（`KIST_FUZZ_NICE` 可覆寫：0–19，0 =
+關閉讓路；未設/留空 = 19），sh → cargo → rustc → libFuzzer 全樹繼承，
+忙時讓給日常操作、閒時全速。注意 `-max_total_time` 是掛鐘時間：被搶時
+每小時 exec 數下降，24h 的總覆蓋率比深夜獨跑少——這是取捨不是失效。
+
+讓路效果依核心排程設定（autogroup、cgroup 排程都會影響 nice 的實效），
+換核心後用這個 5 秒協議重驗：兩個 busy loop 釘在同一核（`taskset -c N`），
+一個 nice 0、一個 nice 19，量 `/proc/<pid>/stat` 的 utime+stime ticks 差。
+2026-09-10（CachyOS 核心 7.2.0：autogroup 開、但 cgroup v2 的 cpu
+controller 作用中把它繞過）實測同 scope 與跨 systemd user scope 都是
+nice0 佔 99.4%、nice19 佔 0.6%——nice 直接有效，不需要 systemd-run 或
+寫 autogroup。
+
 ### 看門狗參數（不要改回預設）
 
 smoke.sh 固定傳 `-rss_limit_mb=0 -malloc_limit_mb=2048`。預設的累計 RSS

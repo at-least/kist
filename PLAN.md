@@ -153,7 +153,9 @@ kist/
   RSS 失真（live heap 僅 36MB、無 ASan 對照峰值 62Mb），看門狗改
   `-rss_limit_mb=0 -malloc_limit_mb=2048` 並負向對照驗證（ADR 010 §6）。
   96h 全量（每 target 24h）腳本就緒：`nohup sh fuzz/longrun.sh 86400 &`，
-  擇時執行。
+  擇時執行。長跑驅動內建 nice 19 讓路【2026-09-10】（`KIST_FUZZ_NICE`
+  覆寫、0 關閉；同核心爭搶實測 nice19 僅佔 0.6%，跨 systemd scope 同效，
+  協議見 fuzz/README.md）。
 - 記憶體目標：100 萬檔 repo 的 backup 峰值 < 512 MiB【完成 2026-09-06】：
   量測（dhat 歸因）找出每檔 16 MiB zeroed 切塊緩衝、每檔 1 MiB BufReader、
   pack 緩衝 Vec 倍增到 128 MiB 級、CBOR 走 Value 中繼、平面大目錄把 parent
