@@ -2,14 +2,17 @@
 
 去重、加密、可多台機器共用 repo 的備份工具（Rust）。
 
-> 目前狀態：**M4 進行中** —— M3（GC、無鎖並發）完成：本機與 S3（含 MinIO）repo 的 `init` /
-> `backup` / `snapshots` / `restore` / `check` / `rebuild-index` / `forget` / `prune` 可用，
-> 多台機器可同時備份到同一個 repo，GC 不需要鎖，on-disk 格式已凍結（見 [docs/format.md](docs/format.md)）。
-> M4 已有：設定檔、排程、webhook（`kist run`）、`--json`、Prometheus metrics 與 Web UI（`kist serve`）、
-> SFTP 後端（[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接
-> （[ADR 014](docs/decisions/014-rclone-bridge.md)）與唯讀 FUSE 掛載
-> （[ADR 015](docs/decisions/015-mount-fuse.md)）；M4 全數完成。
-> 還沒有：Windows VSS。
+> 目前狀態：**路線圖全數完成（2026-09-09，格式 v3）**。`init` / `backup` / `snapshots` / `restore` /
+> `check` / `rebuild-index` / `forget` / `prune` 可用；多台機器可同時備份到同一個 repo，GC 不需要鎖；
+> on-disk 格式 v3 已凍結（[docs/format.md](docs/format.md)）。備份來源可以是本機路徑，也可以是
+> `sftp://` / `s3://` 的**遠端來源**——client 當轉運：讀遠端、本機切塊加密後上傳，金鑰不出機器
+> （[ADR 016](docs/decisions/016-v3-remote-sources.md)）。儲存後端：本機、S3（含 MinIO）、SFTP
+> （[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接（[ADR 014](docs/decisions/014-rclone-bridge.md)）。
+> 另有：唯讀 FUSE 掛載（[ADR 015](docs/decisions/015-mount-fuse.md)）、選配 Reed-Solomon parity
+> （[ADR 009](docs/decisions/009-m5-parity.md)）、設定檔／排程／webhook（`kist run`）、`--json`、
+> Prometheus metrics 與 Web UI（`kist serve`）。Go 參考實作在同一個 repo 的 [go/](go/)（monorepo），
+> 跨語言互通有雙向 E2E 與 CI interop job 背書。
+> 已接受的限制：Windows VSS（不在路線圖上，見 [PLAN.md](PLAN.md)）。
 
 ## 建置
 
@@ -26,6 +29,7 @@ export KIST_PASSWORD=...                # 或 --password-file，或互動輸入
 
 kist init                               # 建立 repo
 kist backup ~/Documents ~/Photos        # 備份，產生一個 snapshot
+kist backup sftp://nas.local/srv/data   # 遠端來源也能備：讀遠端、本機切塊加密後上傳
 kist snapshots                          # 列出 snapshot
 kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路徑>
 kist check                              # 檢查一致性（不下載資料）
@@ -227,7 +231,8 @@ TCP port、不用 known_hosts，rclone 的設定就是全部。`KIST_RCLONE_BIN`
 
 ## 開發
 
-所有驗證都在本機跑（GitHub Actions 的 workflow 只留手動觸發，避免吃配額）；四道關卡：
+Rust 端四道關卡（與 `ci-rust.yml` 同款；該 workflow 還含 MinIO 整合測試、
+fuzz smoke 與跨語言 interop，但只開 `workflow_dispatch` 手動觸發，避免吃配額）：
 
 ```sh
 cargo fmt --all --check
@@ -238,6 +243,10 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 
 S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
+Go 端（`go/`）的關卡是 `cd go && make verify`（build / vet / lint / test / -race）；
+`ci.yml` 在每次 push 與 PR 上自動跑這些。跨語言 interop（conformance 向量與
+兩份 `format.md` 逐 byte 一致）由 `ci-rust.yml` 的 interop job 檢查。
+
 ## Workspace 結構
 
 | crate | 職責 |
@@ -245,11 +254,14 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 | `kist-format` | on-disk 格式：結構定義、CBOR 序列化、golden files（改動需負責人確認） |
 | `kist-crypto` | 金鑰階層（Argon2id → KEK → master key → 派生子金鑰）與 XChaCha20-Poly1305 封裝 |
 | `kist-chunker` | 內容定義切塊（FastCDC，512 KiB / 2 MiB / 8 MiB） |
-| `kist-backend` | 儲存後端（本機、S3、SFTP、rclone 橋接）|
+| `kist-backend` | 儲存後端（本機、S3、SFTP、rclone 橋接）與遠端來源（Source 抽象）|
 | `kist-core` | backup / restore / check / snapshots 流程 |
+| `kist-app` | 應用層：設定檔、排程、工作執行、通知、Prometheus metrics 與 Web UI |
+| `kist-mount` | 唯讀 FUSE 掛載（`kist mount`） |
 | `kist-cli` | `kist` 執行檔（clap） |
 
 格式規格：[docs/format.md](docs/format.md)。設計決策：[docs/decisions/](docs/decisions/)。
+Go 參考實作在 [go/](go/)，開發與驗證都在 `go/` 內進行（見〈開發〉一節）。
 
 ## M1 驗收數據
 
@@ -320,7 +332,7 @@ grace 設 0 只是為了驗收能在幾分鐘內走完；實際使用請保留�
 | M0 骨架（只有 clap） | 3.9 s | 3.5 s |
 | M1（完整相依） | 8.7 s | 15.8 s |
 
-（CI 從未實際執行；負責人決定所有驗證只在本機跑。）
+（當時 Rust 的 workflow 只開手動觸發、至今未實際執行過；量測皆在本機。）
 
 ## 授權
 
