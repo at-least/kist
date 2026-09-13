@@ -229,7 +229,8 @@ kist/
    與 prune 的正本選擇同一個全序（兩側都算 `(marked, pack)`，見
    `prune.rs` 的 rank），新增決定性單元測試釘死兩種加入順序。修後：
    單元測試綠、整合測試 20/20、`cargo test --workspace` 59 執行檔零
-   失敗、MinIO S3 整合（contract + s3）全過、gc_race 200 案例通過
+   失敗、MinIO S3 整合全過（contract 3 + s3 4 + s3_end_to_end 3，容器
+   測畢已清）、gc_race 200 案例通過
    （317.9s）、fmt/clippy/deny 綠；Go `make verify`（build/vet/lint/
    test/-race，含 interop）綠。
 
