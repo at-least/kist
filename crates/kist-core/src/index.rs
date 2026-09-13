@@ -342,13 +342,19 @@ impl ChunkIndex {
     /// 同 [`Self::add_pack`]，但合併規則帶 rank（例如「未標記優先，
     /// 其次名稱最小」）：`rank` 對 pack 名稱回傳排序鍵的前半，越小越
     /// 優先。同一 chunk 出現在多個 blob 時，保留 rank 最小的位置——
-    /// 與 prune 的正本選擇同一個排序。
+    /// 與 prune 的正本選擇同一個排序。既有與新來的位置都用同一個
+    /// `rank` 計算，合併結果才是 pack 集合的純函數、與 blob 載入順序
+    /// 無關（[`Self::add_pack`] 文件所述的不變量）。
     pub fn add_pack_ranked(&mut self, pack: &IndexPack, rank: impl Fn(&ObjectId) -> bool) {
         self.packs.insert(pack.pack, pack.size);
         let new_rank = (rank(&pack.pack), pack.pack);
         for e in &pack.entries {
             match self.overlay.get(&e.id) {
-                Some(existing) if (false, existing.pack) <= new_rank => {}
+                // 既有位置也要算真 rank（它在哪個 pack、該 pack 是否被標記），
+                // 才是與 prune 同一個全序；寫死 `false` 會讓「先進來的
+                // 被標記位置」永遠贏過後到的未標記位置，結果隨 blob
+                // 載入順序擺盪。
+                Some(existing) if (rank(&existing.pack), existing.pack) <= new_rank => {}
                 Some(_) | None => {
                     self.overlay.insert(e.id, location(pack.pack, e));
                 }
@@ -404,5 +410,51 @@ impl ChunkLocator for ChunkIndex {
     }
     fn get(&self, id: &ChunkId) -> Option<ChunkLocation> {
         ChunkIndex::get(self, id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_chunk_pack(pack_id: [u8; 32], chunk: [u8; 32]) -> IndexPack {
+        IndexPack {
+            pack: ObjectId::from_bytes(pack_id),
+            size: 1,
+            entries: vec![PackEntry {
+                id: ChunkId::from_bytes(chunk),
+                offset: 0,
+                length: 1,
+                raw_len: 1,
+            }],
+        }
+    }
+
+    /// §10：chunk → pack 的對應是「(標記, 名稱)」排序的純函數，與加入
+    /// 順序無關。被標記的 pack 先加、未標記的後加，overlay 也要停在
+    /// 未標記的位置——否則 backup 之後每次都把 chunk 重寫一份
+    /// （backup_gc_rules::marked_pack_is_not_used_for_dedup 間歇失敗的根因）。
+    #[test]
+    fn ranked_merge_prefers_unmarked_regardless_of_insertion_order() {
+        // marked 的名稱刻意比未標記的小：錯誤實作會靠名稱比較讓
+        // 「先進來的 marked 位置」贏過未標記的新位置。
+        let marked_pack = one_chunk_pack([0x00; 32], [0xAA; 32]);
+        let fresh_pack = one_chunk_pack([0xFF; 32], [0xAA; 32]);
+        let chunk = ChunkId::from_bytes([0xAA; 32]);
+        let is_marked = |id: &ObjectId| id == &marked_pack.pack;
+        let location_of = |idx: &ChunkIndex| match idx.get(&chunk) {
+            Some(loc) => loc.pack,
+            None => panic!("chunk not in index"),
+        };
+
+        let mut marked_first = ChunkIndex::new();
+        marked_first.add_pack_ranked(&marked_pack, is_marked);
+        marked_first.add_pack_ranked(&fresh_pack, is_marked);
+        assert_eq!(location_of(&marked_first), fresh_pack.pack);
+
+        let mut fresh_first = ChunkIndex::new();
+        fresh_first.add_pack_ranked(&fresh_pack, is_marked);
+        fresh_first.add_pack_ranked(&marked_pack, is_marked);
+        assert_eq!(location_of(&fresh_first), fresh_pack.pack);
     }
 }

@@ -219,6 +219,20 @@ kist/
 （56 個測試執行檔零失敗）、`cargo deny check` 四項 ok（修復 RUSTSEC-2024-0384
 紅燈後，見已接受的限制）、MinIO S3 整合測試（contract + s3 共七案）全過。
 
+6. **gate 全量重驗在收斂後的 monorepo 上重跑【2026-09-13】**：抓到一個
+   間歇失敗——`backup_gc_rules::marked_pack_is_not_used_for_dedup`
+   （5 次跑失敗 4 次）。根因：`ChunkIndex::add_pack_ranked` 的合併比較把
+   既有位置的「是否被標記」寫死成 `false`，被標記的舊位置一旦先進
+   overlay 就永遠贏過後到的未標記位置，backup 於是反覆重寫那些 chunk
+   （違反 §10「與載入順序無關」與 M3 驗收「標記後 0 新 chunk」）；是否
+   踩中取決於 blob 載入順序與每次 backup 都不同的隨機 pack 名稱。修法
+   與 prune 的正本選擇同一個全序（兩側都算 `(marked, pack)`，見
+   `prune.rs` 的 rank），新增決定性單元測試釘死兩種加入順序。修後：
+   單元測試綠、整合測試 20/20、`cargo test --workspace` 59 執行檔零
+   失敗、MinIO S3 整合（contract + s3）全過、gc_race 200 案例通過
+   （317.9s）、fmt/clippy/deny 綠；Go `make verify`（build/vet/lint/
+   test/-race，含 interop）綠。
+
 ## M7：format v3 ＋ 遠端來源（2026-09-08 起）【完成 2026-09-09】
 
 【2026-09-09 二次重排】本專案改為 **monorepo**：Rust（產品）在 repo 根，
