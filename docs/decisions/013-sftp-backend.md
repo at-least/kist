@@ -22,6 +22,16 @@ M3 的 GC 安全性依賴它）：原子寫入、`put_if_absent` 對已存在 ke
   且多了一個外部執行檔依賴。
 - **russh ＋ russh-sftp**：全 in-process，但 russh-sftp 沒有寫入管線化（64 MiB pack
   在 WAN 上會慢一個量級），也缺 posix-rename 擴充。
+  **2026-09-17 補記**：上面評的是 2.4.0；russh-sftp **3.0.0**（2026-09-08，本 ADR
+  隔天發佈）讀原始碼確認：寫入有管線化（`Config::max_concurrent_writes` 預設 16，
+  `poll_write` 維持 in-flight ack 佇列）、有 `hardlink`／`fsync`／`limits` 擴充的
+  偵測與呼叫、有 O_EXCL（`OpenFlags::EXCLUDE`）、建構子接受任意
+  `AsyncRead + AsyncWrite` stream（russh channel 與 rclone stdio 都接得上）。仍缺
+  `posix-rename` 包裝，但 `RawSftpSession::extended()` 公開，自己送
+  `posix-rename@openssh.com` 即可。**未實測**（吞吐、對端 EOF、multi_thread 收尾）。
+  暫不遷移：openssh-sftp-client 的懸掛 bug 已找到根因並提交一行修法（見 ADR 014
+  上游怪癖段落）；若上游不採納或再踩坑，3.0.0 是可行替代，遷移前需先 probe EOF／
+  multi_thread 行為並重跑全套合約測試。
 - **russh ＋ openssh-sftp-client（採用）**：openssh-sftp-client 吃任意
   AsyncRead+AsyncWrite stream（文件明言支援任何 SSH 庫當傳輸），同時具備管線化寫入、
   `hardlink`／`posix-rename`／`fsync` 三個 OpenSSH 擴充的偵測與呼叫。

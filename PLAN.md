@@ -153,7 +153,9 @@ kist/
   RSS 失真（live heap 僅 36MB、無 ASan 對照峰值 62Mb），看門狗改
   `-rss_limit_mb=0 -malloc_limit_mb=2048` 並負向對照驗證（ADR 010 §6）。
   96h 全量（每 target 24h）腳本就緒：`nohup sh fuzz/longrun.sh 86400 &`，
-  擇時執行。
+  擇時執行。長跑驅動內建 nice 19 讓路【2026-09-10】（`KIST_FUZZ_NICE`
+  覆寫、0 關閉；同核心爭搶實測 nice19 僅佔 0.6%，跨 systemd scope 同效，
+  協議見 fuzz/README.md）。
 - 記憶體目標：100 萬檔 repo 的 backup 峰值 < 512 MiB【完成 2026-09-06】：
   量測（dhat 歸因）找出每檔 16 MiB zeroed 切塊緩衝、每檔 1 MiB BufReader、
   pack 緩衝 Vec 倍增到 128 MiB 級、CBOR 走 Value 中繼、平面大目錄把 parent
@@ -216,6 +218,21 @@ kist/
 `cargo fmt --check`、`clippy --all-targets -D warnings`、`cargo test --workspace`
 （56 個測試執行檔零失敗）、`cargo deny check` 四項 ok（修復 RUSTSEC-2024-0384
 紅燈後，見已接受的限制）、MinIO S3 整合測試（contract + s3 共七案）全過。
+
+6. **gate 全量重驗在收斂後的 monorepo 上重跑【2026-09-13】**：抓到一個
+   間歇失敗——`backup_gc_rules::marked_pack_is_not_used_for_dedup`
+   （5 次跑失敗 4 次）。根因：`ChunkIndex::add_pack_ranked` 的合併比較把
+   既有位置的「是否被標記」寫死成 `false`，被標記的舊位置一旦先進
+   overlay 就永遠贏過後到的未標記位置，backup 於是反覆重寫那些 chunk
+   （違反 §10「與載入順序無關」與 M3 驗收「標記後 0 新 chunk」）；是否
+   踩中取決於 blob 載入順序與每次 backup 都不同的隨機 pack 名稱。修法
+   與 prune 的正本選擇同一個全序（兩側都算 `(marked, pack)`，見
+   `prune.rs` 的 rank），新增決定性單元測試釘死兩種加入順序。修後：
+   單元測試綠、整合測試 20/20、`cargo test --workspace` 59 執行檔零
+   失敗、MinIO S3 整合全過（contract 3 + s3 4 + s3_end_to_end 3，容器
+   測畢已清）、gc_race 200 案例通過
+   （317.9s）、fmt/clippy/deny 綠；Go `make verify`（build/vet/lint/
+   test/-race，含 interop）綠。
 
 ## M7：format v3 ＋ 遠端來源（2026-09-08 起）【完成 2026-09-09】
 
@@ -340,3 +357,14 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   （見 ci.yml interop job 內註解）。未設則該 job 預期失敗，**不影響其餘
   gate**，不要誤判為 regression。另：本機開發環境未設定 git remote，
   commit 均只存在本地，push 需先由負責人加上遠端。
+  【2026-09-12 更新：monorepo（M8）之後 interop job 移到 `ci-rust.yml`、
+  與 Rust 同樹 checkout，不再需要跨 repo PAT——此條僅存歷史。】
+
+- **GitHub Actions 額度：`ci.yml`（Go）push 觸發的 runs 全數未啟動**
+  【2026-09-12 記錄】：私有 repo 的 Actions 因帳號「recent account payments
+  have failed or your spending limit needs to be increased」無法啟動 job——
+  自 2026-09-09 起每個 push 的 run 都瞬間 failure：job 無 steps、無 runner、
+  無 log（2026-09-04 當天仍有成功的 run，Go repo 時代）。**不是 regression**：
+  程式 gate 以本機重驗為準（見上方 2026-09-09 完成 gate 全量重驗）。
+  修復途徑擇一：Settings → Billing & plans 補付款／提高 spending limit；
+  或把 `ci.yml` 觸發改為 `workflow_dispatch`（與 Rust 端同政策，省配額）。

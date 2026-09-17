@@ -12,7 +12,8 @@ docker rm -f kist-minio             # 用完關掉
 ```
 
 `tests/minio-setup.sh` 會印出要 export 的環境變數（root 帳號、Put/Get/List-only 的 `kistbackup`
-帳號）。每個測試用隨機 prefix，同一個 bucket 可以重複跑。（CI workflow 只手動觸發；驗證都在本機跑。）
+帳號）。每個測試用隨機 prefix，同一個 bucket 可以重複跑。（Rust 的 CI workflow 只手動觸發；
+`ci.yml` 會隨 push 跑 Go 端 gate。）
 
 ## SFTP
 
