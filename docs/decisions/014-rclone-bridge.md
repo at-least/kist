@@ -108,8 +108,17 @@ host key（rclone 每次啟動重生 host key，strict known_hosts 根本無法�
   [openssh-sftp-client#183](https://github.com/openssh-rust/openssh-sftp-client/issues/183)）**：
   openssh-sftp-client **0.15.8** 的
   `Sftp::new` 在 tokio **multi_thread** runtime 上，對端在版本交換前就退出
-  （stdout EOF）**不會**喚醒等待中的版本交換——future 無限懸掛；current_thread
-  runtime 不受影響（~25 ms 正常回 EOF 錯誤）。最小重現（與 kist 程式無關）：
+  （stdout EOF）——future 無限懸掛；current_thread runtime 不受影響（~25 ms 正常回
+  EOF 錯誤）。**根因（2026-09-17 以 tracing + probe build 驗證，見
+  [issue 回覆](https://github.com/openssh-rust/openssh-sftp-client/issues/183#issuecomment-5711697596)）**：
+  EOF 其實有喚醒 `read_task`，它退出時把 `shutdown_stage` 存成 2 通知 `flush_task`
+  收工；但 `Sftp::init` 的錯誤路徑接著 drop write end 與 handle，最後一個使用者被
+  drop 觸發 `order_shutdown` 在**呼叫端 thread** 存 1，把 2 蓋掉。multi_thread 上這個
+  覆寫落在 `flush_task` 檢查之前，它讀到 1 就永遠等下去（`read_task` 已死，不會再存
+  2）；current_thread 上同樣的覆寫發生在 `flush_task` 退出之後，所以無害。與 rclone
+  無關，`/bin/true` 當伺服器也重現。候選修法是 `order_shutdown` 改用 `fetch_max(1)`
+  讓 stage 不倒退，本機測 multi 10/10 正常；上游尚未採納，繞法仍需保留。最小重現
+  （與 kist 程式無關）：
 
   ```rust
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
