@@ -664,6 +664,7 @@ impl Repository {
     }
 }
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod index_cap_tests {
     use crate::repo::decode_index_blob_limited;
     use kist_format::Algorithm;
@@ -688,9 +689,8 @@ mod index_cap_tests {
             out.extend_from_slice(&zstd::encode_all(&vec![0u8; 1 << 20][..], 3).unwrap());
             out
         };
-        match decode_index_blob_limited(&ok, 4 << 20) {
-            Err(e) => assert!(!format!("{e:?}").contains("limit"), "不該是上限錯誤：{e:?}"),
-            Ok(_) => {}
+        if let Err(e) = decode_index_blob_limited(&ok, 4 << 20) {
+            assert!(!format!("{e:?}").contains("limit"), "不該是上限錯誤：{e:?}");
         }
     }
 }
