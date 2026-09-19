@@ -368,7 +368,8 @@ impl Repository {
         let keys = Arc::clone(self.keys());
         let id = *id;
         let raw_len = loc.raw_len;
-        blocking(move || decode_chunk(&keys, &id, &bytes, raw_len)).await
+        let max_chunk = u64::from(self.config().chunker.max);
+        blocking(move || decode_chunk(&keys, &id, &bytes, raw_len, max_chunk)).await
     }
 }
 

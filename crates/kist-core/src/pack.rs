@@ -8,6 +8,7 @@
 //! 壓縮的演算法 byte 是 AEAD 明文的第一個 byte（self-describing），
 //! trailer entry 不需要 flags。壓縮門檻：zstd-3，沒省下 > 1/16 就存原文。
 
+use std::io::Read;
 use std::sync::Arc;
 
 use kist_crypto::RepoKeys;
@@ -39,8 +40,11 @@ pub fn compress_chunk(raw: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// 解開 `algorithm byte ‖ 資料`。
-fn decompress_chunk(payload: &[u8]) -> Result<Vec<u8>> {
+/// 解開 `algorithm byte ‖ 資料`。`limit` 是 repo 的 chunker.max
+/// （format.md §6：解壓上限＝chunker.max）：超過上限的 frame 是炸彈，
+/// 不是 chunk——認證只證明位元組沒被改，證明不了有 bug 的 writer 沒寫出
+/// 宣稱巨大長度的 frame。
+fn decompress_chunk(payload: &[u8], limit: u64) -> Result<Vec<u8>> {
     let Some((algorithm, data)) = payload.split_first() else {
         return Err(CoreError::Corrupt {
             key: "<chunk>".to_owned(),
@@ -49,10 +53,36 @@ fn decompress_chunk(payload: &[u8]) -> Result<Vec<u8>> {
     };
     match Algorithm::from_u8(*algorithm)? {
         Algorithm::Raw => Ok(data.to_vec()),
-        Algorithm::Zstd => zstd::decode_all(data).map_err(|e| CoreError::Corrupt {
-            key: "<chunk>".to_owned(),
-            reason: format!("zstd decode failed: {e}"),
-        }),
+        Algorithm::Zstd => {
+            // 串流解到 limit+1 為止：多讀的那 1 byte 用來分辨「恰好在上限」
+            // 與「超過上限」，配置因此以 limit 為上界。
+            // with_buffer：`&[u8]` 已是 BufRead，省掉 Decoder::new 額外包的
+            // BufReader（restore/mount 的熱路徑，每個 chunk 一次）。
+            let decoder =
+                zstd::stream::read::Decoder::with_buffer(data).map_err(|e| CoreError::Corrupt {
+                    key: "<chunk>".to_owned(),
+                    reason: format!("zstd decode failed: {e}"),
+                })?;
+            let mut out = Vec::new();
+            decoder
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut out)
+                .map_err(|e| CoreError::Corrupt {
+                    key: "<chunk>".to_owned(),
+                    reason: format!("zstd decode failed: {e}"),
+                })?;
+            if out.len() as u64 > limit {
+                return Err(CoreError::Corrupt {
+                    key: "<chunk>".to_owned(),
+                    reason: format!(
+                        "chunk decompresses to {} bytes, over the {} limit",
+                        out.len(),
+                        limit
+                    ),
+                });
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -142,14 +172,16 @@ impl PackWriter {
 }
 
 /// 解開一個 pack entry：解密、（必要時）解壓、驗證長度與 chunk ID。
+/// `max_chunk` 是 repo 的 chunker.max，作為解壓上限（format.md §6）。
 pub fn decode_chunk(
     keys: &RepoKeys,
     id: &ChunkId,
     entry_bytes: &[u8],
     raw_len: u64,
+    max_chunk: u64,
 ) -> Result<Vec<u8>> {
     let payload = keys.open_chunk(id, entry_bytes)?;
-    let plaintext = decompress_chunk(&payload)?;
+    let plaintext = decompress_chunk(&payload, max_chunk)?;
     if plaintext.len() as u64 != raw_len {
         return Err(CoreError::Corrupt {
             key: format!("chunk {id}"),
@@ -338,5 +370,38 @@ mod tests {
         let mut w = PackWriter::new(keys, 64 * 1024 * 1024, 8 * 1024 * 1024);
         assert!(w.finish().unwrap().is_none());
         assert!(w.is_empty());
+    }
+
+    /// 解壓上限＝chunker.max（format.md §6）：超過上限的 frame 是炸彈，
+    /// 不是 chunk。上限由呼叫端從 repo 不變式傳入，不由解碼器自行猜。
+    #[test]
+    fn decompress_chunk_is_bounded_by_the_configured_max() {
+        // 100 MiB 的零壓成幾 KB 的 frame：貨真價實的炸彈。
+        let bomb = compress_chunk(&vec![0u8; 100 * 1024 * 1024]).unwrap();
+        assert_eq!(bomb[0], Algorithm::Zstd as u8, "全零內容必須存成 zstd");
+
+        let err = match decompress_chunk(&bomb, 8 * 1024 * 1024) {
+            Err(err) => err,
+            Ok(out) => panic!("frame 解出 {} bytes，超過 8 MiB 上限必須被拒", out.len()),
+        };
+        assert!(
+            matches!(err, CoreError::Corrupt { .. }),
+            "回錯種類不對：{err:?}"
+        );
+
+        // 上限之內的合法 chunk 照常解。
+        let ok = compress_chunk(&vec![0u8; 1024 * 1024]).unwrap();
+        let out = decompress_chunk(&ok, 8 * 1024 * 1024).unwrap();
+        assert_eq!(out.len(), 1024 * 1024);
+
+        // 邊界：恰好等於上限的 chunk 是合法的（Go 端曾在此回歸——上限
+        // 釘在常數上，貼著設定的 chunk 寫得進讀不出）；差 1 就不是。
+        let exact = compress_chunk(&vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let out = decompress_chunk(&exact, 4 * 1024 * 1024).unwrap();
+        assert_eq!(out.len(), 4 * 1024 * 1024);
+        assert!(
+            decompress_chunk(&exact, 4 * 1024 * 1024 - 1).is_err(),
+            "上限差 1 必須被拒"
+        );
     }
 }

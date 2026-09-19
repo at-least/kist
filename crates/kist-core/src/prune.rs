@@ -818,6 +818,7 @@ impl Repository {
             return Ok((Vec::new(), 0, Vec::new()));
         }
         let keys_ = Arc::clone(self.keys());
+        let max_chunk = u64::from(self.config().chunker.max);
         let mut writer = Some(PackWriter::new(
             Arc::clone(self.keys()),
             pack_target_size,
@@ -866,7 +867,8 @@ impl Repository {
                         key: key.clone(),
                         reason: format!("chunk {} points outside the pack", e.id),
                     });
-                    let plain = slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.raw_len));
+                    let plain =
+                        slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.raw_len, max_chunk));
                     match plain {
                         Ok(p) => plains.push((e.id, p)),
                         Err(err) => return Ok((w, Vec::new(), 0, Some(err))),
