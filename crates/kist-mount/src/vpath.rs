@@ -168,13 +168,13 @@ fn has_name(level: &[VEntry], name: &[u8]) -> bool {
     level.iter().any(|v| v.name() == name)
 }
 
-/// 放入真實條目；同名合成條目被替換（真實的贏）。
+/// 放入真實條目；同名條目（合成或真實）被替換——後到的 root 贏。同名
+/// 真實條目只會來自「兩個 root 切出同一組組件」：不去重的話 mount 會列
+/// 出兩個同名 entry（層級有序、二分查找只找得到一個），restore 也會對
+/// 同一目標寫兩次。
 fn push_real(levels: &mut HashMap<Vec<u8>, Vec<VEntry>>, key: &[u8], e: &Entry) {
     let level = levels.entry(key.to_vec()).or_default();
-    match level
-        .iter()
-        .position(|v| matches!(v, VEntry::Synthetic { .. }) && v.name() == e.name)
-    {
+    match level.iter().position(|v| v.name() == e.name) {
         Some(i) => level[i] = VEntry::Real(Arc::new(e.clone())),
         None => level.push(VEntry::Real(Arc::new(e.clone()))),
     }
@@ -278,6 +278,26 @@ mod tests {
         );
         assert!(VirtualRoot::lookup(root.top(), b"m").is_some());
         assert!(VirtualRoot::lookup(root.top(), b"b").is_none());
+    }
+
+    /// 兩個 root 的定位切出同一組組件（`/a/b` 與 `a/b`——scheme 去掉後
+    /// host 不入組件、絕對與相對定位同形）時，同名葉只能出現一次——
+    /// 重複條目會讓 mount 列出兩個 `b`（層級已排序、二分查找只找得到
+    /// 其中之一），restore 也會對同一目標寫兩次。後到的 root 贏
+    /// （與 restore 目前的覆寫行為一致）。
+    #[test]
+    fn two_roots_with_the_same_expansion_dedupe_to_one_entry() {
+        let root = VirtualRoot::build([
+            dir_root(root_of("/a/b")),
+            dir_root(root_of("a/b")),
+        ]);
+        assert_eq!(names(root.top()), vec![b"a".to_vec()]);
+        let level = root.level(b"/a");
+        assert_eq!(
+            names(level),
+            vec![b"b".to_vec()],
+            "同名葉要去重，不能重複列出"
+        );
     }
 
     /// `..` 組件的對映必須與 fsmeta::locator_to_relative（和 Go 端的

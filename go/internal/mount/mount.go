@@ -294,6 +294,23 @@ func (n *clientNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 //     the top level, since there are none.
 //
 // Real entries always win over synthetic ones at the same name.
+// pushEntry places a real leaf entry at a virtual level. Any same-name
+// entry -- synthetic placeholder or a real one pushed by an earlier
+// root -- is replaced: the later root wins, matching restore's
+// overwrite behavior. Two roots whose locators cut into the same
+// components would otherwise list the name twice at one level while
+// the mount's sorted lookup finds only one of them.
+func pushEntry(table map[string][]tree.Entry, key string, e tree.Entry) {
+	level := table[key]
+	if i := slices.IndexFunc(level, func(x tree.Entry) bool {
+		return string(x.Name) == string(e.Name)
+	}); i >= 0 {
+		level[i] = e // the later root's real entry wins
+	} else {
+		table[key] = append(level, e)
+	}
+}
+
 func expandRoots(ctx context.Context, r *repo.Repository, roots []snapshot.Root, mtimeNs int64) ([]tree.Entry, map[string][]tree.Entry, error) {
 	table := make(map[string][]tree.Entry)
 	hasName := func(level []tree.Entry, name string) bool {
@@ -305,14 +322,7 @@ func expandRoots(ctx context.Context, r *repo.Repository, roots []snapshot.Root,
 		return false
 	}
 	push := func(key string, e tree.Entry) {
-		level := table[key]
-		if i := slices.IndexFunc(level, func(x tree.Entry) bool {
-			return x.Subtree == nil && string(x.Name) == string(e.Name)
-		}); i >= 0 {
-			level[i] = e // a real entry replaces the synthetic placeholder
-		} else {
-			table[key] = append(level, e)
-		}
+		pushEntry(table, key, e)
 	}
 	synthetic := func(name string) tree.Entry {
 		// Subtree nil marks a synthetic directory whose children live in
