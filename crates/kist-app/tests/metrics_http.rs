@@ -21,13 +21,19 @@ fn outcome(job: JobKind, status: JobStatus, detail: serde_json::Value) -> JobOut
 
 #[test]
 fn metrics_render_after_jobs() {
-    // jobs.rs 真實跑工作時放進 detail 的是 v2 BackupSummary 的序列化
-    // （stats 欄位名已是 "bytes"/"bytes_stored"），兩邊對不上——見
+    // jobs.rs 真實跑工作時放進 detail 的是 BackupSummary 的序列化：
+    // stats 只有資料事實（files/dirs/symlinks/bytes），過程計數
+    // （bytes_stored/chunks_new/errors）在 report 之下——fixture 得
+    // 長得一樣，否則測的是不存在的形狀。
     let m = Metrics::new();
     m.record(&outcome(
         JobKind::Backup,
         JobStatus::Success,
-        json!({"stats": {"files": 3, "bytes": 100, "bytes_stored": 50, "chunks_new": 2, "errors": 0}}),
+        json!({
+            "snapshot_key": "snapshots/aa/20260905T000000Z",
+            "stats": {"files": 3, "bytes": 100},
+            "report": {"bytes_stored": 50, "chunks_new": 2, "errors": 0}
+        }),
     ));
     m.record(&outcome(
         JobKind::Prune,
