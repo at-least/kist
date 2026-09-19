@@ -75,6 +75,7 @@ func (r *Repository) Restore(ctx context.Context, key, target string, opts Resto
 	run := &restoreRun{
 		repo:   r,
 		opts:   opts,
+		target: abs,
 		chunks: r.NewChunkSource(),
 		links:  make(map[hardLinkKey]string),
 	}
@@ -94,8 +95,8 @@ func (r *Repository) Restore(ctx context.Context, key, target string, opts Resto
 		if err != nil {
 			return run.stats, err
 		}
-		if err := os.MkdirAll(base, 0o700); err != nil {
-			return run.stats, fmt.Errorf("restore: %w", err)
+		if err := run.mkdirAllNoFollow(base); err != nil {
+			return run.stats, err
 		}
 		for _, entry := range entries {
 			if err := ctx.Err(); err != nil {
@@ -168,6 +169,11 @@ type restoreRun struct {
 	repo *Repository
 	opts RestoreOptions
 
+	// target is the restore root the user named, already created: every
+	// path below it is snapshot content, and mkdirAllNoFollow trusts
+	// nothing below it.
+	target string
+
 	chunks *ChunkSource
 
 	// links maps an inode seen in the snapshot to the first path it was
@@ -188,7 +194,7 @@ func (run *restoreRun) restoreNode(ctx context.Context, entry tree.Entry, path s
 		if entry.Subtree == nil {
 			return fmt.Errorf("restore: %w: entry %q has no subtree", tree.ErrCorrupt, entry.Name)
 		}
-		if err := os.MkdirAll(path, 0o700); err != nil {
+		if err := run.mkdirAllNoFollow(path); err != nil {
 			return fmt.Errorf("restore: %w", err)
 		}
 		children, err := run.repo.LoadTreeChain(ctx, *entry.Subtree)
@@ -212,7 +218,7 @@ func (run *restoreRun) restoreNode(ctx context.Context, entry tree.Entry, path s
 		return run.applyMetadata(path, entry, false)
 
 	case tree.TypeSymlink:
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		if err := run.mkdirAllNoFollow(filepath.Dir(path)); err != nil {
 			return fmt.Errorf("restore: %w", err)
 		}
 		if err := os.Symlink(string(entry.Target), path); err != nil {
@@ -222,7 +228,7 @@ func (run *restoreRun) restoreNode(ctx context.Context, entry tree.Entry, path s
 		return run.applyMetadata(path, entry, true)
 
 	case tree.TypeFile:
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		if err := run.mkdirAllNoFollow(filepath.Dir(path)); err != nil {
 			return fmt.Errorf("restore: %w", err)
 		}
 		if err := run.restoreFile(ctx, entry, path); err != nil {
@@ -257,6 +263,58 @@ func safeJoin(dir, name string) (string, error) {
 		return "", fmt.Errorf("restore: %w: entry name %q escapes %s", tree.ErrCorrupt, name, dir)
 	}
 	return path, nil
+}
+
+// mkdirAllNoFollow creates dir and any missing parents below the
+// restore target, refusing to create or pass through a symlink in any
+// component from the target downward. A symlink there can only have
+// been planted by this very snapshot -- restore starts from an empty
+// target -- and os.MkdirAll would follow it, turning the snapshot's own
+// content into a write outside the directory the user named; this gives
+// directory paths the protection the file path's O_EXCL open already
+// has. The target itself and everything above it are the user's own
+// path and stay trusted.
+func (run *restoreRun) mkdirAllNoFollow(dir string) error {
+	rel, err := filepath.Rel(run.target, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("restore: %s is not under the restore target %s", dir, run.target)
+	}
+	cur := run.target
+	for _, comp := range strings.Split(rel, string(os.PathSeparator)) {
+		if comp == "" || comp == "." {
+			continue
+		}
+		cur = filepath.Join(cur, comp)
+		info, err := os.Lstat(cur)
+		switch {
+		case err == nil:
+			if info.Mode()&fs.ModeSymlink != 0 {
+				return fmt.Errorf("restore: %w: %s is a symlink", tree.ErrCorrupt, cur)
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("restore: %s exists and is not a directory", cur)
+			}
+		case errors.Is(err, fs.ErrNotExist):
+			if err := os.Mkdir(cur, 0o700); err != nil {
+				if !errors.Is(err, fs.ErrExist) {
+					return fmt.Errorf("restore: %w", err)
+				}
+				info, err := os.Lstat(cur)
+				if err != nil {
+					return fmt.Errorf("restore: %w", err)
+				}
+				if info.Mode()&fs.ModeSymlink != 0 {
+					return fmt.Errorf("restore: %w: %s is a symlink", tree.ErrCorrupt, cur)
+				}
+				if !info.IsDir() {
+					return fmt.Errorf("restore: %s exists and is not a directory", cur)
+				}
+			}
+		default:
+			return fmt.Errorf("restore: %w", err)
+		}
+	}
+	return nil
 }
 
 func (run *restoreRun) restoreFile(ctx context.Context, entry tree.Entry, path string) error {
