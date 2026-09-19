@@ -100,6 +100,7 @@ pub struct PruneSection {
     #[serde(default, with = "crate::duration::serde_opt")]
     pub grace: Option<std::time::Duration>,
     /// Tolerated client/prune clock difference; 0 defaults to 1h.
+    #[serde(default, with = "crate::duration::serde_opt")]
     pub clock_skew: Option<std::time::Duration>,
     #[serde(default, with = "crate::duration::serde_opt")]
     pub inactive_after: Option<std::time::Duration>,
@@ -299,5 +300,19 @@ mod scheme_case_tests {
         )
         .unwrap();
         assert!(cfg.validate().is_ok(), "大寫 scheme 是合法的 webhook URL");
+    }
+
+    /// `[prune] clock_skew` 與 grace／inactive_after 同一形式：
+    /// `<number><unit>` 字串（文件寫的就是這種）。
+    #[test]
+    fn prune_clock_skew_accepts_string_duration() {
+        let cfg = Config::parse(
+            "repo = \"x\"\npassword_file = \"/etc/kist/pw\"\n[prune]\ngrace = \"72h\"\nclock_skew = \"30m\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.prune.as_ref().unwrap().clock_skew,
+            Some(std::time::Duration::from_secs(30 * 60))
+        );
     }
 }
