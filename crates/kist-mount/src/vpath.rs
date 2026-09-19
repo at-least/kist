@@ -287,10 +287,7 @@ mod tests {
     /// （與 restore 目前的覆寫行為一致）。
     #[test]
     fn two_roots_with_the_same_expansion_dedupe_to_one_entry() {
-        let root = VirtualRoot::build([
-            dir_root(root_of("/a/b")),
-            dir_root(root_of("a/b")),
-        ]);
+        let root = VirtualRoot::build([dir_root(root_of("/a/b")), dir_root(root_of("a/b"))]);
         assert_eq!(names(root.top()), vec![b"a".to_vec()]);
         let level = root.level(b"/a");
         assert_eq!(

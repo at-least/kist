@@ -117,8 +117,14 @@ async fn seal_tree_rejects_trees_readers_would_reject() {
         ("dotdot name", Tree::new(vec![file_entry(b"..")], None)),
         ("empty name", Tree::new(vec![file_entry(b"")], None)),
         ("slash in name", Tree::new(vec![file_entry(b"a/b")], None)),
-        ("duplicate names", Tree::new(vec![file_entry(b"a"), file_entry(b"a")], None)),
-        ("unsorted names", Tree::new(vec![file_entry(b"b"), file_entry(b"a")], None)),
+        (
+            "duplicate names",
+            Tree::new(vec![file_entry(b"a"), file_entry(b"a")], None),
+        ),
+        (
+            "unsorted names",
+            Tree::new(vec![file_entry(b"b"), file_entry(b"a")], None),
+        ),
     ];
     for (what, tree) in bad_trees {
         let result = repo.seal_tree(tree).await;

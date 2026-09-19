@@ -273,7 +273,9 @@ async fn replica_read_error_is_not_masked_as_not_found() {
     let repo_dir = dir.path().join("repo");
     let src = dir.path().join("src");
     make_source(&src);
-    let repo = Repository::open(backend, PASSWORD.as_bytes()).await.unwrap();
+    let repo = Repository::open(backend, PASSWORD.as_bytes())
+        .await
+        .unwrap();
     let b1 = repo
         .backup(std::slice::from_ref(&src), common::backup_options())
         .await

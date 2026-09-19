@@ -303,10 +303,7 @@ async fn snapshot_with_invalid_structure_is_rejected_on_read() {
         .keys()
         .seal_snapshot(&s.snapshot_key, &cbor::encode(&snap).unwrap())
         .unwrap();
-    repo.backend()
-        .put(&s.snapshot_key, sealed)
-        .await
-        .unwrap();
+    repo.backend().put(&s.snapshot_key, sealed).await.unwrap();
 
     let err = repo
         .read_snapshot_by_key(&s.snapshot_key)
