@@ -386,7 +386,20 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   restore 據此拒絕（Windows 路徑切分未處理倒斜線與磁碟機代號）；
   ② `TestSFTPConformance/stat_reports_size_and_mtime` 的 mtime 回報零值
   ——**本機 `make test-sftp` 同步重現**（2026-09-19，非 CI 環境問題；
-  該 target 不在 `make verify` 與 09-09 的重驗清單內，何時回歸待
-  bisect）。s3 job 的 `docker: pull access denied
+  該 target 不在 `make verify` 與 09-09 的重驗清單內）。
+  **同日已修**：`SFTP.Stat`（go）自诞生即漏設 `Modified`（回傳行
+  `git log -S` 顯示從未變過；v2 統一時加的子測試一直紅著沒被跑到），
+  修為與 `Local`／`S3` 同款 `ModTime().Truncate(time.Second)`。影響
+  （修前，SFTP repo 上）：prune 端 `treeRevivedAfterMark` 把已 touch
+  救活的樹判死——**資料遺失方向**，只因 commit 端 `headTreeAndTouch`
+  的同一個零值恰好擋住快門（假性 `ErrTreeMarked`）才沒咬人，兩個
+  bug 靠巧合互相抵銷；`gc.go:403` 的「標記後重寫的 pack 放過」保護
+  被靜默停用（窄、不安全）；`gc.go:593` 樹自癒檢查停用（僅保險絲）。
+  標記年齡走 `List`（本來就正確）不受影響。修後 `make test-sftp` 綠、
+  `make verify` 全綠。**同型隱患待辦（Rust）**：`crates/kist-backend/
+  src/sftp.rs:649-651` 的 `to_meta` 把伺服器缺送的 mtime 換成
+  `UNIX_EPOCH` 餵進同一套 GC 年齡比較——OpenSSH 一律會送所以未爆，
+  但正確行為是回錯而非 sentinel 時間。
+  s3 job 的 `docker: pull access denied
   for minio/minio` 是 runner 端 Docker Hub 拉取限制（暫時性環境問題）。
   ubuntu/macos 全綠。】

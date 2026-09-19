@@ -580,7 +580,9 @@ func (s *SFTP) Stat(_ context.Context, key string) (FileInfo, error) {
 	if info.IsDir() {
 		return FileInfo{}, fmt.Errorf("stat %s: %w", key, ErrNotFound)
 	}
-	return FileInfo{Key: key, Size: info.Size()}, nil
+	// Modified 是 GC 標記協議的年齡來源（prune 的重寫保護、touch 復活
+	// 檢查都拿它跟標記時間比）——漏了會餵零值時間進那些比較。
+	return FileInfo{Key: key, Size: info.Size(), Modified: info.ModTime().Truncate(time.Second)}, nil
 }
 
 // Delete removes an object, treating an absent object as already deleted.
