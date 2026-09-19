@@ -396,10 +396,19 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   bug 靠巧合互相抵銷；`gc.go:403` 的「標記後重寫的 pack 放過」保護
   被靜默停用（窄、不安全）；`gc.go:593` 樹自癒檢查停用（僅保險絲）。
   標記年齡走 `List`（本來就正確）不受影響。修後 `make test-sftp` 綠、
-  `make verify` 全綠。**同型隱患待辦（Rust）**：`crates/kist-backend/
-  src/sftp.rs:649-651` 的 `to_meta` 把伺服器缺送的 mtime 換成
-  `UNIX_EPOCH` 餵進同一套 GC 年齡比較——OpenSSH 一律會送所以未爆，
-  但正確行為是回錯而非 sentinel 時間。
+  `make verify` 全綠。
+  **同型隱患（Rust）同日已修**：`crates/kist-backend/src/sftp.rs` 的
+  `to_meta` 原把伺服器缺送的 mtime 換成 `UNIX_EPOCH` 餵進同一套 GC
+  年齡比較（OpenSSH 一律會送所以未爆）。修為：缺 mtime 回
+  `MetaError::NoMtime` 大聲失敗——head/stat 直接傳播，兩個 list 端
+  對「命名規則外名稱」維持略過、對「缺 mtime」讓整個 list 失敗
+  （略過一個 gc/ 標記比 sentinel 更糟）；名稱檢查先於 mtime（爛名稱
+  絕不讓 list 失敗）。單元測試 RED→GREEN 釘死兩種分類；真伺服器
+  整合（SFTP 容器 4 案＋rclone 橋接 4 案）與 fmt/clippy/
+  `test --workspace`（59 執行檔）全綠。**對等隱患待辦（Go）**：
+  `pkg/sftp`（第三方程式庫）在 List/Stat 對缺送的 ACMODTIME 同樣
+  映成零值——kist-go 端若要徹底，得在 backend 層偵測並拒絕，屆時
+  與上游回報一併考慮。
   s3 job 的 `docker: pull access denied
   for minio/minio` 是 runner 端 Docker Hub 拉取限制（暫時性環境問題）。
   ubuntu/macos 全綠。】

@@ -644,13 +644,28 @@ fn generic(e: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     }
 }
 
-fn to_meta(path: &str, m: &MetaData) -> std::result::Result<ObjectMeta, StoreError> {
+/// [`to_meta`] 的失敗模式。呼叫端對兩種失敗的反應不同：list 對不合
+/// 命名規則的名稱**略過該條目**（伺服器目錄裡可能有命名規則外的東西），
+/// 但缺 mtime 是 GC 年齡來源出了問題——標記年齡、touch 復活與「標記後
+/// 重寫」檢查都拿 `last_modified` 當時間軸——必須讓整個操作失敗，不能
+/// 略過也不能換 sentinel 時間（epoch 對那些比較是「無限老」）。
+#[derive(Debug, thiserror::Error)]
+enum MetaError {
+    #[error("sftp entry {0:?}: name outside the object-store namespace rules")]
+    BadName(String),
+    #[error("sftp entry {0:?}: server sent no mtime")]
+    NoMtime(String),
+}
+
+fn to_meta(path: &str, m: &MetaData) -> std::result::Result<ObjectMeta, MetaError> {
+    // 名稱先檢查：命名規則外的條目無論屬性缺什麼都只是略過，不讓 list 失敗。
+    let location =
+        StorePath::parse(path).map_err(|e| MetaError::BadName(format!("{path}: {e}")))?;
     let size = m.len().unwrap_or(0);
-    let secs = m.modified().map(|ts| ts.into_raw() as i64).unwrap_or(0);
-    let last_modified =
-        chrono::DateTime::from_timestamp(secs, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
-    // 伺服器給了 object_store 命名規則外的名稱：略過該條目，不讓整個 list 失敗
-    let location = StorePath::parse(path).map_err(generic)?;
+    let last_modified = m
+        .modified()
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts.into_raw() as i64, 0))
+        .ok_or_else(|| MetaError::NoMtime(path.to_owned()))?;
     Ok(ObjectMeta {
         location,
         last_modified,
@@ -808,7 +823,7 @@ impl SftpInner {
                 source: "is a directory".into(),
             });
         }
-        to_meta(full, &m)
+        to_meta(full, &m).map_err(generic)
     }
 
     fn store_error(&self, location: &StorePath, e: SftpError) -> StoreError {
@@ -936,8 +951,12 @@ async fn walk(
             .and_then(|r| r.strip_prefix('/'))
             .map(|r| r.to_owned())
             .unwrap_or_else(|| full.clone());
-        if let Ok(m) = to_meta(&key, &entry.metadata()) {
-            out.push(m);
+        match to_meta(&key, &entry.metadata()) {
+            Ok(m) => out.push(m),
+            // 伺服器給了 object_store 命名規則外的名稱：略過該條目，不讓整個 list 失敗
+            Err(MetaError::BadName(_)) => {}
+            // 缺 mtime 是 GC 年齡來源的問題：整個 list 失敗，不默默跳過
+            Err(e) => return Err(generic(e)),
         }
     }
     Ok(())
@@ -1243,8 +1262,13 @@ impl ObjectStore for SftpStore {
                     // 伺服器給了 object_store 命名規則外的名稱：略過，不讓整個 list 失敗
                     Err(_) => continue,
                 }
-            } else if let Ok(m) = to_meta(&rel(&full), &entry.metadata()) {
-                objects.push(m);
+            } else {
+                match to_meta(&rel(&full), &entry.metadata()) {
+                    Ok(m) => objects.push(m),
+                    // 同 walk：命名規則外的名稱略過；缺 mtime 讓 list 失敗
+                    Err(MetaError::BadName(_)) => {}
+                    Err(e) => return Err(generic(e)),
+                }
             }
         }
         common_prefixes.sort();
@@ -1279,5 +1303,58 @@ impl ObjectStore for SftpStore {
         drop(fs);
         inner.remove_quiet(&scratch).await;
         renamed.map_err(generic)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssh_sftp_client::metadata::MetaDataBuilder;
+    use openssh_sftp_client::UnixTimeStamp;
+
+    /// GC 的標記年齡、touch 復活與「標記後重寫」檢查都拿 `last_modified`
+    /// 當時間軸：伺服器缺送 mtime 時不能默默換成 sentinel 時間——
+    /// `UNIX_EPOCH` 對那些比較是「無限老」，會把保護整個關掉。要大聲失敗。
+    #[test]
+    fn to_meta_rejects_entries_without_mtime() {
+        // MetaDataBuilder 不呼叫 time() 就是缺 mtime 的條目。
+        let m = MetaDataBuilder::new().len(5).create();
+        match to_meta("packs/dd", &m) {
+            Err(MetaError::NoMtime(_)) => {}
+            other => panic!("missing mtime must be NoMtime, got {other:?}"),
+        }
+
+        // 對照組：有 mtime 的條目照常轉換。
+        let ts = match UnixTimeStamp::from_raw(1_758_000_000) {
+            Some(t) => t,
+            None => panic!("valid timestamp rejected by UnixTimeStamp"),
+        };
+        let m = MetaDataBuilder::new().len(5).time(ts, ts).create();
+        let meta = match to_meta("packs/dd", &m) {
+            Ok(m) => m,
+            Err(e) => panic!("entry with mtime rejected: {e:?}"),
+        };
+        assert_eq!(meta.size, 5);
+        assert_eq!(meta.last_modified.timestamp(), 1_758_000_000);
+    }
+
+    /// 命名規則外的名稱即使同時缺 mtime 也分類為 BadName：list 端對
+    /// 這種條目維持「略過」，爛名稱永遠不該讓 list 失敗。
+    #[test]
+    fn to_meta_classifies_bad_name_before_missing_mtime() {
+        let m = MetaDataBuilder::new().len(5).create(); // 同時缺 mtime
+        match to_meta("a/../b", &m) {
+            Err(MetaError::BadName(_)) => {}
+            other => panic!("junk name must be BadName, got {other:?}"),
+        }
+        let ts = match UnixTimeStamp::from_raw(1) {
+            Some(t) => t,
+            None => panic!("valid timestamp rejected by UnixTimeStamp"),
+        };
+        let m = MetaDataBuilder::new().len(5).time(ts, ts).create();
+        match to_meta("a/../b", &m) {
+            Err(MetaError::BadName(_)) => {}
+            other => panic!("junk name must be BadName, got {other:?}"),
+        }
     }
 }
