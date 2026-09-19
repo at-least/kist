@@ -195,7 +195,16 @@ func (r *Runner) backup(ctx context.Context, b *config.Backup) error {
 			return err
 		}
 		defer r.closeRepo(rp)
-		summary, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Parity: r.Config.Repository.Parity, Warnf: warn})
+		// The backup's commit gate must assume the grace prune actually
+		// uses (BackupOptions.GCGrace's own contract): a config that
+		// shortens [prune] grace shortens the gate with it, or a backup
+		// running past the real grace commits against packs prune may
+		// already have swept. Zero (no [prune] section) keeps the default.
+		var grace time.Duration
+		if r.Config.Prune != nil {
+			grace = r.Config.Prune.Grace
+		}
+		summary, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Parity: r.Config.Repository.Parity, GCGrace: grace, Warnf: warn})
 		if err != nil {
 			return err
 		}

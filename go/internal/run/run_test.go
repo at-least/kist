@@ -225,3 +225,67 @@ func TestServeExposesMetrics(t *testing.T) {
 		t.Errorf("Serve returned %v", err)
 	}
 }
+
+// A [prune] grace shorter than the default must reach the backup's
+// commit gate: GCGrace's own contract says it must match what prune
+// uses, and the runner is the one mode where backup and prune share a
+// config. With a millisecond grace the gate refuses immediately (the
+// safe side) instead of committing under a 72h assumption the pruner on
+// the same config does not share.
+func TestRunnerForwardsPruneGraceToTheBackupGate(t *testing.T) {
+	ctx := context.Background()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	b, err := backend.CreateLocal(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	password := []byte("run-test")
+	stateDir, cacheDir := t.TempDir(), t.TempDir()
+	init, err := repo.Init(ctx, b, repo.Options{Password: password, StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse(`
+[repository]
+location = "` + repoDir + `"
+state_dir = "` + stateDir + `"
+cache_dir = "` + cacheDir + `"
+
+[[backup]]
+name = "docs"
+paths = ["` + source + `"]
+schedule = "@daily"
+
+[prune]
+schedule = "@daily"
+grace = "1us"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events []report.Event
+	r := &Runner{
+		Config:   cfg,
+		Password: password,
+		Logf:     func(string, ...any) {},
+		OpenBackend: func(_ context.Context, location string) (backend.Backend, error) {
+			return backend.OpenLocal(location)
+		},
+		Events: func(ev report.Event) { events = append(events, ev) },
+	}
+	if err := r.Once(ctx); err == nil || !strings.Contains(err.Error(), "docs") {
+		t.Fatalf("Once: err = %v, want the docs job reported failed", err)
+	}
+	if len(events) == 0 || events[0].OK || !strings.Contains(events[0].Error, "longer than the gc grace") {
+		t.Fatalf("backup event: %+v, want it refused for outliving the configured 1us grace", events)
+	}
+}
