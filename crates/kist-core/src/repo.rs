@@ -420,6 +420,10 @@ impl Repository {
     pub async fn seal_tree(&self, tree: Tree) -> Result<(TreeId, Vec<u8>)> {
         let keys = Arc::clone(&self.keys);
         blocking(move || {
+            // 寫入端跑與讀取端同一套結構不變式（§8.1）：來源端冒出的 `..`／
+            // 重複／未排序名稱在這裡當場失敗，不寫出所有讀取端都拒讀的 tree
+            // （Go 的 Encode 同款）。
+            tree.validate()?;
             let plain = cbor::encode(&tree)?;
             let id = keys.tree_id(&plain);
             let bytes = keys.seal_tree(&id, &plain)?;
@@ -627,7 +631,7 @@ impl Repository {
             })?;
             if snap.version != kist_format::FORMAT_VERSION {
                 return Err(CoreError::Corrupt {
-                    key: key_owned,
+                    key: key_owned.clone(),
                     reason: format!(
                         "snapshot declares version {}, this build reads {}",
                         snap.version,
@@ -635,6 +639,12 @@ impl Repository {
                     ),
                 });
             }
+            // 結構驗證與 Go 的 load 同款（roots 非空、排序、唯一）：
+            // 解得開不等於合法，structurally-invalid 的 snapshot 不能往下走。
+            snap.validate().map_err(|e| CoreError::Corrupt {
+                key: key_owned.clone(),
+                reason: e.to_string(),
+            })?;
             Ok(snap)
         })
         .await?;

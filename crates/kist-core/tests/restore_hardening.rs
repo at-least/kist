@@ -278,3 +278,39 @@ fn locator_with_nul_component_is_rejected() {
     );
     assert!(locator_to_relative(b"/a/b").is_ok());
 }
+
+/// 讀取端對 snapshot 內容也要跑結構驗證（`Snapshot::validate`：roots 非空、
+/// 排序、唯一；Go 在 save 與 load 都跑）：解得開但結構不合法的 snapshot
+/// 要以 Corrupt 拒絕，不能被 restore/mount 當正常資料。
+#[tokio::test]
+async fn snapshot_with_invalid_structure_is_rejected_on_read() {
+    use kist_core::CoreError;
+    use kist_format::cbor;
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"data").unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let mut snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+    snap.roots.clear(); // 解密與反序列化都會過、結構不合法
+    let sealed = repo
+        .keys()
+        .seal_snapshot(&s.snapshot_key, &cbor::encode(&snap).unwrap())
+        .unwrap();
+    repo.backend()
+        .put(&s.snapshot_key, sealed)
+        .await
+        .unwrap();
+
+    let err = repo
+        .read_snapshot_by_key(&s.snapshot_key)
+        .await
+        .expect_err("roots 為空的 snapshot 必須被讀取端拒絕");
+    assert!(matches!(err, CoreError::Corrupt { .. }), "{err}");
+}

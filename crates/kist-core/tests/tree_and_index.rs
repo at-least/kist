@@ -79,3 +79,49 @@ async fn superseded_index_blobs_are_ignored() {
     assert_eq!(index.pack_count(), 0, "被取代的 blob 裡的 pack 不該出現");
     assert!(index.is_empty());
 }
+
+/// 寫入端必須擋住讀取端會拒絕的 tree（讀取路徑有 `Tree::validate`，seal 沒有）：
+/// 來源端冒出 `..`、重複或未排序的名稱時，backup 要當場失敗，而不是把
+/// 「兩種實作的讀取端都拒讀」的 tree 寫進 repo（Go 的 Encode 會擋）。
+#[tokio::test]
+async fn seal_tree_rejects_trees_readers_would_reject() {
+    use kist_format::tree::{content_type, meta_kind, node_type, Entry, Tree};
+
+    fn file_entry(name: &[u8]) -> Entry {
+        Entry {
+            name: name.to_vec(),
+            kind: node_type::FILE,
+            meta_kind: meta_kind::GENERIC,
+            size: 0,
+            target: Vec::new(),
+            content: content_type::DIRECT,
+            chunks: Vec::new(),
+            subtree: kist_format::TreeId::ZERO,
+            mode: None,
+            uid: None,
+            gid: None,
+            mtime_ns: None,
+            ctime_ns: None,
+            dev: None,
+            inode: None,
+            nlink: None,
+            xattrs: None,
+            etag: None,
+            vern: None,
+        }
+    }
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let bad_trees: Vec<(&str, Tree)> = vec![
+        ("dotdot name", Tree::new(vec![file_entry(b"..")], None)),
+        ("empty name", Tree::new(vec![file_entry(b"")], None)),
+        ("slash in name", Tree::new(vec![file_entry(b"a/b")], None)),
+        ("duplicate names", Tree::new(vec![file_entry(b"a"), file_entry(b"a")], None)),
+        ("unsorted names", Tree::new(vec![file_entry(b"b"), file_entry(b"a")], None)),
+    ];
+    for (what, tree) in bad_trees {
+        let result = repo.seal_tree(tree).await;
+        assert!(result.is_err(), "{what}: seal_tree 必須回錯，卻成功寫出");
+    }
+}
