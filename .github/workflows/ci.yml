@@ -33,6 +33,9 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
+          # M8 之後 go.mod 在 go/——setup-go 的快取預設在 repo 根找 go.sum，
+          # 永遠 miss（會跑還只是慢，但別浪費）。
+          cache-dependency-path: go/go.sum
 
       # The shipped binary must build without cgo on every platform.
       - name: build
@@ -93,10 +96,15 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
+          cache-dependency-path: go/go.sum
       - uses: golangci/golangci-lint-action@v9
         with:
           # Pinned in lockstep with the Makefile. Bump both together.
           version: v2.13.2
+          # defaults.run.working-directory 只對 run: 步驟生效；action 要
+          # 自己告訴它在哪跑——M8 後 go.mod 在 go/，在根目錄跑會
+          # 「directory prefix . does not contain main module」。
+          working-directory: go
 
   # The S3 backend against a real MinIO, on Linux only: the tests start
   # the container themselves and need a Docker daemon.
@@ -107,6 +115,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
+          cache-dependency-path: go/go.sum
       - run: make test-sftp
 
   s3:
@@ -117,5 +126,6 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
+          cache-dependency-path: go/go.sum
       - name: test against minio
         run: make test-s3

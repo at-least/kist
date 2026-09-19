@@ -375,3 +375,18 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   （見上方 2026-09-09 完成 gate 全量重驗）。處置：`ci.yml` 觸發改為僅
   `workflow_dispatch`（與 `ci-rust.yml` 同政策，省配額），push 不再產生
   必失敗的 run；額度若日後補上，可隨時改回。
+  【2026-09-19 後記：額度封鎖當天已解除——`105a469` 的 push 產生了
+  額度封鎖解除後第一個（也是最後一個 auto）run，job 真的執行。這是
+  M8 monorepo 重排後 ci.yml 第一次真正跑，暴露的問題：lint 三平台全敗
+  與 setup-go 快取永遠 miss——`defaults.run.working-directory` 不作用於
+  `uses:` action（golangci-lint-action 與 setup-go 快取都要自帶路徑），
+  當天已修（actionlint 過）。**真實 bug 兩件待辦**：① Windows 上
+  `internal/cmd`／`internal/repo` 測試全敗——來源根路徑 `C:\Users\…`
+  被整段寫成 tree entry 名稱，違反 v3「entry 名稱＝單一路徑元件」，
+  restore 據此拒絕（Windows 路徑切分未處理倒斜線與磁碟機代號）；
+  ② `TestSFTPConformance/stat_reports_size_and_mtime` 的 mtime 回報零值
+  ——**本機 `make test-sftp` 同步重現**（2026-09-19，非 CI 環境問題；
+  該 target 不在 `make verify` 與 09-09 的重驗清單內，何時回歸待
+  bisect）。s3 job 的 `docker: pull access denied
+  for minio/minio` 是 runner 端 Docker Hub 拉取限制（暫時性環境問題）。
+  ubuntu/macos 全綠。】
