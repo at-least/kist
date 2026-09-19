@@ -22,7 +22,7 @@ func inProcessSFTP(t *testing.T, dir string) *sftp.Client {
 	go func() { _ = srv.Serve() }() //nolint:errcheck // best-effort server loop for the test
 	t.Cleanup(func() {
 		_ = clientConn.Close() //nolint:errcheck // teardown
-		_ = srv.Close() //nolint:errcheck // teardown
+		_ = srv.Close()        //nolint:errcheck // teardown
 	})
 	client, err := sftp.NewClientPipe(clientConn, clientConn)
 	if err != nil {
