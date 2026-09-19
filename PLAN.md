@@ -155,7 +155,13 @@ kist/
   96h 全量（每 target 24h）腳本就緒：`nohup sh fuzz/longrun.sh 86400 &`，
   擇時執行。長跑驅動內建 nice 19 讓路【2026-09-10】（`KIST_FUZZ_NICE`
   覆寫、0 關閉；同核心爭搶實測 nice19 僅佔 0.6%，跨 systemd scope 同效，
-  協議見 fuzz/README.md）。
+  協議見 fuzz/README.md）。**96h 全量已執行【2026-09-13 → 09-17，fail=0】**：
+  四個 target 依序各 24h 全數 OK、零 crash、`fuzz/artifacts/` 四個目錄皆空、
+  `fuzz/seeds` 未被寫入。逐 target 執行量（掛鐘 86401s）與 corpus 成長：
+  pack 149.3M exec（corpus → 50M）、cbor 7 033.0M exec（→ 200M）、
+  chunker 143.1M exec（→ 732K）、parity 72.9M exec（→ 6.9M）；全程 nice 19
+  讓路未影響日常操作。完整 log：`~/kist-fuzz-96h.log`（本次 log 移出 /tmp，
+  避免 4 天期間被清）。
 - 記憶體目標：100 萬檔 repo 的 backup 峰值 < 512 MiB【完成 2026-09-06】：
   量測（dhat 歸因）找出每檔 16 MiB zeroed 切塊緩衝、每檔 1 MiB BufReader、
   pack 緩衝 Vec 倍增到 128 MiB 級、CBOR 走 Value 中繼、平面大目錄把 parent
