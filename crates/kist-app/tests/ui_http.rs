@@ -520,3 +520,16 @@ async fn ui_second_trigger_is_queued_conflict() {
     .await
     .expect("test timed out");
 }
+
+/// UI 回應帶 Content-Security-Policy：maud 的輸出編碼是唯一防線，
+/// CSP 把未來任何漏編碼的爆炸半徑壓到同源。
+#[tokio::test]
+async fn ui_responses_carry_content_security_policy() {
+    let s = start(false).await;
+    let (status, headers, _) = request(s.addr, "GET", "/", &[("Host", &s.host)], "").await;
+    assert!(status.contains("200"), "{status}");
+    assert!(
+        headers.contains("content-security-policy:"),
+        "UI 回應要帶 CSP header：{headers}"
+    );
+}

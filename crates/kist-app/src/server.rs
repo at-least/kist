@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Path, Request, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use kist_core::SnapshotInfo;
@@ -434,9 +434,20 @@ struct SnapshotRow {
     paths: String,
 }
 
-/// maud 在編譯期產生 HTML，沒有執行期錯誤；這裡只是補上狀態碼。
+/// maud 在編譯期產生 HTML，沒有執行期錯誤；這裡補上狀態碼與 CSP。
+/// maud 的輸出編碼是 XSS 的第一道防線，CSP 是第二道：未來任何漏編碼的
+/// 插值，爆炸半徑被壓到同源（腳本與樣式只有 /static、無 inline、
+/// 連外全禁、不允許被 embed）。
 fn render(status: StatusCode, markup: Markup) -> Response {
-    (status, markup).into_response()
+    let mut resp = (status, markup).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; \
+             img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    resp
 }
 
 async fn index(State(state): State<ServeState>) -> Response {

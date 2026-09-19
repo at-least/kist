@@ -71,6 +71,9 @@ PLAN 指定 askama；實作時負責人指示改用 maud 0.27，在此記錄。�
 
 - HTTPS：UI 預設綁 loopback；要遠端存取請放在 reverse proxy 後面。Basic auth 走明文
   HTTP，README 有警告。
+- 密碼猜測的速率限制 / 鎖定：密碼比對是 blake3 對 blake3，沒有 KDF 成本，非 loopback
+  綁定時線上猜測速度只受網路限制。預設部署（loopback）不受此影響；要遠端存取的人本來
+  就得放 reverse proxy 後面——連率限制也一併交給它（例如 proxy 層的 per-IP limit）。
 - 帳號系統 / session：單人自架工具，Basic auth + 密碼檔夠用。
 - 即時推送（SSE / WebSocket）：2 秒輪詢的即時感已經夠，複雜度不值得。
 - 刪 snapshot / 跑 forget / prune 的按鈕：見上。
