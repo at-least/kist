@@ -324,17 +324,44 @@ impl Repository {
             })?;
             list.chunks
         };
-        // 目標已存在且是 symlink：不跟隨。restore 到含惡意 symlink 的目錄時，
-        // 跟隨會把資料寫到目標之外（與 Go 端同樣的防護）。
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                return Err(CoreError::Corrupt {
-                    key: path.display().to_string(),
-                    reason: "a symlink is in the way of a restored file".to_owned(),
-                });
+        // 開檔不跟隨最終元件的 symlink（與 Go 端 O_EXCL 同族的最終元件
+        // 防護；這裡保留「覆寫既有一般檔」的契約）。unix 以 O_NOFOLLOW
+        // 讓拒絕發生在開檔瞬間——先 symlink_metadata 再 File::create 的
+        // 兩步之間有競態窗口，本地攻擊者能把寫入轉到目標之外；其餘平台
+        // 退回兩步檢查（與原行為相同，無窗口防護）。
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+            {
+                Ok(f) => f,
+                // ELOOP＝O_NOFOLLOW 拒絕「最終元件是 symlink」。
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(CoreError::Corrupt {
+                        key: path.display().to_string(),
+                        reason: "a symlink is in the way of a restored file".to_owned(),
+                    });
+                }
+                Err(e) => return Err(CoreError::io(path, e)),
             }
-        }
-        let file = std::fs::File::create(path).map_err(|e| CoreError::io(path, e))?;
+        };
+        #[cfg(not(unix))]
+        let file = {
+            if let Ok(meta) = std::fs::symlink_metadata(path) {
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::Corrupt {
+                        key: path.display().to_string(),
+                        reason: "a symlink is in the way of a restored file".to_owned(),
+                    });
+                }
+            }
+            std::fs::File::create(path).map_err(|e| CoreError::io(path, e))?
+        };
         let mut writer = std::io::BufWriter::new(file);
         let mut written = 0u64;
         for id in &chunk_ids {

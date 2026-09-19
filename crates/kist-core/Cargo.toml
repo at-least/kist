@@ -27,6 +27,7 @@ zstd.workspace = true
 # xattr crate 只有 Unix 實作（Windows 連編譯都不過）；kist-core 的 xattr
 # 讀取本來就是 cfg(unix) 分支 + 非 Unix 的空實作（fsmeta.rs read_xattrs）。
 [target.'cfg(unix)'.dependencies]
+libc.workspace = true
 xattr.workspace = true
 
 [dev-dependencies]

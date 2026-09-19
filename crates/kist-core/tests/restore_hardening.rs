@@ -232,3 +232,37 @@ fn zero_entry() -> kist_format::tree::Entry {
         vern: None,
     }
 }
+
+/// 檔案路徑的 symlink-in-the-way 拒絕（防護的可行為釘死；開檔瞬間的
+/// 原子拒絕——O_NOFOLLOW——無法以確定性測試重現競態本身）。
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_in_the_way_of_a_file_is_refused() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src); // small.txt、link -> small.txt
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let target = t.dir.path().join("out");
+    let restored_root = target.join(src.strip_prefix("/").unwrap_or(&src));
+    // 先放一個指向目標外的 symlink 在 small.txt 的位置：restore 不得
+    // 跟隨它寫到目標之外。
+    std::fs::create_dir_all(&restored_root).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", restored_root.join("small.txt")).unwrap();
+
+    let summary = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        summary
+            .errors
+            .iter()
+            .any(|e| e.contains("symlink is in the way")),
+        "應拒絕而非跟隨：{summary:?}"
+    );
+}
