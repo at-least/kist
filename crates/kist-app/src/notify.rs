@@ -12,10 +12,10 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub fn new(section: &NotifySection) -> Self {
+    pub fn new(section: &NotifySection) -> std::result::Result<Self, String> {
         // reqwest 的 rustls 不帶 provider；由 kist-backend 安裝（冪等）。本機 repo 不會建 S3 後端，所以這裡也要叫。
         kist_backend::install_tls_provider();
-        Self {
+        Ok(Self {
             url: section.webhook_url.clone(),
             on: section.on.iter().cloned().collect(),
             // 不跟隨 redirect：端點（或入侵它的人）不能把工作資料轉投到
@@ -23,8 +23,8 @@ impl Notifier {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .expect("webhook client"),
-        }
+                .map_err(|e| e.to_string())?,
+        })
     }
 
     pub fn wants(&self, outcome: &JobOutcome) -> bool {
@@ -96,7 +96,7 @@ mod redirect_tests {
             webhook_url: format!("http://{addr}/hook"),
             on: vec!["failure".to_owned()],
         };
-        let notifier = Notifier::new(&section);
+        let notifier = Notifier::new(&section).unwrap();
         let outcome = JobOutcome {
             job: crate::jobs::JobKind::Backup,
             status: crate::jobs::JobStatus::Failure,

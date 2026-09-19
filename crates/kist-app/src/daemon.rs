@@ -144,7 +144,12 @@ impl Daemon {
                 schedules.insert(JobKind::Prune, s);
             }
         }
-        let notifier = cfg.notify.as_ref().map(Notifier::new);
+        let notifier = cfg
+            .notify
+            .as_ref()
+            .map(Notifier::new)
+            .transpose()
+            .map_err(AppError::Config)?;
         let metrics = Arc::new(crate::metrics::Metrics::new());
         if let Some(dir) = &cfg.cache_dir {
             for kind in [JobKind::Backup, JobKind::Forget, JobKind::Prune] {
