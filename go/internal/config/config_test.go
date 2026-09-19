@@ -140,3 +140,25 @@ func TestPasswordSources(t *testing.T) {
 		t.Error("no source: no error")
 	}
 }
+
+// A webhook URL must be http(s) (the Rust side enforces the same): URLs
+// with other schemes are rejected at load, before they can reach a
+// transport that would misinterpret them.
+func TestWebhookURLRequiresHTTPScheme(t *testing.T) {
+	for _, bad := range []string{"ftp://example.com/hook", "example.com/hook", "file:///etc/passwd"} {
+		c, err := Parse("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl = \"" + bad + "\"\n")
+		if err != nil {
+			continue // parse-time rejection is also fine
+		}
+		if err := c.validate(); err == nil {
+			t.Errorf("url %q validated without error", bad)
+		}
+	}
+	c, err := Parse("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl = \"https://example.com/hook\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.validate(); err != nil {
+		t.Errorf("https webhook URL rejected: %v", err)
+	}
+}

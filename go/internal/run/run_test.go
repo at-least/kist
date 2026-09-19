@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -287,5 +288,35 @@ grace = "1us"
 	}
 	if len(events) == 0 || events[0].OK || !strings.Contains(events[0].Error, "longer than the gc grace") {
 		t.Fatalf("backup event: %+v, want it refused for outliving the configured 1us grace", events)
+	}
+}
+
+// A webhook error must not carry the URL into the logs: webhook URLs
+// routinely embed tokens or basic-auth userinfo, and warnings persist.
+func TestWebhookErrorOmitsTheURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	// credentials in the userinfo of an otherwise valid http URL.
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword("ops", "hunter2")
+	cfg, err := config.Parse("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl='" + u.String() + "'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	r := &Runner{Config: cfg, Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	ev := report.Event{Kind: "backup", Job: "j", Started: time.Now()}
+	if err := r.finish(context.Background(), &ev, nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	for _, l := range logs {
+		if strings.Contains(l, "ops:hunter2") || strings.Contains(l, u.Host) && strings.Contains(l, "returned") {
+			t.Errorf("log leaks the webhook URL: %q", l)
+		}
 	}
 }

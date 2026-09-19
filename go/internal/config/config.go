@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -225,8 +226,18 @@ func (c *Config) validate() error {
 			return fmt.Errorf("prune.forget_clients_after is %s, want a non-negative duration (omit it for the default)", c.Prune.ForgetClientsAfter)
 		}
 	}
-	if c.Webhook != nil && c.Webhook.URL == "" {
-		return errors.New("webhook.url is required")
+	if c.Webhook != nil {
+		if c.Webhook.URL == "" {
+			return errors.New("webhook.url is required")
+		}
+		// http(s) only (the Rust side enforces the same): anything else
+		// reaching a transport would be misinterpreted at best, and URLs
+		// embedding credentials in other schemes are a habit to refuse
+		// early.
+		u, err := url.Parse(c.Webhook.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("webhook.url %q must start with http:// or https://", c.Webhook.URL)
+		}
 	}
 	if c.Metrics != nil && c.Metrics.Listen == "" {
 		return errors.New("metrics.listen is required")
