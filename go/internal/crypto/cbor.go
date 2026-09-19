@@ -42,6 +42,7 @@ func init() {
 	opts := cbor.DecOptions{
 		DupMapKey:        cbor.DupMapKeyEnforcedAPF,
 		IndefLength:      cbor.IndefLengthForbidden,
+		TagsMd:           cbor.TagsForbidden,
 		MaxArrayElements: 8 << 20,
 		MaxMapPairs:      1 << 20,
 	}

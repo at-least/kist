@@ -119,3 +119,23 @@ func TestUnmarshalRejectsTrailingGarbage(t *testing.T) {
 		t.Fatal("unmarshal with trailing bytes: got nil error")
 	}
 }
+
+// format.md §4 rule 4: CBOR tags are forbidden -- a tagged encoding and
+// its untagged equivalent are two readings of one object, exactly what
+// the canonical-form rules exist to rule out. The decoder must reject
+// major type 6 rather than silently unwrap it.
+func TestDecodeRejectsTags(t *testing.T) {
+	// tag(1) wrapped around the integer 5, then trailing text is
+	// irrelevant: Unmarshal into an int must fail on the tag alone.
+	var n int
+	if err := Unmarshal([]byte{0xc1, 0x05}, &n); err == nil {
+		t.Fatal("a tagged integer decoded without error")
+	}
+	var s struct {
+		A uint64 `cbor:"a"`
+	}
+	// map(1){ "a": tag(1)(5) } -- the tag hides inside a field.
+	if err := Unmarshal([]byte{0xa1, 0x61, 'a', 0xc1, 0x05}, &s); err == nil {
+		t.Fatal("a tagged field value decoded without error")
+	}
+}
