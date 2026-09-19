@@ -272,7 +272,7 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 }
 
 func verifyPack(ctx context.Context, r *Repository, id crypto.ID) error {
-	reader, err := pack.OpenReader(ctx, r.backend, r.keys, id)
+	reader, err := pack.OpenReader(ctx, r.backend, r.keys, id, uint64(r.config.Chunker.MaxSize))
 	if err != nil {
 		return err
 	}

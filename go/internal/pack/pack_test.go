@@ -93,7 +93,7 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("wrote %d entries, want %d", len(entries), len(payloads))
 	}
 
-	r, err := OpenReader(ctx, b, keys, id)
+	r, err := OpenReader(ctx, b, keys, id, chunker.MaxSize)
 	if err != nil {
 		t.Fatalf("open reader: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestCompressionIsDecidedPerChunk(t *testing.T) {
 		t.Errorf("incompressible chunk stored in %d bytes, want %d (stored raw)", entries[1].Length, want)
 	}
 
-	r, err := OpenReader(ctx, b, keys, id)
+	r, err := OpenReader(ctx, b, keys, id, chunker.MaxSize)
 	if err != nil {
 		t.Fatalf("open reader: %v", err)
 	}
@@ -434,7 +434,7 @@ func TestReaderRejectsDamagedPacks(t *testing.T) {
 				t.Fatalf("store damaged pack: %v", err)
 			}
 
-			r, err := OpenReader(ctx, damaged, keys, id)
+			r, err := OpenReader(ctx, damaged, keys, id, chunker.MaxSize)
 			if tc.structural {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("open: err = %v, want %v", err, tc.wantErr)
@@ -483,7 +483,7 @@ func TestReaderRejectsInconsistentTrailer(t *testing.T) {
 		if err := backend.PutBytesIfAbsent(ctx, b, Key(id), raw); err != nil {
 			t.Fatalf("store: %v", err)
 		}
-		_, err = OpenReader(ctx, b, keys, id)
+		_, err = OpenReader(ctx, b, keys, id, chunker.MaxSize)
 		return err
 	}
 
@@ -539,7 +539,7 @@ func TestTrailerIsBoundToTheRepositoryKeys(t *testing.T) {
 	otherMaster[0] ^= 0xff
 	other := crypto.DeriveKeys(otherMaster)
 
-	if _, err := OpenReader(ctx, b, other, id); !errors.Is(err, crypto.ErrDecrypt) {
+	if _, err := OpenReader(ctx, b, other, id, chunker.MaxSize); !errors.Is(err, crypto.ErrDecrypt) {
 		t.Fatalf("open with the wrong keys: err = %v, want ErrDecrypt", err)
 	}
 }
@@ -557,7 +557,7 @@ func TestDecompressionBombIsRefused(t *testing.T) {
 	bomb := enc.EncodeAll(oversized, nil)
 	t.Logf("frame is %d bytes and claims to decode to %d", len(bomb), len(oversized))
 
-	out, err := decompress(algorithmZstd, bomb)
+	out, err := decompress(algorithmZstd, bomb, chunker.MaxSize)
 	if err == nil {
 		t.Fatalf("decompress returned %d bytes; the decoder is not bounded by chunker.MaxSize", len(out))
 	}
@@ -565,7 +565,7 @@ func TestDecompressionBombIsRefused(t *testing.T) {
 }
 
 func TestDecompressRejectsAnUnknownEncoding(t *testing.T) {
-	if _, err := decompress(0xfe, []byte("payload")); !errors.Is(err, ErrCorrupt) {
+	if _, err := decompress(0xfe, []byte("payload"), chunker.MaxSize); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("decompress with an unknown algorithm byte: err = %v, want ErrCorrupt", err)
 	}
 }
@@ -593,5 +593,36 @@ func TestWriterRefusesADuplicateChunk(t *testing.T) {
 	}
 	if w.Count() != 1 {
 		t.Errorf("pack holds %d chunks, want 1", w.Count())
+	}
+}
+
+// chunker.max is a repository invariant that config validation allows to
+// raise to 64 MiB, well over this package's default constant. The decode
+// cap must follow the configured maximum, not the constant: a chunk
+// between the two is written compressed and then can never be decoded.
+func TestDecompressHonorsTheConfiguredMaximum(t *testing.T) {
+	const limit = uint64(32 << 20)
+	big := bytes.Repeat([]byte{0}, 9<<20) // over the 8 MiB constant
+
+	alg, payload, err := compress(big)
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	if alg != algorithmZstd {
+		t.Fatalf("9 MiB of zeros stored as algorithm %d, want zstd", alg)
+	}
+
+	out, err := decompress(alg, payload, limit)
+	if err != nil {
+		t.Fatalf("decode under the configured 32 MiB maximum: %v", err)
+	}
+	if !bytes.Equal(out, big) {
+		t.Fatal("round trip mismatch")
+	}
+
+	// The cap is still a cap: a frame over the configured maximum is a
+	// bomb, not a chunk.
+	if _, err := decompress(alg, payload, 8<<20); err == nil {
+		t.Fatal("decoding a 9 MiB frame under an 8 MiB cap must fail")
 	}
 }

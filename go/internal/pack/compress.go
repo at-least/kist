@@ -5,8 +5,6 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
-
-	"github.com/at-least/kist/internal/chunker"
 )
 
 // Compression is decided per chunk by compressing it and comparing, not
@@ -25,13 +23,17 @@ var (
 	encoder     *zstd.Encoder
 	encoderErr  error
 
-	decoderOnce sync.Once
-	decoder     *zstd.Decoder
-	decoderErr  error
+	// One decoder per decode cap: the cap is the repository's chunker.max,
+	// a per-repo invariant, so a process touching repositories with
+	// different maxima holds one decoder each. zstd's stateless
+	// EncodeAll/DecodeAll are safe for concurrent use, so they serve the
+	// whole process without further locking.
+	decodersMu sync.Mutex
+	decoders   = map[uint64]*zstd.Decoder{}
 )
 
 // zstd's stateless EncodeAll/DecodeAll are safe for concurrent use, so
-// one encoder and one decoder serve the whole process.
+// one encoder serves the whole process.
 func getEncoder() (*zstd.Encoder, error) {
 	encoderOnce.Do(func() {
 		encoder, encoderErr = zstd.NewWriter(nil,
@@ -48,19 +50,23 @@ func getEncoder() (*zstd.Encoder, error) {
 	return encoder, encoderErr
 }
 
-func getDecoder() (*zstd.Decoder, error) {
-	decoderOnce.Do(func() {
-		decoder, decoderErr = zstd.NewReader(nil,
-			// A chunk is never larger than the chunker's maximum, so a
-			// frame claiming more is a decompression bomb, not a chunk.
-			zstd.WithDecoderMaxMemory(chunker.MaxSize),
-			zstd.WithDecoderConcurrency(1),
-		)
-		if decoderErr != nil {
-			decoderErr = fmt.Errorf("create zstd decoder: %w", decoderErr)
-		}
-	})
-	return decoder, decoderErr
+func getDecoder(limit uint64) (*zstd.Decoder, error) {
+	decodersMu.Lock()
+	defer decodersMu.Unlock()
+	if dec, ok := decoders[limit]; ok {
+		return dec, nil
+	}
+	// A chunk is never larger than the repository's chunker maximum, so a
+	// frame claiming more is a decompression bomb, not a chunk.
+	dec, err := zstd.NewReader(nil,
+		zstd.WithDecoderMaxMemory(limit),
+		zstd.WithDecoderConcurrency(1),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create zstd decoder: %w", err)
+	}
+	decoders[limit] = dec
+	return dec, nil
 }
 
 // compress returns the payload to store and the algorithm byte that
@@ -78,13 +84,15 @@ func compress(plaintext []byte) (byte, []byte, error) {
 	return algorithmRaw, plaintext, nil
 }
 
-// decompress reverses compress.
-func decompress(algorithm byte, payload []byte) ([]byte, error) {
+// decompress reverses compress. limit is the repository's chunker maximum:
+// the decoder refuses any frame that would decode to more, so a corrupted
+// length field cannot ask for unbounded memory.
+func decompress(algorithm byte, payload []byte, limit uint64) ([]byte, error) {
 	switch algorithm {
 	case algorithmRaw:
 		return payload, nil
 	case algorithmZstd:
-		dec, err := getDecoder()
+		dec, err := getDecoder(limit)
 		if err != nil {
 			return nil, err
 		}

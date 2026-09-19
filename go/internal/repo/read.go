@@ -80,8 +80,9 @@ func (c *ChunkSource) reader(ctx context.Context, packID crypto.ID) (*pack.Reade
 	}
 	// Opened outside the lock: a trailer read is a network round trip,
 	// and two files in two packs should not wait on each other. Two
-	// concurrent opens of the same pack are wasteful, not wrong.
-	reader, err := pack.OpenReader(ctx, c.repo.backend, c.repo.keys, packID)
+	// concurrent opens of the same pack are wasteful, not wrong. The
+	// decode cap is the repository's chunker maximum (format.md §6).
+	reader, err := pack.OpenReader(ctx, c.repo.backend, c.repo.keys, packID, uint64(c.repo.config.Chunker.MaxSize))
 	if err != nil {
 		return nil, err
 	}

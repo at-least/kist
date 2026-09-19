@@ -27,10 +27,14 @@ type Reader struct {
 	size    uint64
 	entries []Entry
 	byID    map[crypto.ID]Entry
+	// maxChunk is the repository's chunker maximum: the decode cap for
+	// every chunk in this pack (format.md §6, 解壓上限＝chunker.max).
+	maxChunk uint64
 }
 
-// OpenReader fetches and authenticates a pack's trailer.
-func OpenReader(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.ID) (*Reader, error) {
+// OpenReader fetches and authenticates a pack's trailer. maxChunk is the
+// repository's chunker maximum and bounds chunk decompression.
+func OpenReader(ctx context.Context, b backend.Backend, keys *crypto.Keys, id crypto.ID, maxChunk uint64) (*Reader, error) {
 	info, err := b.Stat(ctx, Key(id))
 	if err != nil {
 		return nil, fmt.Errorf("open pack %s: %w", id, err)
@@ -49,7 +53,7 @@ func OpenReader(ctx context.Context, b backend.Backend, keys *crypto.Keys, id cr
 	for _, e := range entries {
 		byID[e.ID] = e
 	}
-	return &Reader{backend: b, keys: keys, id: id, size: size, entries: entries, byID: byID}, nil
+	return &Reader{backend: b, keys: keys, id: id, size: size, entries: entries, byID: byID, maxChunk: maxChunk}, nil
 }
 
 // ID is the pack's content address.
@@ -106,7 +110,7 @@ func (r *Reader) decodeChunk(entry Entry, sealed []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: chunk %s in pack %s has no encoding byte", ErrCorrupt, id, r.id)
 	}
 
-	plaintext, err := decompress(framed[0], framed[1:])
+	plaintext, err := decompress(framed[0], framed[1:], r.maxChunk)
 	if err != nil {
 		return nil, fmt.Errorf("chunk %s in pack %s: %w", id, r.id, err)
 	}

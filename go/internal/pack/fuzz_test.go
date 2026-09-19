@@ -126,7 +126,7 @@ func FuzzReadTrailer(f *testing.F) {
 			t.Fatalf("entries reach %d, past the %d-byte pack", next, len(data))
 		}
 
-		r, err := OpenReader(ctx, b, keys, id)
+		r, err := OpenReader(ctx, b, keys, id, chunker.MaxSize)
 		if err != nil {
 			return
 		}
@@ -152,7 +152,7 @@ func FuzzDecompress(f *testing.F) {
 	f.Add(byte(1), []byte{0x28, 0xb5, 0x2f, 0xfd})
 	f.Add(byte(7), []byte("unknown"))
 	f.Fuzz(func(t *testing.T, algorithm byte, payload []byte) {
-		out, err := decompress(algorithm, payload)
+		out, err := decompress(algorithm, payload, chunker.MaxSize)
 		if err != nil {
 			return
 		}
