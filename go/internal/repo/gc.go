@@ -316,14 +316,19 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 
 	// Phase 1: mark the dead, unmark the living. Marks whose objects are
 	// gone are dealt with last, after the index has stopped naming the
-	// packs among them. A young object is not marked: it may belong to a
-	// backup in flight whose snapshot is not visible yet, and the commit
-	// gate only re-checks marks the backup could see.
-	opts.progress("marking")
-	// The dead are marked on the first run that sees them; the AGE gate
-	// lives in the sweep (phase 2), not here. A young-but-dead object is
-	// marked now and held there until the grace has passed -- marking
-	// never waits, deletion does.
+	// packs among them.
+	//
+	// Marking never waits: the dead are marked on the first run that
+	// sees them and the AGE gate lives in the sweep (phase 2) -- a
+	// young-but-dead object is marked now and held until the grace has
+	// passed. A mark on a pack an in-flight backup deduplicated against
+	// is young at that backup's commit (BackupTooLong bounds the backup
+	// shorter than the grace), so the gate passes and the next run's
+	// liveness walk unmarks it. NOTE: the Rust side age-gates marking
+	// itself (prune.rs skips objects younger than the grace), so the
+	// two implementations leave different gc/ state behind on the same
+	// repo -- safe in both directions, but a deliberate divergence to
+	// remember when comparing prune runs across implementations.
 	for _, id := range sortedPackInfos(packs) {
 		_, isLive := live[id]
 		_, isMarked := marks[id]
