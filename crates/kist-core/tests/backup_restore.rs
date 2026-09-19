@@ -103,6 +103,64 @@ async fn modified_file_is_picked_up_and_only_it_is_new() {
     assert_same_tree(&src, &restored);
 }
 
+/// FIFO 這類非正規檔案必須跳過並記一筆略過（與 Go 實作同款）；
+/// 不能把 open（FIFO 無寫端會無限阻塞）帶進 backup——那會讓整個備份掛死。
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_in_source_tree_is_skipped_not_read() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"hello").unwrap();
+    let fifo = src.join("pipe");
+    let ok = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo")
+        .success();
+    assert!(ok, "mkfifo failed");
+
+    let repo = t.open().await;
+    let summary = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    assert_eq!(summary.report.errors, 1, "{:?}", summary.report);
+    assert_eq!(summary.stats.files, 1, "{:?}", summary.stats);
+
+    let target = t.dir.path().join("out");
+    repo.restore(&summary.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(std::fs::read(restored.join("f.txt")).unwrap(), b"hello");
+    assert!(!restored.join("pipe").exists(), "FIFO 不該進 snapshot");
+}
+
+/// 檔案 root 明確指到非正規檔：直接失敗並指名原因，不掛死。
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_as_file_root_fails_loudly() {
+    let t = TestRepo::new().await;
+    let fifo = t.dir.path().join("pipe");
+    let ok = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo")
+        .success();
+    assert!(ok, "mkfifo failed");
+
+    let repo = t.open().await;
+    let err = repo
+        .backup(std::slice::from_ref(&fifo), backup_options())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not a regular file"),
+        "錯誤要指名非正規檔：{err}"
+    );
+}
+
 #[tokio::test]
 async fn touching_mtime_without_changing_content_does_not_write_chunks() {
     // parent 快速路徑失效（mtime 變了）也只是重讀檔案，chunk 去重仍然不寫新東西。
