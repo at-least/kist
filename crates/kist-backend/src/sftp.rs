@@ -698,6 +698,10 @@ struct SftpInner {
     keepalive: Keepalive,
     root: String,
     display: String,
+    /// 來源模式：列出**使用者的資料**，不做 dot-skip（repo 命名空間的
+    /// listing 要藏 kist 自己的 `.tmp-<hex>` 暫存檔；來源的使用者檔名
+    /// 不是 kist 的業務——`.bashrc` 是內容，不是雜訊）。
+    list_all: bool,
 }
 
 impl Drop for SftpInner {
@@ -860,6 +864,7 @@ impl SftpStore {
                 cfg.port,
                 root
             ),
+            list_all: false,
         });
         inner.ensure_dir(&root).await?;
         Ok(Self(inner))
@@ -884,7 +889,34 @@ impl SftpStore {
             keepalive: Keepalive::Stdio { _child: child },
             root: String::new(),
             display,
+            list_all: false,
         });
+        Ok(Self(inner))
+    }
+
+    /// 以**來源**身分開 sftp store：listing 不做 dot-skip（見
+    /// [`SftpInner::list_all`]）。連線參數與 [`SftpStore::open`] 相同。
+    pub async fn open_source(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
+        let (keepalive, sftp, fsync) = connect(cfg, auth).await?;
+        let root = format!("/{}", cfg.path.trim_matches('/'));
+        let inner = Arc::new(SftpInner {
+            sftp,
+            fsync,
+            relaxed: false,
+            warned_no_o_excl: AtomicBool::new(false),
+            stderr_tail: None,
+            keepalive,
+            list_all: true,
+            root: root.clone(),
+            display: format!(
+                "sftp://{}@{}:{}/{}",
+                cfg.user.clone().unwrap_or_default(),
+                cfg.host,
+                cfg.port,
+                root
+            ),
+        });
+        inner.ensure_dir(&root).await?;
         Ok(Self(inner))
     }
 }
@@ -916,10 +948,19 @@ fn bytes_of(payload: &PutPayload) -> Vec<u8> {
 /// （packs/、indexes/、snapshots/<client>/…）。
 /// `root` 不帶尾斜線；回傳的 ObjectMeta.location 是**相對於 root** 的 key
 /// （object_store 的語意），不是遠端絕對路徑。
+/// listing 的 dot-skip 只屬於 **repo 命名空間**：kist 自己的 `.tmp-<hex>`
+/// 暫存檔不能進 repo 的物件列表（index 重建／GC 會把它們當真）。來源模式
+/// （`list_all`）列的是**使用者的資料**——`.bashrc` 是內容不是雜訊，本地
+/// 與 s3 來源也都列出 dotfiles。
+fn skip_in_listing(list_all: bool, name: &str) -> bool {
+    !list_all && name.starts_with('.')
+}
+
 async fn walk(
     sftp: &Sftp,
     root: &str,
     dir: &str,
+    list_all: bool,
     out: &mut Vec<ObjectMeta>,
 ) -> std::result::Result<(), StoreError> {
     let mut fs = sftp.fs();
@@ -938,12 +979,12 @@ async fn walk(
     while let Some(entry) = entries.next().await {
         let entry = entry.map_err(generic)?;
         let name = entry.filename().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if skip_in_listing(list_all, &name) {
             continue;
         }
         let full = format!("{dir}/{name}");
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            Box::pin(walk(sftp, root, &full, out)).await?;
+            Box::pin(walk(sftp, root, &full, list_all, out)).await?;
             continue;
         }
         let key = full
@@ -1202,9 +1243,10 @@ impl ObjectStore for SftpStore {
         // rclone 模式的 root 是空字串（served root 即 SFTP 根）；SFTP 路徑要絕對。
         let dir = if dir.is_empty() { "/".to_owned() } else { dir };
         let root = self.0.root.clone();
+        let list_all = self.0.list_all;
         let task = async move {
             let mut out = Vec::new();
-            walk(&sftp, &root, &dir, &mut out).await?;
+            walk(&sftp, &root, &dir, list_all, &mut out).await?;
             Ok::<_, StoreError>(out)
         };
         futures::stream::once(task)
@@ -1248,11 +1290,12 @@ impl ObjectStore for SftpStore {
         };
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
+        let list_all = self.0.list_all;
         let mut entries = std::pin::pin!(d.read_dir());
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(generic)?;
             let name = entry.filename().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+            if skip_in_listing(list_all, &name) {
                 continue;
             }
             let full = format!("{dir}/{name}");
@@ -1356,5 +1399,22 @@ mod tests {
             Err(MetaError::BadName(_)) => {}
             other => panic!("junk name must be BadName, got {other:?}"),
         }
+    }
+
+    /// dot-skip 只屬於 repo 命名空間；來源模式（list_all）列使用者的
+    /// 資料，`.bashrc` 是內容不是雜訊。e2e 行為由 Docker-gated 的 sftp
+    /// 整合測試背書（本機跑不到）；謂詞本身在這裡釘死。
+    #[test]
+    fn dot_skip_belongs_to_the_repo_namespace_only() {
+        assert!(
+            skip_in_listing(false, ".tmp-abc123"),
+            "repo 模式要藏 kist 暫存檔"
+        );
+        assert!(skip_in_listing(false, ".bashrc"), "repo 模式一律 dot-skip");
+        assert!(
+            !skip_in_listing(true, ".bashrc"),
+            "來源模式列使用者的 dotfiles"
+        );
+        assert!(!skip_in_listing(true, "readme.txt"), "一般檔案兩種模式都列");
     }
 }

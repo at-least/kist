@@ -231,7 +231,9 @@ impl ObjectStoreSource {
         let (store, root, locator, meta_kind) = if spec.starts_with("sftp://") {
             let cfg = sftp::parse_sftp_url(spec)
                 .map_err(|e| BackendError::Source(format!("{}: {e}", spec.to_owned())))?;
-            let store = sftp::SftpStore::open(&cfg, &sftp::auth_from_env()).await?;
+            // 來源模式：listing 不做 dot-skip——列的是使用者的資料，
+            // 不是 repo 命名空間（`.bashrc` 是內容，本地/s3 來源也列）。
+            let store = sftp::SftpStore::open_source(&cfg, &sftp::auth_from_env()).await?;
             // SftpStore 內部已把 cfg.root（URL 的 path）當根：key 相對於它。
             // 來源的 root 因此是空（避免雙重前綴；rel 直接是 store key）。
             let root = object_store::path::Path::default();
