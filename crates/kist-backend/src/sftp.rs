@@ -953,6 +953,12 @@ fn bytes_of(payload: &PutPayload) -> Vec<u8> {
 /// （`list_all`）列的是**使用者的資料**——`.bashrc` 是內容不是雜訊，本地
 /// 與 s3 來源也都列出 dotfiles。
 fn skip_in_listing(list_all: bool, name: &str) -> bool {
+    // `.`/`..` 永遠跳：伺服器可以送（filexfer 草稿允許）、
+    // openssh-sftp-client 不過濾——`.` 當目錄會無限遞迴、`..` 會走出
+    // root。（Go 端由 pkg/sftp 客戶端在協議層過濾，見其測試釘。）
+    if name == "." || name == ".." {
+        return true;
+    }
     !list_all && name.starts_with('.')
 }
 
@@ -1416,5 +1422,19 @@ mod tests {
             "來源模式列使用者的 dotfiles"
         );
         assert!(!skip_in_listing(true, "readme.txt"), "一般檔案兩種模式都列");
+    }
+
+    /// `.` 與 `..` **永遠**要跳——任何模式。SFTP 伺服器可以送（filexfer
+    /// 草稿允許），openssh-sftp-client 不過濾：`.` 當目錄會無限遞迴，
+    /// `..` 會走出來源 root。它們不是使用者資料，也不是 repo 物件。
+    #[test]
+    fn self_and_parent_entries_are_always_skipped() {
+        assert!(skip_in_listing(true, "."), "來源模式也要跳 .（無限遞迴）");
+        assert!(
+            skip_in_listing(true, ".."),
+            "來源模式也要跳 ..（走出 root）"
+        );
+        assert!(skip_in_listing(false, "."), "repo 模式當然也跳");
+        assert!(skip_in_listing(false, ".."), "repo 模式當然也跳");
     }
 }
