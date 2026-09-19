@@ -962,6 +962,27 @@ fn skip_in_listing(list_all: bool, name: &str) -> bool {
     !list_all && name.starts_with('.')
 }
 
+/// repo 命名空間的目錄深度上限：kist 自己的物件最深三層
+/// （`snapshots/<client>/<ts>`、`trees/<2hex>/<id>`），16 已是數倍寬裕。
+/// 超過代表 repo 裡有不該在的東西（或敵意伺服器造鏈）：乾淨回錯，不無限
+/// 走下去。來源模式（list_all）不設限——使用者資料可以很深。
+const REPO_MAX_DEPTH: usize = 16;
+
+/// 深度上限只屬於 repo 命名空間；來源模式列使用者資料，深度跟著內容走。
+fn too_deep(list_all: bool, child_depth: usize) -> bool {
+    !list_all && child_depth > REPO_MAX_DEPTH
+}
+
+/// 讀取緩衝的**預配**提示：伺服器宣稱的 size 不可信任（敵意後端可以報
+/// 2^62——`vec![0u8; size]` 會在讀到任何 byte 前走進 handle_alloc_error，
+/// uncatchable abort）。宣稱值只取到提示上限，其餘讓 Vec 邊讀邊長：
+/// 謊報只有在真的送來那些 bytes 時才花記憶體。
+const READ_CAPACITY_HINT: u64 = 1024 * 1024;
+
+fn read_capacity_hint(claimed: u64) -> usize {
+    claimed.min(READ_CAPACITY_HINT) as usize
+}
+
 async fn walk(
     sftp: &Sftp,
     root: &str,
@@ -969,42 +990,61 @@ async fn walk(
     list_all: bool,
     out: &mut Vec<ObjectMeta>,
 ) -> std::result::Result<(), StoreError> {
-    let mut fs = sftp.fs();
-    let d = match fs.open_dir(dir).await {
-        Ok(d) => d,
-        Err(e) => {
-            return if is_not_found(&e) {
-                Ok(()) // 這個 prefix 還沒有任何東西
-            } else {
-                Err(generic(e))
-            };
+    // 迭代 DFS（明確堆疊取代 Box::pin 遞迴）：敵意伺服器可以捏造任意深
+    // 的目錄鏈，遞迴會把原生堆疊吃成 abort。輸出順序＝伺服器 readdir 順
+    // 序（與原遞迴相同、本來就未排序）；Backend::list 的合約是不保證順序。
+    let mut stack: Vec<(String, usize)> = vec![(dir.to_owned(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let mut fs = sftp.fs();
+        let d = match fs.open_dir(&dir).await {
+            Ok(d) => d,
+            Err(e) => {
+                return if is_not_found(&e) {
+                    Ok(()) // 這個 prefix 還沒有任何東西
+                } else {
+                    Err(generic(e))
+                };
+            }
+        };
+        drop(fs);
+        let mut entries = std::pin::pin!(d.read_dir());
+        let mut subdirs: Vec<(String, usize)> = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(generic)?;
+            let name = entry.filename().to_string_lossy().into_owned();
+            if skip_in_listing(list_all, &name) {
+                continue;
+            }
+            let full = format!("{dir}/{name}");
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let child_depth = depth + 1;
+                if too_deep(list_all, child_depth) {
+                    return Err(StoreError::Generic {
+                        store: "sftp",
+                        source: format!(
+                            "directory tree under {root} exceeds the repo namespace depth limit ({REPO_MAX_DEPTH}): {full}"
+                        )
+                        .into(),
+                    });
+                }
+                subdirs.push((full, child_depth));
+                continue;
+            }
+            let key = full
+                .strip_prefix(root)
+                .and_then(|r| r.strip_prefix('/'))
+                .map(|r| r.to_owned())
+                .unwrap_or_else(|| full.clone());
+            match to_meta(&key, &entry.metadata()) {
+                Ok(m) => out.push(m),
+                // 伺服器給了 object_store 命名規則外的名稱：略過該條目，不讓整個 list 失敗
+                Err(MetaError::BadName(_)) => {}
+                // 缺 mtime 是 GC 年齡來源的問題：整個 list 失敗，不默默跳過
+                Err(e) => return Err(generic(e)),
+            }
         }
-    };
-    drop(fs);
-    let mut entries = std::pin::pin!(d.read_dir());
-    while let Some(entry) = entries.next().await {
-        let entry = entry.map_err(generic)?;
-        let name = entry.filename().to_string_lossy().into_owned();
-        if skip_in_listing(list_all, &name) {
-            continue;
-        }
-        let full = format!("{dir}/{name}");
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            Box::pin(walk(sftp, root, &full, list_all, out)).await?;
-            continue;
-        }
-        let key = full
-            .strip_prefix(root)
-            .and_then(|r| r.strip_prefix('/'))
-            .map(|r| r.to_owned())
-            .unwrap_or_else(|| full.clone());
-        match to_meta(&key, &entry.metadata()) {
-            Ok(m) => out.push(m),
-            // 伺服器給了 object_store 命名規則外的名稱：略過該條目，不讓整個 list 失敗
-            Err(MetaError::BadName(_)) => {}
-            // 缺 mtime 是 GC 年齡來源的問題：整個 list 失敗，不默默跳過
-            Err(e) => return Err(generic(e)),
-        }
+        // 反向壓疊：pop 順序＝readdir 順序。
+        stack.extend(subdirs.into_iter().rev());
     }
     Ok(())
 }
@@ -1155,8 +1195,18 @@ impl ObjectStore for SftpStore {
                 .await
                 .map_err(generic)?;
         }
-        let mut buf = vec![0u8; (range.end - range.start) as usize];
-        tf.as_mut().read_exact(&mut buf).await.map_err(generic)?;
+        // 預配只取容量提示；take(長度) 邊讀邊長——謊報大小不預配。
+        let len = (range.end - range.start) as usize;
+        let mut buf = Vec::with_capacity(read_capacity_hint(range.end - range.start));
+        let mut limited = tf.as_mut().take(len as u64);
+        limited.read_to_end(&mut buf).await.map_err(generic)?;
+        if buf.len() != len {
+            return Err(generic(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{full}: server closed after {} of {len} bytes", buf.len()),
+            )));
+        }
+        drop(limited);
         Ok(GetResult {
             payload: GetResultPayload::Stream(
                 futures::stream::once(async move { Ok(Bytes::from(buf)) }).boxed(),
@@ -1185,7 +1235,8 @@ impl ObjectStore for SftpStore {
             .map_err(|e| inner.store_error(location, e))?;
         let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
         use tokio::io::AsyncReadExt as _;
-        let mut buf = Vec::with_capacity(meta.size as usize);
+        // 預配只取容量提示：宣稱 size 不可信任，實際長度邊讀邊長。
+        let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
         tf.as_mut().read_to_end(&mut buf).await.map_err(generic)?;
         // 切片前用**實際讀到的長度**做邊界檢查：index 壞掉或 pack 被截斷時回乾淨的
         // 錯誤，而不是切片 panic。
@@ -1436,5 +1487,34 @@ mod tests {
         );
         assert!(skip_in_listing(false, "."), "repo 模式當然也跳");
         assert!(skip_in_listing(false, ".."), "repo 模式當然也跳");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    /// 容量提示：宣稱大小只取到提示上限，其餘讓 Vec 邊讀邊長——敵意伺服器
+    /// 謊報 size 不能把我們推進 handle_alloc_error（uncatchable abort）。
+    #[test]
+    fn read_capacity_hint_caps_claimed_sizes() {
+        assert_eq!(read_capacity_hint(0), 0);
+        assert_eq!(read_capacity_hint(4096), 4096);
+        assert_eq!(
+            read_capacity_hint(READ_CAPACITY_HINT + 1),
+            READ_CAPACITY_HINT as usize
+        );
+        assert_eq!(read_capacity_hint(1 << 62), READ_CAPACITY_HINT as usize);
+    }
+
+    /// 深度上限只屬於 repo 命名空間；來源模式（list_all）列使用者資料，
+    /// 深度跟著內容走、不設限（迭代走訪不會燒堆疊）。
+    #[test]
+    fn depth_cap_belongs_to_the_repo_namespace_only() {
+        assert!(!too_deep(false, 0));
+        assert!(!too_deep(false, REPO_MAX_DEPTH));
+        assert!(too_deep(false, REPO_MAX_DEPTH + 1));
+        assert!(!too_deep(true, REPO_MAX_DEPTH + 1));
+        assert!(!too_deep(true, 10_000));
     }
 }
