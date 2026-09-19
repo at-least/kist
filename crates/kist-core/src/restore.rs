@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 use kist_format::tree::{content_type, node_type, ChunkList, Entry};
-use kist_format::{cbor, keys, ChunkId, TreeId};
+use kist_format::{cbor, keys, ChunkId};
 
 use crate::fsmeta;
 use crate::index::{ChunkIndex, ChunkLocator};
@@ -77,6 +77,51 @@ impl ReloadableIndex {
 
 const RELOAD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 在 `anchor` 之下建立 `dir`（含缺失的中間目錄），但從 anchor 往下**拒絕
+/// 穿過 symlink**：`create_dir_all` 會跟隨 symlink，snapshot 自己種的 symlink
+/// （另一個 root 的定位恰好穿過它）就能把寫入帶出使用者指名的目標——這是
+/// 檔案路徑既有防護（symlink-in-the-way 拒絕、`replace_with_symlink` 先移除）
+/// 的目錄版。anchor 本身與其之上是使用者自己的路徑，照常跟隨。
+fn create_dir_nofollow(anchor: &Path, dir: &Path) -> Result<()> {
+    let refuse = |cur: &Path, what: &str| {
+        Err(CoreError::Corrupt {
+            key: cur.display().to_string(),
+            reason: format!("{what} is in the way of a restored directory"),
+        })
+    };
+    let rel = dir.strip_prefix(anchor).map_err(|_| CoreError::Corrupt {
+        key: dir.display().to_string(),
+        reason: format!("restore path is not under the target {}", anchor.display()),
+    })?;
+    let mut cur = anchor.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return refuse(&cur, "a symlink"),
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return refuse(&cur, "a non-directory"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&cur) {
+                    Ok(()) => {}
+                    // 同一路徑可能在另一個 root 已經建好：只要它是真目錄就放行。
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        match std::fs::symlink_metadata(&cur) {
+                            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+                            Ok(m) if m.file_type().is_symlink() => {
+                                return refuse(&cur, "a symlink");
+                            }
+                            _ => return refuse(&cur, "a non-directory"),
+                        }
+                    }
+                    Err(e) => return Err(CoreError::io(&cur, e)),
+                }
+            }
+            Err(e) => return Err(CoreError::io(&cur, e)),
+        }
+    }
+    Ok(())
+}
+
 /// restore 的結果：單一檔案失敗不會中止整個 restore，而是記在 `errors` 裡。
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RestoreSummary {
@@ -98,7 +143,11 @@ fn apply_meta(path: &Path, node: &Entry, is_symlink: bool) -> Result<()> {
 }
 
 impl Repository {
-    /// 還原到 `target`。目標目錄最好是空的：既有檔案會被覆寫、既有 symlink 會被跟隨。
+    /// 還原到 `target`。目標目錄最好是空的：既有檔案會被覆寫。目標**之下**
+    /// 的路徑不穿過 symlink——不論是既有的還是 snapshot 自己種的（另一個
+    /// root 的定位穿過它）；目錄路徑遇到 symlink 回錯，與檔案路徑的
+    /// symlink-in-the-way 防護一致。`target` 本身與其之上是使用者自己的
+    /// 路徑，照常跟隨。
     pub async fn restore(
         &self,
         snapshot_key: &str,
@@ -130,12 +179,12 @@ impl Repository {
             } else {
                 target.join(&rel)
             };
-            std::fs::create_dir_all(&base).map_err(|e| CoreError::io(&base, e))?;
+            create_dir_nofollow(target, &base)?;
             for entry in entries {
                 // v3：節點名一律是單一路徑元件（合成根已淘汰）。
                 fsmeta::validate_child_name(&entry.name)?;
                 let path = base.join(fsmeta::bytes_to_name(&entry.name)?);
-                self.restore_node(&entry, &path, &index, &mut summary, &mut hardlinks)
+                self.restore_node(&entry, &path, target, &index, &mut summary, &mut hardlinks)
                     .await;
             }
         }
@@ -147,6 +196,7 @@ impl Repository {
         &'a self,
         node: &'a Entry,
         path: &'a Path,
+        target: &'a Path,
         index: &'a ReloadableIndex,
         summary: &'a mut RestoreSummary,
         hardlinks: &'a mut std::collections::HashMap<(u64, u64), PathBuf>,
@@ -154,7 +204,7 @@ impl Repository {
         Box::pin(async move {
             let result = match node.kind {
                 node_type::DIR if !node.subtree.is_zero() => {
-                    self.restore_dir(&node.subtree, node, path, index, summary, hardlinks)
+                    self.restore_dir(node, path, target, index, summary, hardlinks)
                         .await
                 }
                 node_type::FILE => {
@@ -229,22 +279,22 @@ impl Repository {
 
     async fn restore_dir(
         &self,
-        subtree: &TreeId,
         node: &Entry,
         path: &Path,
+        target: &Path,
         index: &ReloadableIndex,
         summary: &mut RestoreSummary,
         hardlinks: &mut std::collections::HashMap<(u64, u64), PathBuf>,
     ) -> Result<()> {
-        std::fs::create_dir_all(path).map_err(|e| CoreError::io(path, e))?;
-        let children = self.read_tree_chain(subtree).await?;
+        create_dir_nofollow(target, path)?;
+        let children = self.read_tree_chain(&node.subtree).await?;
         for child in children {
             if let Err(e) = fsmeta::validate_child_name(&child.name) {
                 summary.errors.push(format!("{}: {e}", path.display()));
                 continue;
             }
             let child_path = path.join(fsmeta::bytes_to_name(&child.name)?);
-            self.restore_node(&child, &child_path, index, summary, hardlinks)
+            self.restore_node(&child, &child_path, target, index, summary, hardlinks)
                 .await;
         }
         summary.dirs += 1;
