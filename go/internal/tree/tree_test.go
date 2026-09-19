@@ -549,3 +549,20 @@ func TestWriteHeadUsesTheShortestForm(t *testing.T) {
 		}
 	}
 }
+
+// format.md §4: duplicate map keys are rejected on decode. The outer
+// decoder's DupMapKey rule cannot see inside the RawMessage the xattrs
+// map travels as, so the hand parser rejects them itself -- a forged or
+// corrupt tree with two readings of one xattr key must not decode.
+func TestXattrsRejectDuplicateKeys(t *testing.T) {
+	// map(2){ "a": "1", "a": "2" } -- canonical heads, duplicate key.
+	raw := []byte{
+		0xa2,
+		0x41, 'a', 0x41, '1',
+		0x41, 'a', 0x41, '2',
+	}
+	var x Xattrs
+	if err := x.UnmarshalCBOR(raw); err == nil {
+		t.Fatal("duplicate xattr key decoded without error")
+	}
+}

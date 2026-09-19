@@ -238,6 +238,14 @@ func (x *Xattrs) UnmarshalCBOR(data []byte) error {
 		if err != nil {
 			return err
 		}
+		// format.md §4: duplicate map keys are a decode rejection. The
+		// outer decoder's DupMapKey rule cannot see inside this
+		// RawMessage, so the hand parser rejects them itself.
+		if pos := slices.IndexFunc(out, func(e Xattr) bool {
+			return bytes.Equal(e.Name, name)
+		}); pos >= 0 {
+			return fmt.Errorf("%w: duplicate xattr key %q", ErrCorrupt, name)
+		}
 		out = append(out, Xattr{Name: name, Value: value})
 	}
 	if pos != len(data) {
