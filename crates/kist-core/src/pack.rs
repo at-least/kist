@@ -278,6 +278,16 @@ pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
         }
         next = end;
     }
+    if next != data_end as u64 {
+        // 規格 §7：entries 連續排列且**完整覆蓋**資料區——夾縫位元組是
+        // 有 bug 的 client 或損壞的表，不是可略的填充（Go 端同一檢查）。
+        return Err(CoreError::Corrupt {
+            key: "<pack trailer>".to_owned(),
+            reason: format!(
+                "entries cover {next} bytes but the pack holds {data_end} of chunk data"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -403,5 +413,30 @@ mod tests {
             decompress_chunk(&exact, 4 * 1024 * 1024 - 1).is_err(),
             "上限差 1 必須被拒"
         );
+    }
+
+    /// 規格 §7：entries 必須完整覆蓋資料區——最後一個 entry 之後到
+    /// trailer 之間不該有縫隙。只檢邊界不檢覆蓾會放行「有夾縫的 pack」。
+    #[test]
+    fn trailer_must_fully_cover_the_data_region() {
+        let keys = test_keys();
+        let id = keys.chunk_id(b"payload");
+        let trailer = PackTrailer {
+            version: kist_format::FORMAT_VERSION,
+            entries: vec![PackEntry {
+                id,
+                offset: pack::HEADER_LEN as u64,
+                length: 128,
+                raw_len: 100,
+            }],
+        };
+        // 資料區比 entry 多出 64 bytes 的縫隙：必須拒絕。
+        let err = validate_trailer(&trailer, pack::HEADER_LEN + 128 + 64).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Corrupt { .. }),
+            "縫隙要回 Corrupt：{err:?}"
+        );
+        // 恰好覆蓋：放行。
+        validate_trailer(&trailer, pack::HEADER_LEN + 128).unwrap();
     }
 }
