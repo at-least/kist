@@ -1380,6 +1380,9 @@ impl Backup {
                 .await?
                 .ok_or_else(|| CoreError::Join("chunk list read failed".into()))?;
             self.report.chunks_new += list_result.chunks_new;
+            // 清單 chunk 也是這次新存的 bytes（對帳：trailer entry 總和
+            // == bytes_stored）。
+            self.report.bytes_stored += list_result.bytes_new;
             (size, list_result.chunks, content_type::INDIRECT)
         };
         if let Some(key) = hl_key {
