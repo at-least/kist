@@ -790,11 +790,17 @@ impl PrunePlan {
                     let _ = repo.backend().delete(&key).await;
                     continue;
                 };
-                if repo.backend().head(&keys::tree(&tree_id)).await.is_err() {
-                    match repo.backend().delete(&key).await {
+                // 樹不在了才清 touch；head 的**其他**錯誤（暫時性網路）不得
+                // 當成「樹不在」——誤刪活著的復活訊號，下一輪 prune 會把
+                // 進行中 backup 重用中的樹當死的刪掉（同函式刪除迴圈對
+                // 錯誤種類的分法）。
+                match repo.backend().head(&keys::tree(&tree_id)).await {
+                    Err(BackendError::NotFound(_)) => match repo.backend().delete(&key).await {
                         Ok(()) | Err(BackendError::NotFound(_)) => {}
                         Err(e) => return Err(e.into()),
-                    }
+                    },
+                    Err(e) => return Err(e.into()),
+                    Ok(_) => {}
                 }
             }
         }

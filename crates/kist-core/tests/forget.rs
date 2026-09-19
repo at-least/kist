@@ -254,3 +254,41 @@ async fn forget_explicit_snapshots_and_refuses_empty_request() {
         .unwrap_err();
     assert!(matches!(err, CoreError::SnapshotNotFound(_)), "{err}");
 }
+
+/// 副本刪除失敗（非 NotFound）必須擋下主體的刪除：主體刪了、副本留著，
+/// 是 prune 不清、check 當「主體意外遺失」災難訊號回報的孤兒。以「把
+/// `.r1` 換成目錄」製造可重現的非 NotFound 刪除錯誤（本地後端對目錄
+/// remove_file 回 EISDIR）。
+#[cfg(unix)]
+#[tokio::test]
+async fn replica_delete_failure_blocks_the_primary_delete() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    // 手工補一份 .r1（測試的 init_options 是 replicas=0）。
+    let replica = format!("{}{}", s.snapshot_key, kist_format::keys::REPLICA_SUFFIX);
+    let primary = t.repo_path().join(&s.snapshot_key);
+    let replica_path = t.repo_path().join(&replica);
+    std::fs::copy(&primary, &replica_path).unwrap();
+    // 把副本換成目錄：刪除回 EISDIR（非 NotFound），主體仍是可刪的檔案。
+    std::fs::remove_file(&replica_path).unwrap();
+    std::fs::create_dir(&replica_path).unwrap();
+
+    let r = repo
+        .forget(ForgetOptions {
+            snapshots: vec![s.snapshot_key.clone()],
+            policy: Default::default(),
+            dry_run: false,
+        })
+        .await;
+    assert!(r.is_err(), "副本刪不掉時 forget 必須回錯，不是默默刪主體");
+    assert!(
+        primary.exists(),
+        "主體必須原封不動——刪掉它會留下 check 當災難訊號回報的孤兒副本"
+    );
+}
