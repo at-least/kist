@@ -71,6 +71,25 @@ type SFTP struct {
 // SFTP implements Backend.
 var _ Backend = (*SFTP)(nil)
 
+// ErrNoMtime means the server sent no modification time. Modified is
+// the age source of the whole GC mark protocol (prune's rewrite
+// protection and the touch-revival checks compare against it), and
+// pkg/sftp maps an omitted ACMODTIME to the Unix epoch -- "infinitely
+// old", the data-loss direction of every one of those comparisons. The
+// Rust side rejects the same case; it can tell an omitted attribute
+// from an explicit zero and respects the latter, but the value-typed
+// Mtime here cannot, so epoch is refused outright.
+var ErrNoMtime = errors.New("the server sent no modification time")
+
+// modifiedAt is the classification both List and Stat feed through: a
+// whole-second mtime, or ErrNoMtime when the server omitted it.
+func modifiedAt(key string, mt time.Time) (time.Time, error) {
+	if mt.IsZero() || mt.Unix() == 0 {
+		return time.Time{}, fmt.Errorf("stat %s: %w", key, ErrNoMtime)
+	}
+	return mt.Truncate(time.Second), nil
+}
+
 // ParseSFTPLocation parses sftp://[user@]host[:port]/path. The path is
 // absolute; write sftp://host/~/path for one relative to the session's
 // starting directory.
@@ -560,7 +579,11 @@ func (s *SFTP) walk(ctx context.Context, dir, prefix string, fn func(FileInfo) e
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if err := fn(FileInfo{Key: key, Size: e.Size(), Modified: e.ModTime().Truncate(time.Second)}); err != nil {
+		modified, err := modifiedAt(key, e.ModTime())
+		if err != nil {
+			return err
+		}
+		if err := fn(FileInfo{Key: key, Size: e.Size(), Modified: modified}); err != nil {
 			return err
 		}
 	}
@@ -582,7 +605,11 @@ func (s *SFTP) Stat(_ context.Context, key string) (FileInfo, error) {
 	}
 	// Modified 是 GC 標記協議的年齡來源（prune 的重寫保護、touch 復活
 	// 檢查都拿它跟標記時間比）——漏了會餵零值時間進那些比較。
-	return FileInfo{Key: key, Size: info.Size(), Modified: info.ModTime().Truncate(time.Second)}, nil
+	modified, err := modifiedAt(key, info.ModTime())
+	if err != nil {
+		return FileInfo{}, err
+	}
+	return FileInfo{Key: key, Size: info.Size(), Modified: modified}, nil
 }
 
 // Delete removes an object, treating an absent object as already deleted.

@@ -405,10 +405,14 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   （略過一個 gc/ 標記比 sentinel 更糟）；名稱檢查先於 mtime（爛名稱
   絕不讓 list 失敗）。單元測試 RED→GREEN 釘死兩種分類；真伺服器
   整合（SFTP 容器 4 案＋rclone 橋接 4 案）與 fmt/clippy/
-  `test --workspace`（59 執行檔）全綠。**對等隱患待辦（Go）**：
-  `pkg/sftp`（第三方程式庫）在 List/Stat 對缺送的 ACMODTIME 同樣
-  映成零值——kist-go 端若要徹底，得在 backend 層偵測並拒絕，屆時
-  與上游回報一併考慮。同族兩筆記錄（皆正確行為、非 bug，防再犯）：
+  `test --workspace`（59 執行檔）全綠。**對等隱患（Go）2026-09-19 已修**：
+  `pkg/sftp` 在 List/Stat 對缺送的 ACMODTIME 映成 `time.Unix(0,0)`
+  ——`go/internal/backend/sftp.go` 的 `modifiedAt` 分類器（List 與
+  Stat 都走它）對零值／epoch 回 `ErrNoMtime` 大聲失敗，名稱檢查先於
+  mtime 的順序與 Rust 相同。**刻意偏差**：`pkg/sftp` 的 `Mtime` 是值
+  型別，無法分辨「缺送」與「明送 0」（Rust 能分辨且尊重後者），Go 端
+  對 epoch 一律拒絕——保守側；真有 1970-01-01 整點的檔案會得到明確
+  錯誤，而不是悄悄餵「無限老」進 GC。同族兩筆記錄（皆正確行為、非 bug，防再犯）：
   ① 伺服器**明送** mtime=0 時 `to_meta` 仍會得到 epoch——協議上
   伺服器斷言了時間，尊重它，但這是「無限老」進 GC 的最後一條路；
   ② `size` 缺送仍代換 0（不在 GC 時間軸上，無嚴重度，但與剛移除

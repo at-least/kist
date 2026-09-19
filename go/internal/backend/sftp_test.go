@@ -435,3 +435,26 @@ func TestSFTPRemoveBlacklistLeavesSpoolFilesBehind(t *testing.T) {
 	}
 	t.Logf("put-if-absent succeeded and left %d spool file(s) behind: %v", len(stray), stray)
 }
+
+// The GC protocol feeds Modified into every age comparison; a server
+// that omits ACMODTIME (pkg/sftp maps it to the Unix epoch) must fail
+// loudly instead of reading as "infinitely old" -- the data-loss
+// direction. The Rust side rejects the same case with NoMtime; it can
+// tell absent from an explicit zero and respects the latter, but the
+// third-party library here cannot, so epoch is refused outright.
+func TestSFTPMissingMtimeIsRefused(t *testing.T) {
+	if _, err := modifiedAt("packs/x", time.Unix(0, 0)); !errors.Is(err, ErrNoMtime) {
+		t.Fatalf("epoch mtime: err = %v, want ErrNoMtime", err)
+	}
+	if _, err := modifiedAt("packs/x", time.Time{}); !errors.Is(err, ErrNoMtime) {
+		t.Fatalf("zero time: err = %v, want ErrNoMtime", err)
+	}
+	at := time.Unix(1_750_000_123, 456_000_000)
+	got, err := modifiedAt("packs/x", at)
+	if err != nil {
+		t.Fatalf("real mtime: %v", err)
+	}
+	if want := at.Truncate(time.Second); !got.Equal(want) {
+		t.Fatalf("mtime = %v, want %v", got, want)
+	}
+}
