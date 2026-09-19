@@ -790,11 +790,17 @@ impl PrunePlan {
                     let _ = repo.backend().delete(&key).await;
                     continue;
                 };
-                if repo.backend().head(&keys::tree(&tree_id)).await.is_err() {
-                    match repo.backend().delete(&key).await {
+                // 樹不在了才清 touch；head 的**其他**錯誤（暫時性網路）不得
+                // 當成「樹不在」——誤刪活著的復活訊號，下一輪 prune 會把
+                // 進行中 backup 重用中的樹當死的刪掉（同函式刪除迴圈對
+                // 錯誤種類的分法）。
+                match repo.backend().head(&keys::tree(&tree_id)).await {
+                    Err(BackendError::NotFound(_)) => match repo.backend().delete(&key).await {
                         Ok(()) | Err(BackendError::NotFound(_)) => {}
                         Err(e) => return Err(e.into()),
-                    }
+                    },
+                    Err(e) => return Err(e.into()),
+                    Ok(_) => {}
                 }
             }
         }
@@ -818,6 +824,7 @@ impl Repository {
             return Ok((Vec::new(), 0, Vec::new()));
         }
         let keys_ = Arc::clone(self.keys());
+        let max_chunk = u64::from(self.config().chunker.max);
         let mut writer = Some(PackWriter::new(
             Arc::clone(self.keys()),
             pack_target_size,
@@ -866,7 +873,8 @@ impl Repository {
                         key: key.clone(),
                         reason: format!("chunk {} points outside the pack", e.id),
                     });
-                    let plain = slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.raw_len));
+                    let plain =
+                        slice.and_then(|s| decode_chunk(&keys2, &e.id, s, e.raw_len, max_chunk));
                     match plain {
                         Ok(p) => plains.push((e.id, p)),
                         Err(err) => return Ok((w, Vec::new(), 0, Some(err))),

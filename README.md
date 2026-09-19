@@ -244,9 +244,9 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
 Go 端（`go/`）的關卡是 `cd go && make verify`（build / vet / lint / test / -race）；
-`ci.yml` 在每次 push 與 PR 上自動跑這些。跨語言 interop（conformance 向量與
-兩份 `format.md` 逐 byte 一致）在 `ci-rust.yml` 有對應 job，但同樣只手動觸發；
-本機快速 gate：`cd go && go test ./internal/interop/...`。
+兩個 workflow（`ci.yml`、`ci-rust.yml`）都只手動觸發（私有 repo 的 Actions 額度
+留給真正需要的時候），本機 gate 是平時的準則。跨語言 interop（conformance 向量
+與兩份 `format.md` 逐 byte 一致）本機快速 gate：`cd go && go test ./internal/interop/...`。
 
 ## Workspace 結構
 

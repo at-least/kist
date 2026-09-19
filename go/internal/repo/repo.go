@@ -320,6 +320,23 @@ func (r *Repository) refreshIndex(ctx context.Context, warn func(string, ...any)
 	return nil
 }
 
+// refreshIndexRanked is refreshIndex with a gc-mark rank (see
+// index.AddPackRanked): backup's deduplication view resolves to
+// unmarked copies first, so it does not re-upload data whose live copy
+// it could reuse -- and prune, deleting a marked duplicate, does not
+// pull data out from under the next backup.
+func (r *Repository) refreshIndexRanked(ctx context.Context, warn func(string, ...any), marked func(crypto.ID) bool) error {
+	ix, skipped, err := index.LoadAllRanked(ctx, r.indexSource, r.keys, marked)
+	if err != nil {
+		return err
+	}
+	for _, s := range skipped {
+		warn("%v; run `kist-go rebuild-index` to repair the index", s)
+	}
+	r.index = ix
+	return nil
+}
+
 // Backend returns the storage this repository sits on.
 func (r *Repository) Backend() backend.Backend { return r.backend }
 

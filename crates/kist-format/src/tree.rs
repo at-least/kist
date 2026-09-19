@@ -245,6 +245,17 @@ impl Entry {
         if !matches!(self.content, content_type::DIRECT | content_type::INDIRECT) {
             return bad(format!("unknown content type {}", self.content));
         }
+        // 直接內容的 inline chunk 數上限（§8：超過就必須轉間接）。
+        // 寫入端在 backup 決定；讀取端同樣拒絕——超標的直接 entry 不是
+        // 任何正確 writer 會產出的形狀（Go 端 Validate 同一檢查）。
+        if self.content == content_type::DIRECT && self.chunks.len() > MAX_INLINE_CHUNKS {
+            return bad(format!(
+                "file {:?} has {} inline chunks, over the {} limit (must be indirect)",
+                self.name,
+                self.chunks.len(),
+                MAX_INLINE_CHUNKS
+            ));
+        }
         if self.kind != node_type::FILE && !self.chunks.is_empty() {
             return bad("chunks only on file entries".to_owned());
         }
@@ -471,6 +482,25 @@ mod tests {
         let z = posix_file(b"z");
         let y = posix_file(b"y");
         assert!(Tree::new(vec![z, y], None).validate().is_err(), "未排序");
+    }
+
+    /// §8：直接內容的 inline chunk 數 ≤ 256，超過必須轉間接。寫入端在
+    /// backup 決定；讀取端同樣拒絕——超標的直接 entry 不是任何正確
+    /// writer 會產出的形狀。
+    #[test]
+    fn direct_content_over_the_inline_limit_is_rejected() {
+        let mut e = posix_file(b"big");
+        e.chunks = vec![ChunkId::ZERO; MAX_INLINE_CHUNKS + 1];
+        assert!(e.validate().is_err(), "超標的直接 entry 必須被拒");
+        e.chunks.truncate(MAX_INLINE_CHUNKS);
+        assert!(e.validate().is_ok(), "恰好在上限內的直接 entry 合法");
+        // 間接內容的 chunks 指向清單 chunk，不受這條限制。
+        e.content = content_type::INDIRECT;
+        e.chunks = vec![ChunkId::ZERO; MAX_INLINE_CHUNKS + 1];
+        assert!(
+            e.validate().is_ok(),
+            "間接 entry 的清單 chunk 數不是 inline 數"
+        );
     }
 }
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -195,7 +196,16 @@ func (r *Runner) backup(ctx context.Context, b *config.Backup) error {
 			return err
 		}
 		defer r.closeRepo(rp)
-		summary, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Parity: r.Config.Repository.Parity, Warnf: warn})
+		// The backup's commit gate must assume the grace prune actually
+		// uses (BackupOptions.GCGrace's own contract): a config that
+		// shortens [prune] grace shortens the gate with it, or a backup
+		// running past the real grace commits against packs prune may
+		// already have swept. Zero (no [prune] section) keeps the default.
+		var grace time.Duration
+		if r.Config.Prune != nil {
+			grace = r.Config.Prune.Grace
+		}
+		summary, err := rp.Backup(ctx, b.Paths, repo.BackupOptions{Host: b.Host, SpoolDir: b.SpoolDir, Parity: r.Config.Repository.Parity, GCGrace: grace, Warnf: warn})
 		if err != nil {
 			return err
 		}
@@ -317,12 +327,22 @@ func (r *Runner) post(ctx context.Context, ev report.Event) error {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// *url.Error embeds the full URL, and webhook URLs routinely
+		// carry tokens or basic-auth userinfo; this error reaches the
+		// logs, so report only the cause (the Rust notifier does the
+		// same).
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			// 只報底因：url.Error 的訊息含完整 URL（含 userinfo）；
+			// 底因（連線錯誤）不含憑證。
+			return ue.Err
+		}
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) //nolint:errcheck // draining a response body whose content is irrelevant
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("%s returned %s", r.Config.Webhook.URL, resp.Status)
+		return fmt.Errorf("webhook returned %s", resp.Status)
 	}
 	return nil
 }

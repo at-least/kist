@@ -173,19 +173,21 @@ impl Metrics {
         };
         match o.job {
             crate::jobs::JobKind::Backup => {
+                // BackupSummary 的形狀（jobs.rs 以 serde_json::to_value 放進
+                // detail）：stats 只有資料事實，過程計數在 report 之下。
                 if let Some(n) = get(&["stats", "files"]) {
                     self.backup_files.set(n);
                 }
                 if let Some(n) = get(&["stats", "bytes"]) {
                     self.backup_bytes.set(n);
                 }
-                if let Some(n) = get(&["stats", "bytes_stored"]) {
+                if let Some(n) = get(&["report", "bytes_stored"]) {
                     self.backup_bytes_new.set(n);
                 }
-                if let Some(n) = get(&["stats", "chunks_new"]) {
+                if let Some(n) = get(&["report", "chunks_new"]) {
                     self.backup_chunks_new.set(n);
                 }
-                if let Some(n) = get(&["stats", "errors"]) {
+                if let Some(n) = get(&["report", "errors"]) {
                     self.backup_errors.set(n);
                 }
             }

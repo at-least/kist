@@ -71,6 +71,25 @@ type SFTP struct {
 // SFTP implements Backend.
 var _ Backend = (*SFTP)(nil)
 
+// ErrNoMtime means the server sent no modification time. Modified is
+// the age source of the whole GC mark protocol (prune's rewrite
+// protection and the touch-revival checks compare against it), and
+// pkg/sftp maps an omitted ACMODTIME to the Unix epoch -- "infinitely
+// old", the data-loss direction of every one of those comparisons. The
+// Rust side rejects the same case; it can tell an omitted attribute
+// from an explicit zero and respects the latter, but the value-typed
+// Mtime here cannot, so epoch is refused outright.
+var ErrNoMtime = errors.New("the server sent no modification time")
+
+// modifiedAt is the classification both List and Stat feed through: a
+// whole-second mtime, or ErrNoMtime when the server omitted it.
+func modifiedAt(key string, mt time.Time) (time.Time, error) {
+	if mt.IsZero() || mt.Unix() == 0 {
+		return time.Time{}, fmt.Errorf("stat %s: %w", key, ErrNoMtime)
+	}
+	return mt.Truncate(time.Second), nil
+}
+
 // ParseSFTPLocation parses sftp://[user@]host[:port]/path. The path is
 // absolute; write sftp://host/~/path for one relative to the session's
 // starting directory.
@@ -524,13 +543,24 @@ func (s *SFTP) List(ctx context.Context, prefix string, fn func(FileInfo) error)
 	}
 	base, _ := path.Split(prefix)
 	root := path.Join(s.root, base)
-	if err := s.walk(ctx, root, prefix, fn); err != nil {
+	if err := s.walk(ctx, root, prefix, 0, fn); err != nil {
 		return fmt.Errorf("list %q in %s: %w", prefix, s.location, err)
 	}
 	return nil
 }
 
-func (s *SFTP) walk(ctx context.Context, dir, prefix string, fn func(FileInfo) error) error {
+// maxWalkDepth bounds the repo namespace: kist's own objects sit at
+// most three levels deep (snapshots/<client>/<ts>, trees/<2hex>/<id>),
+// so 16 is several times that. Deeper chains are not a kist layout --
+// or a hostile server fabricating one -- and fail the listing cleanly
+// instead of recursing without bound. The Rust peer enforces the same
+// cap.
+const maxWalkDepth = 16
+
+func (s *SFTP) walk(ctx context.Context, dir, prefix string, depth int, fn func(FileInfo) error) error {
+	if depth > maxWalkDepth {
+		return fmt.Errorf("directory tree exceeds the repo namespace depth limit (%d): %s", maxWalkDepth, dir)
+	}
 	entries, err := s.client.ReadDirContext(ctx, dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -548,7 +578,7 @@ func (s *SFTP) walk(ctx context.Context, dir, prefix string, fn func(FileInfo) e
 		}
 		full := path.Join(dir, name)
 		if e.IsDir() {
-			if err := s.walk(ctx, full, prefix, fn); err != nil {
+			if err := s.walk(ctx, full, prefix, depth+1, fn); err != nil {
 				return err
 			}
 			continue
@@ -560,7 +590,11 @@ func (s *SFTP) walk(ctx context.Context, dir, prefix string, fn func(FileInfo) e
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if err := fn(FileInfo{Key: key, Size: e.Size(), Modified: e.ModTime().Truncate(time.Second)}); err != nil {
+		modified, err := modifiedAt(key, e.ModTime())
+		if err != nil {
+			return err
+		}
+		if err := fn(FileInfo{Key: key, Size: e.Size(), Modified: modified}); err != nil {
 			return err
 		}
 	}
@@ -580,7 +614,13 @@ func (s *SFTP) Stat(_ context.Context, key string) (FileInfo, error) {
 	if info.IsDir() {
 		return FileInfo{}, fmt.Errorf("stat %s: %w", key, ErrNotFound)
 	}
-	return FileInfo{Key: key, Size: info.Size()}, nil
+	// Modified 是 GC 標記協議的年齡來源（prune 的重寫保護、touch 復活
+	// 檢查都拿它跟標記時間比）——漏了會餵零值時間進那些比較。
+	modified, err := modifiedAt(key, info.ModTime())
+	if err != nil {
+		return FileInfo{}, err
+	}
+	return FileInfo{Key: key, Size: info.Size(), Modified: modified}, nil
 }
 
 // Delete removes an object, treating an absent object as already deleted.

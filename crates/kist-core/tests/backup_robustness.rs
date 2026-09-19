@@ -284,3 +284,34 @@ fn fast_path_compares_size_even_without_ctime() {
         "size 變了不能沿用"
     );
 }
+
+/// report.bytes_stored 必須涵蓋**全部**新寫的 chunk——間接內容的清單
+/// chunk 也是這次存的 bytes。對帳基準：fresh repo 的第一個 backup，
+/// 所有 pack trailer 的 entry 長度總和 == bytes_stored（無去重、無殘留）。
+#[tokio::test]
+async fn bytes_stored_counts_the_indirect_chunk_list_too() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // >256 chunks（avg 16 KiB）：清單必須走間接。
+    std::fs::write(src.join("big.bin"), random_bytes(77, 10 * 1024 * 1024)).unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let keys = repo.keys().clone();
+    // bytes_stored 的語義是**明文** bytes 新存（chunk.len() 的累加），
+    // 對帳基準用 trailer 的 raw_len。
+    let mut trailer_raw = 0u64;
+    for pack in walk_files(&t.repo_path().join("packs")) {
+        let bytes = std::fs::read(&pack).unwrap();
+        let trailer = kist_core::pack::read_trailer(&keys, &bytes).unwrap();
+        trailer_raw += trailer.entries.iter().map(|e| e.raw_len).sum::<u64>();
+    }
+    assert_eq!(
+        s.report.bytes_stored, trailer_raw,
+        "bytes_stored 要等於 pack 裡實存 chunk 的明文 bytes（含間接清單 chunk）"
+    );
+}

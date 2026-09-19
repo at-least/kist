@@ -1892,6 +1892,7 @@ dependencies = [
  "kist-chunker",
  "kist-crypto",
  "kist-format",
+ "libc",
  "proptest",
  "rand 0.10.2",
  "serde",

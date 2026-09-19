@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -223,5 +224,121 @@ func TestServeExposesMetrics(t *testing.T) {
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Errorf("Serve returned %v", err)
+	}
+}
+
+// A [prune] grace shorter than the default must reach the backup's
+// commit gate: GCGrace's own contract says it must match what prune
+// uses, and the runner is the one mode where backup and prune share a
+// config. With a millisecond grace the gate refuses immediately (the
+// safe side) instead of committing under a 72h assumption the pruner on
+// the same config does not share.
+func TestRunnerForwardsPruneGraceToTheBackupGate(t *testing.T) {
+	ctx := context.Background()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	b, err := backend.CreateLocal(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	password := []byte("run-test")
+	stateDir, cacheDir := t.TempDir(), t.TempDir()
+	init, err := repo.Init(ctx, b, repo.Options{Password: password, StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse(`
+[repository]
+location = "` + repoDir + `"
+state_dir = "` + stateDir + `"
+cache_dir = "` + cacheDir + `"
+
+[[backup]]
+name = "docs"
+paths = ["` + source + `"]
+schedule = "@daily"
+
+[prune]
+schedule = "@daily"
+grace = "1us"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events []report.Event
+	r := &Runner{
+		Config:   cfg,
+		Password: password,
+		Logf:     func(string, ...any) {},
+		OpenBackend: func(_ context.Context, location string) (backend.Backend, error) {
+			return backend.OpenLocal(location)
+		},
+		Events: func(ev report.Event) { events = append(events, ev) },
+	}
+	if err := r.Once(ctx); err == nil || !strings.Contains(err.Error(), "docs") {
+		t.Fatalf("Once: err = %v, want the docs job reported failed", err)
+	}
+	if len(events) == 0 || events[0].OK || !strings.Contains(events[0].Error, "longer than the gc grace") {
+		t.Fatalf("backup event: %+v, want it refused for outliving the configured 1us grace", events)
+	}
+}
+
+// A webhook error must not carry the URL into the logs: webhook URLs
+// routinely embed tokens or basic-auth userinfo, and warnings persist.
+func TestWebhookErrorOmitsTheURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	// credentials in the userinfo of an otherwise valid http URL.
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword("ops", "hunter2")
+	cfg, err := config.Parse("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl='" + u.String() + "'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	r := &Runner{Config: cfg, Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	ev := report.Event{Kind: "backup", Job: "j", Started: time.Now()}
+	if err := r.finish(context.Background(), &ev, nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	for _, l := range logs {
+		if strings.Contains(l, "ops:hunter2") || strings.Contains(l, u.Host) {
+			t.Errorf("log leaks the webhook URL: %q", l)
+		}
+	}
+
+	// 傳輸失敗（連不上）走 *url.Error 的拆除路徑：底因進 log，URL 不進。
+	dead, err := url.Parse("http://ops:hunter2@127.0.0.1:1/nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg2, err := config.Parse("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl='" + dead.String() + "'\ntimeout='200ms'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs = nil
+	r2 := &Runner{Config: cfg2, Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	ev2 := report.Event{Kind: "backup", Job: "j", Started: time.Now()}
+	if err := r2.finish(context.Background(), &ev2, nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	for _, l := range logs {
+		// 憑證（userinfo）絕不進 log；撥號位址與設定檔同級，不是秘密。
+		if strings.Contains(l, "ops:hunter2") || strings.Contains(l, "dead.String()") {
+			t.Errorf("transport-failure log leaks the webhook credentials: %q", l)
+		}
 	}
 }

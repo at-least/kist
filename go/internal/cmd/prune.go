@@ -85,7 +85,7 @@ func newPruneCommand() *cobra.Command {
 	flags.register(cmd)
 	f := cmd.Flags()
 	f.DurationVar(&grace, "grace", repo.DefaultGrace, "how long a pack stays marked before it can be deleted")
-	f.DurationVar(&forgetClientsAfter, "forget-clients-after", 0, "stop waiting for a client that has not backed up in this long (default 10x grace)")
+	f.DurationVar(&forgetClientsAfter, "forget-clients-after", 0, "stop waiting for a client that has not backed up in this long (default 30 days)")
 	f.DurationVar(&clockSkew, "clock-skew", repo.DefaultClockSkew, "clock disagreement tolerated between clients and this machine")
 	f.BoolVar(&dryRun, "dry-run", false, "report what would happen and change nothing")
 	return cmd

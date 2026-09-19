@@ -230,13 +230,19 @@ impl Repository {
         if !opts.dry_run {
             for key in &removed {
                 debug_assert!(key.starts_with(keys::SNAPSHOTS_PREFIX));
-                // 副本隨主體（format-v3-draft §13.5）；不存在就算了。
+                // 副本隨主體（format-v3-draft §13.5）。不存在（沒設副本）是
+                // 常態；**其他**錯誤必須擋下主體的刪除：主體刪了、副本留
+                // 著，是 prune 不清、check 當「主體意外遺失」災難訊號回報的
+                // 孤兒——一次暫時性網路錯誤不該造成永久洩漏＋常設誤報。
                 if let Err(e) = self
                     .backend()
                     .delete(&format!("{key}{}", kist_format::keys::REPLICA_SUFFIX))
                     .await
                 {
-                    tracing::debug!("no replica for {key}: {e}");
+                    if !matches!(e, kist_backend::BackendError::NotFound(_)) {
+                        return Err(e.into());
+                    }
+                    tracing::debug!("no replica for {key}");
                 }
                 self.backend().delete(key).await?;
             }

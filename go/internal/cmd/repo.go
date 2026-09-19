@@ -146,8 +146,10 @@ func openBackend(ctx context.Context, location string, create bool) (backend.Bac
 	}
 }
 
-// withRepository opens a repository, runs fn, and closes it.
-func (f *repoFlags) withRepository(cmd *cobra.Command, fn func(context.Context, *repo.Repository) error) error {
+// withRepository opens a repository, runs fn, and closes it. A failure
+// to close surfaces when fn itself succeeded -- silently dropping it
+// would turn a failed flush into exit 0.
+func (f *repoFlags) withRepository(cmd *cobra.Command, fn func(context.Context, *repo.Repository) error) (err error) {
 	location, err := f.location()
 	if err != nil {
 		return err

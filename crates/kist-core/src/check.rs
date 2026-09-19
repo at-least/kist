@@ -230,6 +230,7 @@ impl Repository {
             }
         };
         let keys = Arc::clone(self.keys());
+        let max_chunk = u64::from(self.config().chunker.max);
         let _id = *id;
         let key_for_task = key.clone();
         let result: Result<Vec<String>> = blocking(move || {
@@ -272,7 +273,7 @@ impl Repository {
                     ));
                     continue;
                 };
-                if let Err(e) = decode_chunk(&keys, &entry.id, slice, entry.raw_len) {
+                if let Err(e) = decode_chunk(&keys, &entry.id, slice, entry.raw_len, max_chunk) {
                     errs.push(format!("{key_for_task}: chunk {}: {e}", entry.id));
                 }
             }

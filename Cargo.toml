@@ -62,6 +62,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 zeroize = { version = "1", features = ["derive"] }
+libc = "0.2"
 zstd = "0.13"
 
 # The profile that 'dist' will build with

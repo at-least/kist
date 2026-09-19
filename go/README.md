@@ -2,7 +2,7 @@
 
 Deduplicating, encrypted backups to object storage, from one binary with no cgo.
 
-> **狀態：儲存格式 v2（Go/Rust 統一版，2026-09-05 定案）。** 本 repo 是參考實作，
+> **狀態：儲存格式 v3（2026-09-09 定案，[docs/format.md](docs/format.md) 與 kist-rs 逐 byte 一致）。** 本 repo 是參考實作，
 > 產品是 `kist-rs`；兩者讀寫同一種 repo、互為驗證（[`PLAN.md`](PLAN.md)）。
 > 本機 / S3 / SFTP 後端、無鎖 GC（`forget` / `prune`）、排程 `run`、`mount` 都已具備。
 
@@ -10,13 +10,13 @@ Deduplicating, encrypted backups to object storage, from one binary with no cgo.
 $ export KIST_REPOSITORY=/backup/kist KIST_PASSWORD=...
 $ kist-go init
 $ kist-go backup ~/work
-snapshot snapshots/fe2988.../20260904t141955.943279016z
+snapshot snapshots/fe2988.../20260904T141955943279016Z
   3 files, 3 directories, 1 symlinks
   3.7 MiB read, 2.9 MiB stored in 1 new packs
 $ kist-go backup ~/work         # 沒改東西
   3.7 MiB read, 0 B stored in 0 new packs
 $ kist-go snapshots
-$ kist-go restore snapshots/fe2988.../20260904t141955.943279016z /tmp/out
+$ kist-go restore snapshots/fe2988.../20260904T141955943279016Z /tmp/out
 $ kist-go check --read-data
 ```
 
@@ -45,7 +45,7 @@ $ kist-go check --read-data
 
 每個指令都接受 `--json`：stdout 只印一個 JSON 物件（`snapshots` 印一個陣列），警告與進度仍在 stderr，失敗仍以非零結束。
 
-`forget` 與 `prune` 要用持有 Delete 權限的憑證跑；備份用的憑證做不到（[權限表](docs/format.md#10-權限模型)）。`prune` 定期跑：第一次只標記，grace 過後的下一次才刪，中間有 client 引用到被標記的 pack 會自動復活它。
+`forget` 與 `prune` 要用持有 Delete 權限的憑證跑；備份用的憑證做不到（見 [docs/format.md](docs/format.md) §15 後端契約的權限分工）。`prune` 定期跑：第一次只標記，grace 過後的下一次才刪，中間有 client 引用到被標記的 pack 會自動復活它。
 
 repo 位置：`--repo` 或 `$KIST_REPOSITORY`——本機路徑、`s3://bucket/prefix`、或 `sftp://user@host:port/path`（`/~/path` 表示相對於登入目錄）。SFTP 一定驗 host key（`~/.ssh/known_hosts` 或 `$KIST_SFTP_KNOWN_HOSTS`，先 `ssh-keyscan`）；認證依序試 SSH agent、`$KIST_SFTP_KEY`（`$KIST_SFTP_KEY_PASSPHRASE`）、`$KIST_SFTP_PASSWORD`。
 密碼：`--password-file`、`$KIST_PASSWORD`，或終端機提示，依此順序。
@@ -107,7 +107,7 @@ Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,r
 
 ## 文件
 
-- [`docs/format.md`](docs/format.md) — 儲存格式 v2（Go/Rust 統一版），含「設計決定 × 證據」對照表
+- [`docs/format.md`](docs/format.md) — 儲存格式 v3（唯一權威副本在 kist-rs，本副本逐 byte 一致），含「設計決定 × 證據」對照表
 - [`docs/decisions/`](docs/decisions/) — ADR，記錄為什麼這樣設計
 - [`docs/release.md`](docs/release.md) — 版本、平台、release 流程
 - [`PLAN.md`](PLAN.md) — 里程碑與工程規範

@@ -408,9 +408,9 @@ type dirNode struct {
 	virtualPath string
 	table       map[string][]tree.Entry
 
-	once    sync.Once
+	mu      sync.Mutex
+	loaded  bool
 	entries []tree.Entry
-	loadErr error
 }
 
 var (
@@ -421,19 +421,31 @@ var (
 	_ fs.NodeListxattrer = (*dirNode)(nil)
 )
 
+// load serves the directory's entries, caching them once they have
+// loaded successfully. A failed load is NOT cached: over SFTP or S3 the
+// first failure is usually a transient blip, and bricking one directory
+// with EIO until remount -- what a sync.Once would do -- turns a hiccup
+// into an outage.
 func (n *dirNode) load(ctx context.Context) ([]tree.Entry, error) {
-	n.once.Do(func() {
-		if n.synthetic != nil {
-			n.entries = n.synthetic
-			return
-		}
-		if n.entry.Subtree == nil {
-			n.loadErr = fmt.Errorf("directory has no subtree")
-			return
-		}
-		n.entries, n.loadErr = n.fs.repo.LoadTreeChain(ctx, *n.entry.Subtree)
-	})
-	return n.entries, n.loadErr
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.loaded {
+		return n.entries, nil
+	}
+	if n.synthetic != nil {
+		n.entries, n.synthetic = n.synthetic, nil
+		n.loaded = true
+		return n.entries, nil
+	}
+	if n.entry.Subtree == nil {
+		return nil, fmt.Errorf("directory has no subtree")
+	}
+	entries, err := n.fs.repo.LoadTreeChain(ctx, *n.entry.Subtree)
+	if err != nil {
+		return nil, err
+	}
+	n.entries, n.loaded = entries, true
+	return n.entries, nil
 }
 
 func (n *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -531,9 +543,10 @@ type fileNode struct {
 	fs    *filesystem
 	entry tree.Entry
 
-	once       sync.Once
-	chunks     []crypto.ID
-	resolveErr error
+	chunks []crypto.ID
+	// resolved marks a successful resolve; failures are retried on the
+	// next call (see dirNode.load for why an error must not be cached).
+	resolved bool
 
 	mu   sync.Mutex
 	ends []uint64 // ends[i] = plaintext offset just past chunk i
@@ -541,28 +554,29 @@ type fileNode struct {
 
 // resolve produces the data chunk list, following indirect entries.
 func (n *fileNode) resolve(ctx context.Context) ([]crypto.ID, error) {
-	n.once.Do(func() {
-		if tree.ContentType(n.entry.ContentType) == tree.ContentIndirect {
-			var buf []byte
-			for _, id := range n.entry.Chunks {
-				data, err := n.fs.chunk(ctx, id)
-				if err != nil {
-					n.resolveErr = err
-					return
-				}
-				buf = append(buf, data...)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.resolved {
+		return n.chunks, nil
+	}
+	if tree.ContentType(n.entry.ContentType) == tree.ContentIndirect {
+		var buf []byte
+		for _, id := range n.entry.Chunks {
+			data, err := n.fs.chunk(ctx, id)
+			if err != nil {
+				return nil, err
 			}
-			var list tree.ChunkList
-			if err := crypto.Unmarshal(buf, &list); err != nil {
-				n.resolveErr = err
-				return
-			}
-			n.chunks = list.Chunks
-			return
+			buf = append(buf, data...)
 		}
-		n.chunks = n.entry.Chunks
-	})
-	return n.chunks, n.resolveErr
+		var list tree.ChunkList
+		if err := crypto.Unmarshal(buf, &list); err != nil {
+			return nil, err
+		}
+		n.chunks, n.resolved = list.Chunks, true
+		return n.chunks, nil
+	}
+	n.chunks, n.resolved = n.entry.Chunks, true
+	return n.chunks, nil
 }
 
 var (

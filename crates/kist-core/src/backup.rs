@@ -261,6 +261,13 @@ fn local_file_item(path: &Path, name: &[u8]) -> Result<SourceItem> {
         SourceItemKind::Symlink {
             target: fsmeta::path_to_bytes(&target)?,
         }
+    } else if !meta.is_file() {
+        // 檔案 root 明確指到非正規檔（FIFO/socket/裝置）：大聲失敗——
+        // read 的 open 在 FIFO 無寫端時會無限阻塞，不能默默吞掉一個指名的 root。
+        return Err(CoreError::Usage(format!(
+            "{}: not a regular file (fifo/socket/device); cannot back up",
+            path.display()
+        )));
     } else {
         SourceItemKind::File {
             size: meta.len(),
@@ -1329,6 +1336,17 @@ impl Backup {
         f: &FileFacts,
         parent: Option<&Entry>,
     ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
+        // 本機（posix）來源：非正規檔（FIFO/socket/裝置）跳過並記警告——
+        // open 在 FIFO 無寫端時無限阻塞、裝置讀不完，還原也無法忠實重建。
+        // 遠端來源沒有型別位元（posix = None），不檢查。Go 實作同款。
+        #[cfg(unix)]
+        if let Some(posix) = f.posix {
+            if posix.mode & 0o170000 != 0o100000 {
+                let display = ctx.display_path(rel);
+                self.skip(&display, "not a regular file (fifo/socket/device)");
+                return Ok(None);
+            }
+        }
         if let Some(reused) = self.try_reuse(f, parent).await? {
             self.report.files_reused += 1;
             return Ok(Some(reused));
@@ -1380,6 +1398,9 @@ impl Backup {
                 .await?
                 .ok_or_else(|| CoreError::Join("chunk list read failed".into()))?;
             self.report.chunks_new += list_result.chunks_new;
+            // 清單 chunk 也是這次新存的 bytes（對帳：trailer entry 總和
+            // == bytes_stored）。
+            self.report.bytes_stored += list_result.bytes_new;
             (size, list_result.chunks, content_type::INDIRECT)
         };
         if let Some(key) = hl_key {

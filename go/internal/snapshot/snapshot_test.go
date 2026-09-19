@@ -398,3 +398,17 @@ func TestGoldenSnapshot(t *testing.T) {
 		t.Error("the snapshot object format changed")
 	}
 }
+
+// strconv.Atoi accepts a leading '+', so a key like
+// "snapshots/<client>/20260905T114202+23456789Z" parsed here but is
+// rejected by Rust's strict digit parser. Neither implementation ever
+// writes such keys; a hostile or corrupt key must not split the
+// implementations.
+func TestParseKeyTimeRejectsSignedFields(t *testing.T) {
+	if _, err := parseKeyTime("20260905T114202+23456789Z"); err == nil {
+		t.Fatal("a '+'-signed timestamp field must be rejected")
+	}
+	if _, err := parseKeyTime("20260905T114202123456789Z"); err != nil {
+		t.Fatalf("a well-formed timestamp must still parse: %v", err)
+	}
+}

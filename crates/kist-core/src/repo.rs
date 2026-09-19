@@ -120,8 +120,18 @@ fn encode_index_blob(blob: &IndexBlob) -> Result<Vec<u8>> {
     }
 }
 
+/// index blob 解壓上限（與 Go 端同一數字）：一個 blob 描述 repo 裡每個
+/// pack，真實 blob 遠遠不到，壞掉的長度欄位不該能要到 GiB 級記憶體。
+const MAX_INDEX_PLAIN: u64 = 1 << 30;
+
 /// 解開 index blob 的明文（見 [`encode_index_blob`]）。
 fn decode_index_blob(payload: &[u8]) -> Result<IndexBlob> {
+    decode_index_blob_limited(payload, MAX_INDEX_PLAIN)
+}
+
+/// 同上，上限由呼叫端給（測試用小上限釘行為；正式路徑恆為
+/// [`MAX_INDEX_PLAIN`]）。串流解到上限+1 為止，超過即 Corrupt。
+fn decode_index_blob_limited(payload: &[u8], limit: u64) -> Result<IndexBlob> {
     let Some((algorithm, data)) = payload.split_first() else {
         return Err(CoreError::Corrupt {
             key: "index".to_owned(),
@@ -130,10 +140,33 @@ fn decode_index_blob(payload: &[u8]) -> Result<IndexBlob> {
     };
     let plain = match Algorithm::from_u8(*algorithm)? {
         Algorithm::Raw => data.to_vec(),
-        Algorithm::Zstd => zstd::decode_all(data).map_err(|e| CoreError::Corrupt {
-            key: "index".to_owned(),
-            reason: format!("zstd decode failed: {e}"),
-        })?,
+        Algorithm::Zstd => {
+            use std::io::Read;
+            let decoder =
+                zstd::stream::read::Decoder::with_buffer(data).map_err(|e| CoreError::Corrupt {
+                    key: "index".to_owned(),
+                    reason: format!("zstd decode failed: {e}"),
+                })?;
+            let mut out = Vec::new();
+            decoder
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut out)
+                .map_err(|e| CoreError::Corrupt {
+                    key: "index".to_owned(),
+                    reason: format!("zstd decode failed: {e}"),
+                })?;
+            if out.len() as u64 > limit {
+                return Err(CoreError::Corrupt {
+                    key: "index".to_owned(),
+                    reason: format!(
+                        "index blob decompresses to {} bytes, over the {} limit",
+                        out.len(),
+                        limit
+                    ),
+                });
+            }
+            out
+        }
     };
     Ok(cbor::decode(&plain)?)
 }
@@ -387,6 +420,10 @@ impl Repository {
     pub async fn seal_tree(&self, tree: Tree) -> Result<(TreeId, Vec<u8>)> {
         let keys = Arc::clone(&self.keys);
         blocking(move || {
+            // 寫入端跑與讀取端同一套結構不變式（§8.1）：來源端冒出的 `..`／
+            // 重複／未排序名稱在這裡當場失敗，不寫出所有讀取端都拒讀的 tree
+            // （Go 的 Encode 同款）。
+            tree.validate()?;
             let plain = cbor::encode(&tree)?;
             let id = keys.tree_id(&plain);
             let bytes = keys.seal_tree(&id, &plain)?;
@@ -574,7 +611,12 @@ impl Repository {
                         );
                         b
                     }
-                    Err(_) => return Err(CoreError::SnapshotNotFound(key.to_owned())),
+                    Err(BackendError::NotFound(_)) => {
+                        return Err(CoreError::SnapshotNotFound(key.to_owned()))
+                    }
+                    // 副本讀取本身失敗（權限、5xx…）：保留真錯誤——
+                    // 謊報「not found」會讓操作者以為 snapshot 遺失了。
+                    Err(e) => return Err(e.into()),
                 }
             }
             Err(e) => return Err(e.into()),
@@ -594,7 +636,7 @@ impl Repository {
             })?;
             if snap.version != kist_format::FORMAT_VERSION {
                 return Err(CoreError::Corrupt {
-                    key: key_owned,
+                    key: key_owned.clone(),
                     reason: format!(
                         "snapshot declares version {}, this build reads {}",
                         snap.version,
@@ -602,6 +644,12 @@ impl Repository {
                     ),
                 });
             }
+            // 結構驗證與 Go 的 load 同款（roots 非空、排序、唯一）：
+            // 解得開不等於合法，structurally-invalid 的 snapshot 不能往下走。
+            snap.validate().map_err(|e| CoreError::Corrupt {
+                key: key_owned.clone(),
+                reason: e.to_string(),
+            })?;
             Ok(snap)
         })
         .await?;
@@ -628,5 +676,36 @@ impl Repository {
             });
         }
         Ok(snapshot)
+    }
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod index_cap_tests {
+    use crate::repo::decode_index_blob_limited;
+    use kist_format::Algorithm;
+
+    /// index blob 的解壓上限（Go 端 1 GiB 同款）：超過上限的 frame 是
+    /// 炸彈不是 blob。正式上限太大，測試以小上限釘同一條規則。
+    #[test]
+    fn index_blob_over_the_limit_is_refused() {
+        let bomb = {
+            let mut out = vec![Algorithm::Zstd as u8];
+            out.extend_from_slice(&zstd::encode_all(&vec![0u8; 4 << 20][..], 3).unwrap());
+            out
+        };
+        let err = match decode_index_blob_limited(&bomb, 1 << 20) {
+            Err(e) => e,
+            Ok(_) => panic!("超過上限的 index blob 必須被拒"),
+        };
+        assert!(matches!(err, crate::CoreError::Corrupt { .. }), "{err:?}");
+        // 上限之內照常解（會因內容不是合法 IndexBlob 而錯，但不是上限錯）。
+        let ok = {
+            let mut out = vec![Algorithm::Zstd as u8];
+            out.extend_from_slice(&zstd::encode_all(&vec![0u8; 1 << 20][..], 3).unwrap());
+            out
+        };
+        if let Err(e) = decode_index_blob_limited(&ok, 4 << 20) {
+            assert!(!format!("{e:?}").contains("limit"), "不該是上限錯誤：{e:?}");
+        }
     }
 }

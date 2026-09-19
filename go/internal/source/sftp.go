@@ -1,6 +1,7 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,7 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
-	"strings"
+	"slices"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -123,9 +124,10 @@ func (s *SFTPSource) List(ctx context.Context, dir []byte) ([]SourceItem, error)
 	out := make([]SourceItem, 0, len(entries))
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, ".") {
-			continue // scratch files, the server's business
-		}
+		// No dot-skip here: this is the USER'S data, not the repository's
+		// namespace (the backend's own listing keeps its skip for kist's
+		// scratch files). Hiding .bashrc from a backup is silent data
+		// omission -- the local and s3 sources list dotfiles.
 		if e.IsDir() {
 			out = append(out, SourceItem{Name: []byte(name), Kind: SourceItemKind{Kind: KindDir}})
 			continue
@@ -141,6 +143,11 @@ func (s *SFTPSource) List(ctx context.Context, dir []byte) ([]SourceItem, error)
 			},
 		})
 	}
+	// The Source contract promises ascending name bytes (the walker's
+	// parent merge-join depends on it); ReadDir order is the server's.
+	slices.SortFunc(out, func(a, b SourceItem) int {
+		return bytes.Compare(a.Name, b.Name)
+	})
 	return out, nil
 }
 

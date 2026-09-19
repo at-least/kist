@@ -248,3 +248,50 @@ fn walk_count_suffix(root: &Path, suffix: &str) -> usize {
     }
     n
 }
+
+/// 主體不在、`.r1` 的讀取**本身失敗**（不是 NotFound）時：要把真錯誤回報，
+/// 不能吞成 SnapshotNotFound——那會讓 `check`／`snapshots` 把一次暫時性的
+/// I/O 錯誤謊報成「snapshot 遺失」（對照：`read_tree` 的 fallback 保留
+/// 主體錯誤，同一個 repo 裡兩種語意）。
+#[cfg(unix)]
+#[tokio::test]
+async fn replica_read_error_is_not_masked_as_not_found() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = kist_backend::Backend::local(&dir.path().join("repo")).unwrap();
+    let mut o = replica_init_options();
+    o.kdf_cost = KdfCost {
+        m_cost_kib: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    Repository::init(backend.clone(), PASSWORD.as_bytes(), o)
+        .await
+        .unwrap();
+
+    let repo_dir = dir.path().join("repo");
+    let src = dir.path().join("src");
+    make_source(&src);
+    let repo = Repository::open(backend, PASSWORD.as_bytes()).await.unwrap();
+    let b1 = repo
+        .backup(std::slice::from_ref(&src), common::backup_options())
+        .await
+        .unwrap();
+
+    let primary = repo_dir.join(&b1.snapshot_key);
+    let replica = repo_dir.join(format!("{}.r1", b1.snapshot_key));
+    assert!(primary.exists() && replica.exists(), "主體與副本都要在");
+
+    std::fs::remove_file(&primary).unwrap();
+    std::fs::set_permissions(&replica, PermissionsExt::from_mode(0o000)).unwrap();
+
+    let err = repo
+        .read_snapshot_by_key(&b1.snapshot_key)
+        .await
+        .unwrap_err();
+    assert!(
+        !matches!(err, kist_core::CoreError::SnapshotNotFound(_)),
+        "副本的 I/O 錯誤不能被吞成 SnapshotNotFound：{err}"
+    );
+}

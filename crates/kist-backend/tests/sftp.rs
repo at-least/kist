@@ -147,3 +147,37 @@ async fn no_auth_material_is_reported_clearly() {
         other => panic!("expected auth failure, got {other:?}"),
     }
 }
+
+/// repo 命名空間的 list 有目錄深度上限：kist 自己的物件最深三層
+/// （`snapshots/<client>/<ts>`、`trees/<2hex>/<id>`），上限是數倍寬裕；
+/// 超過代表 repo 裡有不該在的東西（或敵意伺服器造鏈）——要乾淨回錯，
+/// 不能無限走下去吃記憶體／堆疊。
+#[tokio::test]
+async fn repo_listing_rejects_absurd_directory_depth() {
+    let Some((url, password, known_hosts, _)) = sftp_env() else {
+        eprintln!("SFTP depth test skipped (tests/sftp-setup.sh 未跑)");
+        return;
+    };
+    let cfg = parse_sftp_url(&url).unwrap();
+    let auth = SftpAuth {
+        known_hosts: Some(known_hosts.into()),
+        key: None,
+        password: Some(password),
+    };
+    let b = kist_backend::Backend::sftp(&cfg, auth).await.unwrap();
+
+    // 20 層深的目錄鏈＋一個物件。寫入端照常成功（建目錄本來就行）。
+    let key = vec!["d"; 20].join("/");
+    b.put(&format!("{key}/x"), vec![1u8]).await.unwrap();
+
+    let err = b.list("").await;
+    assert!(
+        err.is_err(),
+        "repo 命名空間 20 層深的 list 必須回錯，卻成功：{:?}",
+        err.map(|v| v.len())
+    );
+
+    // 對照：正常深度的 prefix 照常可列。
+    b.put("packs/normal", vec![2u8]).await.unwrap();
+    assert!(b.list("packs").await.is_ok(), "正常深度的 list 不能被連坐");
+}

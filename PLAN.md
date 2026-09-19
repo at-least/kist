@@ -155,7 +155,13 @@ kist/
   96h 全量（每 target 24h）腳本就緒：`nohup sh fuzz/longrun.sh 86400 &`，
   擇時執行。長跑驅動內建 nice 19 讓路【2026-09-10】（`KIST_FUZZ_NICE`
   覆寫、0 關閉；同核心爭搶實測 nice19 僅佔 0.6%，跨 systemd scope 同效，
-  協議見 fuzz/README.md）。
+  協議見 fuzz/README.md）。**96h 全量已執行【2026-09-13 → 09-17，fail=0】**：
+  四個 target 依序各 24h 全數 OK、零 crash、`fuzz/artifacts/` 四個目錄皆空、
+  `fuzz/seeds` 未被寫入。逐 target 執行量（掛鐘 86401s）與 corpus 成長：
+  pack 149.3M exec（corpus → 50M）、cbor 7 033.0M exec（→ 200M）、
+  chunker 143.1M exec（→ 732K）、parity 72.9M exec（→ 6.9M）；全程 nice 19
+  讓路未影響日常操作。完整 log：`~/kist-fuzz-96h.log`（本次 log 移出 /tmp，
+  避免 4 天期間被清）。
 - 記憶體目標：100 萬檔 repo 的 backup 峰值 < 512 MiB【完成 2026-09-06】：
   量測（dhat 歸因）找出每檔 16 MiB zeroed 切塊緩衝、每檔 1 MiB BufReader、
   pack 緩衝 Vec 倍增到 128 MiB 級、CBOR 走 Value 中繼、平面大目錄把 parent
@@ -361,10 +367,56 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   與 Rust 同樹 checkout，不再需要跨 repo PAT——此條僅存歷史。】
 
 - **GitHub Actions 額度：`ci.yml`（Go）push 觸發的 runs 全數未啟動**
-  【2026-09-12 記錄】：私有 repo 的 Actions 因帳號「recent account payments
-  have failed or your spending limit needs to be increased」無法啟動 job——
-  自 2026-09-09 起每個 push 的 run 都瞬間 failure：job 無 steps、無 runner、
-  無 log（2026-09-04 當天仍有成功的 run，Go repo 時代）。**不是 regression**：
-  程式 gate 以本機重驗為準（見上方 2026-09-09 完成 gate 全量重驗）。
-  修復途徑擇一：Settings → Billing & plans 補付款／提高 spending limit；
-  或把 `ci.yml` 觸發改為 `workflow_dispatch`（與 Rust 端同政策，省配額）。
+  【2026-09-12 記錄；2026-09-19 已處置】：私有 repo 的 Actions 因帳號
+  「recent account payments have failed or your spending limit needs to be
+  increased」無法啟動 job——自 2026-09-09 起每個 push 的 run 都瞬間
+  failure：job 無 steps、無 runner、無 log（2026-09-04 當天仍有成功的
+  run，Go repo 時代）。**不是 regression**：程式 gate 以本機重驗為準
+  （見上方 2026-09-09 完成 gate 全量重驗）。處置：`ci.yml` 觸發改為僅
+  `workflow_dispatch`（與 `ci-rust.yml` 同政策，省配額），push 不再產生
+  必失敗的 run；額度若日後補上，可隨時改回。
+  【2026-09-19 後記：額度封鎖當天已解除——`105a469` 的 push 產生了
+  額度封鎖解除後第一個（也是最後一個 auto）run，job 真的執行。這是
+  M8 monorepo 重排後 ci.yml 第一次真正跑，暴露的問題：lint 三平台全敗
+  與 setup-go 快取永遠 miss——`defaults.run.working-directory` 不作用於
+  `uses:` action（golangci-lint-action 與 setup-go 快取都要自帶路徑），
+  當天已修（actionlint 過）。**真實 bug 兩件待辦**：① Windows 上
+  `internal/cmd`／`internal/repo` 測試全敗——來源根路徑 `C:\Users\…`
+  被整段寫成 tree entry 名稱，違反 v3「entry 名稱＝單一路徑元件」，
+  restore 據此拒絕（Windows 路徑切分未處理倒斜線與磁碟機代號）；
+  ② `TestSFTPConformance/stat_reports_size_and_mtime` 的 mtime 回報零值
+  ——**本機 `make test-sftp` 同步重現**（2026-09-19，非 CI 環境問題；
+  該 target 不在 `make verify` 與 09-09 的重驗清單內）。
+  **同日已修**：`SFTP.Stat`（go）自诞生即漏設 `Modified`（回傳行
+  `git log -S` 顯示從未變過；v2 統一時加的子測試一直紅著沒被跑到），
+  修為與 `Local`／`S3` 同款 `ModTime().Truncate(time.Second)`。影響
+  （修前，SFTP repo 上）：prune 端 `treeRevivedAfterMark` 把已 touch
+  救活的樹判死——**資料遺失方向**，只因 commit 端 `headTreeAndTouch`
+  的同一個零值恰好擋住快門（假性 `ErrTreeMarked`）才沒咬人，兩個
+  bug 靠巧合互相抵銷；`gc.go:403` 的「標記後重寫的 pack 放過」保護
+  被靜默停用（窄、不安全）；`gc.go:593` 樹自癒檢查停用（僅保險絲）。
+  標記年齡走 `List`（本來就正確）不受影響。修後 `make test-sftp` 綠、
+  `make verify` 全綠。
+  **同型隱患（Rust）同日已修**：`crates/kist-backend/src/sftp.rs` 的
+  `to_meta` 原把伺服器缺送的 mtime 換成 `UNIX_EPOCH` 餵進同一套 GC
+  年齡比較（OpenSSH 一律會送所以未爆）。修為：缺 mtime 回
+  `MetaError::NoMtime` 大聲失敗——head/stat 直接傳播，兩個 list 端
+  對「命名規則外名稱」維持略過、對「缺 mtime」讓整個 list 失敗
+  （略過一個 gc/ 標記比 sentinel 更糟）；名稱檢查先於 mtime（爛名稱
+  絕不讓 list 失敗）。單元測試 RED→GREEN 釘死兩種分類；真伺服器
+  整合（SFTP 容器 4 案＋rclone 橋接 4 案）與 fmt/clippy/
+  `test --workspace`（59 執行檔）全綠。**對等隱患（Go）2026-09-19 已修**：
+  `pkg/sftp` 在 List/Stat 對缺送的 ACMODTIME 映成 `time.Unix(0,0)`
+  ——`go/internal/backend/sftp.go` 的 `modifiedAt` 分類器（List 與
+  Stat 都走它）對零值／epoch 回 `ErrNoMtime` 大聲失敗，名稱檢查先於
+  mtime 的順序與 Rust 相同。**刻意偏差**：`pkg/sftp` 的 `Mtime` 是值
+  型別，無法分辨「缺送」與「明送 0」（Rust 能分辨且尊重後者），Go 端
+  對 epoch 一律拒絕——保守側；真有 1970-01-01 整點的檔案會得到明確
+  錯誤，而不是悄悄餵「無限老」進 GC。同族兩筆記錄（皆正確行為、非 bug，防再犯）：
+  ① 伺服器**明送** mtime=0 時 `to_meta` 仍會得到 epoch——協議上
+  伺服器斷言了時間，尊重它，但這是「無限老」進 GC 的最後一條路；
+  ② `size` 缺送仍代換 0（不在 GC 時間軸上，無嚴重度，但與剛移除
+  的 mtime 模式同型）。
+  s3 job 的 `docker: pull access denied
+  for minio/minio` 是 runner 端 Docker Hub 拉取限制（暫時性環境問題）。
+  ubuntu/macos 全綠。】

@@ -644,13 +644,28 @@ fn generic(e: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     }
 }
 
-fn to_meta(path: &str, m: &MetaData) -> std::result::Result<ObjectMeta, StoreError> {
+/// [`to_meta`] 的失敗模式。呼叫端對兩種失敗的反應不同：list 對不合
+/// 命名規則的名稱**略過該條目**（伺服器目錄裡可能有命名規則外的東西），
+/// 但缺 mtime 是 GC 年齡來源出了問題——標記年齡、touch 復活與「標記後
+/// 重寫」檢查都拿 `last_modified` 當時間軸——必須讓整個操作失敗，不能
+/// 略過也不能換 sentinel 時間（epoch 對那些比較是「無限老」）。
+#[derive(Debug, thiserror::Error)]
+enum MetaError {
+    #[error("sftp entry {0:?}: name outside the object-store namespace rules")]
+    BadName(String),
+    #[error("sftp entry {0:?}: server sent no mtime")]
+    NoMtime(String),
+}
+
+fn to_meta(path: &str, m: &MetaData) -> std::result::Result<ObjectMeta, MetaError> {
+    // 名稱先檢查：命名規則外的條目無論屬性缺什麼都只是略過，不讓 list 失敗。
+    let location =
+        StorePath::parse(path).map_err(|e| MetaError::BadName(format!("{path}: {e}")))?;
     let size = m.len().unwrap_or(0);
-    let secs = m.modified().map(|ts| ts.into_raw() as i64).unwrap_or(0);
-    let last_modified =
-        chrono::DateTime::from_timestamp(secs, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
-    // 伺服器給了 object_store 命名規則外的名稱：略過該條目，不讓整個 list 失敗
-    let location = StorePath::parse(path).map_err(generic)?;
+    let last_modified = m
+        .modified()
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts.into_raw() as i64, 0))
+        .ok_or_else(|| MetaError::NoMtime(path.to_owned()))?;
     Ok(ObjectMeta {
         location,
         last_modified,
@@ -683,6 +698,10 @@ struct SftpInner {
     keepalive: Keepalive,
     root: String,
     display: String,
+    /// 來源模式：列出**使用者的資料**，不做 dot-skip（repo 命名空間的
+    /// listing 要藏 kist 自己的 `.tmp-<hex>` 暫存檔；來源的使用者檔名
+    /// 不是 kist 的業務——`.bashrc` 是內容，不是雜訊）。
+    list_all: bool,
 }
 
 impl Drop for SftpInner {
@@ -808,7 +827,7 @@ impl SftpInner {
                 source: "is a directory".into(),
             });
         }
-        to_meta(full, &m)
+        to_meta(full, &m).map_err(generic)
     }
 
     fn store_error(&self, location: &StorePath, e: SftpError) -> StoreError {
@@ -845,6 +864,7 @@ impl SftpStore {
                 cfg.port,
                 root
             ),
+            list_all: false,
         });
         inner.ensure_dir(&root).await?;
         Ok(Self(inner))
@@ -869,7 +889,34 @@ impl SftpStore {
             keepalive: Keepalive::Stdio { _child: child },
             root: String::new(),
             display,
+            list_all: false,
         });
+        Ok(Self(inner))
+    }
+
+    /// 以**來源**身分開 sftp store：listing 不做 dot-skip（見
+    /// [`SftpInner::list_all`]）。連線參數與 [`SftpStore::open`] 相同。
+    pub async fn open_source(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
+        let (keepalive, sftp, fsync) = connect(cfg, auth).await?;
+        let root = format!("/{}", cfg.path.trim_matches('/'));
+        let inner = Arc::new(SftpInner {
+            sftp,
+            fsync,
+            relaxed: false,
+            warned_no_o_excl: AtomicBool::new(false),
+            stderr_tail: None,
+            keepalive,
+            list_all: true,
+            root: root.clone(),
+            display: format!(
+                "sftp://{}@{}:{}/{}",
+                cfg.user.clone().unwrap_or_default(),
+                cfg.host,
+                cfg.port,
+                root
+            ),
+        });
+        inner.ensure_dir(&root).await?;
         Ok(Self(inner))
     }
 }
@@ -901,44 +948,103 @@ fn bytes_of(payload: &PutPayload) -> Vec<u8> {
 /// （packs/、indexes/、snapshots/<client>/…）。
 /// `root` 不帶尾斜線；回傳的 ObjectMeta.location 是**相對於 root** 的 key
 /// （object_store 的語意），不是遠端絕對路徑。
+/// listing 的 dot-skip 只屬於 **repo 命名空間**：kist 自己的 `.tmp-<hex>`
+/// 暫存檔不能進 repo 的物件列表（index 重建／GC 會把它們當真）。來源模式
+/// （`list_all`）列的是**使用者的資料**——`.bashrc` 是內容不是雜訊，本地
+/// 與 s3 來源也都列出 dotfiles。
+fn skip_in_listing(list_all: bool, name: &str) -> bool {
+    // `.`/`..` 永遠跳：伺服器可以送（filexfer 草稿允許）、
+    // openssh-sftp-client 不過濾——`.` 當目錄會無限遞迴、`..` 會走出
+    // root。（Go 端由 pkg/sftp 客戶端在協議層過濾，見其測試釘。）
+    if name == "." || name == ".." {
+        return true;
+    }
+    !list_all && name.starts_with('.')
+}
+
+/// repo 命名空間的目錄深度上限：kist 自己的物件最深三層
+/// （`snapshots/<client>/<ts>`、`trees/<2hex>/<id>`），16 已是數倍寬裕。
+/// 超過代表 repo 裡有不該在的東西（或敵意伺服器造鏈）：乾淨回錯，不無限
+/// 走下去。來源模式（list_all）不設限——使用者資料可以很深。
+const REPO_MAX_DEPTH: usize = 16;
+
+/// 深度上限只屬於 repo 命名空間；來源模式列使用者資料，深度跟著內容走。
+fn too_deep(list_all: bool, child_depth: usize) -> bool {
+    !list_all && child_depth > REPO_MAX_DEPTH
+}
+
+/// 讀取緩衝的**預配**提示：伺服器宣稱的 size 不可信任（敵意後端可以報
+/// 2^62——`vec![0u8; size]` 會在讀到任何 byte 前走進 handle_alloc_error，
+/// uncatchable abort）。宣稱值只取到提示上限，其餘讓 Vec 邊讀邊長：
+/// 謊報只有在真的送來那些 bytes 時才花記憶體。
+const READ_CAPACITY_HINT: u64 = 1024 * 1024;
+
+fn read_capacity_hint(claimed: u64) -> usize {
+    claimed.min(READ_CAPACITY_HINT) as usize
+}
+
 async fn walk(
     sftp: &Sftp,
     root: &str,
     dir: &str,
+    list_all: bool,
     out: &mut Vec<ObjectMeta>,
 ) -> std::result::Result<(), StoreError> {
-    let mut fs = sftp.fs();
-    let d = match fs.open_dir(dir).await {
-        Ok(d) => d,
-        Err(e) => {
-            return if is_not_found(&e) {
-                Ok(()) // 這個 prefix 還沒有任何東西
-            } else {
-                Err(generic(e))
-            };
+    // 迭代 DFS（明確堆疊取代 Box::pin 遞迴）：敵意伺服器可以捏造任意深
+    // 的目錄鏈，遞迴會把原生堆疊吃成 abort。輸出順序＝伺服器 readdir 順
+    // 序（與原遞迴相同、本來就未排序）；Backend::list 的合約是不保證順序。
+    let mut stack: Vec<(String, usize)> = vec![(dir.to_owned(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let mut fs = sftp.fs();
+        let d = match fs.open_dir(&dir).await {
+            Ok(d) => d,
+            Err(e) => {
+                return if is_not_found(&e) {
+                    Ok(()) // 這個 prefix 還沒有任何東西
+                } else {
+                    Err(generic(e))
+                };
+            }
+        };
+        drop(fs);
+        let mut entries = std::pin::pin!(d.read_dir());
+        let mut subdirs: Vec<(String, usize)> = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(generic)?;
+            let name = entry.filename().to_string_lossy().into_owned();
+            if skip_in_listing(list_all, &name) {
+                continue;
+            }
+            let full = format!("{dir}/{name}");
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let child_depth = depth + 1;
+                if too_deep(list_all, child_depth) {
+                    return Err(StoreError::Generic {
+                        store: "sftp",
+                        source: format!(
+                            "directory tree under {root} exceeds the repo namespace depth limit ({REPO_MAX_DEPTH}): {full}"
+                        )
+                        .into(),
+                    });
+                }
+                subdirs.push((full, child_depth));
+                continue;
+            }
+            let key = full
+                .strip_prefix(root)
+                .and_then(|r| r.strip_prefix('/'))
+                .map(|r| r.to_owned())
+                .unwrap_or_else(|| full.clone());
+            match to_meta(&key, &entry.metadata()) {
+                Ok(m) => out.push(m),
+                // 伺服器給了 object_store 命名規則外的名稱：略過該條目，不讓整個 list 失敗
+                Err(MetaError::BadName(_)) => {}
+                // 缺 mtime 是 GC 年齡來源的問題：整個 list 失敗，不默默跳過
+                Err(e) => return Err(generic(e)),
+            }
         }
-    };
-    drop(fs);
-    let mut entries = std::pin::pin!(d.read_dir());
-    while let Some(entry) = entries.next().await {
-        let entry = entry.map_err(generic)?;
-        let name = entry.filename().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let full = format!("{dir}/{name}");
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            Box::pin(walk(sftp, root, &full, out)).await?;
-            continue;
-        }
-        let key = full
-            .strip_prefix(root)
-            .and_then(|r| r.strip_prefix('/'))
-            .map(|r| r.to_owned())
-            .unwrap_or_else(|| full.clone());
-        if let Ok(m) = to_meta(&key, &entry.metadata()) {
-            out.push(m);
-        }
+        // 反向壓疊：pop 順序＝readdir 順序。
+        stack.extend(subdirs.into_iter().rev());
     }
     Ok(())
 }
@@ -1089,8 +1195,18 @@ impl ObjectStore for SftpStore {
                 .await
                 .map_err(generic)?;
         }
-        let mut buf = vec![0u8; (range.end - range.start) as usize];
-        tf.as_mut().read_exact(&mut buf).await.map_err(generic)?;
+        // 預配只取容量提示；take(長度) 邊讀邊長——謊報大小不預配。
+        let len = (range.end - range.start) as usize;
+        let mut buf = Vec::with_capacity(read_capacity_hint(range.end - range.start));
+        let mut limited = tf.as_mut().take(len as u64);
+        limited.read_to_end(&mut buf).await.map_err(generic)?;
+        if buf.len() != len {
+            return Err(generic(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{full}: server closed after {} of {len} bytes", buf.len()),
+            )));
+        }
+        drop(limited);
         Ok(GetResult {
             payload: GetResultPayload::Stream(
                 futures::stream::once(async move { Ok(Bytes::from(buf)) }).boxed(),
@@ -1119,7 +1235,8 @@ impl ObjectStore for SftpStore {
             .map_err(|e| inner.store_error(location, e))?;
         let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
         use tokio::io::AsyncReadExt as _;
-        let mut buf = Vec::with_capacity(meta.size as usize);
+        // 預配只取容量提示：宣稱 size 不可信任，實際長度邊讀邊長。
+        let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
         tf.as_mut().read_to_end(&mut buf).await.map_err(generic)?;
         // 切片前用**實際讀到的長度**做邊界檢查：index 壞掉或 pack 被截斷時回乾淨的
         // 錯誤，而不是切片 panic。
@@ -1183,9 +1300,10 @@ impl ObjectStore for SftpStore {
         // rclone 模式的 root 是空字串（served root 即 SFTP 根）；SFTP 路徑要絕對。
         let dir = if dir.is_empty() { "/".to_owned() } else { dir };
         let root = self.0.root.clone();
+        let list_all = self.0.list_all;
         let task = async move {
             let mut out = Vec::new();
-            walk(&sftp, &root, &dir, &mut out).await?;
+            walk(&sftp, &root, &dir, list_all, &mut out).await?;
             Ok::<_, StoreError>(out)
         };
         futures::stream::once(task)
@@ -1229,11 +1347,12 @@ impl ObjectStore for SftpStore {
         };
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
+        let list_all = self.0.list_all;
         let mut entries = std::pin::pin!(d.read_dir());
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(generic)?;
             let name = entry.filename().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+            if skip_in_listing(list_all, &name) {
                 continue;
             }
             let full = format!("{dir}/{name}");
@@ -1243,8 +1362,13 @@ impl ObjectStore for SftpStore {
                     // 伺服器給了 object_store 命名規則外的名稱：略過，不讓整個 list 失敗
                     Err(_) => continue,
                 }
-            } else if let Ok(m) = to_meta(&rel(&full), &entry.metadata()) {
-                objects.push(m);
+            } else {
+                match to_meta(&rel(&full), &entry.metadata()) {
+                    Ok(m) => objects.push(m),
+                    // 同 walk：命名規則外的名稱略過；缺 mtime 讓 list 失敗
+                    Err(MetaError::BadName(_)) => {}
+                    Err(e) => return Err(generic(e)),
+                }
             }
         }
         common_prefixes.sort();
@@ -1279,5 +1403,118 @@ impl ObjectStore for SftpStore {
         drop(fs);
         inner.remove_quiet(&scratch).await;
         renamed.map_err(generic)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssh_sftp_client::metadata::MetaDataBuilder;
+    use openssh_sftp_client::UnixTimeStamp;
+
+    /// GC 的標記年齡、touch 復活與「標記後重寫」檢查都拿 `last_modified`
+    /// 當時間軸：伺服器缺送 mtime 時不能默默換成 sentinel 時間——
+    /// `UNIX_EPOCH` 對那些比較是「無限老」，會把保護整個關掉。要大聲失敗。
+    #[test]
+    fn to_meta_rejects_entries_without_mtime() {
+        // MetaDataBuilder 不呼叫 time() 就是缺 mtime 的條目。
+        let m = MetaDataBuilder::new().len(5).create();
+        match to_meta("packs/dd", &m) {
+            Err(MetaError::NoMtime(_)) => {}
+            other => panic!("missing mtime must be NoMtime, got {other:?}"),
+        }
+
+        // 對照組：有 mtime 的條目照常轉換。
+        let ts = match UnixTimeStamp::from_raw(1_758_000_000) {
+            Some(t) => t,
+            None => panic!("valid timestamp rejected by UnixTimeStamp"),
+        };
+        let m = MetaDataBuilder::new().len(5).time(ts, ts).create();
+        let meta = match to_meta("packs/dd", &m) {
+            Ok(m) => m,
+            Err(e) => panic!("entry with mtime rejected: {e:?}"),
+        };
+        assert_eq!(meta.size, 5);
+        assert_eq!(meta.last_modified.timestamp(), 1_758_000_000);
+    }
+
+    /// 命名規則外的名稱即使同時缺 mtime 也分類為 BadName：list 端對
+    /// 這種條目維持「略過」，爛名稱永遠不該讓 list 失敗。
+    #[test]
+    fn to_meta_classifies_bad_name_before_missing_mtime() {
+        let m = MetaDataBuilder::new().len(5).create(); // 同時缺 mtime
+        match to_meta("a/../b", &m) {
+            Err(MetaError::BadName(_)) => {}
+            other => panic!("junk name must be BadName, got {other:?}"),
+        }
+        let ts = match UnixTimeStamp::from_raw(1) {
+            Some(t) => t,
+            None => panic!("valid timestamp rejected by UnixTimeStamp"),
+        };
+        let m = MetaDataBuilder::new().len(5).time(ts, ts).create();
+        match to_meta("a/../b", &m) {
+            Err(MetaError::BadName(_)) => {}
+            other => panic!("junk name must be BadName, got {other:?}"),
+        }
+    }
+
+    /// dot-skip 只屬於 repo 命名空間；來源模式（list_all）列使用者的
+    /// 資料，`.bashrc` 是內容不是雜訊。e2e 行為由 Docker-gated 的 sftp
+    /// 整合測試背書（本機跑不到）；謂詞本身在這裡釘死。
+    #[test]
+    fn dot_skip_belongs_to_the_repo_namespace_only() {
+        assert!(
+            skip_in_listing(false, ".tmp-abc123"),
+            "repo 模式要藏 kist 暫存檔"
+        );
+        assert!(skip_in_listing(false, ".bashrc"), "repo 模式一律 dot-skip");
+        assert!(
+            !skip_in_listing(true, ".bashrc"),
+            "來源模式列使用者的 dotfiles"
+        );
+        assert!(!skip_in_listing(true, "readme.txt"), "一般檔案兩種模式都列");
+    }
+
+    /// `.` 與 `..` **永遠**要跳——任何模式。SFTP 伺服器可以送（filexfer
+    /// 草稿允許），openssh-sftp-client 不過濾：`.` 當目錄會無限遞迴，
+    /// `..` 會走出來源 root。它們不是使用者資料，也不是 repo 物件。
+    #[test]
+    fn self_and_parent_entries_are_always_skipped() {
+        assert!(skip_in_listing(true, "."), "來源模式也要跳 .（無限遞迴）");
+        assert!(
+            skip_in_listing(true, ".."),
+            "來源模式也要跳 ..（走出 root）"
+        );
+        assert!(skip_in_listing(false, "."), "repo 模式當然也跳");
+        assert!(skip_in_listing(false, ".."), "repo 模式當然也跳");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    /// 容量提示：宣稱大小只取到提示上限，其餘讓 Vec 邊讀邊長——敵意伺服器
+    /// 謊報 size 不能把我們推進 handle_alloc_error（uncatchable abort）。
+    #[test]
+    fn read_capacity_hint_caps_claimed_sizes() {
+        assert_eq!(read_capacity_hint(0), 0);
+        assert_eq!(read_capacity_hint(4096), 4096);
+        assert_eq!(
+            read_capacity_hint(READ_CAPACITY_HINT + 1),
+            READ_CAPACITY_HINT as usize
+        );
+        assert_eq!(read_capacity_hint(1 << 62), READ_CAPACITY_HINT as usize);
+    }
+
+    /// 深度上限只屬於 repo 命名空間；來源模式（list_all）列使用者資料，
+    /// 深度跟著內容走、不設限（迭代走訪不會燒堆疊）。
+    #[test]
+    fn depth_cap_belongs_to_the_repo_namespace_only() {
+        assert!(!too_deep(false, 0));
+        assert!(!too_deep(false, REPO_MAX_DEPTH));
+        assert!(too_deep(false, REPO_MAX_DEPTH + 1));
+        assert!(!too_deep(true, REPO_MAX_DEPTH + 1));
+        assert!(!too_deep(true, 10_000));
     }
 }
