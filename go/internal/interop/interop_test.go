@@ -202,3 +202,23 @@ func TestInteropTreeCanonicalCBOR(t *testing.T) {
 		t.Fatalf("tree encoding diverged from the recorded vector (got %d bytes, want %d)", len(encoded), len(want)/2)
 	}
 }
+
+// The two format specs must stay byte-identical (README: the local
+// interop gate covers "conformance vectors 與兩份 format.md 逐 byte
+// 一致"). ci-rust.yml enforces it with cmp, but that workflow is
+// manual-dispatch-only; this test is the local enforcement the README
+// promises, so a spec edit that skips the Go copy fails `go test
+// ./internal/interop/...` on the spot.
+func TestFormatSpecCopiesAreByteIdentical(t *testing.T) {
+	authoritative, err := os.ReadFile("../../../docs/format.md")
+	if err != nil {
+		t.Fatalf("read docs/format.md: %v", err)
+	}
+	goCopy, err := os.ReadFile("../../docs/format.md")
+	if err != nil {
+		t.Fatalf("read go/docs/format.md: %v", err)
+	}
+	if !bytes.Equal(authoritative, goCopy) {
+		t.Fatal("go/docs/format.md differs from the authoritative docs/format.md; update both or run: cp docs/format.md go/docs/format.md")
+	}
+}
