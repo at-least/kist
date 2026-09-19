@@ -543,9 +543,10 @@ type fileNode struct {
 	fs    *filesystem
 	entry tree.Entry
 
-	once       sync.Once
-	chunks     []crypto.ID
-	resolveErr error
+	chunks []crypto.ID
+	// resolved marks a successful resolve; failures are retried on the
+	// next call (see dirNode.load for why an error must not be cached).
+	resolved bool
 
 	mu   sync.Mutex
 	ends []uint64 // ends[i] = plaintext offset just past chunk i
@@ -553,28 +554,29 @@ type fileNode struct {
 
 // resolve produces the data chunk list, following indirect entries.
 func (n *fileNode) resolve(ctx context.Context) ([]crypto.ID, error) {
-	n.once.Do(func() {
-		if tree.ContentType(n.entry.ContentType) == tree.ContentIndirect {
-			var buf []byte
-			for _, id := range n.entry.Chunks {
-				data, err := n.fs.chunk(ctx, id)
-				if err != nil {
-					n.resolveErr = err
-					return
-				}
-				buf = append(buf, data...)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.resolved {
+		return n.chunks, nil
+	}
+	if tree.ContentType(n.entry.ContentType) == tree.ContentIndirect {
+		var buf []byte
+		for _, id := range n.entry.Chunks {
+			data, err := n.fs.chunk(ctx, id)
+			if err != nil {
+				return nil, err
 			}
-			var list tree.ChunkList
-			if err := crypto.Unmarshal(buf, &list); err != nil {
-				n.resolveErr = err
-				return
-			}
-			n.chunks = list.Chunks
-			return
+			buf = append(buf, data...)
 		}
-		n.chunks = n.entry.Chunks
-	})
-	return n.chunks, n.resolveErr
+		var list tree.ChunkList
+		if err := crypto.Unmarshal(buf, &list); err != nil {
+			return nil, err
+		}
+		n.chunks, n.resolved = list.Chunks, true
+		return n.chunks, nil
+	}
+	n.chunks, n.resolved = n.entry.Chunks, true
+	return n.chunks, nil
 }
 
 var (
