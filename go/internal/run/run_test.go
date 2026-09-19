@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -340,5 +341,44 @@ func TestWebhookErrorOmitsTheURL(t *testing.T) {
 		if strings.Contains(l, "ops:hunter2") || strings.Contains(l, "dead.String()") {
 			t.Errorf("transport-failure log leaks the webhook credentials: %q", l)
 		}
+	}
+}
+
+// A redirect must not be followed: the webhook endpoint (or whoever
+// has compromised it) could bounce the event JSON at internal URLs.
+// A 3xx is reported as a webhook failure instead.
+func TestWebhookDoesNotFollowRedirects(t *testing.T) {
+	var redirected atomic.Int32
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/stolen", http.StatusFound)
+	}))
+	defer hook.Close()
+
+	cfg, err := config.Parse(fmt.Sprintf("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl='%s/hook'\ntimeout='2s'", hook.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	r := &Runner{Config: cfg, Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	ev := report.Event{Kind: "backup", Job: "j", Started: time.Now()}
+	if err := r.finish(context.Background(), &ev, nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if redirected.Load() != 0 {
+		t.Fatal("the webhook redirect was followed")
+	}
+	found := false
+	for _, l := range logs {
+		if strings.Contains(l, "302") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the 3xx must be logged as a webhook failure: %v", logs)
 	}
 }
