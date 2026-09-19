@@ -64,6 +64,17 @@ pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
         match comp {
             b"" | b"." => {}
             b".." => rel.push("__parent__"),
+            // NUL 不是路徑元件（Go 端同判斷）：Unix 的 bytes_to_name 什麼
+            // 都收，得在這裡擋。
+            name if name.contains(&0) => {
+                return Err(crate::CoreError::Corrupt {
+                    key: "<locator>".to_owned(),
+                    reason: format!(
+                        "locator component {:?} is not a path component",
+                        String::from_utf8_lossy(name)
+                    ),
+                })
+            }
             name => rel.push(bytes_to_name(name)?),
         }
     }

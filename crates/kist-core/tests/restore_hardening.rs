@@ -266,3 +266,15 @@ async fn symlink_in_the_way_of_a_file_is_refused() {
         "應拒絕而非跟隨：{summary:?}"
     );
 }
+
+/// 定位組件含 NUL 必須回錯（與 Go 端 restore.go 的 locatorComponents
+/// 同判斷）：NUL 不是路徑元件，Unix 上會在 syscall 層 EINVAL。
+#[test]
+fn locator_with_nul_component_is_rejected() {
+    use kist_core::fsmeta::locator_to_relative;
+    assert!(
+        locator_to_relative(b"/a\0b/c").is_err(),
+        "含 NUL 的定位組件要回錯"
+    );
+    assert!(locator_to_relative(b"/a/b").is_ok());
+}

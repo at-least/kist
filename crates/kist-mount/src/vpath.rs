@@ -125,6 +125,16 @@ fn locator_components(path: &[u8]) -> Vec<&[u8]> {
     };
     rest.split(|&b| b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
+        // `..` 映射成 `__parent__`：與 fsmeta::locator_to_relative、Go 端
+        // locatorComponents 同一套規則——字面 `..` 是 FUSE 核心自己的
+        // 東西，虛擬層重複吐一個只會是不可達的同名 entry。
+        .map(|c| {
+            if c == b".." {
+                b"__parent__" as &[u8]
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -268,5 +278,30 @@ mod tests {
         );
         assert!(VirtualRoot::lookup(root.top(), b"m").is_some());
         assert!(VirtualRoot::lookup(root.top(), b"b").is_none());
+    }
+
+    /// `..` 組件的對映必須與 fsmeta::locator_to_relative（和 Go 端的
+    /// locatorComponents）同一套：映射成 `__parent__`，不是留下字面 `..`。
+    /// 字面 `..` 在 FUSE 目錄裡是核心自己的東西，虛擬層重複吐一個
+    /// 不可達的同名 entry。
+    #[test]
+    fn dotdot_component_maps_to_parent_marker() {
+        // /a/../b：a 之下是 __parent__（.. 的映射）與 b，絕不是字面 ..。
+        let root = VirtualRoot::build([dir_root(root_of("/a/../b"))]);
+        assert_eq!(names(root.top()), vec![b"a".to_vec()]);
+        let under_a = names(root.level(b"/a"));
+        assert!(
+            under_a.iter().any(|n| n == &b"__parent__".to_vec()),
+            "`..` 應映射成 __parent__，得到 {under_a:?}"
+        );
+        assert!(
+            !under_a.iter().any(|n| n == &b"..".to_vec()),
+            "字面 `..` 不該留在虛擬層：{under_a:?}"
+        );
+        assert_eq!(
+            names(root.level(b"/a/__parent__")),
+            vec![b"b".to_vec()],
+            "root 葉在映射後的路徑下"
+        );
     }
 }
