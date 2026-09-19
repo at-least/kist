@@ -408,7 +408,11 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   `test --workspace`（59 執行檔）全綠。**對等隱患待辦（Go）**：
   `pkg/sftp`（第三方程式庫）在 List/Stat 對缺送的 ACMODTIME 同樣
   映成零值——kist-go 端若要徹底，得在 backend 層偵測並拒絕，屆時
-  與上游回報一併考慮。
+  與上游回報一併考慮。同族兩筆記錄（皆正確行為、非 bug，防再犯）：
+  ① 伺服器**明送** mtime=0 時 `to_meta` 仍會得到 epoch——協議上
+  伺服器斷言了時間，尊重它，但這是「無限老」進 GC 的最後一條路；
+  ② `size` 缺送仍代換 0（不在 GC 時間軸上，無嚴重度，但與剛移除
+  的 mtime 模式同型）。
   s3 job 的 `docker: pull access denied
   for minio/minio` 是 runner 端 Docker Hub 拉取限制（暫時性環境問題）。
   ubuntu/macos 全綠。】
