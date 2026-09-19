@@ -1038,3 +1038,95 @@ func TestMarkedDuplicateLosesToTheUnmarkedHolder(t *testing.T) {
 	}
 	s.healthy()
 }
+
+// The commit gate re-resolves every referenced CHUNK, not the pack it
+// happened to be read from (format.md §13.3, mirroring Rust's
+// verify_referenced_chunks): a prune between the dedup and the commit
+// may have moved the chunk's live copy to another pack and deleted the
+// old one. The data is alive -- the commit must pass. Only a chunk that
+// resolves nowhere, or into a pack that is gone or expired, refuses.
+func TestCommitGateResolvesChunksNotPacks(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+
+	// A duplicate pair: both packs hold both of the source's chunks.
+	a, b := s.open(clientA), s.open(clientB)
+	backupHooks.afterMarks = func() {
+		backupHooks.afterMarks = nil
+		s.backup(b, src)
+	}
+	defer func() { backupHooks.afterMarks = nil }()
+	s.backup(a, src)
+	if s.packs() != 2 {
+		t.Fatalf("%d packs, want the duplicate pair", s.packs())
+	}
+	entries, err := os.ReadDir(filepath.Join(s.dir, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []crypto.ID
+	for _, e := range entries {
+		if id, err := crypto.ParseID(e.Name()); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("found %d pack ids, want 2", len(ids))
+	}
+	dead, alive := ids[0], ids[1]
+
+	ctx := context.Background()
+	// The chunks the "backup" deduplicated out of the dying pack, read
+	// from its trailer before it goes.
+	client := s.open(clientA)
+	deadEntries, err := pack.ReadTrailer(ctx, client.Backend(), client.keys, dead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks := make(map[crypto.ID]struct{}, len(deadEntries))
+	for _, e := range deadEntries {
+		chunks[e.ID] = struct{}{}
+	}
+
+	// The state a prune leaves behind after repacking and sweeping the
+	// dying pack: the object is gone and the index names only the
+	// survivor. RebuildIndex reproduces exactly that index.
+	if err := os.Remove(filepath.Join(s.dir, pack.Key(dead))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RebuildIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	run := &backupRun{
+		repo:       client,
+		opts:       BackupOptions{SpoolDir: t.TempDir()},
+		referenced: map[crypto.ID]map[crypto.ID]struct{}{dead: chunks},
+		ownPacks:   make(map[crypto.ID]struct{}),
+		marked:     make(map[crypto.ID]time.Time),
+		seenTrees:  make(map[crypto.ID]struct{}),
+		started:    client.now().UTC(),
+	}
+	if err := run.verifyBeforeCommit(ctx); err != nil {
+		t.Fatalf("every referenced chunk is alive in %s; the gate refused anyway: %v", alive, err)
+	}
+
+	// A chunk that resolves nowhere still refuses: that data is gone and
+	// the snapshot must not be written.
+	var ghost crypto.ID
+	ghost[0] = 0xee
+	run.referenced = map[crypto.ID]map[crypto.ID]struct{}{dead: {ghost: {}}}
+	if err := run.verifyBeforeCommit(ctx); err == nil {
+		t.Fatal("a chunk no pack holds must refuse the commit")
+	}
+
+	// A chunk that resolves to a pack the storage no longer has refuses
+	// too: the index still names it, the object is gone.
+	if err := os.Remove(filepath.Join(s.dir, pack.Key(alive))); err != nil {
+		t.Fatal(err)
+	}
+	run.referenced = map[crypto.ID]map[crypto.ID]struct{}{dead: chunks}
+	if err := run.verifyBeforeCommit(ctx); err == nil {
+		t.Fatal("a chunk whose resolved pack is gone must refuse the commit")
+	}
+}

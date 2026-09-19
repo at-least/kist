@@ -221,7 +221,7 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 		opts:             opts,
 		marked:           marksAtStart,
 		uploaded:         make(map[crypto.ID]struct{}),
-		referenced:       make(map[crypto.ID]struct{}),
+		referenced:       make(map[crypto.ID]map[crypto.ID]struct{}),
 		written:          make(map[crypto.ID]index.PackInfo),
 		ownPacks:         make(map[crypto.ID]struct{}),
 		hard:             make(map[hardLinkKey]fileContents),
@@ -345,9 +345,12 @@ type backupRun struct {
 	// the start of this backup, with the age of each mark. See has.
 	marked map[crypto.ID]time.Time
 
-	// referenced is the set of packs this run deduplicated against: it
-	// refers to their chunks without holding a copy.
-	referenced map[crypto.ID]struct{}
+	// referenced maps each pack this run deduplicated against to the
+	// chunks it read from it: the commit gate re-resolves those chunks
+	// one by one (format.md §13.3), not the pack they happened to come
+	// from -- a prune between the dedup and the commit may have moved
+	// the live copy elsewhere and deleted the old pack.
+	referenced map[crypto.ID]map[crypto.ID]struct{}
 
 	// uploaded holds every chunk this run has put into a pack, finished
 	// or not.
@@ -1140,7 +1143,10 @@ func (b *backupRun) has(id crypto.ID) bool {
 		return false
 	}
 
-	b.referenced[loc.Pack] = struct{}{}
+	if b.referenced[loc.Pack] == nil {
+		b.referenced[loc.Pack] = make(map[crypto.ID]struct{})
+	}
+	b.referenced[loc.Pack][id] = struct{}{}
 	return true
 }
 
@@ -1164,12 +1170,17 @@ func (b *backupRun) verifyBeforeCommit(ctx context.Context) error {
 		return fmt.Errorf("%w (elapsed %s, grace %s)", ErrBackupTooLong, elapsed, grace)
 	}
 
-	needChecks := len(b.referenced) > 0 || len(b.seenTrees) > 0
-	if !needChecks {
+	// The index reload is paid only when there are referenced chunks to
+	// re-resolve: on a first backup (or one that reused nothing) it is a
+	// full index read for nothing, which on a million-chunk repository
+	// is the difference between a fast and a slow commit.
+	if len(b.referenced) == 0 && len(b.seenTrees) == 0 {
 		return nil
 	}
-	if err := b.repo.refreshIndex(ctx, b.opts.warn); err != nil {
-		return err
+	if len(b.referenced) > 0 {
+		if err := b.repo.refreshIndex(ctx, b.opts.warn); err != nil {
+			return err
+		}
 	}
 	marks, err := b.repo.listMarkedPacks(ctx)
 	if err != nil {
@@ -1177,15 +1188,36 @@ func (b *backupRun) verifyBeforeCommit(ctx context.Context) error {
 	}
 	now := b.repo.now().UTC()
 
-	for id := range b.referenced {
-		if _, own := b.ownPacks[id]; own {
+	// Per chunk, not per pack (format.md §13.3, mirroring Rust's
+	// verify_referenced_chunks): a prune between the dedup and the commit
+	// may have repacked the chunk into another pack and deleted the one
+	// it was read from. The data is alive and the commit must pass; what
+	// refuses is a chunk that resolves nowhere, or into a pack that is
+	// gone or whose mark has outlived the grace.
+	packAlive := make(map[crypto.ID]bool)
+	for from, chunks := range b.referenced {
+		if _, own := b.ownPacks[from]; own {
 			continue
 		}
-		if markedAt, doomed := marks[id]; doomed && now.Sub(markedAt) >= grace {
-			return fmt.Errorf("pack %s has been marked for deletion longer than the grace period", id)
-		}
-		if _, err := b.repo.backend.Stat(ctx, pack.Key(id)); err != nil {
-			return fmt.Errorf("pack %s, referenced by this backup, is missing: %w", id, err)
+		for chunk := range chunks {
+			loc, ok := b.repo.index.Lookup(chunk)
+			if !ok {
+				return fmt.Errorf("chunk %s (read from pack %s) resolves to no pack in the current index; a prune may have repacked the repository -- rerun the backup", chunk, from)
+			}
+			alive, cached := packAlive[loc.Pack]
+			if !cached {
+				if markedAt, doomed := marks[loc.Pack]; doomed && now.Sub(markedAt) >= grace {
+					return fmt.Errorf("chunk %s (read from pack %s) resolves to pack %s, marked for deletion longer than the grace period", chunk, from, loc.Pack)
+				}
+				if _, err := b.repo.backend.Stat(ctx, pack.Key(loc.Pack)); err != nil {
+					return fmt.Errorf("chunk %s (read from pack %s) resolves to pack %s, which is missing: %w", chunk, from, loc.Pack, err)
+				}
+				alive = true
+				packAlive[loc.Pack] = true
+			}
+			if !alive {
+				return fmt.Errorf("chunk %s (read from pack %s) no longer resolves to a live pack (%s)", chunk, from, loc.Pack)
+			}
 		}
 	}
 

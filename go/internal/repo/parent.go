@@ -260,11 +260,14 @@ func (b *backupRun) tryReuse(ctx context.Context, f fileFacts, parent *tree.Entr
 	return parent.Size, parent.Chunks, tree.ContentType(parent.ContentType), true
 }
 
-// recordReferenced notes the packs this backup now deduplicates against,
-// so the commit gate can insist they still exist.
+// recordReferenced notes the chunks this backup deduplicated and the
+// packs it read them from, so the commit gate can re-resolve each one.
 func (b *backupRun) recordReferenced(refs []reusableChunk) {
 	for _, ref := range refs {
-		b.referenced[ref.pack] = struct{}{}
+		if b.referenced[ref.pack] == nil {
+			b.referenced[ref.pack] = make(map[crypto.ID]struct{})
+		}
+		b.referenced[ref.pack][ref.id] = struct{}{}
 	}
 }
 
