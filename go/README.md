@@ -2,8 +2,8 @@
 
 Deduplicating, encrypted backups to object storage, from one binary with no cgo.
 
-> **狀態：儲存格式 v3（2026-09-09 定案，[docs/format.md](docs/format.md) 與 kist-rs 逐 byte 一致）。** 本 repo 是參考實作，
-> 產品是 `kist-rs`；兩者讀寫同一種 repo、互為驗證（[`PLAN.md`](PLAN.md)）。
+> **狀態：儲存格式 v3（2026-09-09 定案，與本 repo 根目錄的 [docs/format.md](../docs/format.md) 逐 byte 一致）。**
+> 本目錄是 Go 參考實作，與根目錄的 Rust 產品讀寫同一種 repo、互為驗證（[`PLAN.md`](PLAN.md)）。
 > 本機 / S3 / SFTP 後端、無鎖 GC（`forget` / `prune`）、排程 `run`、`mount` 都已具備。
 
 ```console
@@ -107,7 +107,7 @@ Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,r
 
 ## 文件
 
-- [`docs/format.md`](docs/format.md) — 儲存格式 v3（唯一權威副本在 kist-rs，本副本逐 byte 一致），含「設計決定 × 證據」對照表
+- [`docs/format.md`](docs/format.md) — 儲存格式 v3（唯一權威副本在 repo 根目錄的 [`docs/format.md`](../docs/format.md)，本副本逐 byte 一致，有測試釘住），含「設計決定 × 證據」對照表
 - [`docs/decisions/`](docs/decisions/) — ADR，記錄為什麼這樣設計
 - [`docs/release.md`](docs/release.md) — 版本、平台、release 流程
 - [`PLAN.md`](PLAN.md) — 里程碑與工程規範

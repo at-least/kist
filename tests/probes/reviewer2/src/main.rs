@@ -1,6 +1,6 @@
 //! 探針：兩個 index 寫入者（兩個交錯的 prune，或 prune 中途 rebuild-index）留下「index 裡有、儲存上沒有」
 //! 的 pack（phantom），下一輪 prune 把 phantom 當正本、把真正的持有者標記然後刪掉。
-#[path = "/home/newlix/github/at-least/kist-rs/crates/kist-core/tests/common/mod.rs"]
+#[path = "../../../../crates/kist-core/tests/common/mod.rs"]
 mod common;
 
 use std::collections::HashSet;
@@ -19,11 +19,13 @@ fn client(id: u8, now: OffsetDateTime) -> BackupOptions {
         username: "tester".to_owned(),
         now: Some(now),
         gc_grace: 72 * H,
+        parity: 0,
         progress: None,
+        source: kist_core::SourceSpec::default(),
     }
 }
 fn prune_opts(now: OffsetDateTime) -> PruneOptions {
-    PruneOptions { grace: 72 * H, inactive_after: 30 * 24 * H, repack_below_percent: 50, dry_run: false, now: Some(now) }
+    PruneOptions { grace: 72 * H, inactive_after: 30 * 24 * H, clock_skew: std::time::Duration::ZERO, repack_below_percent: 50, dry_run: false, now: Some(now) }
 }
 fn ids_under(t: &TestRepo, prefix: &str) -> HashSet<ObjectId> {
     let dir = t.repo_path().join(prefix);
@@ -75,7 +77,7 @@ async fn run(variant: &str, seed: u64) -> bool {
     assert!(!x_set.is_empty());
     // r+1d: c1 再備份 e（X 已標記 → 重寫進 W）；刪大檔再備份 src；forget s1 → 跨界 pack 成為 repack 候選
     let se2 = repo.backup(std::slice::from_ref(&src_e), client(1, r + Duration::days(1))).await.unwrap();
-    assert!(se2.stats.chunks_new > 0);
+    assert!(se2.report.chunks_new > 0);
     std::fs::remove_file(src.join("zz-big.bin")).unwrap();
     let s2 = repo.backup(std::slice::from_ref(&src), client(1, r + Duration::days(1) + Duration::hours(1))).await.unwrap();
     forget(&repo, s1.snapshot_key).await;
@@ -124,7 +126,7 @@ async fn run(variant: &str, seed: u64) -> bool {
     let in_index: HashSet<ObjectId> = idx.packs().map(|(id, _)| *id).collect();
     let phantoms: Vec<ObjectId> = x_set.iter().filter(|x| in_index.contains(x)).copied().collect();
     println!("phantom packs (in effective index, not in storage): {}", phantoms.len());
-    let c = fresh.check(CheckOptions { read_data: false }).await.unwrap();
+    let c = fresh.check(CheckOptions { read_data: false, repair: false }).await.unwrap();
     println!("check after race: {} error(s); first: {:?}", c.errors.len(), c.errors.first());
     assert!(!phantoms.is_empty(), "no phantom → scenario did not reproduce");
     assert!(c.errors.iter().any(|e| e.contains("pack is missing")));
@@ -151,13 +153,13 @@ async fn run(variant: &str, seed: u64) -> bool {
     let w_gone: Vec<_> = w_marked.iter().filter(|w| !packs_final.contains(w)).collect();
     println!("W packs deleted: {}/{}", w_gone.len(), w_marked.len());
     let fresh = t.open().await;
-    let c = fresh.check(CheckOptions { read_data: true }).await.unwrap();
+    let c = fresh.check(CheckOptions { read_data: true, repair: false }).await.unwrap();
     println!("check --read-data: {} error(s); e.g. {:?}", c.errors.len(), c.errors.first());
     let out = t.dir.path().join("out");
     let rr = fresh.restore(&se2.snapshot_key, &out, Default::default()).await.unwrap();
     println!("restore of snapshot {} (e, committed r+1d): {} error(s); e.g. {:?}", se2.snapshot_key, rr.errors.len(), rr.errors.first());
     let _ = s2;
-    let cc = fresh.check(kist_core::CheckOptions { read_data: true }).await.unwrap();
+    let cc = fresh.check(kist_core::CheckOptions { read_data: true, repair: false }).await.unwrap();
     println!("check --read-data after prune D: {} error(s), {} warning(s)", cc.errors.len(), cc.warnings.len());
     assert!(rr.errors.is_empty() && cc.errors.is_empty(), "DATA LOSS ({variant})");
     println!("NO DATA LOSS ({variant}): restore ok, check clean");

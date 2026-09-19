@@ -8,11 +8,12 @@
 去重、加密、可多台機器共用 repo 的備份工具，對象是 object storage（S3 相容）優先，其次本機與 SFTP。
 設計目標依序：資料安全性 > 還原可靠性 > 抗勒索 > 效能 > 功能數量。
 
-**本 repo（kist-rs）是正式產品與格式標竿**；`github.com/at-least/kist`（Go）是
-參考實作，只用来交叉驗證格式與抓 bug，不單獨演進。兩邊共用同一份
-`docs/format.md`（v2，權威規格）與跨語言 conformance 向量；任何格式改動
-都要同時改兩邊、golden、向量與 E2E。設計取捨以產品（Rust）為優先，不為
-遷就 Go 選次級方案（2026-09-05 的 CBOR 欄位順序修訂就是這個原則的執行）。
+**本 repo 是 monorepo：根目錄的 Rust 工作區是正式產品與格式標竿**；`go/`
+（同一 repo 內的 Go 參考實作）只用来交叉驗證格式與抓 bug，不單獨演進。
+兩邊共用同一份 `docs/format.md`（v3，權威規格）與跨語言 conformance
+向量；任何格式改動都要同時改兩邊、golden、向量與 E2E。設計取捨以產品
+（Rust）為優先，不為遷就 Go 選次級方案（2026-09-05 的 CBOR 欄位順序
+修訂就是這個原則的執行）。
 
 競品參考：restic（穩定但有鎖、記憶體重）、Kopia（pack + 無鎖，最接近我們）、Duplicacy（無鎖 GC 但一 chunk 一檔）。
 我們要的是 Kopia 的儲存效率 + Duplicacy 的無鎖 GC + 原生抗勒索設計 + Rust 帶來的低記憶體與安全性。

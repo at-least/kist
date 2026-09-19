@@ -6,7 +6,7 @@
 mkdir -p ~/kist-acceptance && cp tests/acceptance/*.py ~/kist-acceptance/
 cd ~/kist-acceptance
 python3 gen.py src                                   # 10 萬檔、約 10 GiB
-python3 -u run.py /path/to/kist-rs/target/release/kist   # backup → restore → diff -r → check → 破壞偵測
+python3 -u run.py /path/to/kist/target/release/kist      # backup → restore → diff -r → check → 破壞偵測
 ```
 
 S3 版：先 `eval "$(sh tests/minio-setup.sh)"` 起 MinIO，再 `python3 -u run_s3.py /path/to/kist`

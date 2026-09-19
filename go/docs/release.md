@@ -29,7 +29,7 @@ $ systemctl --user show kist-fuzz-long.service -p ActiveState -p MemoryCurrent
 
 git tag `vX.Y.Z`。binary 裡的版本來自 link 時的 `-X github.com/at-least/kist/internal/cmd.version=…`；`kist-go version` 印出來。沒 tag 的 build 是 `dev`。
 
-儲存格式的版本（`docs/format.md` 的 v1）跟程式版本無關：程式可以升很多版而格式不動。格式一動就要有 ADR，而且是新的格式版本號。
+儲存格式的版本（`docs/format.md` 的 v3）跟程式版本無關：程式可以升很多版而格式不動。格式一動就要有 ADR，而且是新的格式版本號。
 
 ## 建置
 
@@ -46,7 +46,7 @@ $ ls dist/
 
 ## 平台
 
-CI（`.github/workflows/ci.yml`）在每次 push 跑：三個 OS × Go 1.26.x / stable 的 build、vet、test、`-race`；三個 OS 的 golangci-lint；ubuntu 上的 MinIO 與 OpenSSH suite。2026-09-05 首次推送後全綠（run 33903651553）。
+CI（`.github/workflows/ci.yml`）只手動觸發（2026-09-19 起；私有 repo 的 Actions 額度留給真正需要的時候，平時以本機 `make verify` 為準）：三個 OS × Go 1.26.x / stable 的 build、vet、test、`-race`；三個 OS 的 golangci-lint；ubuntu 上的 MinIO 與 OpenSSH suite。2026-09-05 首次推送後全綠（run 33903651553）。
 
 | | build | vet | 測試 | 備註 |
 | --- | --- | --- | --- | --- |

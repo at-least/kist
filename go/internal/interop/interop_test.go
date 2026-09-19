@@ -1,8 +1,8 @@
 package interop
 
 // Cross-language conformance tests: the same vectors are consumed by the
-// Rust implementation (kist-rs/crates/kist-format/tests/interop.rs and
-// kist-chunker/tests/interop.rs). A change that breaks one side's
+// Rust implementation (crates/kist-format/tests/interop.rs and
+// crates/kist-chunker/tests/interop.rs). A change that breaks one side's
 // expectations breaks the other's repository.
 
 import (
@@ -111,7 +111,7 @@ func loadBoundaries(path string) ([]int, error) {
 
 func TestInteropKeyDerivation(t *testing.T) {
 	// The vectors are pinned by BOTH implementations; see
-	// kist-rs/crates/kist-crypto/tests/poc_keys.rs (kept permanently).
+	// crates/kist-crypto/tests/poc_keys.rs (kept permanently).
 	password := []byte("correct horse battery staple")
 	salt := bytes.Repeat([]byte{0x11}, 16)
 	master := bytes.Repeat([]byte{0x42}, 32)
