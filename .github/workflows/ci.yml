@@ -1,9 +1,8 @@
 name: CI
 
+# 只手動觸發（2026-09-19）：與 ci-rust.yml 同政策——私有 repo 的 Actions
+# 額度留給真正需要的時候；Go gate 平時以本機 `cd go && make verify` 為準。
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:

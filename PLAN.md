@@ -367,10 +367,11 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   與 Rust 同樹 checkout，不再需要跨 repo PAT——此條僅存歷史。】
 
 - **GitHub Actions 額度：`ci.yml`（Go）push 觸發的 runs 全數未啟動**
-  【2026-09-12 記錄】：私有 repo 的 Actions 因帳號「recent account payments
-  have failed or your spending limit needs to be increased」無法啟動 job——
-  自 2026-09-09 起每個 push 的 run 都瞬間 failure：job 無 steps、無 runner、
-  無 log（2026-09-04 當天仍有成功的 run，Go repo 時代）。**不是 regression**：
-  程式 gate 以本機重驗為準（見上方 2026-09-09 完成 gate 全量重驗）。
-  修復途徑擇一：Settings → Billing & plans 補付款／提高 spending limit；
-  或把 `ci.yml` 觸發改為 `workflow_dispatch`（與 Rust 端同政策，省配額）。
+  【2026-09-12 記錄；2026-09-19 已處置】：私有 repo 的 Actions 因帳號
+  「recent account payments have failed or your spending limit needs to be
+  increased」無法啟動 job——自 2026-09-09 起每個 push 的 run 都瞬間
+  failure：job 無 steps、無 runner、無 log（2026-09-04 當天仍有成功的
+  run，Go repo 時代）。**不是 regression**：程式 gate 以本機重驗為準
+  （見上方 2026-09-09 完成 gate 全量重驗）。處置：`ci.yml` 觸發改為僅
+  `workflow_dispatch`（與 `ci-rust.yml` 同政策，省配額），push 不再產生
+  必失敗的 run；額度若日後補上，可隨時改回。
