@@ -544,3 +544,32 @@ func TestGoldenIndexBlob(t *testing.T) {
 		t.Error("the index blob format changed")
 	}
 }
+
+// §10 (format.md): the chunk → pack mapping is a pure function of the
+// (marked, name) order, independent of insertion order. A marked pack
+// whose name sorts below an unmarked holder must still lose -- a
+// name-only comparison lets "the marked location that arrived first"
+// win, and a backup then re-uploads data it could have deduplicated
+// against the unmarked copy (the Rust side met this as an intermittent
+// failure of marked_pack_is_not_used_for_dedup).
+func TestAddPackRankedPrefersUnmarkedRegardlessOfInsertionOrder(t *testing.T) {
+	markedPack, freshPack := id(0x00), id(0xff) // the marked one sorts below
+	chunk := entry(0xaa, 0, 100)
+	isMarked := func(p crypto.ID) bool { return p == markedPack }
+
+	markedFirst, freshFirst := New(), New()
+	markedFirst.AddPackRanked(markedPack, []pack.Entry{chunk}, isMarked)
+	markedFirst.AddPackRanked(freshPack, []pack.Entry{chunk}, isMarked)
+	freshFirst.AddPackRanked(freshPack, []pack.Entry{chunk}, isMarked)
+	freshFirst.AddPackRanked(markedPack, []pack.Entry{chunk}, isMarked)
+
+	for name, ix := range map[string]*Index{"marked first": markedFirst, "fresh first": freshFirst} {
+		loc, ok := ix.Lookup(id(0xaa))
+		if !ok {
+			t.Fatalf("%s: chunk is missing", name)
+		}
+		if loc.Pack != freshPack {
+			t.Errorf("%s: chunk resolves to the marked pack %s; want the unmarked %s", name, loc.Pack, freshPack)
+		}
+	}
+}

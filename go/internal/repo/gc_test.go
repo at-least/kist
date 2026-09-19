@@ -953,3 +953,88 @@ func TestPruneCompactsTheIndexPastTheThreshold(t *testing.T) {
 		t.Fatalf("prune left %d effective index blobs, want 1 (compaction is mandatory)", len(post))
 	}
 }
+
+// Scenario E. A chunk lives in two packs -- two clients packed the same
+// content at once -- and the smaller-named one carries an aged gc mark
+// (the state a prune that listed marks before the second pack landed,
+// or one interrupted between mark and sweep, leaves behind). Liveness
+// is derived from the (marked, name) order (format.md §10, the same
+// rank as Rust's mark_and_canonicalize): the unmarked holder is the
+// live copy, the marked duplicate stays marked and dies. Ranking by
+// name alone would revive the marked pack and mark the survivor -- the
+// mirror-image repository. The backup's dedup view ranks the same way:
+// it reuses the unmarked copy instead of re-uploading.
+func TestMarkedDuplicateLosesToTheUnmarkedHolder(t *testing.T) {
+	s := newScenario(t)
+	src := s.source("one", 300<<10)
+
+	// Two packs holding the same chunks (scenario D's interleave).
+	a, b := s.open(clientA), s.open(clientB)
+	backupHooks.afterMarks = func() {
+		backupHooks.afterMarks = nil
+		s.backup(b, src)
+	}
+	defer func() { backupHooks.afterMarks = nil }()
+	s.backup(a, src)
+	if s.packs() != 2 {
+		t.Fatalf("%d packs, want the duplicate pair", s.packs())
+	}
+
+	// Enumerate the pair and hand-plant an aged mark on the SMALLER
+	// name: name-only ranking is exactly what must not decide here.
+	entries, err := os.ReadDir(filepath.Join(s.dir, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []crypto.ID
+	for _, e := range entries {
+		if id, err := crypto.ParseID(e.Name()); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("found %d pack ids, want 2", len(ids))
+	}
+	slices.SortFunc(ids, func(x, y crypto.ID) int { return bytes.Compare(x[:], y[:]) })
+	small := ids[0] // the larger name needs no mark: it is the copy that must win
+
+	ctx := context.Background()
+	p := s.pruner()
+	// The pack must look older than its mark, the order the protocol
+	// writes them in -- a pack whose mtime is newer than the mark reads
+	// as "rewritten after the mark" and is rightly revived.
+	older := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(filepath.Join(s.dir, pack.Key(small)), older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.PutBytesIfAbsent(ctx, p.Backend(), gcKey(small), GCMarkMagic); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(filepath.Join(s.dir, gcKey(small)), past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	first := s.prune(p, shortGrace)
+	// The marked duplicate stays marked (it dies after the grace); the
+	// unmarked holder stays unmarked (it is the live copy). Reviving the
+	// marked one and marking the survivor is the mirror-image outcome.
+	if len(first.Unmarked) != 0 || len(first.Marked) != 0 {
+		t.Fatalf("prune flipped the marks: marked=%v unmarked=%v; want both empty (the marked duplicate stays marked, the unmarked holder stays live)", first.Marked, first.Unmarked)
+	}
+	if first.Live != 1 {
+		t.Fatalf("live packs = %d, want 1 (the unmarked holder)", first.Live)
+	}
+
+	// The dedup view ranks the same way: the next backup reuses the
+	// unmarked copy instead of re-uploading the data a second time.
+	summary, err := s.open(clientA).Backup(ctx, []string{src}, BackupOptions{SpoolDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	s.sources[summary.Handle.Key] = src
+	if summary.Report.PacksNew != 0 || summary.Report.PacksRevived != 0 {
+		t.Fatalf("backup uploaded from scratch (new %d, revived %d); the unmarked holder should have served every chunk", summary.Report.PacksNew, summary.Report.PacksRevived)
+	}
+	s.healthy()
+}

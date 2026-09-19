@@ -113,14 +113,45 @@ func (ix *Index) Packs() []crypto.ID {
 // depends on it, because "which packs are live" is derived from exactly
 // this mapping, and a rebuild between two prune runs must not move the
 // live copy.
+//
+// Readers use this plain rule; backup's dedup view and prune's liveness
+// walk load through AddPackRanked instead, which prefers an unmarked
+// holder over a marked one (format.md §10).
 func (ix *Index) AddPack(packID crypto.ID, entries []pack.Entry) {
+	ix.AddPackRanked(packID, entries, func(crypto.ID) bool { return false })
+}
+
+// AddPackRanked is AddPack with a gc-mark rank: a chunk held by both a
+// marked and an unmarked pack resolves to the unmarked one, name order
+// deciding within each group. The rank applies to the existing location
+// too -- it lives in whichever pack won earlier -- so the merged view is
+// a pure function of the pack set and the mark set, whatever order the
+// packs arrived in. Backup deduplicates through this view (format.md
+// §10): pointing at a marked copy makes every backup re-upload the
+// chunk until prune deletes the pack.
+func (ix *Index) AddPackRanked(packID crypto.ID, entries []pack.Entry, marked func(crypto.ID) bool) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
+	rankOf := func(p crypto.ID) int {
+		if marked(p) {
+			return 1
+		}
+		return 0
+	}
+
 	ix.sealed[packID] = struct{}{}
+	newRank := rankOf(packID)
 	for _, e := range entries {
-		if existing, ok := ix.byID[e.ID]; ok && bytes.Compare(existing.Pack[:], packID[:]) <= 0 {
-			continue
+		if existing, ok := ix.byID[e.ID]; ok {
+			// The existing location keeps the chunk when it does not lose
+			// the (rank, name) comparison -- both sides ranked, so the
+			// result is the same whatever order packs arrived in.
+			existingRank := rankOf(existing.Pack)
+			if existingRank < newRank ||
+				(existingRank == newRank && bytes.Compare(existing.Pack[:], packID[:]) <= 0) {
+				continue
+			}
 		}
 		ix.byID[e.ID] = Location{Pack: packID, Offset: e.Offset, Length: e.Length, RawLen: e.RawLen}
 	}
@@ -333,6 +364,13 @@ func List(ctx context.Context, b backend.Backend) ([]crypto.ID, []string, error)
 // have not been collected yet, the replacement wins. This is what makes
 // overlapping prunes and a rebuild during a prune safe.
 func LoadAll(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index, []error, error) {
+	return LoadAllRanked(ctx, b, keys, func(crypto.ID) bool { return false })
+}
+
+// LoadAllRanked is LoadAll with a gc-mark rank (see AddPackRanked):
+// backup loads through it, so deduplication resolves to unmarked copies
+// first.
+func LoadAllRanked(ctx context.Context, b backend.Backend, keys *crypto.Keys, marked func(crypto.ID) bool) (*Index, []error, error) {
 	ids, unusable, err := List(ctx, b)
 	if err != nil {
 		return nil, nil, err
@@ -370,7 +408,7 @@ func LoadAll(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index,
 			continue
 		}
 		for _, p := range doc.Packs {
-			ix.AddPack(p.ID, p.Entries)
+			ix.AddPackRanked(p.ID, p.Entries, marked)
 		}
 	}
 	return ix, skipped, nil
@@ -384,6 +422,14 @@ func LoadAll(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index,
 // a chunk stored in two packs is recorded once, so reconstructing the map
 // from it would silently drop the second pack's copy.
 func Rebuild(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index, map[crypto.ID]PackInfo, error) {
+	return RebuildRanked(ctx, b, keys, func(crypto.ID) bool { return false })
+}
+
+// RebuildRanked is Rebuild with a gc-mark rank (see AddPackRanked):
+// prune's liveness walk loads through it, so "which pack is live" is
+// derived from the same (marked, name) order Rust's prune uses, and a
+// marked duplicate loses to the unmarked copy instead of being revived.
+func RebuildRanked(ctx context.Context, b backend.Backend, keys *crypto.Keys, marked func(crypto.ID) bool) (*Index, map[crypto.ID]PackInfo, error) {
 	var infos []backend.FileInfo
 	err := b.List(ctx, pack.Prefix, func(fi backend.FileInfo) error {
 		infos = append(infos, fi)
@@ -405,7 +451,7 @@ func Rebuild(ctx context.Context, b backend.Backend, keys *crypto.Keys) (*Index,
 		if err != nil {
 			return nil, nil, fmt.Errorf("rebuild index: %w", err)
 		}
-		ix.AddPack(id, entries)
+		ix.AddPackRanked(id, entries, marked)
 		packs[id] = PackInfo{Size: uint64(max(fi.Size, 0)), Entries: entries}
 	}
 	return ix, packs, nil

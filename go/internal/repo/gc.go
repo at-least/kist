@@ -271,7 +271,14 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	}
 
 	opts.progress("reading pack trailers")
-	ix, packs, err := index.Rebuild(ctx, r.backend, r.keys)
+	// Liveness is derived from the (marked, name) order (format.md §10,
+	// same rank as the backup's dedup view): a chunk held by a marked
+	// and an unmarked pack counts its unmarked holder as the live copy,
+	// so a marked duplicate dies instead of being revived.
+	ix, packs, err := index.RebuildRanked(ctx, r.backend, r.keys, func(id crypto.ID) bool {
+		_, marked := marks[id]
+		return marked
+	})
 	if err != nil {
 		return report, fmt.Errorf("%w: %w", ErrUnhealthy, err)
 	}

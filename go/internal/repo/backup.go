@@ -202,7 +202,14 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	if err != nil {
 		return BackupSummary{}, fmt.Errorf("backup: %w", err)
 	}
-	if err := r.refreshIndex(ctx, opts.warn); err != nil {
+	// The dedup view is ranked by the same marks (format.md §10): a
+	// chunk held by both a marked and an unmarked pack resolves to the
+	// unmarked one, so the backup reuses it instead of re-uploading a
+	// copy prune is about to keep anyway.
+	if err := r.refreshIndexRanked(ctx, opts.warn, func(id crypto.ID) bool {
+		_, marked := marksAtStart[id]
+		return marked
+	}); err != nil {
 		return BackupSummary{}, fmt.Errorf("backup: %w", err)
 	}
 	if backupHooks.afterMarks != nil {
@@ -1241,6 +1248,9 @@ func (b *backupRun) flush(ctx context.Context) error {
 		return fmt.Errorf("backup: %w", err)
 	}
 
+	// Plain AddPack into the ranked in-memory view: this run's own pack
+	// is unmarked, so the name comparison alone cannot lose it to a
+	// marked pack, and has() consults b.uploaded before the index anyway.
 	b.repo.index.AddPack(packID, entries)
 	b.written[packID] = index.PackInfo{Size: size, Entries: entries}
 	b.ownPacks[packID] = struct{}{}
