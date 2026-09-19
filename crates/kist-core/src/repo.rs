@@ -611,7 +611,12 @@ impl Repository {
                         );
                         b
                     }
-                    Err(_) => return Err(CoreError::SnapshotNotFound(key.to_owned())),
+                    Err(BackendError::NotFound(_)) => {
+                        return Err(CoreError::SnapshotNotFound(key.to_owned()))
+                    }
+                    // 副本讀取本身失敗（權限、5xx…）：保留真錯誤——
+                    // 謊報「not found」會讓操作者以為 snapshot 遺失了。
+                    Err(e) => return Err(e.into()),
                 }
             }
             Err(e) => return Err(e.into()),
