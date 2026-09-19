@@ -458,3 +458,33 @@ func TestSFTPMissingMtimeIsRefused(t *testing.T) {
 		t.Fatalf("mtime = %v, want %v", got, want)
 	}
 }
+
+// The repo namespace is shallow (snapshots/<client>/<ts>,
+// trees/<2hex>/<id>); a directory chain deeper than the cap is not a
+// kist object layout -- or a hostile server fabricating one -- and
+// must fail the listing cleanly instead of recursing without bound.
+// The Rust peer enforces the same cap.
+func TestSFTPListRejectsAbsurdDirectoryDepth(t *testing.T) {
+	ctx := context.Background()
+	b := newTestSFTP(t)
+
+	deep := strings.Repeat("d/", 20)
+	if err := b.Put(ctx, deep+"x", bytes.NewReader([]byte{1}), 1); err != nil {
+		t.Fatalf("put deep object: %v", err)
+	}
+	if err := b.List(ctx, "", func(FileInfo) error { return nil }); err == nil {
+		t.Fatal("list of a 20-level directory chain must fail (repo namespace depth cap)")
+	}
+
+	// Normal depth keeps working.
+	if err := b.Put(ctx, "packs/normal", bytes.NewReader([]byte{2}), 1); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	n := 0
+	if err := b.List(ctx, "packs/", func(FileInfo) error { n++; return nil }); err != nil {
+		t.Fatalf("list packs/: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 pack object, got %d", n)
+	}
+}

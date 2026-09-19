@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -151,5 +152,30 @@ func TestSFTPSourceSkipsSelfAndParentEntries(t *testing.T) {
 	}
 	if !got[".bashrc"] || !got["readme.txt"] {
 		t.Fatalf("listing must keep the user's files (got %v)", got)
+	}
+}
+
+// The Source contract says List returns entries sorted by name bytes
+// (the backup walker's parent merge-join relies on ascending names).
+// ReadDirContext returns server order, which is not sorted.
+func TestSFTPSourceListIsSorted(t *testing.T) {
+	dir := t.TempDir()
+	// Creation order deliberately anti-sorted: readdir order follows it.
+	for _, f := range []string{"zeta.txt", "alpha.txt", "mid.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(f), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	src := &SFTPSource{client: inProcessSFTP(t, dir), root: dir}
+	items, err := src.List(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, it := range items {
+		got = append(got, string(it.Name))
+	}
+	if want := []string{"alpha.txt", "mid.txt", "zeta.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("List must return sorted names, got %v", got)
 	}
 }

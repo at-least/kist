@@ -50,6 +50,14 @@ func parseKeyTime(s string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("timestamp %q is not YYYYMMDDTHHMMSSnnnnnnnnnZ", s)
 	}
 	digits := func(run string) (int, error) {
+		// Reject anything Atoi would accept beyond plain ASCII digits
+		// (e.g. a leading '+'): Rust's parser is strict, and a hostile
+		// or corrupt key must not split the implementations.
+		for i := 0; i < len(run); i++ {
+			if run[i] < '0' || run[i] > '9' {
+				return 0, fmt.Errorf("timestamp %q: %q is not a number", s, run)
+			}
+		}
 		v, err := strconv.Atoi(run)
 		if err != nil || v < 0 {
 			return 0, fmt.Errorf("timestamp %q: %q is not a number", s, run)
