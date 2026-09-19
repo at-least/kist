@@ -224,7 +224,7 @@ ChunkList { v:3, chunks:[ChunkId] }
 
 | 來源 | 沿用條件 | 依據 |
 | --- | --- | --- |
-| mk=0 posix | mtime + ctime + inode 都沒變（size/dev 的變化必蘊含 ctime 變化；dev 只在 `nlink>1` 時記錄，供硬連結識別，不參與比較） | kernel 維護，使用者改不了（v2 規則；兩個實作實際比較的欄位） |
+| mk=0 posix | size + mtime + ctime + inode 都沒變（dev 只在 `nlink>1` 時記錄，供硬連結識別，不參與快速路徑比較） | kernel 維護，使用者改不了（v2 規則；size 在兩個實作的外層判斷比較） |
 | mk=2 s3 | etag 相同 + size 相同 | etag 是來源**計算並保證**的內容指紋（單段上傳＝MD5；多段/KMS 的 etag 仍是來源定義的確定性指紋） |
 | mk=1 sftp / mk=3 | **無安全快速路徑**——一律重讀，靠 chunk 去重吸收 | mtime/size 皆 client 可設（`cp -p` 陷阱） |
 

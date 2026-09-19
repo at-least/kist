@@ -333,7 +333,9 @@ func (r *Runner) post(ctx context.Context, ev report.Event) error {
 		// same).
 		var ue *url.Error
 		if errors.As(err, &ue) {
-			return fmt.Errorf("webhook: %w", ue.Err)
+			// 只報底因：url.Error 的訊息含完整 URL（含 userinfo）；
+			// 底因（連線錯誤）不含憑證。
+			return ue.Err
 		}
 		return err
 	}

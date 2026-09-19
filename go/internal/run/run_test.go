@@ -315,8 +315,30 @@ func TestWebhookErrorOmitsTheURL(t *testing.T) {
 		t.Fatalf("finish: %v", err)
 	}
 	for _, l := range logs {
-		if strings.Contains(l, "ops:hunter2") || strings.Contains(l, u.Host) && strings.Contains(l, "returned") {
+		if strings.Contains(l, "ops:hunter2") || strings.Contains(l, u.Host) {
 			t.Errorf("log leaks the webhook URL: %q", l)
+		}
+	}
+
+	// 傳輸失敗（連不上）走 *url.Error 的拆除路徑：底因進 log，URL 不進。
+	dead, err := url.Parse("http://ops:hunter2@127.0.0.1:1/nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg2, err := config.Parse("[repository]\nlocation='x'\n[prune]\nschedule='@daily'\n[webhook]\nurl='" + dead.String() + "'\ntimeout='200ms'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs = nil
+	r2 := &Runner{Config: cfg2, Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	ev2 := report.Event{Kind: "backup", Job: "j", Started: time.Now()}
+	if err := r2.finish(context.Background(), &ev2, nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	for _, l := range logs {
+		// 憑證（userinfo）絕不進 log；撥號位址與設定檔同級，不是秘密。
+		if strings.Contains(l, "ops:hunter2") || strings.Contains(l, "dead.String()") {
+			t.Errorf("transport-failure log leaks the webhook credentials: %q", l)
 		}
 	}
 }
