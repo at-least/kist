@@ -408,9 +408,9 @@ type dirNode struct {
 	virtualPath string
 	table       map[string][]tree.Entry
 
-	once    sync.Once
+	mu      sync.Mutex
+	loaded  bool
 	entries []tree.Entry
-	loadErr error
 }
 
 var (
@@ -421,19 +421,31 @@ var (
 	_ fs.NodeListxattrer = (*dirNode)(nil)
 )
 
+// load serves the directory's entries, caching them once they have
+// loaded successfully. A failed load is NOT cached: over SFTP or S3 the
+// first failure is usually a transient blip, and bricking one directory
+// with EIO until remount -- what a sync.Once would do -- turns a hiccup
+// into an outage.
 func (n *dirNode) load(ctx context.Context) ([]tree.Entry, error) {
-	n.once.Do(func() {
-		if n.synthetic != nil {
-			n.entries = n.synthetic
-			return
-		}
-		if n.entry.Subtree == nil {
-			n.loadErr = fmt.Errorf("directory has no subtree")
-			return
-		}
-		n.entries, n.loadErr = n.fs.repo.LoadTreeChain(ctx, *n.entry.Subtree)
-	})
-	return n.entries, n.loadErr
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.loaded {
+		return n.entries, nil
+	}
+	if n.synthetic != nil {
+		n.entries, n.synthetic = n.synthetic, nil
+		n.loaded = true
+		return n.entries, nil
+	}
+	if n.entry.Subtree == nil {
+		return nil, fmt.Errorf("directory has no subtree")
+	}
+	entries, err := n.fs.repo.LoadTreeChain(ctx, *n.entry.Subtree)
+	if err != nil {
+		return nil, err
+	}
+	n.entries, n.loaded = entries, true
+	return n.entries, nil
 }
 
 func (n *dirNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
