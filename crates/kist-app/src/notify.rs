@@ -54,7 +54,10 @@ impl Notifier {
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            // webhook URL 常在路徑／query 帶 token，reqwest 的 Display 會附上
+            // 完整 URL；這裡比照 Go 端（run.go 只回報 url.Error 的底因）把 URL
+            // 摘掉，token 不跟著進 daemon log。
+            .map_err(|e| e.without_url().to_string())?;
         if !resp.status().is_success() {
             return Err(format!("webhook returned {}", resp.status()));
         }
@@ -112,5 +115,33 @@ mod redirect_tests {
             "3xx 要以錯誤回報並指名狀態碼，得到：{err}"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "只能打第一個端點一次");
+    }
+
+    /// webhook URL 常在路徑或 query 帶 token（Slack、Telegram…都是這種形式）。
+    /// 送出失敗時，錯誤訊息不得把 URL 原封不動帶上——reqwest 的 Display 會附
+    /// ` for url (…)`，token 就跟著進了 daemon log（與 Go 端只回報底因同一理由）。
+    #[tokio::test]
+    async fn send_error_does_not_leak_url_secrets() {
+        // 佔一個 port 再放掉：連線必然被拒，也用不著等 timeout。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let section = NotifySection {
+            webhook_url: format!("http://127.0.0.1:{port}/hooks/TOKEN123?api_key=SECRET456"),
+            on: vec!["failure".to_owned()],
+        };
+        let notifier = Notifier::new(&section).unwrap();
+        let outcome = JobOutcome {
+            job: crate::jobs::JobKind::Backup,
+            status: crate::jobs::JobStatus::Failure,
+            repo: "repo".to_owned(),
+            started: String::new(),
+            duration_secs: 0.0,
+            detail: serde_json::Value::Null,
+            error: None,
+        };
+        let err = notifier.send(&outcome).await.unwrap_err();
+        assert!(!err.contains("TOKEN123"), "錯誤不得含路徑 token：{err}");
+        assert!(!err.contains("SECRET456"), "錯誤不得含 query token：{err}");
     }
 }
