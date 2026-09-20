@@ -256,8 +256,8 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 新輸入兩個：**遠端來源需求**（`kist backup sftp://…`/`s3://…`，client 當
 轉運、金鑰不出機器）與 v1/v2 教訓清單。設計立場：v2 核心全保留（有 PoC
 與 200-case proptest 背書），變更外科手術式九項，每項對應教訓或需求
-（ADR 016；規格草案 `docs/format-v3-draft.md`，定案後逐 byte 取代
-`docs/format.md` 成唯一權威副本）。
+（ADR 016；規格草案已定案——逐 byte 併入 `docs/format.md` 成唯一權威
+副本，教訓對照見其 §0／§19）。
 
 - 設計草案＋advisor 檢查點【完成 2026-09-08，commit 7e626db】：advisor
   抓出 touch 用 PutIfAbsent 的**資料遺失級競態**（第二次 backup 重用已

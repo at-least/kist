@@ -301,9 +301,6 @@ func (r *Runner) record(ev *report.Event) {
 	}
 }
 
-// post sends the event to the webhook. A webhook that fails is logged,
-// not fatal: the backup happened, and a monitoring system that is down
-// is not a reason to report that it did not.
 // webhookHTTPClient is the default client for webhook posts: redirects
 // are never followed (ErrUseLastResponse returns the 3xx as the final
 // response), so a webhook endpoint cannot bounce the event payload at
@@ -314,6 +311,9 @@ var webhookHTTPClient = &http.Client{
 	},
 }
 
+// post sends the event to the webhook. A webhook that fails is logged,
+// not fatal: the backup happened, and a monitoring system that is down
+// is not a reason to report that it did not.
 func (r *Runner) post(ctx context.Context, ev report.Event) error {
 	body, err := json.Marshal(ev)
 	if err != nil {
