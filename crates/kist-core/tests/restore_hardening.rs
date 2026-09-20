@@ -311,3 +311,177 @@ async fn snapshot_with_invalid_structure_is_rejected_on_read() {
         .expect_err("roots 為空的 snapshot 必須被讀取端拒絕");
     assert!(matches!(err, CoreError::Corrupt { .. }), "{err}");
 }
+
+/// 惡意 repo 可以是一條任意深的 DIR chain（每層一棵 tree、一個 entry 指向
+/// 下一層；金鑰持有者寫得出，見 threat model「owns the repository」）。
+/// restore 與 check 的走訪是有界堆疊上的遞迴：超過深度上限必須**乾淨回錯**
+/// （restore 記進 summary.errors、check 記進 report.errors），不是把整個
+/// process 墊進 stack overflow。上限 [`kist_core::MAX_TREE_DEPTH`] 與 Go
+/// 實作的 `maxTreeDepth` 是同一個數，文件寡在 docs/format.md §8.4。
+/// 測試本體在明確指定大小的執行緒上跑：debug build 的遞迴 frame 是 release
+/// 的好幾倍大（實測 256 層深就要 >2 MiB，release 下的 2 MiB tokio worker
+/// 綽綽有餘），libtest 預設執行緒的堆疊承載不了深鏈的 debug frame。
+#[test]
+fn overly_deep_tree_chain_is_reported_not_crashed() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(overly_deep_tree_chain_body())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn overly_deep_tree_chain_body() {
+    use kist_core::Repository;
+    use kist_format::cbor;
+    use kist_format::keys;
+    use kist_format::snapshot::format_key_timestamp;
+    use kist_format::snapshot::Root;
+    use kist_format::tree::{content_type, meta_kind, node_type, Entry, Tree};
+    use kist_format::TreeId;
+    use serde_bytes::ByteBuf;
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+
+    // 最深處：一棵只含一個空檔的 tree；往上串 DIR entry，層數由呼叫端給。
+    async fn leaf(repo: &Repository) -> TreeId {
+        let entry = Entry {
+            name: b"f".to_vec(),
+            kind: node_type::FILE,
+            meta_kind: meta_kind::GENERIC,
+            content: content_type::DIRECT,
+            ..plain_entry()
+        };
+        let (id, sealed) = repo.seal_tree(Tree::new(vec![entry], None)).await.unwrap();
+        repo.backend().put(&keys::tree(&id), sealed).await.unwrap();
+        id
+    }
+    async fn chain(repo: &Repository, depth: usize) -> TreeId {
+        let mut child = leaf(repo).await;
+        for _ in 0..depth {
+            let entry = Entry {
+                name: b"d".to_vec(),
+                kind: node_type::DIR,
+                meta_kind: meta_kind::GENERIC,
+                subtree: child,
+                ..plain_entry()
+            };
+            let (id, sealed) = repo.seal_tree(Tree::new(vec![entry], None)).await.unwrap();
+            repo.backend().put(&keys::tree(&id), sealed).await.unwrap();
+            child = id;
+        }
+        child
+    }
+    async fn write_snapshot(
+        t: &common::TestRepo,
+        repo: &Repository,
+        root: TreeId,
+        path: &[u8],
+    ) -> String {
+        let mut snap = {
+            // 任何一個真 snapshot 都好：借它的形狀，換 root 與時間。
+            let src = t.dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let s = repo
+                .backup(std::slice::from_ref(&src), backup_options())
+                .await
+                .unwrap();
+            let mut snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+            snap.roots.clear();
+            snap
+        };
+        snap.roots.push(Root {
+            path: ByteBuf::from(path.to_vec()),
+            tree: root,
+        });
+        let at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let ts = format_key_timestamp(at).unwrap();
+        snap.time_ns = at.unix_timestamp_nanos() as i64; // i128 → i64：時間軸遠在範圍內
+        let key_path = keys::snapshot(&backup_options().client_id, &ts);
+        let sealed = repo
+            .keys()
+            .seal_snapshot(&key_path, &cbor::encode(&snap).unwrap())
+            .unwrap();
+        repo.backend().put(&key_path, sealed).await.unwrap();
+        key_path
+    }
+
+    // MAX_TREE_DEPTH - 1 層是承諾可以走的深度：check 不可以有任何錯。
+    let ok_root = chain(&repo, kist_core::MAX_TREE_DEPTH - 1).await;
+    let _ok_key = write_snapshot(&t, &repo, ok_root, b"/ok").await;
+    let ok_report = repo
+        .check(kist_core::CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        ok_report.errors.is_empty(),
+        "上限前一層是誠實深度，不該有錯：{:?}",
+        ok_report.errors
+    );
+
+    // 超過上限的 chain：check／prune 的走訪（沒有路徑長度自然封頂）必須乾淨回報。
+    let hostile_root = chain(&repo, 4_200).await;
+    let key_path = write_snapshot(&t, &repo, hostile_root, b"/deep").await;
+
+    let msg = format!("nesting deeper than {}", kist_core::MAX_TREE_DEPTH);
+    let report = repo
+        .check(kist_core::CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        report.errors.iter().any(|e| e.contains(&msg)),
+        "check 要回報深度上限，而不是別的錯／不是 crash：{:?}",
+        report.errors
+    );
+
+    // restore 同樣：記錄錯誤並完成，不是整個 process 陣亡。
+    let target = t.dir.path().join("out");
+    let summary = repo
+        .restore(&key_path, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        summary.errors.iter().any(|e| e.contains(&msg)),
+        "restore 要在上限處回錯：{:?}",
+        summary.errors.first()
+    );
+}
+
+/// 補齊 Entry 其餘欄位的零值（跨平台版：不綁 symlink 測試的 unix cfg）。
+fn plain_entry() -> kist_format::tree::Entry {
+    use kist_format::tree::Entry;
+    Entry {
+        name: Vec::new(),
+        kind: 0,
+        meta_kind: 0,
+        size: 0,
+        target: Vec::new(),
+        content: 0,
+        chunks: Vec::new(),
+        subtree: kist_format::TreeId::ZERO,
+        mode: None,
+        uid: None,
+        gid: None,
+        mtime_ns: None,
+        ctime_ns: None,
+        dev: None,
+        inode: None,
+        nlink: None,
+        xattrs: None,
+        etag: None,
+        vern: None,
+    }
+}

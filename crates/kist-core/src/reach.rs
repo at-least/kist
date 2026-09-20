@@ -13,7 +13,7 @@ use kist_format::{keys, ChunkId, ObjectId, TreeId};
 
 use crate::index::ChunkLocator;
 use crate::repo::Repository;
-use crate::Result;
+use crate::{Result, MAX_TREE_DEPTH};
 
 #[derive(Debug, Default)]
 pub struct Reachability {
@@ -63,16 +63,20 @@ impl Repository {
             let roots: Vec<TreeId> = snapshot.roots.iter().map(|r| r.tree).collect();
             reach.snapshots.push((key.clone(), snapshot));
             for root in roots {
-                self.walk_tree(&root, &key, index, on_file, &mut reach)
+                self.walk_tree(&root, 1, &key, index, on_file, &mut reach)
                     .await;
             }
         }
         Ok(reach)
     }
 
+    /// `depth`：這棵 tree 在 DIR 巢狀裡的深度（根 = 1）。prev 段**不計**深度
+    /// ——同一層目錄的分段，誠實的大目錄可以很長。DIR 巢狀超過
+    /// [`MAX_TREE_DEPTH`] 只能出自腐壞或敵意 repo：記錄錯誤、不深入。
     fn walk_tree<'a, I>(
         &'a self,
         id: &'a TreeId,
+        depth: usize,
         context: &'a str,
         index: &'a I,
         on_file: &'a mut (dyn FnMut(FileVisit<'_>) + Send),
@@ -82,70 +86,91 @@ impl Repository {
         I: ChunkLocator + Sync + ?Sized + 'a,
     {
         Box::pin(async move {
-            if !reach
-                .live_trees
-                .insert(ObjectId::from_bytes(*id.as_bytes()))
-            {
-                return;
-            }
-            let key = keys::tree(id);
-            let tree = match self.read_tree(id).await {
-                Ok(t) => t,
-                Err(e) => {
-                    reach.errors.push(format!("{key} (from {context}): {e}"));
+            // prev chain 用迴圈走：遞迴是 Box::pin 的 future，每一段都吃一份
+            // stack frame，而且抱著 `tree` await 下去會把整條 chain（一個大
+            // 目錄可能上百段）同時留在記憶體（100 萬檔 ≈ 240 MiB）。每段先
+            // 處理完就丟，再去下一段；visited 集合擋掉圈。
+            let mut id = *id;
+            loop {
+                if !reach
+                    .live_trees
+                    .insert(ObjectId::from_bytes(*id.as_bytes()))
+                {
                     return;
                 }
-            };
-            let prev = tree.prev;
-            for node in &tree.entries {
-                match node.kind {
-                    node_type::DIR if !node.subtree.is_zero() => {
-                        self.walk_tree(&node.subtree, context, index, on_file, reach)
-                            .await;
+                let key = keys::tree(&id);
+                let tree = match self.read_tree(&id).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        reach.errors.push(format!("{key} (from {context}): {e}"));
+                        return;
                     }
-                    node_type::FILE => {
-                        let data = if node.content == content_type::DIRECT {
-                            node.chunks.clone()
-                        } else {
-                            reach.referenced_chunks.extend(node.chunks.iter().copied());
-                            if let Some(missing) = node.chunks.iter().find(|c| !index.contains(c)) {
+                };
+                let prev = tree.prev;
+                for node in &tree.entries {
+                    match node.kind {
+                        node_type::DIR if !node.subtree.is_zero() => {
+                            if depth >= MAX_TREE_DEPTH {
                                 reach.errors.push(format!(
-                                    "{key}: chunk list chunk {missing} is missing from the index"
+                                    "{key}: tree nesting deeper than {MAX_TREE_DEPTH} levels \
+                                     (corrupt or hostile repository)"
                                 ));
                                 continue;
                             }
-                            match self.resolve_chunks(&node.chunks, node.content, index).await {
-                                Ok(ids) => ids,
-                                Err(e) => {
-                                    reach.errors.push(format!("{key}: chunk list: {e}"));
+                            self.walk_tree(
+                                &node.subtree,
+                                depth + 1,
+                                context,
+                                index,
+                                on_file,
+                                reach,
+                            )
+                            .await;
+                        }
+                        node_type::FILE => {
+                            let data = if node.content == content_type::DIRECT {
+                                node.chunks.clone()
+                            } else {
+                                reach.referenced_chunks.extend(node.chunks.iter().copied());
+                                if let Some(missing) =
+                                    node.chunks.iter().find(|c| !index.contains(c))
+                                {
+                                    reach.errors.push(format!(
+                                        "{key}: chunk list chunk {missing} is missing from the index"
+                                    ));
                                     continue;
                                 }
+                                match self.resolve_chunks(&node.chunks, node.content, index).await {
+                                    Ok(ids) => ids,
+                                    Err(e) => {
+                                        reach.errors.push(format!("{key}: chunk list: {e}"));
+                                        continue;
+                                    }
+                                }
+                            };
+                            reach.referenced_chunks.extend(data.iter().copied());
+                            for c in &data {
+                                if !index.contains(c) {
+                                    reach.errors.push(format!(
+                                        "{key}: chunk {c} is missing from the index"
+                                    ));
+                                }
                             }
-                        };
-                        reach.referenced_chunks.extend(data.iter().copied());
-                        for c in &data {
-                            if !index.contains(c) {
-                                reach
-                                    .errors
-                                    .push(format!("{key}: chunk {c} is missing from the index"));
-                            }
+                            on_file(FileVisit {
+                                tree_key: &key,
+                                node,
+                                size: node.size,
+                                data_chunks: &data,
+                            });
                         }
-                        on_file(FileVisit {
-                            tree_key: &key,
-                            node,
-                            size: node.size,
-                            data_chunks: &data,
-                        });
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            // 這個 tree 處理完就丟，再去走 prev：遞迴是 Box::pin 的 future，
-            // 抱著 `tree` await 下去會把整條 prev chain（一個大目錄可能上百段）
-            // 同時留在記憶體（100 萬檔 ≈ 240 MiB）。
-            drop(tree);
-            if let Some(prev) = prev {
-                self.walk_tree(&prev, context, index, on_file, reach).await;
+                drop(tree);
+                match prev {
+                    Some(p) => id = p,
+                    None => return,
+                }
             }
         })
     }

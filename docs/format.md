@@ -239,6 +239,14 @@ opt-in，但那是 client 政策，規格不背書其安全性。`etag`/`vern` �
 裡共用 (dev,ino) 的條目是同一份內容——`bytes` 只算一次、restore 重建為
 一個 hard link（第一個出現的位置建立，其餘 link；失敗降級複本＋警告）。
 
+### 8.4 巢狀深度（實作上限）
+
+tree 的 DIR 巢狀**沒有格式上的深度限制**；但兩個參考實作的走訪（restore /
+check / prune）都是遞迴，各自設有實作上限 256 層（Rust `kist_core::MAX_TREE_DEPTH`、
+Go `repo.maxTreeDepth`，兩邊必須一致）。這不是格式規則：誠實資料的深度受來源
+路徑長度约束，遠低於此；超限的 chain 只能出自腐壞或敵意 repo，實作應乾淨回錯
+而不是把走訪遞迴墊進 stack overflow。第三方程式可以自行選擇上限。
+
 ## 9. Snapshot
 
 key：`snapshots/<client hex>/<ts>`，`ts` 沿用

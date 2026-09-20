@@ -127,7 +127,7 @@ const DefaultClockSkew = time.Hour
 const DefaultInactiveAfter = 30 * 24 * time.Hour
 
 // maxEffectiveIndexBlobs is the blob count above which prune MUST merge
-// the index into one blob (format-v3-draft.md §10). Every backup writes
+// the index into one blob (docs/format.md §10). Every backup writes
 // a blob, so a repository that only grows gains one per backup; past
 // this many, each reader's open cost is no longer negligible and the
 // rewrite -- which supersedes everything -- is mandatory.
@@ -303,7 +303,7 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 			continue
 		}
 		for _, root := range snap.Roots {
-			r.walkTree(ctx, root.Tree, h.Key, ix, seenTrees, live, pruneChunks, problem)
+			r.walkTree(ctx, root.Tree, 1, h.Key, ix, seenTrees, live, pruneChunks, problem)
 		}
 	}
 	if len(problems) > 0 {
@@ -510,7 +510,7 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 			continue
 		}
 		// The mark namespace is shared by packs, trees and index blobs
-		// (format-v3-draft.md §1): a mark whose pack is gone may still
+		// (docs/format.md §1): a mark whose pack is gone may still
 		// point at a live tree or blob, and only a mark whose object is
 		// gone everywhere may be removed.
 		if r.anyObjectExists(ctx, id) {
@@ -561,7 +561,7 @@ func (r *Repository) Prune(ctx context.Context, opts PruneOptions) (PruneReport,
 	// never be earned again must not survive its object. An orphan .r1
 	// replica, by contrast, is deliberately NOT cleaned here: it is the
 	// disaster signal "the primary is unexpectedly gone", and check
-	// reports it (format-v3-draft.md §13.2).
+	// reports it (docs/format.md §13.2).
 	var orphanedTouches []string
 	err = r.backend.List(ctx, tree.TouchPrefix, func(fi backend.FileInfo) error {
 		id, err := crypto.ParseID(strings.TrimPrefix(fi.Key, tree.TouchPrefix))
@@ -680,7 +680,7 @@ func holdReason(markedAt, now time.Time, activity map[string]time.Time, opts Pru
 // started. Every backup a client has in flight started after that
 // moment. There is no client registry: a client whose snapshots were all
 // forgotten is inactive by definition, and its first backup is protected
-// by the backup-side commit checks instead (format-v3-draft.md §13.3).
+// by the backup-side commit checks instead (docs/format.md §13.3).
 func lastActivity(handles []snapshot.Handle) map[string]time.Time {
 	activity := make(map[string]time.Time, len(handles))
 	for _, h := range handles {

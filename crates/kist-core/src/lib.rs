@@ -110,6 +110,18 @@ impl CoreError {
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
+/// tree 走訪（restore / check / prune）的最大巢狀深度。
+///
+/// 這是**實作上限**，不是格式規則。走訪是遞迴，每一層吃一份 stack frame：
+/// 上限必須保證「頂到上限之前，任何 build profile（debug 測試、release 的
+/// 2 MiB tokio worker）都還在 stack 預算內」——實測 debug 下 4 200 層就會
+/// stack overflow（`tests/restore_hardening.rs` 釘死這個行為）。誠實資料的
+/// 深度遠低於此：Linux 上 restore 受 PATH_MAX 自然封頂（約 2 000 層就
+/// ENAMETOOLONG），實務目錄樹的深度更是兩個數量級之外。超過上限的 chain
+/// 只能出自腐壞或敵意 repo：乾淨回錯，不是 process 陣亡。數值必須與 Go
+/// 參考實作的 `maxTreeDepth`（go/internal/repo）一致；見 docs/format.md §8.4。
+pub const MAX_TREE_DEPTH: usize = 256;
+
 /// 把 CPU 密集工作丟到 blocking thread pool。
 pub(crate) async fn blocking<T, F>(f: F) -> Result<T>
 where

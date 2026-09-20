@@ -208,12 +208,12 @@ func (r *Repository) Check(ctx context.Context, opts CheckOptions) (CheckReport,
 			continue
 		}
 		for _, root := range snap.Roots {
-			r.walkTree(ctx, root.Tree, handle.Key, rebuilt, seenTrees, usedPacks, checkChunks, problem)
+			r.walkTree(ctx, root.Tree, 1, handle.Key, rebuilt, seenTrees, usedPacks, checkChunks, problem)
 		}
 	}
 	report.Trees = len(seenTrees)
 
-	// 3b. Replica health (format-v3-draft.md §13.5). An orphan replica --
+	// 3b. Replica health (docs/format.md §13.5). An orphan replica --
 	// ".r1" present, primary tree gone -- is the disaster signal the
 	// replica exists to catch, and prune deliberately never cleans one
 	// up: it is reported here as a problem. When the repository keeps
@@ -309,10 +309,21 @@ func (r *Repository) repairPack(ctx context.Context, id crypto.ID) error {
 	return nil
 }
 
-// walkTree descends one snapshot, recording what it reaches.
+// maxTreeDepth caps DIR nesting for the recursive tree walks (check,
+// prune, restore). It is an implementation limit, not a format rule: honest
+// trees are bounded by source path lengths (far shallower), and a chain
+// beyond the limit can only come from a corrupt or hostile repository --
+// refuse it cleanly instead of exhausting the stack. Must match the Rust
+// implementation's kist_core::MAX_TREE_DEPTH; see docs/format.md §8.4.
+const maxTreeDepth = 256
+
+// walkTree descends one snapshot, recording what it reaches. depth is the
+// DIR nesting level (roots = 1); prev segments do not count toward it --
+// they split one directory, and an honest large directory can chain long.
 func (r *Repository) walkTree(
 	ctx context.Context,
 	id crypto.ID,
+	depth int,
 	origin string,
 	ix *index.Index,
 	seenTrees, usedPacks map[crypto.ID]struct{},
@@ -333,7 +344,7 @@ func (r *Repository) walkTree(
 	}
 
 	if t.Prev != nil {
-		r.walkTree(ctx, *t.Prev, origin, ix, seenTrees, usedPacks, chunks, problem)
+		r.walkTree(ctx, *t.Prev, depth, origin, ix, seenTrees, usedPacks, chunks, problem)
 	}
 
 	for _, entry := range t.Entries {
@@ -343,7 +354,11 @@ func (r *Repository) walkTree(
 				problem("%s: tree %s: %q has no subtree", origin, id, entry.Name)
 				continue
 			}
-			r.walkTree(ctx, *entry.Subtree, origin, ix, seenTrees, usedPacks, chunks, problem)
+			if depth >= maxTreeDepth {
+				problem("%s: tree %s: nesting deeper than %d levels (corrupt or hostile repository)", origin, id, maxTreeDepth)
+				continue
+			}
+			r.walkTree(ctx, *entry.Subtree, depth+1, origin, ix, seenTrees, usedPacks, chunks, problem)
 		case tree.TypeFile:
 			// An indirect entry's Chunks name the encoded ChunkList; the
 			// data chunks it resolves to are what keeps packs live, so
