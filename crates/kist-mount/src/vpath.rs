@@ -2,7 +2,7 @@
 //! `s3://bucket/prefix`）不是單一目錄組件，mount 把它們展開成虛擬的
 //! 中介目錄（瀏覽成 `tmp` → `x` → `src`）；葉節點是該 root 的 tree
 //! 內容（合成的 DIR entry 帶 subtree）。與 restore 的映射同一套切段
-//! 規則（format-v3-draft §9：去 scheme、`/` 切段）。
+//! 規則（docs/format.md §9：去 scheme、`/` 切段）。
 
 use std::collections::HashMap;
 use std::sync::Arc;

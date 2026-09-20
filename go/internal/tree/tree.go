@@ -22,7 +22,7 @@ const Version = 3
 const Prefix = "trees/"
 
 // ReplicaSuffix is appended to a tree's key for its .r1 replica, stored
-// when the repository was created with replicas=1 (format-v3-draft.md
+// when the repository was created with replicas=1 (docs/format.md
 // §13.5). The replica's bytes are identical to the primary's; it is a
 // second copy of one object, not a second object.
 const ReplicaSuffix = ".r1"
@@ -30,7 +30,7 @@ const ReplicaSuffix = ".r1"
 // TouchPrefix is the repository prefix of a tree's revival signal. The
 // 8-byte object is written with an OVERWRITING Put on every backup that
 // reuses the tree: the refreshed backend mtime IS the signal
-// (format-v3-draft.md §13.1). A PutIfAbsent here would silently keep the
+// (docs/format.md §13.1). A PutIfAbsent here would silently keep the
 // old mtime on the second reuse and open the deletion race the overwrite
 // exists to close.
 const TouchPrefix = "touch/"
@@ -89,7 +89,7 @@ const (
 
 // A MetaKind says which metadata family an entry carries. v3 entries are
 // a kind union: a source records what it can prove about a file, and the
-// per-kind rules (Validate, format-v3-draft.md §8.1) pin which fields are
+// per-kind rules (Validate, docs/format.md §8.1) pin which fields are
 // required, optional, or must be absent for each kind.
 type MetaKind uint8
 
@@ -262,7 +262,7 @@ func (x *Xattrs) UnmarshalCBOR(data []byte) error {
 // union -- an S3 object has no mode, and "no mode" must not encode as
 // mode 0. A non-nil pointer to zero is a real zero (uid 0 is root) and
 // is encoded. The field order below is the spec table
-// (format-v3-draft.md §4.1); it is the wire order and it feeds every
+// (docs/format.md §4.1); it is the wire order and it feeds every
 // tree ID.
 type Entry struct {
 	Name []byte `cbor:"n"`
@@ -317,7 +317,7 @@ type Entry struct {
 	// Etag is a content fingerprint the source computed and vouches for
 	// (an S3 ETag, for instance); Vern is the source object's version ID.
 	// Both are what the next backup's fast path compares
-	// (format-v3-draft.md §8.2).
+	// (docs/format.md §8.2).
 	Etag []byte `cbor:"etag,omitempty"`
 	Vern []byte `cbor:"vern,omitempty"`
 }
@@ -536,7 +536,7 @@ func singleComponent(name []byte) bool {
 }
 
 // Validate rejects trees that are decodable but cannot mean anything,
-// including the per-kind field matrix (format-v3-draft.md §8.1): a
+// including the per-kind field matrix (docs/format.md §8.1): a
 // reader must refuse an entry whose metadata fields contradict the kind
 // that claims them.
 func (t *Tree) Validate() error {

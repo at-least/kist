@@ -4,7 +4,7 @@
 //! 與 [`crate::Backend`]（repo 端）的分工：Backend 寫入的是 kist 格式物件
 //! （conditional put、range read）；Source 提供的是「檔案系統形狀」的讀取
 //! （列目錄、串流讀檔），metadata 依來源種類遞減——格式的 metadata 聯集
-//! （format-v3-draft §8）就是為此設計：「來源能證明什麼就記什麼」。
+//! （docs/format.md §8）就是為此設計：「來源能證明什麼就記什麼」。
 //!
 //! 快速路徑合約（§8.2）：posix 來源用 ctime/inode（kernel 背書）；s3 來源
 //! 用 etag（來源計算的內容指紋）；sftp/generic **沒有**安全快速路徑——

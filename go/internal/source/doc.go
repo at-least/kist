@@ -5,7 +5,7 @@
 // read: list one directory level, read one file.
 //
 // The metadata an entry carries depends on what its source can PROVE,
-// which is the format's metadata union (format-v3-draft.md §8): a posix
+// which is the format's metadata union (docs/format.md §8): a posix
 // source records the full kernel-backed set, an S3 source records the
 // mtime and the etag it computed, an SFTP source records the mtime it
 // was told. The fast-path contract (§8.2) grades the same way: posix

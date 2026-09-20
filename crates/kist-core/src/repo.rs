@@ -35,7 +35,7 @@ pub struct InitOptions {
     pub pack_target_size: u64,
     pub kdf_cost: KdfCost,
     /// trees/snapshots 的 `.r1` 副本數（0 或 1）。`None` = 依後端決定
-    /// （本機 = 1、遠端 = 0；format-v3-draft §11）。
+    /// （本機 = 1、遠端 = 0；docs/format.md §11）。
     pub replicas: Option<u8>,
 }
 
@@ -194,7 +194,7 @@ impl Repository {
         let mut config = RepoConfig::new(repo_id, created_ns, slot);
         config.chunker = opts.chunker;
         config.pack_target_size = opts.pack_target_size;
-        // v3 副本預設（format-v3-draft §11）：本機後端 = 1（單碟無冗餘，
+        // v3 副本預設（docs/format.md §11）：本機後端 = 1（單碟無冗餘，
         // trees/snapshots 是不可重建的 metadata）；S3/SFTP/rclone = 0
         //（後端已有冗餘，或頻寬成本）。InitOptions.replicas 可覆寫。
         config.replicas = match opts.replicas {
@@ -250,7 +250,7 @@ impl Repository {
             .validate()
             .map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
         // min_reader 閘門：repo 要求的最低版本高於本 build → 明確拒絕，
-        // 不是靠忽略未知欄位半讀（format-v3-draft §11）。
+        // 不是靠忽略未知欄位半讀（docs/format.md §11）。
         if u32::from(config.min_reader) > kist_format::FORMAT_VERSION {
             return Err(CoreError::InvalidConfig(format!(
                 "repository requires a reader of format v{} or newer; this build reads v{}",
@@ -406,7 +406,7 @@ impl Repository {
 
     /// 樹的復活訊號：覆寫式 Put 固定 8 bytes——**後端 mtime 的刷新就是訊號**。
     /// 內容固定，覆寫無害（v2 的 backup 本來就覆寫整棵樹的 bytes；v3 把
-    /// 覆寫面縮到這一種物件，format-v3-draft §13.1）。
+    /// 覆寫面縮到這一種物件，docs/format.md §13.1）。
     pub(crate) async fn touch_tree(&self, id: &TreeId) -> Result<()> {
         self.backend
             .put(&keys::touch(id), keys::TOUCH_MAGIC.to_vec())
@@ -572,7 +572,7 @@ impl Repository {
     /// **不檢查 key 與內容一致**——`read_snapshot` 讀取時會核對（client、時間戳），
     /// 呼叫端必須自己保證 `keys::snapshot(&client_id, ts)` 與內容相符。
     /// `replicas=1` 時 `.r1` 副本**先寫**：主體出現＝commit，副本先行不會
-    /// 造成假 commit（format-v3-draft §13.5）。
+    /// 造成假 commit（docs/format.md §13.5）。
     pub async fn write_snapshot(&self, key: &str, snapshot: Snapshot) -> Result<()> {
         let keys = Arc::clone(&self.keys);
         let key_owned = key.to_owned();

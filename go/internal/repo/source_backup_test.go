@@ -136,7 +136,7 @@ func TestBackupFromMemorySourceRestoresUnderTheLocator(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 
-	// The locator maps to target/bucket/prefix (format-v3-draft.md §9).
+	// The locator maps to target/bucket/prefix (docs/format.md §9).
 	base := filepath.Join(target, "bucket", "prefix")
 	note := bytes.Repeat([]byte("compressible text. "), 20000)
 	for name, want := range map[string][]byte{

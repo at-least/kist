@@ -44,7 +44,7 @@ const (
 )
 
 // HKDF is gone in v2: subkeys are BLAKE3 DeriveKey outputs, one context
-// per purpose. The strings are frozen format (format-v3-draft.md §3).
+// per purpose. The strings are frozen format (docs/format.md §3).
 const (
 	infoHashKey  = "kist/v3/hash"
 	infoChunkKey = "kist/v3/chunk"
@@ -72,7 +72,7 @@ type InvariantsChunker struct {
 // mismatch as an explicit "config tampered" error, never as a silent
 // deduplication change.
 //
-// Field order is the spec table (format-v3-draft.md §4.1): v, repo_id,
+// Field order is the spec table (docs/format.md §4.1): v, repo_id,
 // chunker. New fields go here with the zero-omit + ignore-unknown rules;
 // the AAD stays a constant.
 type Invariants struct {
@@ -168,7 +168,7 @@ func DefaultKDFParams() KDFParams {
 //
 // The wrapped payload is master(32) ‖ Invariants CBOR, sealed under the
 // constant AADMasterKey. Field order is the spec table
-// (format-v3-draft.md §4.1): v, name, created, kdf, wrapped. Reordering
+// (docs/format.md §4.1): v, name, created, kdf, wrapped. Reordering
 // changes every byte it feeds.
 type KeySlot struct {
 	Version       uint64    `cbor:"v"`

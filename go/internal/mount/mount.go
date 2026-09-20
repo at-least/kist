@@ -280,7 +280,7 @@ func (n *clientNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 
 // expandRoots converts a snapshot's roots into a one-level entry list
 // plus a table of deeper synthetic levels, mirroring the restore
-// mapping's component rules (format-v3-draft.md §9): the locator loses
+// mapping's component rules (docs/format.md §9): the locator loses
 // its scheme and splits on "/" (empty and "." components dropped). All
 // but the last component are synthesized directories; the last one is
 // the leaf, whose shape the root tree decides:

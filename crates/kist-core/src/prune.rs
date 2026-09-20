@@ -49,7 +49,7 @@ use crate::repo::{IndexBlobs, Repository};
 use crate::{blocking, CoreError, Result};
 
 /// 有效（未被 supersede）index blob 超過這個數，prune 必須合併重寫為一顆
-/// （format-v3-draft §10 的壓縮觸發；v2 的 ADR 005 未做項）。
+/// （docs/format.md §10 的壓縮觸發；v2 的 ADR 005 未做項）。
 pub const MAX_EFFECTIVE_BLOBS: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -604,7 +604,7 @@ impl PrunePlan {
         if !deleted_packs.is_empty()
             || !new_packs.is_empty()
             || !self.phantoms.is_empty()
-            // v3（format-v3-draft §10）：有效 blob 超過上限就必須合併——
+            // v3（docs/format.md §10）：有效 blob 超過上限就必須合併——
             // 只增不刪的 repo 每次 backup 多一顆 blob，讀取端的 Get＋合併
             // 成本隨之增長；64 顆以內的增量合併代價可忽略。
             || self.all_blob_ids.len() > MAX_EFFECTIVE_BLOBS
@@ -642,7 +642,7 @@ impl PrunePlan {
         // 11. 刪除（刪之前再看一眼：標記後被重寫過就復活。S3 的時間是秒級，同一秒算重寫過——安全那邊）
         //     v3 的樹是 write-once，復活訊號在 `touch/<id>`：touch 不存在或
         //     **嚴格小於**標記才算死（touch ≥ mark＝活，同秒取安全側，
-        //     與 backup 端的比較一致——format-v3-draft §13.2）。
+        //     與 backup 端的比較一致——docs/format.md §13.2）。
         let mut marks_to_remove = std::mem::take(&mut self.marks_to_remove);
         for (target, mark) in std::mem::take(&mut self.to_delete) {
             let key = target.kind.key(&target.id);
@@ -690,7 +690,7 @@ impl PrunePlan {
                             Err(e) => return Err(e.into()),
                         }
                     }
-                    // 樹的成組生命週期（format-v3-draft §13.2/§13.5）：
+                    // 樹的成組生命週期（docs/format.md §13.2/§13.5）：
                     // `.r1` 副本與 touch 訊號隨主體一起走。
                     if target.kind == Kind::Tree {
                         let tree_id = kist_format::TreeId::from_bytes(*target.id.as_bytes());

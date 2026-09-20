@@ -121,7 +121,7 @@ var ErrTreeMarked = errors.New("a tree reached by this backup is marked for dele
 // counters that depend on GC state and dedup order. They are the run's
 // report -- CLI output, --json, metrics -- and deliberately NOT in the
 // snapshot: two clients can legitimately count differently, and an
-// immutable object must not (format-v3-draft.md §9.1).
+// immutable object must not (docs/format.md §9.1).
 type BackupReport struct {
 	// ChunksNew counts chunks this run put into packs.
 	ChunksNew uint64
@@ -141,7 +141,7 @@ type BackupReport struct {
 	// (posix by the kernel's own bookkeeping, s3 by the source's etag)
 	// carry its chunk list over and count one here. Files whose proof
 	// does not exist -- sftp and generic sources -- are always re-read
-	// and never counted (format-v3-draft.md §8.2).
+	// and never counted (docs/format.md §8.2).
 	FilesReused uint64
 }
 
@@ -157,7 +157,7 @@ type BackupSummary struct {
 //
 // The order is forced by the format: chunks go into packs, packs are
 // uploaded, trees are written bottom-up (new trees PutIfAbsent, reused
-// trees touched, format-v3-draft.md §13.1), the index blob is written,
+// trees touched, docs/format.md §13.1), the index blob is written,
 // and only then is the snapshot committed -- its .r1 replica first when
 // the repository has replicas, so the primary is still the one commit
 // point. Dying anywhere before that last step leaves objects nothing
@@ -375,7 +375,7 @@ type backupRun struct {
 
 	// countedHardlinks is the set of (dev,ino) groups whose bytes are
 	// already in the stats: content is counted once per group, across
-	// roots (format-v3-draft.md §9.1).
+	// roots (docs/format.md §9.1).
 	countedHardlinks map[hardLinkKey]struct{}
 
 	// parentStartNs is when the parent snapshot's backup started, in UTC
@@ -654,7 +654,7 @@ func lastComponent(path []byte) []byte {
 	return path
 }
 
-// fillPosixMeta records the posix fields (format-v3-draft.md §8.1):
+// fillPosixMeta records the posix fields (docs/format.md §8.1):
 // mode/uid/gid/mtime are required -- uid 0 is root, a real value -- the
 // change time is recorded when the platform has one, and the hard-link
 // identity only for a file with more than one name.
@@ -750,7 +750,7 @@ func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, 
 // included; false with a nil error means it was skipped with a warning.
 //
 // The entry records only what the source's metadata kind can carry
-// (format-v3-draft.md §8.1): a posix item records the full set, an sftp
+// (docs/format.md §8.1): a posix item records the full set, an sftp
 // item its mtime (and mode/ownership when the source has them), an s3
 // item its mtime and the etag/vern it computed. An absent field means
 // "the source did not say" -- never zero.
