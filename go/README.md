@@ -119,7 +119,6 @@ $ make verify        # build + vet + lint + test + test-race，這是「做完�
 $ make test-s3       # MinIO in Docker；make test-sftp 同理用 OpenSSH
 $ make fuzz          # 每個 Fuzz 目標跑 FUZZTIME（預設 30s）；make fuzz-long 是 24h
 $ make release-snapshot   # 用 goreleaser 在本機建出所有平台的 artifact，不需要 tag
-$ make fuzz          # 跑所有 FuzzXxx target
 ```
 
 大規模驗收測試（10 萬檔 / 10 GiB，預設關閉）：

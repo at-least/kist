@@ -99,7 +99,10 @@ pub struct ForgetSection {
 pub struct PruneSection {
     #[serde(default, with = "crate::duration::serde_opt")]
     pub grace: Option<std::time::Duration>,
-    /// Tolerated client/prune clock difference; 0 defaults to 1h.
+    /// Tolerated client/prune clock difference. Unset takes the 1 h default;
+    /// an explicit 0 is honored literally (zero tolerance), matching the Go
+    /// implementation where zero is a real setting.
+
     #[serde(default, with = "crate::duration::serde_opt")]
     pub clock_skew: Option<std::time::Duration>,
     #[serde(default, with = "crate::duration::serde_opt")]

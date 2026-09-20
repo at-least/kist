@@ -86,8 +86,10 @@ kist/
     kist-format/        所有 on-disk 結構、序列化、版本（最重要，改動需我確認）
     kist-crypto/        key 階層、AEAD 封裝
     kist-chunker/       FastCDC 封裝
-    kist-backend/       object_store 封裝 + conditional put + 本地 index cache
-    kist-core/          backup / restore / check / prune 邏輯
+    kist-backend/       object_store 封裝 + conditional put + 遠端來源（Source）
+    kist-core/          backup / restore / check / prune 邏輯 + 本地 index cache
+    kist-app/           設定檔、排程、工作執行、通知、metrics 與 Web UI
+    kist-mount/         唯讀 FUSE 掛載
     kist-cli/           clap 命令列，產出 `kist` binary
   fuzz/                 cargo-fuzz targets
   tests/                跨 crate 整合測試（含 MinIO 容器）
