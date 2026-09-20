@@ -431,3 +431,38 @@ async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
     prepared.commit().await.unwrap();
     assert_eq!(t.count("snapshots"), 2);
 }
+
+/// 重傳被標記 pack 裡的 chunk，要逐 chunk 回報在 `report.packs_revived`
+/// （與 Go 端 `PacksRevived` 同一事件、同一計數單位；JSON／webhook 的
+/// 監控靠它看「這次 backup 從 GC 手裡救回多少資料」）。
+#[tokio::test]
+async fn report_counts_chunks_revived_from_marked_packs() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    repo.backup(std::slice::from_ref(&src), client(1))
+        .await
+        .unwrap();
+    let victim = pack_ids(&t)[0];
+    let victim_chunks = chunks_in_pack(&repo, &victim).await;
+    assert!(!victim_chunks.is_empty());
+
+    mark(&t, &victim, std::time::Duration::from_secs(60));
+    let s = repo
+        .backup(std::slice::from_ref(&src), client(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.report.packs_revived,
+        victim_chunks.len() as u64,
+        "每個重傳的 chunk 都是一次 revive：{:?}",
+        s.report
+    );
+    // 標記撤了（這裡：沒有標記）之後就不再增加
+    let s = repo
+        .backup(std::slice::from_ref(&src), client(1))
+        .await
+        .unwrap();
+    assert_eq!(s.report.packs_revived, 0, "{:?}", s.report);
+}

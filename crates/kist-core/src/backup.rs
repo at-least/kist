@@ -1,6 +1,6 @@
 //! backup：走訪目錄、切塊、去重、寫 pack / tree / index / snapshot（v3）。
 //!
-//! 流程（寫入順序是刻意的，見 `docs/format-v3-draft.md` §13、§17）：
+//! 流程（寫入順序是刻意的，見 `docs/format.md` §13、§17）：
 //! 1. 讀進所有 index。
 //! 2. 找同一台 client、同一組 roots 的上一個 snapshot 當 parent：
 //!    檔案的 size 與 mtime 沒變就直接沿用它的 chunk 清單，不重讀檔案。
@@ -20,7 +20,7 @@
 //! 走訪消費 `kist_backend::Source`（本機 = `LocalSource`，遠端 = URL 開出的
 //! `ObjectStoreSource`，測試可注入）：「直接遠端備份」就是 client 當轉運——
 //! 讀遠端 → 切塊 → 加密 → 上傳，金鑰不出機器。metadata 依來源種類記錄
-//! （format-v3-draft §8 的聯集），快速路徑依 §8.2 分級：posix 用 ctime+inode
+//! （docs/format.md §8 的聯集），快速路徑依 §8.2 分級：posix 用 ctime+inode
 //! （kernel 背書）、s3 用 etag+size（來源計算的內容指紋）、sftp/generic
 //! 一律重讀。
 //!
@@ -190,6 +190,8 @@ struct ChunkState<R: std::io::Read> {
     bytes_new: u64,
     chunks_new: u64,
     reused_count: u64,
+    /// 這輪從被 GC 標記的 pack 重傳出來的 chunk 數（進 `report.packs_revived`）。
+    revived_count: u64,
     /// 這輪沿用的既有 chunk 與它們所在的 pack。
     reused: Vec<(ChunkId, ObjectId)>,
 }
@@ -340,7 +342,7 @@ struct Backup {
     /// 後續名字直接沿用，不必重讀資料。
     hardlinks: HashMap<(u64, u64), (u64, Vec<ChunkId>, u8)>,
     /// 已把 bytes 計入 stats 的硬連結群組（(dev,ino)）：`bytes` 對同一份內容
-    /// 只算一次（format-v3-draft §9.1），跨 roots 也一樣。
+    /// 只算一次（docs/format.md §9.1），跨 roots 也一樣。
     counted_hardlinks: HashSet<(u64, u64)>,
     /// 切塊緩衝池（每個 2×chunker.max）：整個 backup 重用同一批，不在每個
     /// 檔案各配一次。單執行緒走訪時通常只有一個；池化是為了之後並行切塊。
@@ -373,7 +375,7 @@ fn report_progress(
 /// 100 萬檔的平面目錄光這兩個結構就要 ~450 MiB。
 ///
 /// 段以 `prev` 串接、段內與段間都以名稱遞增（寫入端的排序合約，
-/// format-v3-draft §8），所以 `take_name` 用遞增的查詢名稱做 merge-join：
+/// docs/format.md §8），所以 `take_name` 用遞增的查詢名稱做 merge-join：
 /// 呼叫端（`process_dir`）本來就依名稱遞增走訪。
 struct ParentStream {
     repo: Repository,
@@ -658,7 +660,7 @@ impl Repository {
     /// 比較也是 `>=`，兩邊一致才安全）。任一不成立 → 安全失敗、不 commit
     /// （重跑會沿用已上傳資料）。
     /// 樹自身的 mtime **不**參與比較：v3 的樹是 write-once，mtime 永遠停在
-    /// 初寫時刻；復活訊號只有 touch（format-v3-draft §13.2/§13.3）。
+    /// 初寫時刻；復活訊號只有 touch（docs/format.md §13.2/§13.3）。
     async fn head_tree_and_touch(
         &self,
         tree_id: &TreeId,
@@ -704,7 +706,7 @@ impl Repository {
                     let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
                     abs_paths.push(abs);
                 }
-                // roots 依 path bytes 排序（format-v3-draft §9），不是 PathBuf 的順序
+                // roots 依 path bytes 排序（docs/format.md §9），不是 PathBuf 的順序
                 let mut with_bytes = Vec::new();
                 for p in abs_paths {
                     with_bytes.push((fsmeta::path_to_bytes(&p)?, p));
@@ -862,7 +864,7 @@ impl Repository {
                     let ctx = SourceCtx { source };
                     // 遠端 root 的型態要靠列根判別：「恰好一個 File 且名稱＝
                     // 定位的最後元件」→ 檔案來源（與 restore 的 file-root
-                    // 規則一致，format-v3-draft §9）。這合約要求 Source 在
+                    // 規則一致，docs/format.md §9）。這合約要求 Source 在
                     // 根指向單一檔案時，`list(b"")` 列得出那個檔案本身；
                     // 列不出來的來源會被當成目錄走訪（SFTP 上列一個檔案路徑
                     // 會直接失敗 → backup 失敗，不會悄悄留下空樹）。列根失
@@ -1056,7 +1058,7 @@ impl Backup {
         parent: Option<&Entry>,
     ) -> Result<Option<Entry>> {
         let mk = ctx.source.meta_kind();
-        // 來源能證明什麼就記什麼（format-v3-draft §8 的 metadata 聯集）：
+        // 來源能證明什麼就記什麼（docs/format.md §8 的 metadata 聯集）：
         // posix 記全套；sftp 只有 mtime（mode/uid/gid 來源有才記）；s3 只有
         // mtime/etag/vern。缺席欄位一律 `None`（＝來源未知，不是 0）。
         // posix 的 metadata 在處理條目時對路徑 lstat 取得——清單刻意不攜帶
@@ -1260,7 +1262,7 @@ impl Backup {
 
     /// tree 是 content-addressed：**新樹**以 put_if_absent 寫入；已存在的
     /// （沿用的）以覆寫式 Put 寫 `touch/<id>` 刷新 mtime——那是 GC 復活
-    /// 訊號（format-v3-draft §13.1）。同一次 backup 內同內容的目錄只處理一次。
+    /// 訊號（docs/format.md §13.1）。同一次 backup 內同內容的目錄只處理一次。
     /// `replicas=1` 時順手寫 `.r1` 副本（同 bytes、冪等；已存在則略過）。
     async fn write_tree(&mut self, tree: Tree) -> Result<TreeId> {
         let (id, bytes) = self.repo.seal_tree(tree).await?;
@@ -1540,6 +1542,7 @@ impl Backup {
             bytes_new: 0,
             chunks_new: 0,
             reused_count: 0,
+            revived_count: 0,
             reused: Vec::new(),
         };
         loop {
@@ -1591,6 +1594,9 @@ impl Backup {
                         match packer.add(id, &chunk) {
                             Ok(entry) => {
                                 if in_marked_pack {
+                                    // 從被標記 pack 重傳出來的 chunk：逐 chunk 計數
+                                    //（與 Go 的 PacksRevived 同單位）。
+                                    state.revived_count += 1;
                                     index.replace_pending(&entry);
                                 } else {
                                     index.add_pending(&entry);
@@ -1642,6 +1648,7 @@ impl Backup {
             if done {
                 self.chunk_bufs.push(state.chunks.take_buf());
                 self.report.chunks_read += state.reused_count;
+                self.report.packs_revived += state.revived_count;
                 return Ok(Some(FileResult {
                     chunks: state.ids,
                     bytes_total: state.bytes_total,
