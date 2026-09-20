@@ -577,6 +577,14 @@ impl Repository {
         let keys = Arc::clone(&self.keys);
         let key_owned = key.to_owned();
         let bytes = blocking(move || {
+            // 寫入端與 seal_tree 同一原則：寫只寫讀取端都接受的物件。
+            // key 與內容的一致性仍是呼叫端的責任（讀取端核對），這裡
+            // 擋的是結構不合法——roots 未排序／重複、tree 零值這種
+            // 讀取端會拒絕的形狀。
+            snapshot.validate().map_err(|e| CoreError::Corrupt {
+                key: key_owned.clone(),
+                reason: e.to_string(),
+            })?;
             let plain = cbor::encode(&snapshot)?;
             Ok(keys.seal_snapshot(&key_owned, &plain)?)
         })

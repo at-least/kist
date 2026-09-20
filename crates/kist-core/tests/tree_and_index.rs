@@ -131,3 +131,42 @@ async fn seal_tree_rejects_trees_readers_would_reject() {
         assert!(result.is_err(), "{what}: seal_tree 必須回錯，卻成功寫出");
     }
 }
+
+/// 寫入端也要驗證（「寫只寫讀取端都接受的物件」原則）：`read_snapshot`
+/// 會拒絕 roots 未排序／重複的 snapshot，`write_snapshot` 就不能把這種
+/// 物件放進 repo——手工組 snapshot 的呼叫端（kist-mount 的測試）拼錯了
+/// 要在寫入當下聽到，而不是還原或 check 時才炸。
+#[tokio::test]
+async fn write_snapshot_refuses_structurally_invalid_snapshots() {
+    use kist_core::CoreError;
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let mut snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+    assert!(snap.roots.len() >= 1, "前置：真 snapshot 至少一個 root");
+    // 重複同一個 root：prev >= path 在 validate 必炸，與 root 數多寡無關。
+    snap.roots.push(snap.roots[0].clone());
+
+    let err = repo
+        .write_snapshot(&format!("{}.invalid", s.snapshot_key), snap)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::Corrupt { ref reason, .. } if reason.contains("sorted")),
+        "寫入端必須拒絕結構不合法的 snapshot：{err}"
+    );
+    // repo 裡不能留下一個沒人讀得回來的物件。
+    let mut found = false;
+    for f in walk_files(&t.repo_path().join("snapshots")) {
+        if f.to_string_lossy().contains(".invalid") {
+            found = true;
+        }
+    }
+    assert!(!found, "被拒絕的 snapshot 不得落盤");
+}
