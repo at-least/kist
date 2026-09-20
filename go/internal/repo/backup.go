@@ -553,7 +553,7 @@ func (b *backupRun) backupRoot(ctx context.Context, plan rootPlan) (crypto.ID, e
 		if !ok {
 			return crypto.ID{}, fmt.Errorf("backup: %s: source could not be read", plan.localPath)
 		}
-		entry, ok, err := b.processEntry(ctx, plan.src, name, item, b.parentFileEntry(ctx, plan.locator, name))
+		entry, ok, err := b.processEntry(ctx, plan.src, name, item, b.parentFileEntry(ctx, plan.locator, name), 1)
 		if err != nil {
 			return crypto.ID{}, err
 		}
@@ -577,7 +577,7 @@ func (b *backupRun) backupRoot(ctx context.Context, plan rootPlan) (crypto.ID, e
 	last := string(lastComponent(plan.locator))
 	if len(last) > 0 && len(probe) == 1 &&
 		probe[0].Kind.Kind == source.KindFile && string(probe[0].Name) == last {
-		entry, ok, err := b.processEntry(ctx, plan.src, probe[0].Name, probe[0], b.parentFileEntry(ctx, plan.locator, probe[0].Name))
+		entry, ok, err := b.processEntry(ctx, plan.src, probe[0].Name, probe[0], b.parentFileEntry(ctx, plan.locator, probe[0].Name), 1)
 		if err != nil {
 			return crypto.ID{}, err
 		}
@@ -586,7 +586,7 @@ func (b *backupRun) backupRoot(ctx context.Context, plan rootPlan) (crypto.ID, e
 		}
 		return b.writeSegment(ctx, []tree.Entry{entry}, nil)
 	}
-	return b.walkDir(ctx, plan.src, nil, b.parentSubtree(plan.locator))
+	return b.walkDir(ctx, plan.src, nil, b.parentSubtree(plan.locator), 1)
 }
 
 // parentSubtree returns the parent snapshot's tree for the root with
@@ -692,7 +692,7 @@ func displayPath(src source.Source, rel []byte) string {
 // map. Entries a directory gains, loses or renames between listings are
 // just names the parent does not have: they are read, and the parent's
 // leftovers are never asked for.
-func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, parentSubtree *crypto.ID) (crypto.ID, error) {
+func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, parentSubtree *crypto.ID, depth int) (crypto.ID, error) {
 	var stream *parentStream
 	if parentSubtree != nil && !parentSubtree.IsZero() {
 		s, err := openParentStream(ctx, b.repo, *parentSubtree)
@@ -721,7 +721,17 @@ func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, 
 			return crypto.ID{}, err
 		}
 		childRel := source.JoinRel(dir, item.Name)
-		entry, ok, err := b.processEntry(ctx, src, childRel, item, stream.takeName(ctx, item.Name))
+		// The read side (restore, check, prune) refuses trees nesting
+		// deeper than maxTreeDepth as corrupt or hostile (docs/format.md
+		// §8.4), so the write side must not produce them: a source
+		// directory past the limit is skipped and counted, the same
+		// ledger an unreadable entry lands in. The walk's recursion is
+		// bounded by the same rule. The Rust implementation matches.
+		if item.Kind.Kind == source.KindDir && depth >= maxTreeDepth {
+			b.skip("skipping %s: directory nesting deeper than %d levels; the read side refuses deeper trees", display, maxTreeDepth)
+			continue
+		}
+		entry, ok, err := b.processEntry(ctx, src, childRel, item, stream.takeName(ctx, item.Name), depth)
 		if err != nil {
 			return crypto.ID{}, err
 		}
@@ -754,7 +764,7 @@ func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, 
 // item its mtime (and mode/ownership when the source has them), an s3
 // item its mtime and the etag/vern it computed. An absent field means
 // "the source did not say" -- never zero.
-func (b *backupRun) processEntry(ctx context.Context, src source.Source, rel []byte, item source.SourceItem, parent *tree.Entry) (tree.Entry, bool, error) {
+func (b *backupRun) processEntry(ctx context.Context, src source.Source, rel []byte, item source.SourceItem, parent *tree.Entry, depth int) (tree.Entry, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return tree.Entry{}, false, err
 	}
@@ -785,7 +795,7 @@ func (b *backupRun) processEntry(ctx context.Context, src source.Source, rel []b
 		if parent != nil && tree.NodeType(parent.Type) == tree.TypeDir && parent.Subtree != nil {
 			parentDir = parent.Subtree
 		}
-		subtree, err := b.walkDir(ctx, src, rel, parentDir)
+		subtree, err := b.walkDir(ctx, src, rel, parentDir, depth+1)
 		if err != nil {
 			return tree.Entry{}, false, err
 		}

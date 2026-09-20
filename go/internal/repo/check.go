@@ -309,17 +309,25 @@ func (r *Repository) repairPack(ctx context.Context, id crypto.ID) error {
 	return nil
 }
 
-// maxTreeDepth caps DIR nesting for the recursive tree walks (check,
-// prune, restore). It is an implementation limit, not a format rule: honest
-// trees are bounded by source path lengths (far shallower), and a chain
-// beyond the limit can only come from a corrupt or hostile repository --
-// refuse it cleanly instead of exhausting the stack. Must match the Rust
-// implementation's kist_core::MAX_TREE_DEPTH; see docs/format.md §8.4.
+// maxTreeDepth caps DIR nesting for the tree walks (check, prune,
+// restore). It is an implementation limit, not a format rule: an honest
+// source can legally nest past it (short names fit ~2000 levels under
+// PATH_MAX), so the backup write side enforces the same cap -- deeper
+// source directories are skipped and counted, and stored trees never
+// exceed the limit. A chain beyond it can only come from a corrupt or
+// hostile repository: refuse it cleanly instead of exhausting the stack.
+// Must match the Rust implementation's kist_core::MAX_TREE_DEPTH; see
+// docs/format.md §8.4.
 const maxTreeDepth = 256
 
 // walkTree descends one snapshot, recording what it reaches. depth is the
 // DIR nesting level (roots = 1); prev segments do not count toward it --
 // they split one directory, and an honest large directory can chain long.
+// The prev chain is walked in a LOOP, not recursion: recursion would burn
+// a stack frame per segment and die with an uncatchable fatal (goroutine
+// stack exceeds the limit) once the chain outgrew the stack -- exactly
+// the exhaustion the depth cap exists to prevent. The Rust peer's reach
+// walks prev the same way. seenTrees still guards cycles per segment.
 func (r *Repository) walkTree(
 	ctx context.Context,
 	id crypto.ID,
@@ -330,69 +338,72 @@ func (r *Repository) walkTree(
 	chunks *ChunkSource,
 	problem func(string, ...any),
 ) {
-	if _, done := seenTrees[id]; done {
-		// Shared subtrees are the point of content addressing; walking
-		// one twice would turn a check into an exponential walk.
-		return
-	}
-	seenTrees[id] = struct{}{}
+	for {
+		if _, done := seenTrees[id]; done {
+			// Shared subtrees are the point of content addressing; walking
+			// one twice would turn a check into an exponential walk.
+			return
+		}
+		seenTrees[id] = struct{}{}
 
-	t, err := r.readTree(ctx, id)
-	if err != nil {
-		problem("%s: tree %s: %v", origin, id, err)
-		return
-	}
+		t, err := r.readTree(ctx, id)
+		if err != nil {
+			problem("%s: tree %s: %v", origin, id, err)
+			return
+		}
 
-	if t.Prev != nil {
-		r.walkTree(ctx, *t.Prev, depth, origin, ix, seenTrees, usedPacks, chunks, problem)
-	}
-
-	for _, entry := range t.Entries {
-		switch tree.NodeType(entry.Type) {
-		case tree.TypeDir:
-			if entry.Subtree == nil {
-				problem("%s: tree %s: %q has no subtree", origin, id, entry.Name)
-				continue
-			}
-			if depth >= maxTreeDepth {
-				problem("%s: tree %s: nesting deeper than %d levels (corrupt or hostile repository)", origin, id, maxTreeDepth)
-				continue
-			}
-			r.walkTree(ctx, *entry.Subtree, depth+1, origin, ix, seenTrees, usedPacks, chunks, problem)
-		case tree.TypeFile:
-			// An indirect entry's Chunks name the encoded ChunkList; the
-			// data chunks it resolves to are what keeps packs live, so
-			// both sets must be walked (docs/format.md §13.1).
-			// The list chunks themselves are referenced too (their pack
-			// holds the encoded ChunkList the snapshot needs).
-			for _, chunkID := range entry.Chunks {
-				if loc, ok := ix.Lookup(chunkID); ok {
+		for _, entry := range t.Entries {
+			switch tree.NodeType(entry.Type) {
+			case tree.TypeDir:
+				if entry.Subtree == nil {
+					problem("%s: tree %s: %q has no subtree", origin, id, entry.Name)
+					continue
+				}
+				if depth >= maxTreeDepth {
+					problem("%s: tree %s: nesting deeper than %d levels (corrupt or hostile repository)", origin, id, maxTreeDepth)
+					continue
+				}
+				r.walkTree(ctx, *entry.Subtree, depth+1, origin, ix, seenTrees, usedPacks, chunks, problem)
+			case tree.TypeFile:
+				// An indirect entry's Chunks name the encoded ChunkList; the
+				// data chunks it resolves to are what keeps packs live, so
+				// both sets must be walked (docs/format.md §13.1).
+				// The list chunks themselves are referenced too (their pack
+				// holds the encoded ChunkList the snapshot needs).
+				for _, chunkID := range entry.Chunks {
+					if loc, ok := ix.Lookup(chunkID); ok {
+						usedPacks[loc.Pack] = struct{}{}
+					}
+				}
+				chunkIDs := entry.Chunks
+				if tree.ContentType(entry.ContentType) == tree.ContentIndirect {
+					list, err := chunks.ChunkList(ctx, entry.Chunks)
+					if err != nil {
+						problem("%s: tree %s: %q: chunk list: %v", origin, id, entry.Name, err)
+						continue
+					}
+					chunkIDs = list
+				}
+				for _, chunkID := range chunkIDs {
+					loc, ok := ix.Lookup(chunkID)
+					if !ok {
+						problem("%s: tree %s: %q refers to chunk %s, which no pack holds", origin, id, entry.Name, chunkID)
+						continue
+					}
 					usedPacks[loc.Pack] = struct{}{}
 				}
+			case tree.TypeSymlink:
+				// A symlink has no content to check beyond its target, which
+				// the tree already validated.
+			default:
+				problem("%s: tree %s: %q has unknown type %d", origin, id, entry.Name, entry.Type)
 			}
-			chunkIDs := entry.Chunks
-			if tree.ContentType(entry.ContentType) == tree.ContentIndirect {
-				list, err := chunks.ChunkList(ctx, entry.Chunks)
-				if err != nil {
-					problem("%s: tree %s: %q: chunk list: %v", origin, id, entry.Name, err)
-					continue
-				}
-				chunkIDs = list
-			}
-			for _, chunkID := range chunkIDs {
-				loc, ok := ix.Lookup(chunkID)
-				if !ok {
-					problem("%s: tree %s: %q refers to chunk %s, which no pack holds", origin, id, entry.Name, chunkID)
-					continue
-				}
-				usedPacks[loc.Pack] = struct{}{}
-			}
-		case tree.TypeSymlink:
-			// A symlink has no content to check beyond its target, which
-			// the tree already validated.
-		default:
-			problem("%s: tree %s: %q has unknown type %d", origin, id, entry.Name, entry.Type)
 		}
+
+		if t.Prev == nil {
+			return
+		}
+		id = *t.Prev
 	}
 }
 

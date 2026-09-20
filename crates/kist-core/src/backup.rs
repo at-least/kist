@@ -824,7 +824,7 @@ impl Repository {
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(path.clone())?),
                     };
-                    b.walk_dir(&ctx, b"", parent_subtree).await?
+                    b.walk_dir(&ctx, b"", parent_subtree, 1).await?
                 }
                 RootPlan::LocalFile(path) => {
                     let name = pb
@@ -850,7 +850,7 @@ impl Repository {
                     let item = local_file_item(&path, &name)?;
                     let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
                     let Some(entry) = b
-                        .process_entry(&ctx, &name, item, parent_entry.as_ref())
+                        .process_entry(&ctx, &name, item, parent_entry.as_ref(), 1)
                         .await?
                     else {
                         return Err(CoreError::Usage(format!(
@@ -893,7 +893,7 @@ impl Repository {
                         let name = item.name.clone();
                         let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
                         let Some(entry) = b
-                            .process_entry(&ctx, b"", item, parent_entry.as_ref())
+                            .process_entry(&ctx, b"", item, parent_entry.as_ref(), 1)
                             .await?
                         else {
                             return Err(CoreError::Usage(format!(
@@ -903,7 +903,7 @@ impl Repository {
                         };
                         b.write_tree(Tree::new(vec![entry], None)).await?
                     } else {
-                        b.walk_dir(&ctx, b"", parent_subtree).await?
+                        b.walk_dir(&ctx, b"", parent_subtree, 1).await?
                     }
                 }
             };
@@ -1043,8 +1043,11 @@ impl Backup {
         rel: &[u8],
         item: SourceItem,
         parent: Option<&Entry>,
+        depth: usize,
     ) -> Result<Option<Entry>> {
-        let node = self.process_entry_inner(ctx, rel, item, parent).await?;
+        let node = self
+            .process_entry_inner(ctx, rel, item, parent, depth)
+            .await?;
         let display = ctx.display_path(rel);
         self.report_phase("files", Some(display));
         Ok(node)
@@ -1056,6 +1059,7 @@ impl Backup {
         rel: &[u8],
         item: SourceItem,
         parent: Option<&Entry>,
+        depth: usize,
     ) -> Result<Option<Entry>> {
         let mk = ctx.source.meta_kind();
         // 來源能證明什麼就記什麼（docs/format.md §8 的 metadata 聯集）：
@@ -1107,7 +1111,7 @@ impl Backup {
                     Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
                     _ => None,
                 };
-                let subtree = self.walk_dir(ctx, rel, parent_subtree).await?;
+                let subtree = self.walk_dir(ctx, rel, parent_subtree, depth + 1).await?;
                 self.stats.dirs += 1;
                 entry.kind = node_type::DIR;
                 entry.subtree = subtree;
@@ -1194,6 +1198,7 @@ impl Backup {
         ctx: &'a SourceCtx,
         dir_rel: &'a [u8],
         parent_subtree: Option<TreeId>,
+        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TreeId>> + Send + 'a>> {
         Box::pin(async move {
             let mut parent_stream = match parent_subtree {
@@ -1241,12 +1246,29 @@ impl Backup {
                     }
                 };
                 let child_rel = join_rel(dir_rel, &item.name);
+                // 深度上限與讀取端同一把尺（MAX_TREE_DEPTH，§8.4）：讀取端
+                // 把超過上限的樹當敵意 repo 拒收，寫入端就不能把「合法但
+                // 過深」的來源目錄寫進去——寫得出、還原不回＝自造損壞。
+                // 跳過並記帳（與讀不到的項目同一套帳）；遞迴本身也因此
+                // 有界，深來源不再吃堆疊。Go 實作同款。
+                if matches!(item.kind, SourceItemKind::Dir) && depth >= crate::MAX_TREE_DEPTH {
+                    let display = ctx.display_path(&child_rel);
+                    self.skip(
+                        &display,
+                        &format!(
+                            "directory nesting deeper than {} levels; \
+                             the read side refuses deeper trees",
+                            crate::MAX_TREE_DEPTH
+                        ),
+                    );
+                    continue;
+                }
                 let parent_entry = match parent_stream.as_mut() {
                     Some(s) => s.take_name(&item.name).await,
                     None => None,
                 };
                 let entry = self
-                    .process_entry(ctx, &child_rel, item, parent_entry.as_ref())
+                    .process_entry(ctx, &child_rel, item, parent_entry.as_ref(), depth)
                     .await?;
                 if let Some(entry) = entry {
                     children.push(entry);

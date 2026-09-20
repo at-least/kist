@@ -516,3 +516,73 @@ async fn stats_count_dirs_without_root_tree_and_hard_link_bytes_once() {
         s.stats
     );
 }
+
+/// 寫入端與讀取端同一把深度尺（docs/format.md §8.4）：讀取端把超過
+/// `MAX_TREE_DEPTH` 的樹當敵意 repo 拒收，backup 就不能把「合法但過深」
+/// 的來源目錄寫進去——寫得出、還原不回＝自造損壞。過深的子目錄跳過並
+/// 記帳（與讀不到的項目同一套帳），backup 的走訪遞迴也因此有界。
+#[tokio::test]
+async fn backup_refuses_depth_beyond_the_read_side_limit() {
+    // 修復前這個測試在 260 層就 abort（Box::pin 遞迴每一層的 debug frame
+    // 很肥，2 MiB 的測試執行緒裝不下）：深走訪要在自己的大堆疊執行緒上
+    // 跑，斷言的對象是語意（截斷在讀取端上限），不是堆疊極限本身。
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(run_depth_limit_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run_depth_limit_body() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let t = TestRepo::new().await;
+        let src = t.dir.path().join("src");
+        let mut deep = src.clone();
+        std::fs::create_dir_all(&deep).unwrap();
+        // 260 層巢狀目錄：legal on ext4（PATH_MAX 內），但超出讀取端的 256。
+        for i in 0..260 {
+            deep.push(format!("d{i}"));
+            std::fs::create_dir_all(&deep).unwrap();
+        }
+        std::fs::write(deep.join("leaf.txt"), b"deep").unwrap();
+        std::fs::write(src.join("top.txt"), b"top").unwrap();
+
+        let repo = t.open().await;
+        let summary = repo
+            .backup(std::slice::from_ref(&src), backup_options())
+            .await
+            .unwrap();
+        assert!(
+            summary.report.errors >= 1,
+            "過深的目錄必須記帳跳過：{:?}",
+            summary.report
+        );
+
+        // repo 裡寫出的深度必須在讀取端上限內：restore 整顆成功。
+        let target = t.dir.path().join("out");
+        repo.restore(&summary.snapshot_key, &target, RestoreOptions::default())
+            .await
+            .unwrap();
+        // restore 會在 target 底下重建完整的絕對路徑。
+        let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+        assert!(restored.join("top.txt").is_file(), "淺層內容照常還原");
+        let mut limit_ok = restored.clone();
+        for i in 0..255 {
+            limit_ok.push(format!("d{i}")); // d0..d254 = 第 2..=256 層
+        }
+        assert!(
+            limit_ok.is_dir(),
+            "上限內的深度照常還原：{}",
+            limit_ok.display()
+        );
+        assert!(
+            !limit_ok.join("d255").exists(),
+            "第 257 層起必須被跳過，不能寫出讀取端拒收的樹"
+        );
+    })
+}

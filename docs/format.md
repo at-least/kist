@@ -241,11 +241,14 @@ opt-in，但那是 client 政策，規格不背書其安全性。`etag`/`vern` �
 
 ### 8.4 巢狀深度（實作上限）
 
-tree 的 DIR 巢狀**沒有格式上的深度限制**；但兩個參考實作的走訪（restore /
-check / prune）都是遞迴，各自設有實作上限 256 層（Rust `kist_core::MAX_TREE_DEPTH`、
-Go `repo.maxTreeDepth`，兩邊必須一致）。這不是格式規則：誠實資料的深度受來源
-路徑長度约束，遠低於此；超限的 chain 只能出自腐壞或敵意 repo，實作應乾淨回錯
-而不是把走訪遞迴墊進 stack overflow。第三方程式可以自行選擇上限。
+tree 的 DIR 巢狀**沒有格式上的深度限制**；但兩個參考實作都設有實作上限
+256 層（Rust `kist_core::MAX_TREE_DEPTH`、Go `repo.maxTreeDepth`，兩邊必須一致）。
+這不是格式規則：來源路徑長度允許的巢狀其實可以超過它（ext4 單元件可以短到
+2 bytes，PATH_MAX 內疊得出約 2000 層），所以 backup 的寫入端套同一把尺——
+超過上限的來源子目錄跳過並記警告，寫出的樹因此永不超限。還原／check／prune
+把超過上限的 chain 當腐壞或敵意 repo 乾淨回錯，而不是把走訪遞迴墊進
+stack overflow：DIR 巢狀遞迴受此上限約束，同一目錄的 prev 分段用迴圈走
+（不計深度、也不吃堆疊）。第三方程式可以自行選擇上限。
 
 ## 9. Snapshot
 
