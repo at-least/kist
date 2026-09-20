@@ -533,3 +533,73 @@ async fn ui_responses_carry_content_security_policy() {
         "UI 回應要帶 CSP header：{headers}"
     );
 }
+
+/// 安全標頭是中介層，不是個別 handler 的事：每條回應路徑——guard 拒絕
+/// （421/401/403）、靜態檔 200/404、沒有路由的 404、/healthz——都要帶
+/// CSP 與 nosniff。maud 的編碼是 XSS 的第一道防線，CSP 是第二道；第二
+/// 道防線不能只在「會出 HTML 的路徑」上站崗（攻擊面由路由決定，不由
+/// 今天有哪些 handler 洩漏決定）。
+#[tokio::test]
+async fn security_headers_are_on_every_response_path() {
+    let s = start(false).await;
+
+    // guard 拒絕：Host 不在白名單 → 421。
+    let (status, headers, _) = request(s.addr, "GET", "/", &[("Host", "evil.example")], "").await;
+    assert!(status.contains("421"), "{status}");
+    assert!(
+        headers.contains("content-security-policy:"),
+        "421 must carry CSP: {headers}"
+    );
+    assert!(
+        headers.contains("x-content-type-options:"),
+        "421 must carry nosniff: {headers}"
+    );
+
+    // 靜態檔 404（有路由、handler 自己回的 404）。
+    let (status, headers, _) =
+        request(s.addr, "GET", "/static/nope.js", &[("Host", &s.host)], "").await;
+    assert!(status.contains("404"), "{status}");
+    assert!(
+        headers.contains("content-security-policy:"),
+        "static 404 must carry CSP: {headers}"
+    );
+    assert!(
+        headers.contains("x-content-type-options:"),
+        "static 404 must carry nosniff: {headers}"
+    );
+
+    // 沒有路由的 404（axum 預設 fallback）。
+    let (status, headers, _) = request(s.addr, "GET", "/nope", &[("Host", &s.host)], "").await;
+    assert!(status.contains("404"), "{status}");
+    assert!(
+        headers.contains("content-security-policy:"),
+        "unmatched 404 must carry CSP: {headers}"
+    );
+
+    // /healthz：不是 HTML，nosniff 仍有意義。
+    let (status, headers, _) = request(s.addr, "GET", "/healthz", &[("Host", &s.host)], "").await;
+    assert!(status.contains("200"), "{status}");
+    assert!(
+        headers.contains("x-content-type-options:"),
+        "healthz must carry nosniff: {headers}"
+    );
+
+    // 靜態檔 200 兩個都要。
+    let (status, headers, _) =
+        request(s.addr, "GET", "/static/style.css", &[("Host", &s.host)], "").await;
+    assert!(status.contains("200"), "{status}");
+    assert!(
+        headers.contains("content-security-policy:") && headers.contains("x-content-type-options:"),
+        "static 200 must carry both: {headers}"
+    );
+
+    // 原本就有 CSP 的路徑不能倒退。
+    let (status, headers, _) = request(s.addr, "GET", "/", &[("Host", &s.host)], "").await;
+    assert!(status.contains("200"), "{status}");
+    assert!(
+        headers.contains("content-security-policy:"),
+        "index must still carry CSP: {headers}"
+    );
+
+    s.stop().await;
+}

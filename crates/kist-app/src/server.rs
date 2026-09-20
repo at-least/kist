@@ -96,6 +96,7 @@ pub async fn serve_http(
         .route("/metrics", axum::routing::get(metrics_handler))
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(ui)
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown))
@@ -121,6 +122,29 @@ async fn metrics_handler(State(state): State<ServeState>) -> impl IntoResponse {
 }
 
 // ---- 中介層：Host → auth → POST 規則 ----------------------------------------------------
+
+/// 每一條回應都帶的安全標頭（中介層，不是個別 handler 的事）：guard 拒絕、
+/// 靜態檔、404 fallback、/metrics、/healthz 全部涵蓋。maud 的編碼是 XSS 的
+/// 第一道防線，CSP 是第二道：未來任何漏編碼的插值，爆炸半徑被壓到同源
+/// （腳本與樣式只有 /static、無 inline、連外全禁、不允許被 embed）——第二
+/// 道防線不能只在「會出 HTML 的路徑」上站崗，攻擊面由路由決定。nosniff
+/// 對任何 body（OpenMetrics 文字、octet-stream）都有意義。
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; \
+             img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
+}
 
 /// UI 路由的門（模組說明有講順序與理由）。拒絕都回純文字。
 async fn ui_guard(State(state): State<ServeState>, req: Request, next: Next) -> Response {
@@ -434,20 +458,10 @@ struct SnapshotRow {
     paths: String,
 }
 
-/// maud 在編譯期產生 HTML，沒有執行期錯誤；這裡補上狀態碼與 CSP。
-/// maud 的輸出編碼是 XSS 的第一道防線，CSP 是第二道：未來任何漏編碼的
-/// 插值，爆炸半徑被壓到同源（腳本與樣式只有 /static、無 inline、
-/// 連外全禁、不允許被 embed）。
+/// maud 在編譯期產生 HTML，沒有執行期錯誤；這裡補上狀態碼。CSP 與
+/// nosniff 由 `security_headers` 中介層統一加（每一條回應路徑都涵蓋）。
 fn render(status: StatusCode, markup: Markup) -> Response {
-    let mut resp = (status, markup).into_response();
-    resp.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; \
-             img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-        ),
-    );
-    resp
+    (status, markup).into_response()
 }
 
 async fn index(State(state): State<ServeState>) -> Response {
