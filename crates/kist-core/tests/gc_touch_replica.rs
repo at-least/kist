@@ -169,19 +169,12 @@ async fn metadata_replicas_cover_missing_primaries() {
     // snapshot 副本存在，但列表不把 `.r1` 當 snapshot。
     let snaps = repo.list_snapshots().await.unwrap();
     assert_eq!(snaps.len(), 1, "`.r1` 不得列為 snapshot");
-    let ts = b1.snapshot_key.rsplit('/').next().unwrap().to_owned();
+    // 副本與主體同一把 key 加 `.r1`（與下方 I/O 錯誤測試同一演算法）。
     assert!(
-        repo_dir
-            .join(keys::SNAPSHOTS_PREFIX)
-            .join(format!("{}.r1", hex_of_client_and_ts(&ts).0))
-            .exists()
+        repo_dir.join(format!("{}.r1", b1.snapshot_key)).exists()
             || walk_has_suffix(&repo_dir.join(keys::SNAPSHOTS_PREFIX), keys::REPLICA_SUFFIX),
         "snapshot `.r1` 必須存在"
     );
-}
-
-fn hex_of_client_and_ts(ts: &str) -> (String, String) {
-    (String::new(), ts.to_owned())
 }
 
 /// 對照組：replicas=0 不寫任何 `.r1`。
@@ -284,6 +277,15 @@ async fn replica_read_error_is_not_masked_as_not_found() {
     let primary = repo_dir.join(&b1.snapshot_key);
     let replica = repo_dir.join(format!("{}.r1", b1.snapshot_key));
     assert!(primary.exists() && replica.exists(), "主體與副本都要在");
+
+    // root（或 CAP_DAC_OVERRIDE）無視 0o000：這個測試靠權限注入「副本
+    // 讀不得」，注入不了就誠實跳過——特權環境裡 unwrap_err 只會假失敗。
+    let canary = repo_dir.join(".dac-canary");
+    std::fs::write(&canary, b"x").unwrap();
+    std::fs::set_permissions(&canary, PermissionsExt::from_mode(0o000)).unwrap();
+    if std::fs::read(&canary).is_ok() {
+        return;
+    }
 
     std::fs::remove_file(&primary).unwrap();
     std::fs::set_permissions(&replica, PermissionsExt::from_mode(0o000)).unwrap();

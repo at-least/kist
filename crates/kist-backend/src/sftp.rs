@@ -996,8 +996,9 @@ async fn walk(
     out: &mut Vec<ObjectMeta>,
 ) -> std::result::Result<(), StoreError> {
     // 迭代 DFS（明確堆疊取代 Box::pin 遞迴）：敵意伺服器可以捏造任意深
-    // 的目錄鏈，遞迴會把原生堆疊吃成 abort。輸出順序＝伺服器 readdir 順
-    // 序（與原遞迴相同、本來就未排序）；Backend::list 的合約是不保證順序。
+    // 的目錄鏈，遞迴會把原生堆疊吃成 abort。每個目錄的檔案先全數列出、
+    // 子目錄排在後面（原遞迴是撞到子目錄就先下去——輸出順序因此不同，
+    // 但本來就未排序）；Backend::list 的合約是不保證順序，呼叫端各自排。
     let mut stack: Vec<(String, usize)> = vec![(dir.to_owned(), 0)];
     while let Some((dir, depth)) = stack.pop() {
         let mut fs = sftp.fs();
