@@ -77,11 +77,19 @@ pub fn os_to_bytes(name: OsString) -> Vec<u8> {
 }
 
 pub(crate) fn mtime_ns_of(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|d| i64::try_from(d.as_nanos()).ok())
-        .unwrap_or(0)
+    // mtime 取不到才用 0（= 未記錄）；取得到就要保留全範圍——1970 年以前的
+    // mtime 是合法的（解壓縮打包檔常見），夾成 0 會讓 restore 靜靜把時間
+    // 設成 1970-01-01。
+    let Ok(t) = meta.modified() else {
+        return 0;
+    };
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
+        Err(e) => match i64::try_from(e.duration().as_nanos()) {
+            Ok(ns) => -ns,
+            Err(_) => i64::MIN,
+        },
+    }
 }
 
 #[cfg(unix)]
