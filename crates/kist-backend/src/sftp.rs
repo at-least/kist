@@ -86,14 +86,19 @@ pub fn parse_sftp_url(s: &str) -> Result<SftpConfig> {
         Some(rest) => rest,
         None => return Err(BackendError::InvalidUrl(s.to_owned())),
     };
-    let (user, hostport) = match rest.split_once('@') {
-        Some((u, hp)) => {
-            if u.is_empty() || u.contains(':') {
-                return Err(BackendError::InvalidUrl(s.to_owned()));
+    // `@` 只在 authority（第一個 `/` 之前）裡才算 userinfo：路徑是字面內容，
+    // 裡面的 `@` 與帳號無關（與 Go 端 url.Parse 同一語意）。
+    let (user, hostport) = {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        match rest[..authority_end].split_once('@') {
+            Some((u, hp)) => {
+                if u.is_empty() || u.contains(':') || hp.contains('@') {
+                    return Err(BackendError::InvalidUrl(s.to_owned()));
+                }
+                (Some(u.to_owned()), &rest[u.len() + 1..])
             }
-            (Some(u.to_owned()), hp)
+            None => (None, rest),
         }
-        None => (None, rest),
     };
     // 切出 (host, port 字串, /path)——路徑可能為空，最後統一檢查。
     let (host, port_str, path) = if let Some(stripped) = hostport.strip_prefix('[') {
