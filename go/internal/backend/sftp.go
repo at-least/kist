@@ -557,6 +557,20 @@ func (s *SFTP) List(ctx context.Context, prefix string, fn func(FileInfo) error)
 // cap.
 const maxWalkDepth = 16
 
+// listKey maps a walked absolute server path back to a repository key:
+// the walk starts at root, so everything below it loses that prefix. A
+// root of "." is already relative, and a root of "/" must lose its slash
+// ("root+/" is "//", which no path starts with).
+func (s *SFTP) listKey(full string) string {
+	if s.root == "." {
+		return full
+	}
+	if s.root == "/" {
+		return strings.TrimPrefix(full, "/")
+	}
+	return strings.TrimPrefix(full, s.root+"/")
+}
+
 func (s *SFTP) walk(ctx context.Context, dir, prefix string, depth int, fn func(FileInfo) error) error {
 	if depth > maxWalkDepth {
 		return fmt.Errorf("directory tree exceeds the repo namespace depth limit (%d): %s", maxWalkDepth, dir)
@@ -583,10 +597,7 @@ func (s *SFTP) walk(ctx context.Context, dir, prefix string, depth int, fn func(
 			}
 			continue
 		}
-		key := strings.TrimPrefix(full, s.root+"/")
-		if s.root == "." {
-			key = full
-		}
+		key := s.listKey(full)
 		if !strings.HasPrefix(key, prefix) {
 			continue
 		}

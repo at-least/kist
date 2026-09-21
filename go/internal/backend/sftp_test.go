@@ -488,3 +488,22 @@ func TestSFTPListRejectsAbsurdDirectoryDepth(t *testing.T) {
 		t.Fatalf("expected 1 pack object, got %d", n)
 	}
 }
+
+// The key derivation behind List: a root of "/" must lose its slash --
+// root+"/" is "//", which no walked path starts with, so every key kept
+// its leading slash and the prefix filter dropped every object (an
+// silently empty repository: no dedup, check fails, prune refuses).
+func TestSFTPListKeyStripsTheRootSlash(t *testing.T) {
+	s := &SFTP{root: "/"}
+	if got := s.listKey("/packs/ab/0012"); got != "packs/ab/0012" {
+		t.Fatalf(`a root of "/" must strip its slash, got %q`, got)
+	}
+	s = &SFTP{root: "."}
+	if got := s.listKey("packs/ab/0012"); got != "packs/ab/0012" {
+		t.Fatalf(`a relative root is already a key, got %q`, got)
+	}
+	s = &SFTP{root: "/srv/repo"}
+	if got := s.listKey("/srv/repo/packs/x"); got != "packs/x" {
+		t.Fatalf("a normal root prefix must be stripped, got %q", got)
+	}
+}
