@@ -220,6 +220,9 @@ ChunkList { v:3, chunks:[ChunkId] }
   節點、`prev` 鏈、父記最後一段）；間接清單（chunks > 256 改 ChunkList
   入 pack）；硬連結（mk=0 的 dev/ino/nlink，`nlink>1` 才記）。
 
+> s3 entry 的 `etag`／`vern` 各自上限 **1 KiB**（讀寫兩端的 Validate 都拒超限）：
+> 它們是來源聲稱的位元組，不得無界進記憶體或 repo。
+
 ### 8.2 快速路徑合約（內容可證明 > kernel 可證明 > 來源聲稱）
 
 | 來源 | 沿用條件 | 依據 |

@@ -566,3 +566,30 @@ func TestXattrsRejectDuplicateKeys(t *testing.T) {
 		t.Fatal("duplicate xattr key decoded without error")
 	}
 }
+
+// A hostile S3 listing's etag/vern bytes must be capped (§8.1: 1 KiB):
+// the SFTP read path has had caps for a while, this sibling input did
+// not -- memory amplification plus unbounded repo growth.
+func TestValidateCapsEtagAndVern(t *testing.T) {
+	keys := testKeys(t)
+	big := make([]byte, 1025)
+
+	e := Entry{Name: []byte("f"), Type: uint8(TypeFile), MetaKind: uint8(MetaS3), Etag: big}
+	tr := &Tree{Version: Version, Entries: []Entry{e}}
+	if _, _, err := tr.Encode(&keys.Hash); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("encode: err = %v, want ErrCorrupt (etag over 1 KiB)", err)
+	}
+
+	e.Etag = make([]byte, 1024)
+	e.Vern = big
+	tr = &Tree{Version: Version, Entries: []Entry{e}}
+	if _, _, err := tr.Encode(&keys.Hash); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("encode: err = %v, want ErrCorrupt (vern over 1 KiB)", err)
+	}
+
+	e.Vern = make([]byte, 1024)
+	tr = &Tree{Version: Version, Entries: []Entry{e}}
+	if _, _, err := tr.Encode(&keys.Hash); err != nil {
+		t.Fatalf("at-cap etag/vern must encode: %v", err)
+	}
+}

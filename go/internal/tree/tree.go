@@ -93,6 +93,9 @@ const (
 // required, optional, or must be absent for each kind.
 type MetaKind uint8
 
+// MaxEtagVernBytes caps an s3 entry's etag and vern each (§8.1).
+const MaxEtagVernBytes = 1024
+
 // The metadata kinds.
 const (
 	// MetaPOSIX is a local filesystem source: the kernel maintains mode,
@@ -620,6 +623,15 @@ func (t *Tree) Validate() error {
 				return fmt.Errorf("%w: sftp entry %q must not carry posix/s3 fields", ErrCorrupt, e.Name)
 			}
 		case MetaS3:
+			// etag/vern are the source's claim and must not enter memory
+			// or the repository unbounded (§8.1: 1 KiB each). The Rust
+			// Validate enforces the same cap.
+			if len(e.Etag) > MaxEtagVernBytes {
+				return fmt.Errorf("%w: s3 entry %q etag exceeds %d bytes", ErrCorrupt, e.Name, MaxEtagVernBytes)
+			}
+			if len(e.Vern) > MaxEtagVernBytes {
+				return fmt.Errorf("%w: s3 entry %q vern exceeds %d bytes", ErrCorrupt, e.Name, MaxEtagVernBytes)
+			}
 			if e.Mode != nil || e.UID != nil || e.GID != nil || e.CTimeNs != nil ||
 				e.Device != nil || e.Inode != nil || e.Links != nil || len(e.Xattrs) > 0 {
 				return fmt.Errorf("%w: s3 entry %q must not carry posix fields", ErrCorrupt, e.Name)
