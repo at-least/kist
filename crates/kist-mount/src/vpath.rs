@@ -60,10 +60,10 @@ impl VirtualRoot {
     /// roots → 虛擬層級。每個 root 的定位字串切成組件，最後一段是攜帶
     /// `subtree` 的合成 DIR（瀏覽到那裡就載入 root 的 tree 內容）；
     /// 其餘組件是合成中介目錄。形態判別見 [`RootContents`]。
-    pub fn build(roots: impl IntoIterator<Item = (Root, RootContents)>) -> Self {
+    pub fn build(roots: impl IntoIterator<Item = (Root, RootContents)>) -> Result<Self, String> {
         let mut levels: HashMap<Vec<u8>, Vec<VEntry>> = HashMap::new();
         for (root, contents) in roots {
-            let comps = locator_components(root.path.as_slice());
+            let comps = locator_components(root.path.as_slice())?;
             let Some((last, parents)) = comps.split_last() else {
                 match contents {
                     RootContents::Flatten(entries) => {
@@ -96,7 +96,7 @@ impl VirtualRoot {
         for level in levels.values_mut() {
             level.sort_by(|a, b| a.name().cmp(b.name()));
         }
-        Self { levels }
+        Ok(Self { levels })
     }
 
     /// snapshot 根目錄那一層。
@@ -118,7 +118,7 @@ impl VirtualRoot {
 
 /// root 定位 → 組件（與 fsmeta::locator_to_relative 同一套規則：
 /// 去 scheme、`/` 切段、空與 `.` 組件正規化掉）。
-fn locator_components(path: &[u8]) -> Vec<&[u8]> {
+fn locator_components(path: &[u8]) -> Result<Vec<&[u8]>, String> {
     let rest = match path.iter().position(|&b| b == b':') {
         Some(i) if path.len() >= i + 3 && &path[i + 1..i + 3] == b"//" => &path[i + 3..],
         _ => path,
@@ -130,9 +130,14 @@ fn locator_components(path: &[u8]) -> Vec<&[u8]> {
         // 東西，虛擬層重複吐一個只會是不可達的同名 entry。
         .map(|c| {
             if c == b".." {
-                b"__parent__" as &[u8]
+                Ok(b"__parent__" as &[u8])
+            } else if c.contains(&0u8) {
+                // NUL 不是合法的 FUSE 目錄項位元組：Go 端的
+                // locatorComponents 在這裡回 ErrInvalid，mount 不得是
+                // 三個消費者（Go mount、兩端 restore）中唯一收下的。
+                Err(format!("locator contains a NUL byte: {c:?}"))
             } else {
-                c
+                Ok(c)
             }
         })
         .collect()
@@ -202,14 +207,14 @@ mod tests {
 
     #[test]
     fn single_component_root_is_a_real_top_level_entry() {
-        let root = VirtualRoot::build([dir_root(root_of("data"))]);
+        let root = VirtualRoot::build([dir_root(root_of("data"))]).unwrap();
         assert_eq!(names(root.top()), vec![b"data".to_vec()]);
         assert!(root.top()[0].entry().is_some(), "頂層就是 root 葉");
     }
 
     #[test]
     fn absolute_path_expands_into_synthetic_levels() {
-        let root = VirtualRoot::build([dir_root(root_of("/tmp/x/src"))]);
+        let root = VirtualRoot::build([dir_root(root_of("/tmp/x/src"))]).unwrap();
         assert_eq!(names(root.top()), vec![b"tmp".to_vec()]);
         assert!(root.top()[0].entry().is_none(), "tmp 是合成的");
         assert_eq!(names(root.level(b"/tmp")), vec![b"x".to_vec()]);
@@ -222,7 +227,7 @@ mod tests {
     #[test]
     fn remote_locators_strip_their_scheme() {
         // s3://bucket/prefix → bucket/prefix（與 restore 映射一致）
-        let root = VirtualRoot::build([dir_root(root_of("s3://bucket/prefix"))]);
+        let root = VirtualRoot::build([dir_root(root_of("s3://bucket/prefix"))]).unwrap();
         assert_eq!(names(root.top()), vec![b"bucket".to_vec()]);
         assert_eq!(names(root.level(b"/bucket")), vec![b"prefix".to_vec()]);
     }
@@ -233,7 +238,8 @@ mod tests {
             dir_root(root_of("/home/a/data")),
             dir_root(root_of("/home/b/data")),
             dir_root(root_of("/etc/config")),
-        ]);
+        ])
+        .unwrap();
         let mut top = names(root.top());
         top.sort();
         assert_eq!(top, vec![b"etc".to_vec(), b"home".to_vec()]);
@@ -245,8 +251,25 @@ mod tests {
 
     #[test]
     fn empty_locator_is_skipped_without_panicking() {
-        let root = VirtualRoot::build([dir_root(root_of("/"))]);
+        let root = VirtualRoot::build([dir_root(root_of("/"))]).unwrap();
         assert!(root.top().is_empty());
+    }
+
+    /// 敵意 locator 帶 NUL：Go 的 locatorComponents 與 Rust 的
+    /// fsmeta::locator_to_relative 都拒，mount 不得是唯一收下的通路
+    /// （NUL 不是合法的 FUSE 目錄項位元組）。
+    #[test]
+    fn nul_in_locator_is_rejected() {
+        let mut path = b"/a/b".to_vec();
+        path[2] = 0; // "/a b"
+        let root = VirtualRoot::build([(
+            Root {
+                path: ByteBuf::from(path),
+                tree: TreeId::from_bytes([1; 32]),
+            },
+            RootContents::Dir,
+        )]);
+        assert!(root.is_err(), "NUL locator 必須被拒");
     }
 
     #[test]
@@ -260,7 +283,8 @@ mod tests {
                 tree: TreeId::from_bytes([1; 32]),
             },
             RootContents::Dir,
-        )]);
+        )])
+        .unwrap();
         assert_eq!(names(root.top()), vec![b"tmp".to_vec()]);
         assert!(VirtualRoot::lookup(root.level(b"/tmp"), &[0xFF, 0xFE]).is_some());
     }
@@ -271,7 +295,8 @@ mod tests {
             dir_root(root_of("/z")),
             dir_root(root_of("/a")),
             dir_root(root_of("/m")),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             names(root.top()),
             vec![b"a".to_vec(), b"m".to_vec(), b"z".to_vec()]
@@ -287,7 +312,8 @@ mod tests {
     /// （與 restore 目前的覆寫行為一致）。
     #[test]
     fn two_roots_with_the_same_expansion_dedupe_to_one_entry() {
-        let root = VirtualRoot::build([dir_root(root_of("/a/b")), dir_root(root_of("a/b"))]);
+        let root =
+            VirtualRoot::build([dir_root(root_of("/a/b")), dir_root(root_of("a/b"))]).unwrap();
         assert_eq!(names(root.top()), vec![b"a".to_vec()]);
         let level = root.level(b"/a");
         assert_eq!(
@@ -304,7 +330,7 @@ mod tests {
     #[test]
     fn dotdot_component_maps_to_parent_marker() {
         // /a/../b：a 之下是 __parent__（.. 的映射）與 b，絕不是字面 ..。
-        let root = VirtualRoot::build([dir_root(root_of("/a/../b"))]);
+        let root = VirtualRoot::build([dir_root(root_of("/a/../b"))]).unwrap();
         assert_eq!(names(root.top()), vec![b"a".to_vec()]);
         let under_a = names(root.level(b"/a"));
         assert!(
@@ -322,3 +348,5 @@ mod tests {
         );
     }
 }
+
+// （附加在 tests mod 外會編譯失敗——放進 mod tests）
