@@ -36,8 +36,17 @@ pub fn load_or_create(explicit: Option<&Path>) -> Result<[u8; 16]> {
 /// 同一個 client id 一次只能跑一個 backup：GC 的「活躍 client 在標記後有新 snapshot」
 /// 這條保護假設每台 client 的 backup 是一個接一個的；排程重疊會破壞它。
 /// 鎖是 client id 檔旁邊的 `client-id.lock`，程序結束（或 drop）自動釋放。
+/// 鎖檔路徑：id 檔路徑**加** `.lock`（不是換尾——`with_extension` 會把
+/// `client-id.v1` 的 `.v1` 換掉，兩個不同 client 的鎖塌縮成一把）。
+fn lock_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    let path = resolve_path(explicit)?;
+    let mut os = path.into_os_string();
+    os.push(".lock");
+    Ok(PathBuf::from(os))
+}
+
 pub fn lock(explicit: Option<&Path>) -> Result<std::fs::File> {
-    let path = resolve_path(explicit)?.with_extension("lock");
+    let path = lock_path(explicit)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     }
@@ -96,4 +105,22 @@ pub fn username() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod lock_path_tests {
+    use super::*;
+
+    /// 鎖檔由 id 檔「路徑」衍生，必須是加號不是換尾：`with_extension`
+    /// 會把既有的擴展名換掉——`client-id.v1` 與 `client-id.v2` 塌縮成
+    /// 同一把 `client-id.lock`，兩個真正不同的 client 互相假性互斥。
+    #[test]
+    fn lock_file_appends_not_replaces_the_extension() {
+        let p = std::path::Path::new("/x/client-id.v1");
+        assert_eq!(
+            lock_path(Some(p)).unwrap(),
+            std::path::PathBuf::from("/x/client-id.v1.lock")
+        );
+    }
 }
