@@ -19,6 +19,7 @@ import (
 	"github.com/at-least/kist/internal/crypto"
 	"github.com/at-least/kist/internal/repo"
 	"github.com/at-least/kist/internal/snapshot"
+	"github.com/at-least/kist/internal/tree"
 )
 
 func cheapKDF() *crypto.KDFParams {
@@ -341,5 +342,26 @@ func TestLRUEvictsTheOldest(t *testing.T) {
 	}
 	if _, ok := c.get(crypto.ID{1}); !ok {
 		t.Error("1 should have survived")
+	}
+}
+
+// Two roots whose locators cut into the same components ("/a/b" and
+// "a/b") must not leave two same-name entries at one level: the mount
+// would list the name twice while its sorted lookup finds only one,
+// and restore would write the same target twice. The later root wins,
+// matching restore's overwrite behavior (and the Rust peer's
+// push_real).
+func TestExpandRootsDedupesSameNameReals(t *testing.T) {
+	table := map[string][]tree.Entry{}
+	sub1 := crypto.ID{1}
+	sub2 := crypto.ID{2}
+	pushEntry(table, "/a", tree.Entry{Name: []byte("b"), Subtree: &sub1})
+	pushEntry(table, "/a", tree.Entry{Name: []byte("b"), Subtree: &sub2})
+	got := table["/a"]
+	if len(got) != 1 {
+		t.Fatalf("same-name entries must dedupe to one, got %d: %v", len(got), got)
+	}
+	if *got[0].Subtree != sub2 {
+		t.Fatalf("the later root must win, got subtree %v", *got[0].Subtree)
 	}
 }

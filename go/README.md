@@ -2,8 +2,8 @@
 
 Deduplicating, encrypted backups to object storage, from one binary with no cgo.
 
-> **狀態：儲存格式 v3（2026-09-09 定案，[docs/format.md](docs/format.md) 與 kist-rs 逐 byte 一致）。** 本 repo 是參考實作，
-> 產品是 `kist-rs`；兩者讀寫同一種 repo、互為驗證（[`PLAN.md`](PLAN.md)）。
+> **狀態：儲存格式 v3（2026-09-09 定案，與本 repo 根目錄的 [docs/format.md](../docs/format.md) 逐 byte 一致）。**
+> 本目錄是 Go 參考實作，與根目錄的 Rust 產品讀寫同一種 repo、互為驗證（[`PLAN.md`](PLAN.md)）。
 > 本機 / S3 / SFTP 後端、無鎖 GC（`forget` / `prune`）、排程 `run`、`mount` 都已具備。
 
 ```console
@@ -87,14 +87,14 @@ listen = "127.0.0.1:9345"
 
 一個事件：`kind`（`init backup forget prune check restore rebuild_index`）、`job`（run 模式的工作名）、`started`、`finished`、`ok`、`error`、`warnings`，加上一個對應 kind 的子物件：
 
-- `backup`：`snapshot host paths files dirs symlinks bytes bytes_stored chunks_new packs_added packs_revived`
+- `backup`：`snapshot host roots files dirs symlinks bytes errors` ＋巢狀 `report{chunks_new chunks_read packs_new packs_revived bytes_stored errors files_reused}`
 - `forget`：`dry_run removed kept locked`
 - `prune`：`dry_run packs_stored packs_live marked unmarked deleted locked held[{pack,reason}] bytes_reclaimed`
 - `check`：`read_data snapshots trees chunks packs problems parity_packs repaired unrepairable`
 - `restore`：`snapshot target files dirs symlinks hard_links bytes`
 - `init`：`location client_id`；`rebuild_index`：`chunks`
 
-`snapshots --json` 是陣列：`snapshot client_id time host paths files bytes`（讀不出來的列有 `error`）。
+`snapshots --json` 是陣列：`snapshot client_id time host roots files dirs symlinks bytes`（讀不出來的列有 `error`）。
 
 Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,result}`、`kist_last_run_duration_seconds{job}`、`kist_last_backup_{files,bytes,bytes_stored,packs_added}{job}`、`kist_last_prune_packs_{stored,live,deleted,held}`、`kist_prune_bytes_reclaimed_total`。
 
@@ -107,7 +107,7 @@ Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,r
 
 ## 文件
 
-- [`docs/format.md`](docs/format.md) — 儲存格式 v3（唯一權威副本在 kist-rs，本副本逐 byte 一致），含「設計決定 × 證據」對照表
+- [`docs/format.md`](docs/format.md) — 儲存格式 v3（唯一權威副本在 repo 根目錄的 [`docs/format.md`](../docs/format.md)，本副本逐 byte 一致，有測試釘住），含「設計決定 × 證據」對照表
 - [`docs/decisions/`](docs/decisions/) — ADR，記錄為什麼這樣設計
 - [`docs/release.md`](docs/release.md) — 版本、平台、release 流程
 - [`PLAN.md`](PLAN.md) — 里程碑與工程規範
@@ -119,7 +119,6 @@ $ make verify        # build + vet + lint + test + test-race，這是「做完�
 $ make test-s3       # MinIO in Docker；make test-sftp 同理用 OpenSSH
 $ make fuzz          # 每個 Fuzz 目標跑 FUZZTIME（預設 30s）；make fuzz-long 是 24h
 $ make release-snapshot   # 用 goreleaser 在本機建出所有平台的 artifact，不需要 tag
-$ make fuzz          # 跑所有 FuzzXxx target
 ```
 
 大規模驗收測試（10 萬檔 / 10 GiB，預設關閉）：

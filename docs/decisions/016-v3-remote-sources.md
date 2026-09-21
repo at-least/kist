@@ -20,7 +20,7 @@ v3 的設計立場：**v2 核心全保留**（pack、每 chunk AEAD、明文 key
 命名、欄位表 CBOR、凍結 FastCDC、supersedes index、兩階段無資訊 GC、
 Put-only backup、snapshot 唯一 commit point、parity sidecar——它們有
 跨語言 PoC 與 200-case proptest 背書），變更是外科手術式的九項，每項
-對應一個教訓或需求（見 format-v3-draft §0 對照表）。設計軸的轉移：
+對應一個教訓或需求（見 `docs/format.md` §0 變更總覽——定案時草案的對照表併入於此）。設計軸的轉移：
 **「來源能證明什麼就記什麼」**——內容 hash、版本 ID 是來源能證明的，
 mtime/uid 是來源聲稱的；變更偵測與還原保真度都掛在可證明性上。
 

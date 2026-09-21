@@ -52,7 +52,7 @@ pub fn bytes_to_relative_path(bytes: &[u8]) -> Result<PathBuf> {
 /// v3 的 root 定位字串（`Root.path`）→ restore 目標底下的相對路徑。
 /// 本機絕對路徑 `/srv/data` → `srv/data`；帶 scheme 的遠端定位去掉 scheme
 /// 後切段：`s3://bucket/prefix` → `bucket/prefix`、`sftp://host/path` →
-/// `host/path`（format-v3-draft §9 的 restore 映射，兩實作必須一致）。
+/// `host/path`（docs/format.md §9 的 restore 映射，兩實作必須一致）。
 pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
     // 去掉 `scheme://`（有 scheme 且後接 // 才剝；Windows 的 `C:` 不會中）。
     let rest = match bytes.iter().position(|&b| b == b':') {
@@ -140,21 +140,6 @@ pub fn meta_of_entry(entry: &Entry) -> FsMeta {
     }
 }
 
-pub fn capture(meta: &std::fs::Metadata) -> FsMeta {
-    let mtime = mtime_ns_of(meta);
-    let ctime = ctime_ns_of(meta);
-    FsMeta {
-        mode: mode_of(meta),
-        uid: uid_of(meta),
-        gid: gid_of(meta),
-        mtime_ns: mtime,
-        ctime_ns: ctime,
-        inode: inode_of(meta),
-        dev: dev_of(meta),
-        nlink: nlink_of(meta),
-    }
-}
-
 /// backup 快速路徑的完整判斷：size 相同，且 [`unchanged`] 成立。
 pub fn file_unchanged(
     previous: &FsMeta,
@@ -190,90 +175,6 @@ pub fn unchanged(previous: &FsMeta, now: &FsMeta, parent_start_ns: i64) -> bool 
         return false;
     }
     true
-}
-
-fn mtime_ns_of(meta: &std::fs::Metadata) -> i64 {
-    let ft = filetime::FileTime::from_last_modification_time(meta);
-    ft.unix_seconds()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(i64::from(ft.nanoseconds()))
-}
-
-#[cfg(unix)]
-fn ctime_ns_of(meta: &std::fs::Metadata) -> i64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.ctime().saturating_mul(1_000_000_000) + meta.ctime_nsec()
-}
-
-#[cfg(unix)]
-fn dev_of(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.dev()
-}
-
-#[cfg(unix)]
-fn nlink_of(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.nlink()
-}
-
-#[cfg(not(unix))]
-fn dev_of(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(not(unix))]
-fn nlink_of(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
-fn inode_of(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.ino()
-}
-
-#[cfg(not(unix))]
-fn ctime_ns_of(_: &std::fs::Metadata) -> i64 {
-    0
-}
-
-#[cfg(not(unix))]
-fn inode_of(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
-fn mode_of(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.mode()
-}
-
-#[cfg(unix)]
-fn uid_of(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.uid()
-}
-
-#[cfg(unix)]
-fn gid_of(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.gid()
-}
-
-#[cfg(not(unix))]
-fn mode_of(_: &std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(not(unix))]
-fn uid_of(_: &std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(not(unix))]
-fn gid_of(_: &std::fs::Metadata) -> u32 {
-    0
 }
 
 /// 擷取 `user.*` 擴充屬性（與 Go 端同一個 namespace 約定）。

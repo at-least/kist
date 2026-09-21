@@ -101,7 +101,7 @@ func (c ChunkerParams) validate() error {
 // chunker parameters are ALSO in the wrapped key's authenticated
 // payload; this copy is a hint that must match it.
 //
-// Field order is the spec table (format-v3-draft.md §4.1): v, repo_id,
+// Field order is the spec table (docs/format.md §4.1): v, repo_id,
 // created, chunker, pack_target, min_reader, replicas, slot.
 type Config struct {
 	Version uint64 `cbor:"v"`
@@ -155,7 +155,7 @@ func LoadConfig(ctx context.Context, b backend.Backend) (*Config, error) {
 	if cfg.PackTargetSize < minPack || cfg.PackTargetSize > maxPack || cfg.PackTargetSize < uint64(cfg.Chunker.MaxSize) {
 		return nil, fmt.Errorf("%w: pack_target %d is outside %d..=%d or below chunker.max", ErrCorrupt, cfg.PackTargetSize, minPack, maxPack)
 	}
-	// The min_reader gate (format-v3-draft.md §11): a repository written
+	// The min_reader gate (docs/format.md §11): a repository written
 	// by a newer format says so, and this build refuses rather than
 	// guessing. The range check keeps a corrupted value from being
 	// meaningless in the other direction too.

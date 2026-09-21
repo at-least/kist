@@ -162,7 +162,7 @@ UI 密碼走明文 HTTP：預設只綁 loopback，要遠端存取請放在有 TL
 - 同一台機器同時只能跑一個 backup（client id 檔旁邊有鎖）。
 - bucket 有 versioning 時，真的釋放空間還需要 lifecycle 規則清掉舊版本。
 
-細節與安全性論證：[docs/format.md §11](docs/format.md)、[ADR 005](docs/decisions/005-m3-gc.md)。
+細節與安全性論證：[docs/format.md §13](docs/format.md)、[ADR 005](docs/decisions/005-m3-gc.md)。
 
 本地 index 快取放在使用者快取目錄（Linux：`~/.cache/kist/`），可用 `--cache-dir` /
 `KIST_CACHE_DIR` 指定、`--no-cache` 關閉。`check` 永遠不用快取。

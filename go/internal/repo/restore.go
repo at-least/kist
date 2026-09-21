@@ -44,7 +44,7 @@ type RestoreStats struct {
 // target must not already exist, or must be an empty directory. Restoring
 // over live data is not something a backup tool should do by inference.
 //
-// The v3 mapping (format-v3-draft.md §9): each root's locator loses its
+// The v3 mapping (docs/format.md §9): each root's locator loses its
 // scheme and is split on "/" (empty components dropped), and the source's
 // entries land under target/<relative path>. A root whose tree holds
 // exactly one non-directory entry named like the locator's last
@@ -106,7 +106,7 @@ func (r *Repository) Restore(ctx context.Context, key, target string, opts Resto
 			if err != nil {
 				return run.stats, err
 			}
-			if err := run.restoreNode(ctx, entry, path); err != nil {
+			if err := run.restoreNode(ctx, entry, path, 1); err != nil {
 				return run.stats, err
 			}
 		}
@@ -179,7 +179,7 @@ type restoreRun struct {
 	// links maps an inode seen in the snapshot to the first path it was
 	// restored to, so the second name becomes a hard link rather than a
 	// second copy. The map lives on the run, not per root: hard-link
-	// identity is snapshot-wide across roots (format-v3-draft.md §8.3).
+	// identity is snapshot-wide across roots (docs/format.md §8.3).
 	links map[hardLinkKey]string
 
 	stats RestoreStats
@@ -188,11 +188,15 @@ type restoreRun struct {
 // restoreNode restores one tree entry to path. Errors abort: a missing
 // chunk inside a snapshot means the snapshot is not restorable as a
 // whole, and pretending otherwise would be worse than stopping.
-func (run *restoreRun) restoreNode(ctx context.Context, entry tree.Entry, path string) error {
+func (run *restoreRun) restoreNode(ctx context.Context, entry tree.Entry, path string, depth int) error {
 	switch tree.NodeType(entry.Type) {
 	case tree.TypeDir:
 		if entry.Subtree == nil {
 			return fmt.Errorf("restore: %w: entry %q has no subtree", tree.ErrCorrupt, entry.Name)
+		}
+		// depth counts DIR nesting (roots = 1); same limit as check/prune.
+		if depth >= maxTreeDepth {
+			return fmt.Errorf("restore: %w: tree nesting deeper than %d levels (corrupt or hostile repository)", tree.ErrCorrupt, maxTreeDepth)
 		}
 		if err := run.mkdirAllNoFollow(path); err != nil {
 			return fmt.Errorf("restore: %w", err)
@@ -209,7 +213,7 @@ func (run *restoreRun) restoreNode(ctx context.Context, entry tree.Entry, path s
 			if err != nil {
 				return err
 			}
-			if err := run.restoreNode(ctx, child, childPath); err != nil {
+			if err := run.restoreNode(ctx, child, childPath, depth+1); err != nil {
 				return err
 			}
 		}

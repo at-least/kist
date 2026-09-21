@@ -121,8 +121,11 @@ async fn run_job_inner(
                 .as_ref()
                 .ok_or_else(|| AppError::Config("no [backup] section".to_owned()))?;
             let repo = open_repo(cfg).await?;
-            let id = client_id::load_or_create(cfg.client_id_file.as_deref())?;
+            // 先鎖再載入：鎖檔由 id 檔的「路徑」決定（與內容無關），先取
+            // 鎖把首次的並發建立序列化——否則兩個程序各自 mint 不同 id、
+            // 後寫贏，輸家帶著沒人認得的 id 完成 snapshot。
             let _lock = client_id::lock(cfg.client_id_file.as_deref())?;
+            let id = client_id::load_or_create(cfg.client_id_file.as_deref())?;
             let opts = BackupOptions {
                 client_id: id,
                 hostname: client_id::hostname(),

@@ -212,6 +212,10 @@ impl Default for ChunkerParams {
     }
 }
 
+/// KeySlot 的 schema 版本（`v` 欄位）：讀取端硬拒其他值——版本捲動的
+/// 絆線，與 Go 端 `KeySlotVersion` 一致。
+pub const KEY_SLOT_VERSION: u32 = 3;
+
 /// 一個 key slot：某組密碼可以解開 master key。
 /// slot 0 放在 `config`，其餘放 `keys/<id>`（都是明文 CBOR：以 master key
 /// 加密的話就失去「多組密碼」的意義）。

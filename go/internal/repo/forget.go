@@ -176,7 +176,7 @@ func (r *Repository) Forget(ctx context.Context, opts ForgetOptions) (ForgetResu
 		return result, nil
 	}
 	for _, h := range result.Removed {
-		// The .r1 replica goes with the primary (format-v3-draft.md
+		// The .r1 replica goes with the primary (docs/format.md
 		// §13.5), best effort: a replica that will not delete -- or was
 		// never written -- does not keep the snapshot alive.
 		_ = r.backend.Delete(ctx, h.Key+snapshot.ReplicaSuffix) //nolint:errcheck // best effort by design, see the comment above

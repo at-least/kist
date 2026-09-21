@@ -128,3 +128,55 @@ async fn rebuild_reports_corrupt_pack_trailer() {
     let name = victim.file_name().unwrap().to_str().unwrap();
     assert!(err.to_string().contains(name), "{err}");
 }
+
+/// 「認證」不等於「一致」：trailer 有有效 tag、但內容前後矛盾（有 bug 的 client
+/// 寫得出這種 pack，見 `pack::read_trailer` 的 doc）。rebuild 必須套用與
+/// `read_trailer` 同一套一致性檢查，不能把這種 pack 收進重建出來的 index。
+#[tokio::test]
+async fn rebuild_rejects_authenticated_but_inconsistent_trailer() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    repo.backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    // config 是明文 CBOR：用它解出 repo 的 key，重封一份被改壞的 trailer。
+    let config: kist_format::config::RepoConfig =
+        kist_format::cbor::decode(&std::fs::read(t.repo_path().join("config")).unwrap()).unwrap();
+    let unlocked = kist_crypto::unlock_key_slot(PASSWORD.as_bytes(), &config.key).unwrap();
+    let keys = kist_crypto::RepoKeys::from_master(&unlocked.master);
+
+    // 挑一個 ≥2 entry 的 pack，把 entries[1].offset 覆寫成 entries[0].offset
+    // （連續性破圖；值取自同一份 trailer，重封後 tag 有效）。
+    let mut victim = None;
+    for p in walk_files(&t.repo_path().join("packs")) {
+        let bytes = std::fs::read(&p).unwrap();
+        let trailer_len =
+            kist_format::pack::parse_footer(&bytes[bytes.len() - 16..]).unwrap() as usize;
+        let sealed = &bytes[bytes.len() - 16 - trailer_len..bytes.len() - 16];
+        let plain = keys.open_pack_trailer(sealed).unwrap();
+        let mut trailer: kist_format::pack::PackTrailer =
+            kist_format::cbor::decode(&plain).unwrap();
+        if trailer.entries.len() < 2 {
+            continue;
+        }
+        trailer.entries[1].offset = trailer.entries[0].offset;
+        let new_sealed = keys
+            .seal_pack_trailer(&kist_format::cbor::encode(&trailer).unwrap())
+            .unwrap();
+        let mut out = bytes[..bytes.len() - 16 - trailer_len].to_vec();
+        out.extend_from_slice(&new_sealed);
+        out.extend_from_slice(&(new_sealed.len() as u64).to_be_bytes());
+        out.extend_from_slice(&kist_format::pack::magic());
+        std::fs::write(&p, out).unwrap();
+        victim = Some(p);
+        break;
+    }
+    let victim = victim.expect("測試資料裡該有至少一個多 entry 的 pack");
+
+    let err = repo.rebuild_index().await.unwrap_err();
+    let name = victim.file_name().unwrap().to_str().unwrap();
+    assert!(err.to_string().contains(name), "錯誤要指名 pack：{err}");
+}

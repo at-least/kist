@@ -220,6 +220,9 @@ ChunkList { v:3, chunks:[ChunkId] }
   節點、`prev` 鏈、父記最後一段）；間接清單（chunks > 256 改 ChunkList
   入 pack）；硬連結（mk=0 的 dev/ino/nlink，`nlink>1` 才記）。
 
+> s3 entry 的 `etag`／`vern` 各自上限 **1 KiB**（讀寫兩端的 Validate 都拒超限）：
+> 它們是來源聲稱的位元組，不得無界進記憶體或 repo。
+
 ### 8.2 快速路徑合約（內容可證明 > kernel 可證明 > 來源聲稱）
 
 | 來源 | 沿用條件 | 依據 |
@@ -238,6 +241,17 @@ opt-in，但那是 client 政策，規格不背書其安全性。`etag`/`vern` �
 `(dev, ino)` 的同一性判定範圍＝**整個 snapshot（跨 roots）**：兩個 root
 裡共用 (dev,ino) 的條目是同一份內容——`bytes` 只算一次、restore 重建為
 一個 hard link（第一個出現的位置建立，其餘 link；失敗降級複本＋警告）。
+
+### 8.4 巢狀深度（實作上限）
+
+tree 的 DIR 巢狀**沒有格式上的深度限制**；但兩個參考實作都設有實作上限
+256 層（Rust `kist_core::MAX_TREE_DEPTH`、Go `repo.maxTreeDepth`，兩邊必須一致）。
+這不是格式規則：來源路徑長度允許的巢狀其實可以超過它（ext4 單元件可以短到
+2 bytes，PATH_MAX 內疊得出約 2000 層），所以 backup 的寫入端套同一把尺——
+超過上限的來源子目錄跳過並記警告，寫出的樹因此永不超限。還原／check／prune
+把超過上限的 chain 當腐壞或敵意 repo 乾淨回錯，而不是把走訪遞迴墊進
+stack overflow：DIR 巢狀遞迴受此上限約束，同一目錄的 prev 分段用迴圈走
+（不計深度、也不吃堆疊）。第三方程式可以自行選擇上限。
 
 ## 9. Snapshot
 

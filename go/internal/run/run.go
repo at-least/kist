@@ -86,14 +86,27 @@ func (r *Runner) Jobs() []Job {
 // Once runs every job now, in order, and reports the first failure.
 func (r *Runner) Once(ctx context.Context) error {
 	var failed []string
+	cancelled := false
 	for _, j := range r.Jobs() {
 		if err := j.Run(ctx); err != nil {
+			// A job stopped by the cancelling context is not a job
+			// failure: the command layer turns context.Canceled into a
+			// clean stop, while a REAL failure in the same run must still
+			// surface -- a Ctrl-C must not launder "backend down" into
+			// exit 0.
+			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+				cancelled = true
+				continue
+			}
 			r.logf("%s: %v", j.Name, err)
 			failed = append(failed, j.Name)
 		}
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("%d job(s) failed: %s", len(failed), strings.Join(failed, ", "))
+	}
+	if cancelled {
+		return fmt.Errorf("stopped by signal: %w", context.Canceled)
 	}
 	return nil
 }
@@ -301,6 +314,16 @@ func (r *Runner) record(ev *report.Event) {
 	}
 }
 
+// webhookHTTPClient is the default client for webhook posts: redirects
+// are never followed (ErrUseLastResponse returns the 3xx as the final
+// response), so a webhook endpoint cannot bounce the event payload at
+// other URLs.
+var webhookHTTPClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 // post sends the event to the webhook. A webhook that fails is logged,
 // not fatal: the backup happened, and a monitoring system that is down
 // is not a reason to report that it did not.
@@ -323,7 +346,11 @@ func (r *Runner) post(ctx context.Context, ev report.Event) error {
 	req.Header.Set("User-Agent", "kist")
 	client := r.HTTP
 	if client == nil {
-		client = http.DefaultClient
+		// Never follow redirects: the webhook endpoint (or whoever has
+		// compromised it) must not be able to bounce the event JSON at
+		// internal URLs. ErrUseLastResponse hands back the 3xx, which
+		// the status check below reports as a failure.
+		client = webhookHTTPClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {

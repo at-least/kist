@@ -16,7 +16,7 @@ use crate::fsmeta;
 use crate::index::{ChunkIndex, ChunkLocator};
 use crate::pack::decode_chunk;
 use crate::repo::Repository;
-use crate::{blocking, CoreError, Result};
+use crate::{blocking, CoreError, Result, MAX_TREE_DEPTH};
 
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {}
@@ -159,13 +159,13 @@ impl Repository {
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
         let mut summary = RestoreSummary::default();
         // 硬連結：(dev, inode) → 第一個還原出來的路徑；後續名字 hard_link 過去。
-        // 範圍是**整個 snapshot、跨 roots**（format-v3-draft §8.3）。
+        // 範圍是**整個 snapshot、跨 roots**（docs/format.md §8.3）。
         let mut hardlinks: std::collections::HashMap<(u64, u64), PathBuf> =
             std::collections::HashMap::new();
         for root in &snapshot.roots {
             let rel = fsmeta::locator_to_relative(root.path.as_slice())?;
             let entries = self.read_tree_chain(&root.tree).await?;
-            // v3 的 restore 映射（format-v3-draft §9）：目錄來源的 entries 放在
+            // v3 的 restore 映射（docs/format.md §9）：目錄來源的 entries 放在
             // `target/<locator>` 之下；**檔案/symlink 來源**（root tree 恰好一個
             // 非目錄 entry、名稱 = 定位的末段）落在 `target/<locator 去掉末段>/`
             // ——與 v2「絕對路徑還原」的落點完全一致，而「目錄恰好只含一個同名
@@ -184,18 +184,31 @@ impl Repository {
                 // v3：節點名一律是單一路徑元件（合成根已淘汰）。
                 fsmeta::validate_child_name(&entry.name)?;
                 let path = base.join(fsmeta::bytes_to_name(&entry.name)?);
-                self.restore_node(&entry, &path, target, &index, &mut summary, &mut hardlinks)
-                    .await;
+                self.restore_node(
+                    &entry,
+                    &path,
+                    1,
+                    target,
+                    &index,
+                    &mut summary,
+                    &mut hardlinks,
+                )
+                .await;
             }
         }
         Ok(summary)
     }
 
     /// 還原一個節點。錯誤記進 summary，不往上拋：一個壞掉的 chunk 不該讓其他 99% 的檔案也拿不回來。
+    /// `depth`：DIR 巢狀深度（root 的子女 = 1）；超過 [`MAX_TREE_DEPTH`] 的
+    /// chain 只能出自腐壞或敵意 repo——記錄錯誤、不深入，否則遞迴會把
+    /// process 墊進 stack overflow。
+    #[allow(clippy::too_many_arguments)] // depth 是深度上限帶進來的第 8 個參數
     fn restore_node<'a>(
         &'a self,
         node: &'a Entry,
         path: &'a Path,
+        depth: usize,
         target: &'a Path,
         index: &'a ReloadableIndex,
         summary: &'a mut RestoreSummary,
@@ -204,8 +217,18 @@ impl Repository {
         Box::pin(async move {
             let result = match node.kind {
                 node_type::DIR if !node.subtree.is_zero() => {
-                    self.restore_dir(node, path, target, index, summary, hardlinks)
-                        .await
+                    if depth >= MAX_TREE_DEPTH {
+                        Err(CoreError::Corrupt {
+                            key: path.display().to_string(),
+                            reason: format!(
+                                "tree nesting deeper than {MAX_TREE_DEPTH} levels \
+                                 (corrupt or hostile repository)"
+                            ),
+                        })
+                    } else {
+                        self.restore_dir(node, path, depth, target, index, summary, hardlinks)
+                            .await
+                    }
                 }
                 node_type::FILE => {
                     let hardlink_key = (node.nlink.unwrap_or(0) > 1)
@@ -277,10 +300,12 @@ impl Repository {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // 同 restore_node
     async fn restore_dir(
         &self,
         node: &Entry,
         path: &Path,
+        depth: usize,
         target: &Path,
         index: &ReloadableIndex,
         summary: &mut RestoreSummary,
@@ -294,8 +319,16 @@ impl Repository {
                 continue;
             }
             let child_path = path.join(fsmeta::bytes_to_name(&child.name)?);
-            self.restore_node(&child, &child_path, target, index, summary, hardlinks)
-                .await;
+            self.restore_node(
+                &child,
+                &child_path,
+                depth + 1,
+                target,
+                index,
+                summary,
+                hardlinks,
+            )
+            .await;
         }
         summary.dirs += 1;
         // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋；xattr 在 times/mode 之前

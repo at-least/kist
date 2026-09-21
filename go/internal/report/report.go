@@ -61,7 +61,7 @@ type SnapshotSummary struct {
 // BackupResult is a committed snapshot. The Stats fields are the data
 // facts the snapshot itself carries; the Report fields are this run's
 // process counters, which depend on GC state and dedup order and so live
-// here, never in the snapshot (format-v3-draft.md §9.1).
+// here, never in the snapshot (docs/format.md §9.1).
 type BackupResult struct {
 	Snapshot string   `json:"snapshot"`
 	Host     string   `json:"host"`

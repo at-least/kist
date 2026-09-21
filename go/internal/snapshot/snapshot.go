@@ -25,7 +25,7 @@ const Prefix = "snapshots/"
 // ReplicaSuffix is appended to a snapshot's key for its .r1 replica. The
 // replica is written BEFORE the primary: the primary's appearance is the
 // commit, so a replica can never announce a backup that did not finish
-// (format-v3-draft.md §13.5).
+// (docs/format.md §13.5).
 const ReplicaSuffix = ".r1"
 
 // A snapshot's key timestamp is YYYYMMDDTHHMMSSnnnnnnnnnZ: fixed width
@@ -106,7 +106,7 @@ const maxTimestampRetries = 1000
 
 // Stats summarise what a backup saved. They are DATA FACTS only, counted
 // the same way by any client walking the same source
-// (format-v3-draft.md §9.1): files and symlinks count each name (both
+// (docs/format.md §9.1): files and symlinks count each name (both
 // names of a hard link count); dirs count directory ENTRIES (the roots
 // themselves are paths, not entries, and do not count); bytes count a
 // hard link group's content once across the whole snapshot. Process
@@ -294,7 +294,7 @@ func Load(ctx context.Context, b backend.Backend, keys *crypto.Keys, key string)
 // List returns every snapshot in the repository, oldest first. Passing an
 // empty clientID lists them all. A key ending in the replica suffix is
 // the .r1 copy of a snapshot, not a snapshot of its own, and is excluded
-// (format-v3-draft.md §13.5).
+// (docs/format.md §13.5).
 func List(ctx context.Context, b backend.Backend, clientID string) ([]Handle, error) {
 	prefix := Prefix
 	if clientID != "" {

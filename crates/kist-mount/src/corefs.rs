@@ -424,7 +424,9 @@ impl FsCore {
                     };
                     pairs.push((root.clone(), contents));
                 }
-                let vroot = Arc::new(VirtualRoot::build(pairs));
+                // 敵意 locator（NUL 等非法組件）在這裡拒成 I/O 錯——
+                // 與 Go 的 mount Lookup（ErrInvalid）同款。
+                let vroot = Arc::new(VirtualRoot::build(pairs).map_err(|_| FsError::InvalidInput)?);
                 let attr = Attr::dir(0o555, info.time_ns);
                 let ino = {
                     self.inodes

@@ -13,7 +13,7 @@ import (
 
 // findParent returns this client's newest snapshot when it is a valid
 // parent for this backup: one whose roots are exactly the locators being
-// backed up now, same paths in the same order (format-v3-draft.md §9).
+// backed up now, same paths in the same order (docs/format.md §9).
 // Anything else -- a different path set, an unreadable object -- means
 // no parent, and the backup simply re-reads everything.
 //
@@ -142,7 +142,7 @@ type fileFacts struct {
 // believe. A file modified within the parent backup's own time window
 // can look unchanged and be different -- the "racily clean" trap -- so
 // its timestamps must fall clearly before the parent's start (the racy
-// guard, format-v3-draft.md §8.2). ctime and inode are compared only
+// guard, docs/format.md §8.2). ctime and inode are compared only
 // when the parent recorded them: a platform without them, or a
 // single-link file (whose identity is not recorded), must not fail the
 // comparison for a field that was never there.
@@ -175,7 +175,7 @@ type reusableChunk struct {
 
 // proven reports whether the file may be reused from parent without
 // being read, graded by what each metadata family can prove
-// (format-v3-draft.md §8.2): posix by the kernel's own bookkeeping, s3
+// (docs/format.md §8.2): posix by the kernel's own bookkeeping, s3
 // by the source's etag, and nothing at all for sftp/generic -- their
 // mtime is a claim, so the chunk dedup absorbs the re-read. A kind
 // mismatch (the same path backed up from a different kind of source)
@@ -247,7 +247,7 @@ func (b *backupRun) tryReuse(ctx context.Context, f fileFacts, parent *tree.Entr
 
 	// Bytes are a data fact: a reused file's length is still in the
 	// snapshot's totals, counted once per hard-link group like any other
-	// read (format-v3-draft.md §9.1). The group is the file's own, from
+	// read (docs/format.md §9.1). The group is the file's own, from
 	// the facts the source just reported.
 	var key hardLinkKey
 	isHardlink := false

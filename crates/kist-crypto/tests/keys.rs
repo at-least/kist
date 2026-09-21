@@ -397,3 +397,25 @@ fn cache_id_is_derived_from_master_key() {
     assert_ne!(a.cache_id(), b.cache_id());
     assert_ne!(a.cache_id(), [0; 16]);
 }
+
+// KeySlot.version 是版本捲動的絆線：Go 端硬拒 `≠3`（keys.go「key slot:
+// version %d is not supported」），Rust 端也要在同一個位置拒——否則敵意
+// repo 改掉明文 `v` 欄位，兩端給出不同類別的錯誤（版本錯 vs 密碼錯）。
+#[test]
+fn key_slot_version_is_checked_before_decrypting() {
+    let (mut slot, _) = create_key_slot(
+        PASSWORD.as_bytes(),
+        "default",
+        CREATED_NS,
+        fast_kdf(),
+        &binding(),
+    )
+    .unwrap();
+    slot.version = 9;
+    let err = unlock_key_slot(PASSWORD.as_bytes(), &slot).unwrap_err();
+    assert!(
+        !matches!(err, CryptoError::WrongPassword),
+        "版本錯不能謊報成密碼錯：{err}"
+    );
+    assert!(err.to_string().contains("version"), "錯誤要指出版本：{err}");
+}

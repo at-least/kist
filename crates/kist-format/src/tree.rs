@@ -25,6 +25,9 @@ use crate::{ChunkId, FormatError, Result, TreeId, FORMAT_VERSION};
 
 /// 單一 tree 物件最多放幾個節點，超過就切段。
 pub const MAX_NODES_PER_TREE: usize = 10_000;
+
+/// §8.1：s3 entry 的 etag／vern 各自的位元組上限。
+pub const MAX_ETAG_VER_BYTES: usize = 1024;
 /// 檔案的 chunk 清單超過這個數量就改用間接。
 pub const MAX_INLINE_CHUNKS: usize = 256;
 
@@ -286,6 +289,23 @@ impl Entry {
                 }
             }
             meta_kind::S3 => {
+                // etag/vern 是來源聲稱的位元組，不得無界進記憶體與 repo
+                // （§8.1：各上限 1 KiB）。SFTP 讀取端早已封頂，這裡是
+                // 格式級的同一把尺；Go 端 Validate 同款。
+                if self
+                    .etag
+                    .as_ref()
+                    .is_some_and(|e| e.len() > MAX_ETAG_VER_BYTES)
+                {
+                    return bad(format!("s3 etag exceeds {MAX_ETAG_VER_BYTES} bytes"));
+                }
+                if self
+                    .vern
+                    .as_ref()
+                    .is_some_and(|v| v.len() > MAX_ETAG_VER_BYTES)
+                {
+                    return bad(format!("s3 vern exceeds {MAX_ETAG_VER_BYTES} bytes"));
+                }
                 if self.mode.is_some()
                     || self.uid.is_some()
                     || self.gid.is_some()
@@ -439,11 +459,22 @@ mod tests {
         e.mtime_ns = None;
         e.etag = Some(ByteBuf::from(b"\"etag\"".as_slice()));
         assert!(e.validate().is_ok());
+        // 敵意 S3 listing 的 etag/vern 必須有上限（§8.1：1 KiB）：SFTP
+        // 讀取端早就封頂，這個兄弟輸入沒有——記憶體放大與 repo 膨脹。
+        e.meta_kind = meta_kind::S3;
+        e.etag = Some(ByteBuf::from(vec![b'x'; 1025]));
+        assert!(e.validate().is_err(), "etag 上限 1 KiB");
+        e.etag = Some(ByteBuf::from(vec![b'x'; 1024]));
+        e.vern = Some(ByteBuf::from(vec![b'v'; 1025]));
+        assert!(e.validate().is_err(), "vern 上限 1 KiB");
+        e.vern = Some(ByteBuf::from(vec![b'v'; 1024]));
+        assert!(e.validate().is_ok());
         // generic 帶 etag → 拒。
         e.meta_kind = meta_kind::GENERIC;
         assert!(e.validate().is_err(), "generic 只有 mtime");
-        // sftp 缺 mtime → 拒。
+        // sftp 缺 mtime → 拒（vern 是 s3 欄位，一併清掉）。
         e.etag = None;
+        e.vern = None;
         e.meta_kind = meta_kind::SFTP;
         assert!(e.validate().is_err(), "sftp 必填 mtime");
         e.mtime_ns = Some(1_700_000_000_000_000_000);

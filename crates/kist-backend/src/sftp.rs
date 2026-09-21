@@ -86,14 +86,19 @@ pub fn parse_sftp_url(s: &str) -> Result<SftpConfig> {
         Some(rest) => rest,
         None => return Err(BackendError::InvalidUrl(s.to_owned())),
     };
-    let (user, hostport) = match rest.split_once('@') {
-        Some((u, hp)) => {
-            if u.is_empty() || u.contains(':') {
-                return Err(BackendError::InvalidUrl(s.to_owned()));
+    // `@` 只在 authority（第一個 `/` 之前）裡才算 userinfo：路徑是字面內容，
+    // 裡面的 `@` 與帳號無關（與 Go 端 url.Parse 同一語意）。
+    let (user, hostport) = {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        match rest[..authority_end].split_once('@') {
+            Some((u, hp)) => {
+                if u.is_empty() || u.contains(':') || hp.contains('@') {
+                    return Err(BackendError::InvalidUrl(s.to_owned()));
+                }
+                (Some(u.to_owned()), &rest[u.len() + 1..])
             }
-            (Some(u.to_owned()), hp)
+            None => (None, rest),
         }
-        None => (None, rest),
     };
     // 切出 (host, port 字串, /path)——路徑可能為空，最後統一檢查。
     let (host, port_str, path) = if let Some(stripped) = hostport.strip_prefix('[') {
@@ -991,8 +996,9 @@ async fn walk(
     out: &mut Vec<ObjectMeta>,
 ) -> std::result::Result<(), StoreError> {
     // 迭代 DFS（明確堆疊取代 Box::pin 遞迴）：敵意伺服器可以捏造任意深
-    // 的目錄鏈，遞迴會把原生堆疊吃成 abort。輸出順序＝伺服器 readdir 順
-    // 序（與原遞迴相同、本來就未排序）；Backend::list 的合約是不保證順序。
+    // 的目錄鏈，遞迴會把原生堆疊吃成 abort。每個目錄的檔案先全數列出、
+    // 子目錄排在後面（原遞迴是撞到子目錄就先下去——輸出順序因此不同，
+    // 但本來就未排序）；Backend::list 的合約是不保證順序，呼叫端各自排。
     let mut stack: Vec<(String, usize)> = vec![(dir.to_owned(), 0)];
     while let Some((dir, depth)) = stack.pop() {
         let mut fs = sftp.fs();
@@ -1235,9 +1241,23 @@ impl ObjectStore for SftpStore {
             .map_err(|e| inner.store_error(location, e))?;
         let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
         use tokio::io::AsyncReadExt as _;
-        // 預配只取容量提示：宣稱 size 不可信任，實際長度邊讀邊長。
+        // 預配只取容量提示，讀取用 take(宣稱 size) 封頂：宣稱 size 不可信任
+        // （預配會被推進 alloc abort），真的多送也只收到宣稱量為止（敵意
+        // 伺服器不能靠無止盡的串流把 Vec 養到 OOM）。
         let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
-        tf.as_mut().read_to_end(&mut buf).await.map_err(generic)?;
+        let mut limited = tf.as_mut().take(meta.size);
+        limited.read_to_end(&mut buf).await.map_err(generic)?;
+        drop(limited);
+        if buf.len() != meta.size as usize {
+            return Err(generic(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "{full}: server closed after {} of {} bytes",
+                    buf.len(),
+                    meta.size
+                ),
+            )));
+        }
         // 切片前用**實際讀到的長度**做邊界檢查：index 壞掉或 pack 被截斷時回乾淨的
         // 錯誤，而不是切片 panic。
         for r in ranges {
@@ -1388,6 +1408,7 @@ impl ObjectStore for SftpStore {
         let inner = &*self.0;
         let src = inner.full(from);
         let dst = inner.full(to);
+        let meta = inner.meta_of(&src).await?;
         let fh = inner
             .sftp
             .open(&src)
@@ -1395,8 +1416,22 @@ impl ObjectStore for SftpStore {
             .map_err(|e| inner.store_error(from, e))?;
         let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
         use tokio::io::AsyncReadExt as _;
-        let mut buf = Vec::new();
-        tf.as_mut().read_to_end(&mut buf).await.map_err(generic)?;
+        // 與 get_ranges 同款：預配取提示、讀取用 take(宣稱 size) 封頂，
+        // 不給敵意伺服器「無止盡串流養大 Vec」的機會。
+        let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
+        let mut limited = tf.as_mut().take(meta.size);
+        limited.read_to_end(&mut buf).await.map_err(generic)?;
+        drop(limited);
+        if buf.len() != meta.size as usize {
+            return Err(generic(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "{src}: server closed after {} of {} bytes",
+                    buf.len(),
+                    meta.size
+                ),
+            )));
+        }
         let scratch = inner.spool(dir_of(&dst), &buf).await?;
         let mut fs = inner.sftp.fs();
         let renamed = fs.rename(&scratch, &dst).await;

@@ -3,7 +3,7 @@
 //! 所有密碼學原語都來自 RustCrypto（`argon2`、`chacha20poly1305`、`blake3`），
 //! 這裡只做組合，不自己實作任何原語。金鑰型別離開作用域時會被清零（`zeroize`）。
 //!
-//! v3 重點（`docs/format-v3-draft.md` §3、§5）：
+//! v3 重點（`docs/format.md` §3、§5）：
 //! - 子金鑰 = BLAKE3 DeriveKey，context 為 `kist/v3/{hash,chunk,meta,index}`；
 //!   **沒有 nonce key**——沒有任何決定性 nonce，全部用 OS 亂數。
 //! - sealed 物件沒有 header：`nonce(24) ‖ 密文 ‖ tag(16)`，AAD 依角色
@@ -42,6 +42,8 @@ const CTX_CACHE_ID: &str = "kist/v3/cache";
 pub enum CryptoError {
     #[error("wrong password (or the repository config was tampered with)")]
     WrongPassword,
+    #[error("key slot version {actual} is not supported, want {expected}")]
+    UnsupportedSlotVersion { actual: u64, expected: u64 },
     #[error("the operating system's random number generator failed: {0}")]
     Rng(String),
     #[error("authentication failed: data is corrupt or was encrypted with a different key")]
@@ -200,7 +202,8 @@ pub fn wrap_master_key(
         salt: random_bytes::<16>()?.to_vec(),
     };
     let kek = kdf(password, &params)?;
-    let mut payload = Vec::with_capacity(32 + 64);
+    // payload 帶 master key bytes：與其他金鑰材料同一紀律，離開作用域清零。
+    let mut payload = Zeroizing::new(Vec::with_capacity(32 + 64));
     payload.extend_from_slice(master.as_bytes());
     payload.extend_from_slice(&kist_format::cbor::encode(&binding.invariants())?);
     let sealed = seal_meta(&kek, kist_format::AAD_MASTER, &payload)?;
@@ -223,9 +226,21 @@ pub struct UnlockedMaster {
 
 /// 用密碼解開 key slot：master key 與認證過的不變式。
 pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<UnlockedMaster> {
+    // 版本捲動的絆線：Go 端同款硬拒（keys.go），不能讓版本錯落進
+    // AEAD 開失敗被謊報成密碼錯。
+    if slot.version != kist_format::config::KEY_SLOT_VERSION {
+        return Err(CryptoError::UnsupportedSlotVersion {
+            actual: u64::from(slot.version),
+            expected: u64::from(kist_format::config::KEY_SLOT_VERSION),
+        });
+    }
     let kek = kdf(password, &slot.kdf)?;
-    let plain = open_meta(&kek, kist_format::AAD_MASTER, &slot.wrapped)
-        .map_err(|_| CryptoError::WrongPassword)?;
+    // plain 就是 master key 明文：用 Zeroizing 包住，drop 時清零（kek、
+    // MasterKey 都已如此；模組文件的清零紀律不含例外）。
+    let plain = Zeroizing::new(
+        open_meta(&kek, kist_format::AAD_MASTER, &slot.wrapped)
+            .map_err(|_| CryptoError::WrongPassword)?,
+    );
     if plain.len() < 32 {
         return Err(CryptoError::BadLength {
             what: "unwrapped master payload",

@@ -106,7 +106,7 @@ func (r *Repository) LoadTree(ctx context.Context, id crypto.ID) (*tree.Tree, er
 }
 
 // readTree reads and fully verifies a tree, falling back to the .r1
-// replica when the primary is missing or corrupt (format-v3-draft.md
+// replica when the primary is missing or corrupt (docs/format.md
 // §13.5).
 func (r *Repository) readTree(ctx context.Context, id crypto.ID) (*tree.Tree, error) {
 	t, err := tree.Load(ctx, r.backend, r.keys, id)
@@ -168,7 +168,7 @@ func (r *Repository) LoadTreeChain(ctx context.Context, last crypto.ID) ([]tree.
 
 // touchTree refreshes a tree's revival signal. The Put overwrites: the
 // backend mtime moving forward is the entire signal, and only an
-// overwriting write moves it (format-v3-draft.md §13.1).
+// overwriting write moves it (docs/format.md §13.1).
 func (r *Repository) touchTree(ctx context.Context, id crypto.ID) error {
 	if err := backend.PutBytes(ctx, r.backend, tree.TouchKey(id), tree.TouchMagic); err != nil {
 		return fmt.Errorf("touch tree %s: %w", id, err)

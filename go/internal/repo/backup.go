@@ -121,28 +121,28 @@ var ErrTreeMarked = errors.New("a tree reached by this backup is marked for dele
 // counters that depend on GC state and dedup order. They are the run's
 // report -- CLI output, --json, metrics -- and deliberately NOT in the
 // snapshot: two clients can legitimately count differently, and an
-// immutable object must not (format-v3-draft.md §9.1).
+// immutable object must not (docs/format.md §9.1).
 type BackupReport struct {
 	// ChunksNew counts chunks this run put into packs.
-	ChunksNew uint64
+	ChunksNew uint64 `json:"chunks_new"`
 	// ChunksRead counts chunks whose data this run read back, plus the
 	// ones it confirmed without reading.
-	ChunksRead uint64
+	ChunksRead uint64 `json:"chunks_read"`
 	// PacksNew counts packs this run finished and uploaded.
-	PacksNew uint64
+	PacksNew uint64 `json:"packs_new"`
 	// PacksRevived counts chunk-level re-uploads out of marked packs.
-	PacksRevived uint64
+	PacksRevived uint64 `json:"packs_revived"`
 	// BytesStored is how many bytes of chunks this run sealed.
-	BytesStored uint64
+	BytesStored uint64 `json:"bytes_stored"`
 	// Errors counts source items that could not be read and were skipped.
-	Errors uint64
+	Errors uint64 `json:"errors"`
 	// FilesReused counts files restored from the parent's metadata
 	// without being read: the fast paths that can prove a file unchanged
 	// (posix by the kernel's own bookkeeping, s3 by the source's etag)
 	// carry its chunk list over and count one here. Files whose proof
 	// does not exist -- sftp and generic sources -- are always re-read
-	// and never counted (format-v3-draft.md §8.2).
-	FilesReused uint64
+	// and never counted (docs/format.md §8.2).
+	FilesReused uint64 `json:"files_reused"`
 }
 
 // A BackupSummary is what a committed backup produced: the snapshot
@@ -157,7 +157,7 @@ type BackupSummary struct {
 //
 // The order is forced by the format: chunks go into packs, packs are
 // uploaded, trees are written bottom-up (new trees PutIfAbsent, reused
-// trees touched, format-v3-draft.md §13.1), the index blob is written,
+// trees touched, docs/format.md §13.1), the index blob is written,
 // and only then is the snapshot committed -- its .r1 replica first when
 // the repository has replicas, so the primary is still the one commit
 // point. Dying anywhere before that last step leaves objects nothing
@@ -174,6 +174,12 @@ type BackupSummary struct {
 func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOptions) (BackupSummary, error) {
 	if len(paths) == 0 && !opts.Source.remote() {
 		return BackupSummary{}, errors.New("backup: no paths given")
+	}
+	// The repo layer does not trust its caller to have bounded the knob
+	// (the Rust CLI/route validates 0..=8 the same): an unvalidated value
+	// reaches the RS matrix and silently degrades to warn-only parity.
+	if opts.Parity < 0 || opts.Parity > 8 {
+		return BackupSummary{}, fmt.Errorf("backup: parity %d is outside 0..=8", opts.Parity)
 	}
 
 	host := opts.Host
@@ -375,7 +381,7 @@ type backupRun struct {
 
 	// countedHardlinks is the set of (dev,ino) groups whose bytes are
 	// already in the stats: content is counted once per group, across
-	// roots (format-v3-draft.md §9.1).
+	// roots (docs/format.md §9.1).
 	countedHardlinks map[hardLinkKey]struct{}
 
 	// parentStartNs is when the parent snapshot's backup started, in UTC
@@ -553,7 +559,7 @@ func (b *backupRun) backupRoot(ctx context.Context, plan rootPlan) (crypto.ID, e
 		if !ok {
 			return crypto.ID{}, fmt.Errorf("backup: %s: source could not be read", plan.localPath)
 		}
-		entry, ok, err := b.processEntry(ctx, plan.src, name, item, b.parentFileEntry(ctx, plan.locator, name))
+		entry, ok, err := b.processEntry(ctx, plan.src, name, item, b.parentFileEntry(ctx, plan.locator, name), 1)
 		if err != nil {
 			return crypto.ID{}, err
 		}
@@ -577,7 +583,7 @@ func (b *backupRun) backupRoot(ctx context.Context, plan rootPlan) (crypto.ID, e
 	last := string(lastComponent(plan.locator))
 	if len(last) > 0 && len(probe) == 1 &&
 		probe[0].Kind.Kind == source.KindFile && string(probe[0].Name) == last {
-		entry, ok, err := b.processEntry(ctx, plan.src, probe[0].Name, probe[0], b.parentFileEntry(ctx, plan.locator, probe[0].Name))
+		entry, ok, err := b.processEntry(ctx, plan.src, probe[0].Name, probe[0], b.parentFileEntry(ctx, plan.locator, probe[0].Name), 1)
 		if err != nil {
 			return crypto.ID{}, err
 		}
@@ -586,7 +592,7 @@ func (b *backupRun) backupRoot(ctx context.Context, plan rootPlan) (crypto.ID, e
 		}
 		return b.writeSegment(ctx, []tree.Entry{entry}, nil)
 	}
-	return b.walkDir(ctx, plan.src, nil, b.parentSubtree(plan.locator))
+	return b.walkDir(ctx, plan.src, nil, b.parentSubtree(plan.locator), 1)
 }
 
 // parentSubtree returns the parent snapshot's tree for the root with
@@ -654,7 +660,7 @@ func lastComponent(path []byte) []byte {
 	return path
 }
 
-// fillPosixMeta records the posix fields (format-v3-draft.md §8.1):
+// fillPosixMeta records the posix fields (docs/format.md §8.1):
 // mode/uid/gid/mtime are required -- uid 0 is root, a real value -- the
 // change time is recorded when the platform has one, and the hard-link
 // identity only for a file with more than one name.
@@ -692,7 +698,7 @@ func displayPath(src source.Source, rel []byte) string {
 // map. Entries a directory gains, loses or renames between listings are
 // just names the parent does not have: they are read, and the parent's
 // leftovers are never asked for.
-func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, parentSubtree *crypto.ID) (crypto.ID, error) {
+func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, parentSubtree *crypto.ID, depth int) (crypto.ID, error) {
 	var stream *parentStream
 	if parentSubtree != nil && !parentSubtree.IsZero() {
 		s, err := openParentStream(ctx, b.repo, *parentSubtree)
@@ -721,7 +727,17 @@ func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, 
 			return crypto.ID{}, err
 		}
 		childRel := source.JoinRel(dir, item.Name)
-		entry, ok, err := b.processEntry(ctx, src, childRel, item, stream.takeName(ctx, item.Name))
+		// The read side (restore, check, prune) refuses trees nesting
+		// deeper than maxTreeDepth as corrupt or hostile (docs/format.md
+		// §8.4), so the write side must not produce them: a source
+		// directory past the limit is skipped and counted, the same
+		// ledger an unreadable entry lands in. The walk's recursion is
+		// bounded by the same rule. The Rust implementation matches.
+		if item.Kind.Kind == source.KindDir && depth >= maxTreeDepth {
+			b.skip("skipping %s: directory nesting deeper than %d levels; the read side refuses deeper trees", display, maxTreeDepth)
+			continue
+		}
+		entry, ok, err := b.processEntry(ctx, src, childRel, item, stream.takeName(ctx, item.Name), depth)
 		if err != nil {
 			return crypto.ID{}, err
 		}
@@ -750,11 +766,11 @@ func (b *backupRun) walkDir(ctx context.Context, src source.Source, dir []byte, 
 // included; false with a nil error means it was skipped with a warning.
 //
 // The entry records only what the source's metadata kind can carry
-// (format-v3-draft.md §8.1): a posix item records the full set, an sftp
+// (docs/format.md §8.1): a posix item records the full set, an sftp
 // item its mtime (and mode/ownership when the source has them), an s3
 // item its mtime and the etag/vern it computed. An absent field means
 // "the source did not say" -- never zero.
-func (b *backupRun) processEntry(ctx context.Context, src source.Source, rel []byte, item source.SourceItem, parent *tree.Entry) (tree.Entry, bool, error) {
+func (b *backupRun) processEntry(ctx context.Context, src source.Source, rel []byte, item source.SourceItem, parent *tree.Entry, depth int) (tree.Entry, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return tree.Entry{}, false, err
 	}
@@ -785,7 +801,7 @@ func (b *backupRun) processEntry(ctx context.Context, src source.Source, rel []b
 		if parent != nil && tree.NodeType(parent.Type) == tree.TypeDir && parent.Subtree != nil {
 			parentDir = parent.Subtree
 		}
-		subtree, err := b.walkDir(ctx, src, rel, parentDir)
+		subtree, err := b.walkDir(ctx, src, rel, parentDir, depth+1)
 		if err != nil {
 			return tree.Entry{}, false, err
 		}

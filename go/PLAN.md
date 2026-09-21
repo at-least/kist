@@ -4,8 +4,9 @@
 > 專案名 `kist`（蘇格蘭語「箱子、寶箱」），module path `github.com/<owner>/kist`。
 
 ## 定位（2026-09-05 起）
-**本 repo 是參考實作，不是產品。** 產品是 `kist-rs`（Rust）；本實作的職責是
-交叉驗證格式設計的可行性、抓產品的 bug、提供第二個視角的實作證據。
+**本目錄（monorepo 的 `go/`）是參考實作，不是產品。** 產品是同一 repo 根目錄的
+Rust 工作區；本實作的職責是交叉驗證格式設計的可行性、抓產品的 bug、
+提供第二個視角的實作證據。
 格式以兩邊共用的 `docs/format.md`（v2）為權威，本實作**跟隨不領導**：
 任何格式改動由產品端發起，這邊同步實作、golden 與 `internal/interop`
 的跨語言向量。測試與互通驗證照常維持綠燈。
@@ -23,7 +24,7 @@
 - 後端：介面抽象，實作順序 local → S3（`aws-sdk-go-v2`）→ SFTP（`pkg/sftp`）。
 - 糾錯碼（後期）：`klauspost/reedsolomon`。
 - 測試：標準 `testing` + `testing/fstest`；fuzz 用 Go 原生 `FuzzXxx`；
-  `internal/interop` 持有跨語言 conformance 向量（與 kist-rs 共用）。
+  `internal/interop` 持有跨語言 conformance 向量（與根目錄的 Rust 實作共用）。
 
 ## 儲存格式（v2 — 權威規格見 `docs/format.md`）
 repo 是一個 key-value 命名空間，所有物件不可變、以內容 hash 命名：
