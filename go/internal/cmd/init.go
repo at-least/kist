@@ -26,19 +26,24 @@ func newInitCommand() *cobra.Command {
 			"and kist keeps no copy of it anywhere.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// The event exists from the start so a failing command still
+			// emits the object (json.go's contract): the object says what
+			// happened, the exit code says whether it was good.
+			ev := event("init")
+			fail := func(err error) error { return finish(cmd, ev, err) }
 			location, err := flags.location()
 			if err != nil {
-				return err
+				return fail(err)
 			}
 			opts, err := flags.options(cmd, true)
 			if err != nil {
-				return err
+				return fail(err)
 			}
 			opts.Chunker = &repo.ChunkerParams{MinSize: chunkerMin, AvgSize: chunkerAvg, MaxSize: chunkerMax}
 
 			b, err := openBackend(cmd.Context(), location, true)
 			if err != nil {
-				return err
+				return fail(err)
 			}
 
 			r, err := repo.Init(cmd.Context(), b, opts)
@@ -46,7 +51,7 @@ func newInitCommand() *cobra.Command {
 				if cerr := b.Close(); cerr != nil {
 					warnTo(cmd)("closing the backend: %v", cerr)
 				}
-				return err
+				return fail(err)
 			}
 			defer func() {
 				if cerr := r.Close(); cerr != nil {
@@ -55,7 +60,6 @@ func newInitCommand() *cobra.Command {
 			}()
 
 			if jsonMode(cmd) {
-				ev := event("init")
 				ev.Init = &report.InitResult{Location: b.Location(), ClientID: r.ClientID()}
 				return finish(cmd, ev, nil)
 			}

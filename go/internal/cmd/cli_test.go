@@ -457,3 +457,22 @@ func TestPruneRejectsBadFlagsButStillSpeaksJSON(t *testing.T) {
 		t.Errorf("clock-skew 0 is a real setting, got %v", err)
 	}
 }
+
+// A failing command still emits the JSON object ("the object says what
+// happened, the exit code says whether it was good"): --json init with
+// no password available must print the event, not nothing.
+func TestInitJSONEmitsTheObjectOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	stdout, _, err := run(t, "--json", "init", "--repo", filepath.Join(dir, "repo"),
+		"--password-file", filepath.Join(dir, "absent"))
+	if err == nil {
+		t.Fatal("init without a password file must fail")
+	}
+	var ev report.Event
+	if jerr := json.Unmarshal([]byte(stdout), &ev); jerr != nil {
+		t.Fatalf("--json init must emit the event object even on failure: %v; stdout=%q", jerr, stdout)
+	}
+	if ev.Kind != "init" || ev.OK || ev.Error == "" {
+		t.Fatalf("the failure event must be kind=init, ok=false, with the error: %+v", ev)
+	}
+}
