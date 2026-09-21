@@ -44,7 +44,7 @@ func TestRunnerOnceEndToEnd(t *testing.T) {
 	}
 	password := []byte("run-test")
 	stateDir, cacheDir := t.TempDir(), t.TempDir()
-	init, err := repo.Init(ctx, b, repo.Options{Password: password, StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF()})
+	init, err := repo.Init(ctx, b, repo.Options{Password: []byte(password), StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ url = "` + hook.URL + `"
 	var events []report.Event
 	r := &Runner{
 		Config:   cfg,
-		Password: password,
+		Password: []byte(password),
 		Logf:     func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
 		OpenBackend: func(_ context.Context, location string) (backend.Backend, error) {
 			return backend.OpenLocal(location)
@@ -243,7 +243,7 @@ func TestRunnerForwardsPruneGraceToTheBackupGate(t *testing.T) {
 	}
 	password := []byte("run-test")
 	stateDir, cacheDir := t.TempDir(), t.TempDir()
-	init, err := repo.Init(ctx, b, repo.Options{Password: password, StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF()})
+	init, err := repo.Init(ctx, b, repo.Options{Password: []byte(password), StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ grace = "1us"
 	var events []report.Event
 	r := &Runner{
 		Config:   cfg,
-		Password: password,
+		Password: []byte(password),
 		Logf:     func(string, ...any) {},
 		OpenBackend: func(_ context.Context, location string) (backend.Backend, error) {
 			return backend.OpenLocal(location)
@@ -380,5 +380,118 @@ func TestWebhookDoesNotFollowRedirects(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("the 3xx must be logged as a webhook failure: %v", logs)
+	}
+}
+
+// A job stopped by ctx cancellation is not a job failure: Once must
+// report cancellation (errors.Is context.Canceled) so the command layer
+// can treat an interrupt as a clean stop -- while a REAL failure in the
+// same cancelled run must still come through as a failure, or a Ctrl-C
+// would launder "backend down" into exit 0.
+func TestOnceClassifiesCancellationAgainstRealFailures(t *testing.T) {
+	password := "once classify password"
+	stateDir := t.TempDir()
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	cacheDir := t.TempDir()
+	source := t.TempDir()
+
+	// Seed a working repository so the backup job's only obstacle is the
+	// cancelled context.
+	cfg, err := config.Parse(`
+[repository]
+location = "` + repoDir + `"
+state_dir = "` + stateDir + `"
+cache_dir = "` + cacheDir + `"
+
+[[backup]]
+name = "docs"
+paths = ["` + source + `"]
+schedule = "@daily"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobLogs []string
+	r := &Runner{
+		Config:   cfg,
+		Password: []byte(password),
+		Logf: func(f string, a ...any) {
+			jobLogs = append(jobLogs, fmt.Sprintf(f, a...))
+		},
+		OpenBackend: func(_ context.Context, location string) (backend.Backend, error) {
+			return backend.OpenLocal(location)
+		},
+	}
+	// Seed the repository first: the cancelled run must get PAST open and
+	// into the backup itself, where the context is what stops it.
+	b, err := backend.CreateLocal(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	init, err := repo.Init(context.Background(), b, repo.Options{
+		Password: []byte(password), StateDir: stateDir, CacheDir: cacheDir, KDF: cheapKDF(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Once(context.Background()); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	jobLogs = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = r.Once(ctx)
+	if err == nil {
+		t.Fatal("a cancelled run must not report success")
+	}
+	if !errors.Is(err, context.Canceled) {
+		for e := err; e != nil; e = errors.Unwrap(e) {
+			t.Logf("chain: %T %v", e, e)
+		}
+		t.Logf("job logs: %v", jobLogs)
+		t.Fatalf("a cancelled run's failure must BE the cancellation, got %v", err)
+	}
+
+	// A real failure with a LIVE context must come through as a failure,
+	// not cancellation: this is the guard that keeps the classification
+	// above from laundering "backend down" into a clean stop when the
+	// interrupt lands after the failure. (The mixed sequence -- job fails
+	// for real, THEN the signal -- classifies per job: the failed list
+	// wins over the cancelled flag inside Once.)
+	cfgReal, err := config.Parse(`
+[repository]
+location = "` + repoDir + `"
+state_dir = "` + stateDir + `"
+cache_dir = "` + cacheDir + `"
+
+[[backup]]
+name = "broken"
+paths = ["` + filepath.Join(t.TempDir(), "missing") + `"]
+schedule = "@daily"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2 := &Runner{
+		Config:   cfgReal,
+		Password: []byte(password),
+		Logf:     func(string, ...any) {},
+		OpenBackend: func(_ context.Context, location string) (backend.Backend, error) {
+			return backend.OpenLocal(location)
+		},
+	}
+	err = r2.Once(context.Background())
+	if err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a real failure must not be reported as cancellation: %v", err)
+	}
+	if !strings.Contains(err.Error(), "broken") {
+		t.Fatalf("the real failure must name the job: %v", err)
 	}
 }

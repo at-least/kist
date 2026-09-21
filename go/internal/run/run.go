@@ -86,14 +86,27 @@ func (r *Runner) Jobs() []Job {
 // Once runs every job now, in order, and reports the first failure.
 func (r *Runner) Once(ctx context.Context) error {
 	var failed []string
+	cancelled := false
 	for _, j := range r.Jobs() {
 		if err := j.Run(ctx); err != nil {
+			// A job stopped by the cancelling context is not a job
+			// failure: the command layer turns context.Canceled into a
+			// clean stop, while a REAL failure in the same run must still
+			// surface -- a Ctrl-C must not launder "backend down" into
+			// exit 0.
+			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+				cancelled = true
+				continue
+			}
 			r.logf("%s: %v", j.Name, err)
 			failed = append(failed, j.Name)
 		}
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("%d job(s) failed: %s", len(failed), strings.Join(failed, ", "))
+	}
+	if cancelled {
+		return fmt.Errorf("stopped by signal: %w", context.Canceled)
 	}
 	return nil
 }

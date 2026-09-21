@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"errors"
 	"github.com/at-least/kist/internal/backend"
 	"github.com/at-least/kist/internal/config"
 	kistrun "github.com/at-least/kist/internal/run"
@@ -65,9 +66,14 @@ func newRunCommand() *cobra.Command {
 				// Same contract as serve below: an interrupt is a clean
 				// stop, not a failed unit -- a supervisor must not see a
 				// plain Ctrl-C as a crash just because --once was set.
-				if ctx.Err() != nil {
-					logf("stopping")
-					return nil
+				// Keyed on the classified error, not ctx.Err(): a job
+				// that failed for real before the signal must still exit
+				// non-zero.
+				if err == nil || errors.Is(err, context.Canceled) {
+					if ctx.Err() != nil {
+						logf("stopping")
+						return nil
+					}
 				}
 				return err
 			}
