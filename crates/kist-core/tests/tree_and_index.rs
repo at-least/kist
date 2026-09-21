@@ -149,7 +149,7 @@ async fn write_snapshot_refuses_structurally_invalid_snapshots() {
         .await
         .unwrap();
     let mut snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
-    assert!(snap.roots.len() >= 1, "前置：真 snapshot 至少一個 root");
+    assert!(!snap.roots.is_empty(), "前置：真 snapshot 至少一個 root");
     // 重複同一個 root：prev >= path 在 validate 必炸，與 root 數多寡無關。
     snap.roots.push(snap.roots[0].clone());
 
