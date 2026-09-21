@@ -199,7 +199,7 @@ async fn run_once_executes_backup_forget_prune_in_order() {
     let cfg = Config::parse(&text).unwrap();
     let daemon = Daemon::new(cfg).unwrap();
     let mut seen = Vec::new();
-    let outcomes = daemon.run_once(|o| seen.push(o.job)).await;
+    let outcomes = daemon.run_once(None, |o| seen.push(o.job)).await;
     assert_eq!(seen, [JobKind::Backup, JobKind::Forget, JobKind::Prune]);
     for o in &outcomes {
         assert_eq!(o.status, JobStatus::Success, "{o:?}");
@@ -210,7 +210,7 @@ async fn run_once_executes_backup_forget_prune_in_order() {
         outcomes[0].detail
     );
     // 第二次：forget --keep-last 1 會刪掉舊的那個
-    let outcomes = daemon.run_once(|_| {}).await;
+    let outcomes = daemon.run_once(None, |_| {}).await;
     assert_eq!(
         outcomes[1].detail["removed"].as_array().map(|a| a.len()),
         Some(1)
@@ -230,7 +230,7 @@ async fn failure_is_reported_not_raised() {
         "[backup]\npaths = [\"/nonexistent\"]\n",
     );
     let daemon = Daemon::new(Config::parse(&text).unwrap()).unwrap();
-    let outcomes = daemon.run_once(|_| {}).await;
+    let outcomes = daemon.run_once(None, |_| {}).await;
     assert_eq!(outcomes[0].status, JobStatus::Failure);
     assert!(
         outcomes[0]
@@ -306,4 +306,34 @@ async fn scheduled_runs_and_webhook() {
         .as_str()
         .unwrap()
         .starts_with("snapshots/"));
+}
+
+// 收到 shutdown 訊號後，剩餘的工作不再開跑（與 `run` 的「停在本輪工作
+// 後」同一約定）；已跑完的 outcome 照常回報。
+#[tokio::test]
+async fn run_once_skips_remaining_jobs_after_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path()).await;
+    let password = write_password(dir.path());
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"hello").unwrap();
+    let text = config_text(
+        &repo,
+        &password,
+        dir.path(),
+        &format!(
+            "[backup]\npaths = [{:?}]\nschedule = \"@daily\"\n[forget]\nschedule = \"@daily\"\nkeep_last = 1\n[prune]\nschedule = \"@daily\"\ngrace = \"0s\"\n",
+            src.display().to_string()
+        ),
+    );
+    let cfg = Config::parse(&text).unwrap();
+    let daemon = Daemon::new(cfg).unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tx.send(true).unwrap(); // 訊號先於 run_once：一件都不該開跑
+    let mut seen = Vec::new();
+    let outcomes = daemon.run_once(Some(rx), |o| seen.push(o.job)).await;
+    assert!(outcomes.is_empty(), "shutdown 後不得再開工作：{outcomes:?}");
+    assert!(seen.is_empty());
 }

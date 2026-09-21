@@ -311,14 +311,18 @@ async fn run(cli: Cli) -> Result<()> {
             let cfg = kist_app::Config::load(&config)?;
             let mut daemon = kist_app::Daemon::new(cfg)?;
             if once {
-                // --json：每件工作的結果已經是 JSON，最後印整個陣列
+                // 與 Go 端同約定：Ctrl-C 是乾淨收工（不再開下一件工作、
+                // 進行中的做完），不是 unit 失敗。
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                spawn_ctrl_c(tx.clone());
                 let outcomes = daemon
-                    .run_once(|o| {
+                    .run_once(Some(rx.clone()), |o| {
                         if !json {
                             emit_outcome(o);
                         }
                     })
                     .await;
+                let stopped = *rx.borrow();
                 if json {
                     print_json(&outcomes)?;
                 }
@@ -331,10 +335,15 @@ async fn run(cli: Cli) -> Result<()> {
                     .filter(|o| o.status == kist_app::JobStatus::Incomplete)
                     .count();
                 if failed > 0 {
+                    // 真失敗贏過乾淨收工：Ctrl-C 不能把「本來就會失敗的
+                    // 工作」洗成 exit 0。
                     bail!("{failed} job(s) failed");
                 }
                 if incomplete > 0 {
                     return Err(Incomplete(format!("{incomplete} job(s) incomplete")).into());
+                }
+                if stopped {
+                    eprintln!("stopping after the current job");
                 }
                 return Ok(());
             }

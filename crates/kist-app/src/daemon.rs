@@ -212,11 +212,21 @@ impl Daemon {
     }
 
     /// 設定裡有的工作各跑一次（backup → forget → prune），不看排程。給 `run --once` 與外部 cron 用。
-    pub async fn run_once(&self, mut on_outcome: impl FnMut(&JobOutcome)) -> Vec<JobOutcome> {
+    /// 跑每一件已排程的工作各一次。`shutdown` 一旦被傳訊（Ctrl-C），剩餘
+    /// 的不再開跑——與 `run` 同款「停在本輪工作後」的約定；工作本身做完，
+    /// 不中途取消。
+    pub async fn run_once(
+        &self,
+        mut shutdown: Option<watch::Receiver<bool>>,
+        mut on_outcome: impl FnMut(&JobOutcome),
+    ) -> Vec<JobOutcome> {
         let mut out = Vec::new();
         for kind in [JobKind::Backup, JobKind::Forget, JobKind::Prune] {
             if !configured(&self.cfg, kind) {
                 continue;
+            }
+            if shutdown.as_mut().is_some_and(|rx| *rx.borrow_and_update()) {
+                break;
             }
             let o = self.execute(kind).await;
             on_outcome(&o);
