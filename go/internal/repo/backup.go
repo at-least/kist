@@ -124,25 +124,25 @@ var ErrTreeMarked = errors.New("a tree reached by this backup is marked for dele
 // immutable object must not (docs/format.md §9.1).
 type BackupReport struct {
 	// ChunksNew counts chunks this run put into packs.
-	ChunksNew uint64
+	ChunksNew uint64 `json:"chunks_new"`
 	// ChunksRead counts chunks whose data this run read back, plus the
 	// ones it confirmed without reading.
-	ChunksRead uint64
+	ChunksRead uint64 `json:"chunks_read"`
 	// PacksNew counts packs this run finished and uploaded.
-	PacksNew uint64
+	PacksNew uint64 `json:"packs_new"`
 	// PacksRevived counts chunk-level re-uploads out of marked packs.
-	PacksRevived uint64
+	PacksRevived uint64 `json:"packs_revived"`
 	// BytesStored is how many bytes of chunks this run sealed.
-	BytesStored uint64
+	BytesStored uint64 `json:"bytes_stored"`
 	// Errors counts source items that could not be read and were skipped.
-	Errors uint64
+	Errors uint64 `json:"errors"`
 	// FilesReused counts files restored from the parent's metadata
 	// without being read: the fast paths that can prove a file unchanged
 	// (posix by the kernel's own bookkeeping, s3 by the source's etag)
 	// carry its chunk list over and count one here. Files whose proof
 	// does not exist -- sftp and generic sources -- are always re-read
 	// and never counted (docs/format.md §8.2).
-	FilesReused uint64
+	FilesReused uint64 `json:"files_reused"`
 }
 
 // A BackupSummary is what a committed backup produced: the snapshot

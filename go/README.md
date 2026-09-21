@@ -87,14 +87,14 @@ listen = "127.0.0.1:9345"
 
 一個事件：`kind`（`init backup forget prune check restore rebuild_index`）、`job`（run 模式的工作名）、`started`、`finished`、`ok`、`error`、`warnings`，加上一個對應 kind 的子物件：
 
-- `backup`：`snapshot host paths files dirs symlinks bytes bytes_stored chunks_new packs_added packs_revived`
+- `backup`：`snapshot host roots files dirs symlinks bytes errors` ＋巢狀 `report{chunks_new chunks_read packs_new packs_revived bytes_stored errors files_reused}`
 - `forget`：`dry_run removed kept locked`
 - `prune`：`dry_run packs_stored packs_live marked unmarked deleted locked held[{pack,reason}] bytes_reclaimed`
 - `check`：`read_data snapshots trees chunks packs problems parity_packs repaired unrepairable`
 - `restore`：`snapshot target files dirs symlinks hard_links bytes`
 - `init`：`location client_id`；`rebuild_index`：`chunks`
 
-`snapshots --json` 是陣列：`snapshot client_id time host paths files bytes`（讀不出來的列有 `error`）。
+`snapshots --json` 是陣列：`snapshot client_id time host roots files dirs symlinks bytes`（讀不出來的列有 `error`）。
 
 Metrics：`kist_runs_total{job,result}`、`kist_last_run_timestamp_seconds{job,result}`、`kist_last_run_duration_seconds{job}`、`kist_last_backup_{files,bytes,bytes_stored,packs_added}{job}`、`kist_last_prune_packs_{stored,live,deleted,held}`、`kist_prune_bytes_reclaimed_total`。
 
