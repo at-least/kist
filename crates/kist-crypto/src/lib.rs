@@ -42,6 +42,8 @@ const CTX_CACHE_ID: &str = "kist/v3/cache";
 pub enum CryptoError {
     #[error("wrong password (or the repository config was tampered with)")]
     WrongPassword,
+    #[error("key slot version {actual} is not supported, want {expected}")]
+    UnsupportedSlotVersion { actual: u64, expected: u64 },
     #[error("the operating system's random number generator failed: {0}")]
     Rng(String),
     #[error("authentication failed: data is corrupt or was encrypted with a different key")]
@@ -224,6 +226,14 @@ pub struct UnlockedMaster {
 
 /// 用密碼解開 key slot：master key 與認證過的不變式。
 pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<UnlockedMaster> {
+    // 版本捲動的絆線：Go 端同款硬拒（keys.go），不能讓版本錯落進
+    // AEAD 開失敗被謊報成密碼錯。
+    if slot.version != kist_format::config::KEY_SLOT_VERSION {
+        return Err(CryptoError::UnsupportedSlotVersion {
+            actual: u64::from(slot.version),
+            expected: u64::from(kist_format::config::KEY_SLOT_VERSION),
+        });
+    }
     let kek = kdf(password, &slot.kdf)?;
     // plain 就是 master key 明文：用 Zeroizing 包住，drop 時清零（kek、
     // MasterKey 都已如此；模組文件的清零紀律不含例外）。
