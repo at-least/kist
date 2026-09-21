@@ -103,6 +103,11 @@ func NewWriterParams(keys *crypto.Keys, dir string, target uint64, nonceSource i
 	// v2: the pack opens with the magic (trailer offsets are absolute
 	// file positions, so this must be written before the first chunk).
 	if _, err := w.hasher.Write(magic[:]); err != nil {
+		// The spool file is ours alone, but nobody owns it yet: without a
+		// *Writer there is no Finish/Abort to unlink it, so clean up here
+		// or a disk-full during the header write leaks the temp file.
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
 		return nil, fmt.Errorf("create pack writer: write header: %w", err)
 	}
 	w.size = uint64(len(magic))
