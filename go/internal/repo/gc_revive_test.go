@@ -74,3 +74,31 @@ func TestTreeRewrittenInTheMarkSecondRevives(t *testing.T) {
 		t.Fatal("a tree rewritten in the mark's own second must revive: same-second counts as newer (the safe side), same rule as packs and the Rust peer")
 	}
 }
+
+// Parity shards feed the RS matrix: the CLI bounds 0..=8 (the Rust CLI
+// does the same), but the repo layer must not trust its caller -- a
+// negative or oversized parity must fail the backup loudly, not warn
+// parity objects away after the fact.
+func TestBackupRejectsParityOutsideZeroToEight(t *testing.T) {
+	ctx := context.Background()
+	r, _ := initRepo(t, "parity-bounds")
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, parity := range []int{-1, 9, 200} {
+		opts := BackupOptions{SpoolDir: t.TempDir(), Parity: parity}
+		if _, err := r.Backup(ctx, []string{src}, opts); err == nil {
+			t.Fatalf("parity %d must be rejected by the repo layer", parity)
+		} else if !strings.Contains(err.Error(), "parity") {
+			t.Fatalf("parity %d: error must name the knob: %v", parity, err)
+		}
+	}
+	if _, err := r.Backup(ctx, []string{src}, BackupOptions{SpoolDir: t.TempDir(), Parity: 8}); err != nil {
+		t.Fatalf("parity 8 is inside the range: %v", err)
+	}
+}

@@ -175,6 +175,12 @@ func (r *Repository) Backup(ctx context.Context, paths []string, opts BackupOpti
 	if len(paths) == 0 && !opts.Source.remote() {
 		return BackupSummary{}, errors.New("backup: no paths given")
 	}
+	// The repo layer does not trust its caller to have bounded the knob
+	// (the Rust CLI/route validates 0..=8 the same): an unvalidated value
+	// reaches the RS matrix and silently degrades to warn-only parity.
+	if opts.Parity < 0 || opts.Parity > 8 {
+		return BackupSummary{}, fmt.Errorf("backup: parity %d is outside 0..=8", opts.Parity)
+	}
 
 	host := opts.Host
 	if host == "" {
