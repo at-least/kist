@@ -352,7 +352,13 @@ impl Source for ObjectStoreSource {
         // 物件），list_with_delimiter 會把同名物件藏起來、回傳空清單——
         // 實機測試（MinIO）證實。此時回傳該物件單一條目，走訪端即可走
         // 檔案來源分支（與 Go 實作一致）。
-        if dir.is_empty() {
+        // 與 Go 同守衛（go/internal/source/s3.go）：定位以 `/` 收尾是
+        // 「目錄」的明示，不能拿去 HEAD 同名物件——s3fs 一類工具會放
+        // 0-byte folder marker，HEAD 200 會讓整個來源退化成單一空檔案、
+        // 真正的內容全部不見；裸 bucket（空 root）也沒有可 HEAD 的鍵。
+        // sftp 來源的 root 恆為空（本守衛因此不啟動）：Go 端的 sftp
+        // source 本來就沒有 probe，兩端收斂。
+        if dir.is_empty() && !self.root.as_ref().is_empty() && !self.locator.ends_with(b"/") {
             if let Some(item) = self.head_root_file()? {
                 return Ok(Box::new(StoreListing {
                     items: vec![item].into_iter(),
@@ -567,5 +573,64 @@ mod tests {
     #[tokio::test]
     async fn open_source_rejects_unknown_schemes() {
         assert!(open_source("gopher://x").await.is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod s3_root_probe_tests {
+    use super::*;
+    use object_store::path::Path as StorePath;
+
+    /// `s3://bucket/data/`（尾巴的 `/`＝明示「這是目錄」）不可以拿去 HEAD
+    /// 同名物件：s3fs 一類工具會放 0-byte folder marker，HEAD 200 會讓整個
+    /// 來源退化成單一空檔案、`data/` 的真正內容全部不見。與 Go 同守衛
+    /// （go/internal/source/s3.go：`Prefix != "" && !HasSuffix(spec, "/")`）。
+    #[tokio::test]
+    async fn trailing_slash_locator_skips_the_root_file_probe() {
+        let store = object_store::memory::InMemory::new();
+        store
+            .put(
+                &StorePath::from("data"),
+                object_store::PutPayload::from_static(b""),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &StorePath::from("data/x.txt"),
+                object_store::PutPayload::from_static(b"real content"),
+            )
+            .await
+            .unwrap();
+        let src = ObjectStoreSource {
+            store: Arc::new(store),
+            root: StorePath::from("data"),
+            locator: b"s3://bucket/data/".to_vec(),
+            meta_kind: kist_format::tree::meta_kind::S3,
+            handle: tokio::runtime::Handle::current(),
+        };
+        // 生產端是從 blocking 執行緒呼叫 list（list 內部 block_on）；
+        // 測試照同一個呼叫環境，不然 block_on 會在 runtime 執行緒上 panic。
+        let mut listing = tokio::task::spawn_blocking(move || src.list(b"").unwrap())
+            .await
+            .unwrap();
+        let mut items = Vec::new();
+        while let Some(item) = listing.next_item() {
+            items.push(item.unwrap());
+        }
+        // 退化（probe 命中）＝整個來源只有 folder-marker 一顆 0-byte
+        // 「data」；守衛生效＝prefix 下的真實內容照常列出、marker 不見。
+        assert!(
+            items
+                .iter()
+                .any(|i| i.name == b"x.txt"
+                    && matches!(i.kind, SourceItemKind::File { size: 12, .. })),
+            "prefix 的真實內容必須照常列出，got {items:?}"
+        );
+        assert!(
+            !items.iter().any(|i| i.name == b"data"),
+            "folder marker 不得作為檔案來源出現，got {items:?}"
+        );
     }
 }
