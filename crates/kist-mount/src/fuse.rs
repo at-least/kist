@@ -26,10 +26,17 @@ pub struct KistFs {
 }
 
 fn system_time(ns: i64) -> SystemTime {
-    if ns <= 0 {
-        UNIX_EPOCH
-    } else {
+    if ns >= 0 {
         UNIX_EPOCH + Duration::from_nanos(ns as u64)
+    } else {
+        // 帶負號的合法 mtime（1970 年前）照實表示——fuser 的 Attr.mtime
+        // 是 SystemTime，表示得出；夾成 epoch 會讓 mount 顯示 1970-01-01
+        // （4d97250 修了 capture/restore，這裡是同一修正在 mount 端的
+        // 缺口，Go 端 setAttr 一直照實傳）。平台表示不了的下限（理論
+        // 極端）落回 epoch。
+        UNIX_EPOCH
+            .checked_sub(Duration::from_nanos(ns.unsigned_abs()))
+            .unwrap_or(UNIX_EPOCH)
     }
 }
 
@@ -360,5 +367,22 @@ impl Filesystem for KistFs {
 
     fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
         reply.error(Errno::EROFS);
+    }
+}
+
+#[cfg(test)]
+mod system_time_tests {
+    use super::*;
+
+    /// 帶負號的合法 mtime（1970 年前）要照實表示：夾成 epoch 會讓 mount
+    /// 顯示 1970-01-01（restore 端 4d97250 已修，兩端都吃全 i64）。
+    #[test]
+    fn negative_mtimes_render_before_the_epoch() {
+        assert_eq!(
+            system_time(-1_000_000_000),
+            UNIX_EPOCH - Duration::from_nanos(1_000_000_000)
+        );
+        assert_eq!(system_time(0), UNIX_EPOCH);
+        assert_eq!(system_time(1), UNIX_EPOCH + Duration::from_nanos(1));
     }
 }
