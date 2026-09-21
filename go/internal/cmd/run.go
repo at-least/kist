@@ -61,7 +61,15 @@ func newRunCommand() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			if once {
-				return r.Once(ctx)
+				err := r.Once(ctx)
+				// Same contract as serve below: an interrupt is a clean
+				// stop, not a failed unit -- a supervisor must not see a
+				// plain Ctrl-C as a crash just because --once was set.
+				if ctx.Err() != nil {
+					logf("stopping")
+					return nil
+				}
+				return err
 			}
 			err = r.Serve(ctx)
 			if ctx.Err() != nil {
