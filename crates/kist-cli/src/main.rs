@@ -465,8 +465,9 @@ async fn run(cli: Cli) -> Result<()> {
                 _ => (SourceSpec::LocalPaths, paths),
             };
             let r = open_repo(&repo).await?;
-            let client_id = client_id::load_or_create(client_id_file.as_deref())?;
+            // 先鎖再載入：同 jobs.rs——首建並發各自 mint 不同 id 的視窗。
             let _lock = client_id::lock(client_id_file.as_deref())?;
+            let client_id = client_id::load_or_create(client_id_file.as_deref())?;
             let opts = BackupOptions {
                 client_id,
                 hostname: hostname(),
