@@ -30,6 +30,24 @@ const ClientIDSize = 16
 func ClientID(stateDir string, repoID string) (string, error) {
 	path := filepath.Join(stateDir, "clients", repoID)
 
+	// The read-mint-write below must be atomic across processes: two
+	// concurrent first runs would each mint a different id and the last
+	// writer wins, leaving the loser with a snapshot no later client
+	// recognizes. An exclusive flock on a sidecar lock file serializes
+	// the sequence (the Rust peer's client_id::lock does the same); the
+	// flock releases when the process exits or the file closes.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", fmt.Errorf("create client ID directory: %w", err)
+	}
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("open client ID lock: %w", err)
+	}
+	defer lock.Close()
+	if err := lockClientIDFile(lock); err != nil {
+		return "", fmt.Errorf("lock client ID: %w", err)
+	}
+
 	switch data, err := os.ReadFile(path); { //nolint:gosec // path is built from a validated repository ID
 	case err == nil:
 		id := strings.TrimSpace(string(data))
@@ -44,9 +62,6 @@ func ClientID(stateDir string, repoID string) (string, error) {
 	id, err := newClientID()
 	if err != nil {
 		return "", err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("create client ID directory: %w", err)
 	}
 	if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
 		return "", fmt.Errorf("write client ID to %s: %w", path, err)
