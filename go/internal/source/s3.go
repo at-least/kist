@@ -88,10 +88,14 @@ func (s *S3Source) List(ctx context.Context, dir []byte) ([]SourceItem, error) {
 		})
 		switch {
 		case err == nil:
+			// The version id is the vern slot: the Rust peer records it
+			// from the same HEAD (object_store reads x-amz-version-id),
+			// and §8.1's fast path pins a versioned object to the exact
+			// version it saw.
 			out = append(out, makeFileItem(lastComponent(s.cfg.Prefix),
 				uint64(aws.ToInt64(head.ContentLength)), //nolint:gosec // a length is never negative
 				aws.ToTime(head.LastModified).UnixNano(),
-				[]byte(aws.ToString(head.ETag)), nil))
+				[]byte(aws.ToString(head.ETag)), []byte(aws.ToString(head.VersionId))))
 		case isS3NotFound(err) || isS3AccessDenied(err):
 			// Not a file, or unknowable: S3 answers 403 rather than 404
 			// for a missing key when the caller lacks s3:ListBucket, the
