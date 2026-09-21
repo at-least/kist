@@ -602,8 +602,11 @@ func (r *Repository) treeRevivedAfterMark(ctx context.Context, id crypto.ID, mar
 		return false, nil
 	case err != nil:
 		return false, err
-	case fi.Modified.Truncate(time.Second).After(markedAt):
-		return true, nil // rewritten after the mark: a heal. Keep it.
+	case !fi.Modified.Truncate(time.Second).Before(markedAt):
+		return true, nil // rewritten at or after the mark: a heal. Keep it.
+		// (Same-second counts as newer, exactly as the comment above and
+		// the pack path in this file promise; strict-After deleted a
+		// same-second heal. The Rust peer compares >=.)
 	}
 	touch, err := r.backend.Stat(ctx, tree.TouchKey(id))
 	switch {
