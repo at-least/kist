@@ -1,6 +1,6 @@
-//! 跨語言金鑰推導向量（v3）。v3 起向量由 **Rust（產品／規格管理者）**
-//! 錄製，Go 端（internal/interop）移植時必須對相同輸入得到逐 byte 相同
-//! 的輸出（V3-KEYS-1）。
+//! 跨語言金鑰推導向量（v3，V3-KEYS-1）。v3 起向量由 Rust 錄製，原本與
+//! （已移除的）Go 參考實作共用；現在是凍結的 golden：逐 byte 釘死，
+//! 除非格式版號 bump（`docs/format.md` §16），絕不重新生成。
 //!
 //! 固定輸入：password / salt / repo_id / master 全部用固定 bytes，
 //! Argon2 參數 = RFC 9106 第二組建議，nonce 固定 0x77×24（僅測試；
@@ -29,7 +29,7 @@ fn poc_key_derivation_matches_recorded_vectors() {
     let master = [0x42u8; 32];
 
     // Argon2id: t=3, m=64 MiB, p=4, out=32 — the RFC 9106 second option.
-    // （KDF 與 v2 相同——這條向量在 v2 就已與 Go 逐 byte 對過。）
+    // （KDF 與 v2 相同——這條向量在 v2 就已由獨立實作逐 byte 交叉驗證過。）
     let params = Params::new(64 * 1024, 3, 4, Some(32)).unwrap();
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut kek = [0u8; 32];
@@ -91,7 +91,7 @@ fn poc_key_derivation_matches_recorded_vectors() {
     );
 }
 
-// v3 向量（由本測試的 println 錄製；Go 端移植時對相同輸入驗證）。
+// v3 向量（由本測試的 println 錄製；凍結，格式版號 bump 前不得重錄）。
 const HASH_SUB_HEX: &str = "cb79b897d172c800d23506629ca5b14781f8b0232ab1714c7f85b8199f4e527d";
 const CHUNK_SUB_HEX: &str = "15806189fdb9ae9e6b867a9d40a1cce2ac24a26c74492b64389ce5aafffb579f";
 const META_SUB_HEX: &str = "c4f44efcd5a8c073177757493a3d7f895800060bef9bca2102c5aa6f13ebaf52";

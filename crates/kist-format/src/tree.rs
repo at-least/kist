@@ -250,7 +250,7 @@ impl Entry {
         }
         // 直接內容的 inline chunk 數上限（§8：超過就必須轉間接）。
         // 寫入端在 backup 決定；讀取端同樣拒絕——超標的直接 entry 不是
-        // 任何正確 writer 會產出的形狀（Go 端 Validate 同一檢查）。
+        // 任何正確 writer 會產出的形狀。
         if self.content == content_type::DIRECT && self.chunks.len() > MAX_INLINE_CHUNKS {
             return bad(format!(
                 "file {:?} has {} inline chunks, over the {} limit (must be indirect)",
@@ -291,7 +291,7 @@ impl Entry {
             meta_kind::S3 => {
                 // etag/vern 是來源聲稱的位元組，不得無界進記憶體與 repo
                 // （§8.1：各上限 1 KiB）。SFTP 讀取端早已封頂，這裡是
-                // 格式級的同一把尺；Go 端 Validate 同款。
+                // 格式級的同一把尺。
                 if self
                     .etag
                     .as_ref()

@@ -311,7 +311,7 @@ async fn run(cli: Cli) -> Result<()> {
             let cfg = kist_app::Config::load(&config)?;
             let mut daemon = kist_app::Daemon::new(cfg)?;
             if once {
-                // 與 Go 端同約定：Ctrl-C 是乾淨收工（不再開下一件工作、
+                // 約定：Ctrl-C 是乾淨收工（不再開下一件工作、
                 // 進行中的做完），不是 unit 失敗。
                 let (tx, rx) = tokio::sync::watch::channel(false);
                 spawn_ctrl_c(tx.clone());

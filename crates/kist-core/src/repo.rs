@@ -120,7 +120,7 @@ fn encode_index_blob(blob: &IndexBlob) -> Result<Vec<u8>> {
     }
 }
 
-/// index blob 解壓上限（與 Go 端同一數字）：一個 blob 描述 repo 裡每個
+/// index blob 解壓上限：一個 blob 描述 repo 裡每個
 /// pack，真實 blob 遠遠不到，壞掉的長度欄位不該能要到 GiB 級記憶體。
 const MAX_INDEX_PLAIN: u64 = 1 << 30;
 
@@ -421,8 +421,7 @@ impl Repository {
         let keys = Arc::clone(&self.keys);
         blocking(move || {
             // 寫入端跑與讀取端同一套結構不變式（§8.1）：來源端冒出的 `..`／
-            // 重複／未排序名稱在這裡當場失敗，不寫出所有讀取端都拒讀的 tree
-            // （Go 的 Encode 同款）。
+            // 重複／未排序名稱在這裡當場失敗，不寫出所有讀取端都拒讀的 tree。
             tree.validate()?;
             let plain = cbor::encode(&tree)?;
             let id = keys.tree_id(&plain);
@@ -652,7 +651,7 @@ impl Repository {
                     ),
                 });
             }
-            // 結構驗證與 Go 的 load 同款（roots 非空、排序、唯一）：
+            // 結構驗證（roots 非空、排序、唯一）：
             // 解得開不等於合法，structurally-invalid 的 snapshot 不能往下走。
             snap.validate().map_err(|e| CoreError::Corrupt {
                 key: key_owned.clone(),
@@ -692,7 +691,7 @@ mod index_cap_tests {
     use crate::repo::decode_index_blob_limited;
     use kist_format::Algorithm;
 
-    /// index blob 的解壓上限（Go 端 1 GiB 同款）：超過上限的 frame 是
+    /// index blob 的解壓上限（1 GiB）：超過上限的 frame 是
     /// 炸彈不是 blob。正式上限太大，測試以小上限釘同一條規則。
     #[test]
     fn index_blob_over_the_limit_is_refused() {

@@ -100,8 +100,8 @@ pub struct PruneSection {
     #[serde(default, with = "crate::duration::serde_opt")]
     pub grace: Option<std::time::Duration>,
     /// Tolerated client/prune clock difference. Unset takes the 1 h default;
-    /// an explicit 0 is honored literally (zero tolerance), matching the Go
-    /// implementation where zero is a real setting.
+    /// an explicit 0 is honored literally (zero tolerance): zero is a real
+    /// setting.
 
     #[serde(default, with = "crate::duration::serde_opt")]
     pub clock_skew: Option<std::time::Duration>,
@@ -199,8 +199,7 @@ impl Config {
                     )));
                 }
             }
-            // scheme 大小寫不拘（URL scheme 本就 case-insensitive；Go 端
-            // url.Parse 會先 lower-case——兩個實作同判斷）。
+            // scheme 大小寫不拘（URL scheme 本就 case-insensitive）。
             let scheme = n.webhook_url.to_ascii_lowercase();
             if !(scheme.starts_with("http://") || scheme.starts_with("https://")) {
                 return Err(AppError::Config(
@@ -294,8 +293,7 @@ pub fn duration(s: &str) -> Result<std::time::Duration> {
 mod scheme_case_tests {
     use super::*;
 
-    /// scheme 大小寫不拘（URL scheme 本就 case-insensitive；Go 端的
-    /// url.Parse 會先 lower-case——兩個實作要同判斷）。
+    /// scheme 大小寫不拘（URL scheme 本就 case-insensitive）。
     #[test]
     fn webhook_scheme_is_case_insensitive() {
         let cfg = Config::parse(

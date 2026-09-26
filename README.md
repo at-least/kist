@@ -10,8 +10,9 @@
 > （[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接（[ADR 014](docs/decisions/014-rclone-bridge.md)）。
 > 另有：唯讀 FUSE 掛載（[ADR 015](docs/decisions/015-mount-fuse.md)）、選配 Reed-Solomon parity
 > （[ADR 009](docs/decisions/009-m5-parity.md)）、設定檔／排程／webhook（`kist run`）、`--json`、
-> Prometheus metrics 與 Web UI（`kist serve`）。Go 參考實作在同一個 repo 的 [go/](go/)（monorepo），
-> 跨語言互通有雙向 E2E 與 `go test ./internal/interop/...`（本機 gate）背書。
+> Prometheus metrics 與 Web UI（`kist serve`）。格式相容性由一份凍結的 v3 fixture repo 把關
+> （`crates/kist-core/tests/fixtures/`；原本的 Go 參考實作已移除，見
+> [ADR 018](docs/decisions/018-remove-go-reference.md)）。
 > 已接受的限制：Windows VSS（不在路線圖上，見 [PLAN.md](PLAN.md)）。
 
 ## 建置
@@ -231,8 +232,8 @@ TCP port、不用 known_hosts，rclone 的設定就是全部。`KIST_RCLONE_BIN`
 
 ## 開發
 
-Rust 端四道關卡（與 `ci-rust.yml` 同款；該 workflow 還含 MinIO 整合測試、
-fuzz smoke 與跨語言 interop，但只開 `workflow_dispatch` 手動觸發，避免吃配額）：
+四道關卡（與 `ci-rust.yml` 同款；該 workflow 還含 MinIO 整合測試與 fuzz smoke，
+但只開 `workflow_dispatch` 手動觸發，避免吃配額——本機 gate 是平時的準則）：
 
 ```sh
 cargo fmt --all --check
@@ -243,10 +244,10 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 
 S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
-Go 端（`go/`）的關卡是 `cd go && make verify`（build / vet / lint / test / -race）；
-兩個 workflow（`ci.yml`、`ci-rust.yml`）都只手動觸發（私有 repo 的 Actions 額度
-留給真正需要的時候），本機 gate 是平時的準則。跨語言 interop（conformance 向量
-與兩份 `format.md` 逐 byte 一致）本機快速 gate：`cd go && go test ./internal/interop/...`。
+格式相容性：`cargo test` 會跑 `crates/kist-core/tests/fixture_v3.rs`，讀一份提交在 git 裡、
+**永不重生**的 v3 repo（開啟、`check --read-data`、還原比對、重新編碼逐 byte 比對、
+同內容再備份零新 chunk）。golden 與向量會隨程式重錄，這份不會；它只在格式升版時換
+（見 [ADR 018](docs/decisions/018-remove-go-reference.md)）。
 
 ## Workspace 結構
 
@@ -262,7 +263,6 @@ Go 端（`go/`）的關卡是 `cd go && make verify`（build / vet / lint / test
 | `kist-cli` | `kist` 執行檔（clap） |
 
 格式規格：[docs/format.md](docs/format.md)。設計決策：[docs/decisions/](docs/decisions/)。
-Go 參考實作在 [go/](go/)，開發與驗證都在 `go/` 內進行（見〈開發〉一節）。
 
 ## M1 驗收數據
 

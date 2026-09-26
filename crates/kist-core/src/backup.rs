@@ -122,7 +122,7 @@ pub struct BackupOptions {
     pub source: SourceSpec,
 }
 
-/// **過程計數**（v3 起不在格式裡——它們依 GC 狀態與去重順序而變，兩個實作
+/// **過程計數**（v3 起不在格式裡——它們依 GC 狀態與去重順序而變，不同實作
 /// 可以「合法地」數出不同數字；不可變結構只收資料事實，見 snapshot.stats）。
 /// 屬於 backup 的執行報告，給 CLI / JSON / metrics 用。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -758,7 +758,7 @@ impl Repository {
         };
         let path_bytes: Vec<Vec<u8>> = plans.iter().map(|(b, _)| b.clone()).collect();
 
-        // 標記先於 index（與 Go 版同一個 load-bearing 順序）：backup 的
+        // 標記先於 index（load-bearing 順序）：backup 的
         // index 合併需要標記集合（未標記 pack 優先，規格 §10）。
         let marks_at_start = self.list_gc_marks().await?;
         let marked: HashSet<ObjectId> = marks_at_start.keys().copied().collect();
@@ -1250,7 +1250,7 @@ impl Backup {
                 // 把超過上限的樹當敵意 repo 拒收，寫入端就不能把「合法但
                 // 過深」的來源目錄寫進去——寫得出、還原不回＝自造損壞。
                 // 跳過並記帳（與讀不到的項目同一套帳）；遞迴本身也因此
-                // 有界，深來源不再吃堆疊。Go 實作同款。
+                // 有界，深來源不再吃堆疊。
                 if matches!(item.kind, SourceItemKind::Dir) && depth >= crate::MAX_TREE_DEPTH {
                     let display = ctx.display_path(&child_rel);
                     self.skip(
@@ -1335,8 +1335,7 @@ impl Backup {
             {
                 // 本 run 剛寫出的主體，卻帶著 run 開始時就存在的標記：
                 // 前一輪已刪過同內容的樹、標記按語意多活一輪。補一個
-                // touch，否則 commit gate 會因 touch 缺席而安全失敗一次
-                // （Go 端同樣處理，兩實作行為一致）。
+                // touch，否則 commit gate 會因 touch 缺席而安全失敗一次。
                 self.repo.touch_tree(&id).await?;
             }
         }
@@ -1362,7 +1361,7 @@ impl Backup {
     ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
         // 本機（posix）來源：非正規檔（FIFO/socket/裝置）跳過並記警告——
         // open 在 FIFO 無寫端時無限阻塞、裝置讀不完，還原也無法忠實重建。
-        // 遠端來源沒有型別位元（posix = None），不檢查。Go 實作同款。
+        // 遠端來源沒有型別位元（posix = None），不檢查。
         #[cfg(unix)]
         if let Some(posix) = f.posix {
             if posix.mode & 0o170000 != 0o100000 {
@@ -1617,7 +1616,7 @@ impl Backup {
                             Ok(entry) => {
                                 if in_marked_pack {
                                     // 從被標記 pack 重傳出來的 chunk：逐 chunk 計數
-                                    //（與 Go 的 PacksRevived 同單位）。
+                                    //（`packs_revived` 的單位是 chunk）。
                                     state.revived_count += 1;
                                     index.replace_pending(&entry);
                                 } else {
@@ -1719,7 +1718,7 @@ impl Backup {
             let bytes = p.bytes;
             self.uploads.spawn(async move {
                 // 同位是 sidecar：算不出來或上不去只警告——pack 本身已安全，
-                // 缺的只是冗餘（與 Go pack.Writer.writeParity 相同語意）。
+                // 缺的只是冗餘。
                 // RS 對整個 pack（可到 64 MiB+）做線性組合是重 CPU，丟 blocking；
                 // 閉式把 bytes 帶回來上傳，不為了算同位多抄一份。
                 let (bytes, parity_bytes) = if parity_m > 0 {

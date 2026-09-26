@@ -1,12 +1,12 @@
 //! kist 的內容定義切塊：FastCDC（Xia et al., USENIX ATC '16，normalized
-//! level 2），**與 Go 實作逐 byte 相同的移植**（`docs/format.md` §12）。
+//! level 2），**邊界逐 byte 依 `docs/format.md` §12 凍結**。
 //!
-//! 邊界函式是凍結的儲存格式：gear 表 = fastcdc-go v0.2.0 的表（兩邊以
-//! digest 測試釘死），mask 由 `avg` 以整數運算推導（避免浮點誤差讓兩個
-//! 實作分岔）。參數來自 repo 的 `config`，不是寫死的：同一個 repo 的所有
-//! client 必須用同樣的參數，去重才會一致。
+//! 邊界函式是凍結的儲存格式：gear 表 = fastcdc-go v0.2.0 的表（以
+//! digest 測試釘死），mask 由 `avg` 以整數運算推導（避免浮點誤差：mask
+//! 是凍結的格式值，推導必須精確）。參數來自 repo 的 `config`，不是寫死
+//! 的：同一個 repo 的所有 client 必須用同樣的參數，去重才會一致。
 //!
-//! 與 Go 版相同的緩衝不變量：決定邊界前，掃描位置之後保證 ≥ `max`
+//! 緩衝不變量：決定邊界前，掃描位置之後保證 ≥ `max`
 //! bytes（除非輸入已耗盡）——這讓邊界與 reader 的分塊方式無關。
 
 #![forbid(unsafe_code)]
@@ -347,7 +347,7 @@ impl Chunker {
 }
 
 /// 整數的 round(log2(v))：v >= 2^b·√2 時進位到 b+1。用整數比較
-/// （v² vs 2^(2b+1)）避免浮點捨入在兩個實作間分岔。
+/// （v² vs 2^(2b+1)）避免浮點捨入誤差——結果是凍結的格式值。
 fn round_log2(v: u32) -> u32 {
     debug_assert!(v >= 2);
     let mut b = 0u32;
@@ -363,7 +363,8 @@ fn round_log2(v: u32) -> u32 {
     }
 }
 
-/// 邊界函式：回傳從 data[0] 開始的下一個 chunk 長度。與 Go 版完全相同：
+/// 邊界函式：回傳從 data[0] 開始的下一個 chunk 長度。凍結格式
+/// （`docs/format.md` §12）：
 /// 前 `min` bytes 不參與 hash；未滿 `avg` 用較嚴的 mask、超過用較鬆的；
 /// 硬邊界 `max`；尾巴不足 `min` 就整段。
 fn boundary(
@@ -412,8 +413,8 @@ struct State<R> {
 }
 
 impl<R: Read> State<R> {
-    /// 保證 cursor 之後至少有 max bytes，除非輸入已耗盡（與 Go 版的
-    /// fill() 相同的不變量）。
+    /// 保證 cursor 之後至少有 max bytes，除非輸入已耗盡（即模組說明的
+    /// 緩衝不變量）。
     fn fill(&mut self) -> Result<(), ChunkerError> {
         let max = self.params.max as usize;
         let remaining = self.len - self.cursor;
@@ -433,7 +434,7 @@ impl<R: Read> State<R> {
                 return Ok(());
             }
         };
-        // 讀到滿或 EOF（對應 Go 的 io.ReadFull + UnexpectedEOF → eof）。
+        // 讀到滿或 EOF：短讀就繼續讀，read 回 0 才算 EOF（已讀的照收）。
         while self.len < self.buf.len() {
             match reader.read(&mut self.buf[self.len..]) {
                 Ok(0) => {
@@ -499,7 +500,7 @@ mod tests {
 
     #[test]
     fn gear_table_digest_is_pinned() {
-        // 與 Go 端的 digest 測試相同（LE 串接 SHA-256）。改任何一個
+        // digest = 各 entry LE 串接後的 SHA-256。改任何一個
         // entry 都會改變所有 chunk 邊界，這裡讓它被看見。
         let mut buf = Vec::with_capacity(256 * 8);
         for v in GEAR_TABLE {

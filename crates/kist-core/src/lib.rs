@@ -119,8 +119,7 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 /// 其實可以合法超過它——Linux 上 PATH_MAX 內疊得出約 2 000 層——所以
 /// backup 寫入端套同一把尺：過深的來源子目錄跳過並記警告，寫出的樹因此
 /// 永不超限；超過上限的 chain 只能出自腐壞或敵意 repo：乾淨回錯，不是
-/// process 陣亡。數值必須與 Go 參考實作的 `maxTreeDepth`（go/internal/repo）
-/// 一致；見 docs/format.md §8.4。
+/// process 陣亡。數值見 docs/format.md §8.4。
 pub const MAX_TREE_DEPTH: usize = 256;
 
 /// 把 CPU 密集工作丟到 blocking thread pool。

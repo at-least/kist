@@ -357,11 +357,10 @@ impl Repository {
             })?;
             list.chunks
         };
-        // 開檔不跟隨最終元件的 symlink（與 Go 端 O_EXCL 同族的最終元件
-        // 防護；這裡保留「覆寫既有一般檔」的契約）。unix 以 O_NOFOLLOW
-        // 讓拒絕發生在開檔瞬間——先 symlink_metadata 再 File::create 的
-        // 兩步之間有競態窗口，本地攻擊者能把寫入轉到目標之外；其餘平台
-        // 退回兩步檢查（與原行為相同，無窗口防護）。
+        // 開檔不跟隨最終元件的 symlink（保留「覆寫既有一般檔」的契約）。
+        // unix 以 O_NOFOLLOW 讓拒絕發生在開檔瞬間——先 symlink_metadata
+        // 再 File::create 的兩步之間有競態窗口，本地攻擊者能把寫入轉到目標
+        // 之外；其餘平台退回兩步檢查（與原行為相同，無窗口防護）。
         #[cfg(unix)]
         let file = {
             use std::os::unix::fs::OpenOptionsExt;

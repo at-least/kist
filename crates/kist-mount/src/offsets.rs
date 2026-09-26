@@ -1,6 +1,6 @@
 //! 檔案樹的 chunk 邊界表：樹的 chunk 清單只有 id，但 index 記了每個 chunk 的
 //! 明文長度（`PackEntry.raw_len`），所以「第 N byte 在哪個 chunk」不用解密就能算。
-//! 這是 mount 隨機讀的根基（Go 參考實作得往前解碼 chunks 0..i 才學到邊界）。
+//! 這是 mount 隨機讀的根基（沒有這張表就得往前解碼 chunks 0..i 才學到邊界）。
 
 /// `ends[i]` = 前 i+1 個 chunk 的明文長度總和（chunk i 的結尾 offset）。
 #[derive(Debug, Clone, PartialEq, Eq)]

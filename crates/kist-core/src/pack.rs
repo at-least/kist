@@ -280,7 +280,7 @@ pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
     }
     if next != data_end as u64 {
         // 規格 §7：entries 連續排列且**完整覆蓋**資料區——夾縫位元組是
-        // 有 bug 的 client 或損壞的表，不是可略的填充（Go 端同一檢查）。
+        // 有 bug 的 client 或損壞的表，不是可略的填充。
         return Err(CoreError::Corrupt {
             key: "<pack trailer>".to_owned(),
             reason: format!(
@@ -404,8 +404,8 @@ mod tests {
         let out = decompress_chunk(&ok, 8 * 1024 * 1024).unwrap();
         assert_eq!(out.len(), 1024 * 1024);
 
-        // 邊界：恰好等於上限的 chunk 是合法的（Go 端曾在此回歸——上限
-        // 釘在常數上，貼著設定的 chunk 寫得進讀不出）；差 1 就不是。
+        // 邊界：恰好等於上限的 chunk 是合法的（回歸守衛：上限若釘在常數
+        // 而非設定上，貼著設定的 chunk 會寫得進讀不出）；差 1 就不是。
         let exact = compress_chunk(&vec![0u8; 4 * 1024 * 1024]).unwrap();
         let out = decompress_chunk(&exact, 4 * 1024 * 1024).unwrap();
         assert_eq!(out.len(), 4 * 1024 * 1024);

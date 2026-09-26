@@ -433,8 +433,7 @@ async fn commit_checks_trees_that_were_marked_when_the_backup_started() {
 }
 
 /// 重傳被標記 pack 裡的 chunk，要逐 chunk 回報在 `report.packs_revived`
-/// （與 Go 端 `PacksRevived` 同一事件、同一計數單位；JSON／webhook 的
-/// 監控靠它看「這次 backup 從 GC 手裡救回多少資料」）。
+/// （JSON／webhook 的監控靠它看「這次 backup 從 GC 手裡救回多少資料」）。
 #[tokio::test]
 async fn report_counts_chunks_revived_from_marked_packs() {
     let t = TestRepo::new().await;

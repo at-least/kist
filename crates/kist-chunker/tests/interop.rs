@@ -1,11 +1,12 @@
-//! 跨語言 conformance 測試：同樣的向量由 Go 實作（internal/interop/）
-//! 消費。任何讓一邊期望值改變的格式改動，都會弄壞另一邊的 repo。
+//! conformance 測試：向量是凍結的 golden（原為與已移除的 Go 實作共用的
+//! 跨語言向量）。除非格式版本升級，永不重新產生——期望值一變，既有 repo
+//! 的切塊邊界或金鑰就對不上。
 
 use kist_chunker::Chunker;
 use kist_format::config::ChunkerParams;
 
-/// 共用的測試輸入：xorshift64* 產生的 bytes，與 Go 端同一函式逐 byte
-/// 相同。產生器本身就是 corpus；進 repo 的只有邊界清單。
+/// 測試輸入：xorshift64* 產生的 bytes。產生器本身就是 corpus；進 repo
+/// 的只有邊界清單，所以產生器與清單一樣是凍結的。
 fn corpus_bytes(seed: u64, n: usize) -> Vec<u8> {
     let mut out = vec![0u8; n];
     let mut state = seed;
@@ -54,16 +55,20 @@ fn interop_chunker_boundaries() {
             .chunks(std::io::Cursor::new(&data))
             .map(|c| c.expect("chunk").len())
             .collect();
-        assert_eq!(got.len(), want.len(), "{name}: chunk count differs from Go");
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{name}: chunk count differs from the frozen vector"
+        );
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-            assert_eq!(g, w, "{name}: chunk {i} differs from Go");
+            assert_eq!(g, w, "{name}: chunk {i} differs from the frozen vector");
         }
     }
 }
 
 #[test]
 fn interop_key_derivation() {
-    // 向量兩邊釘死；argon2 參數 64 MiB / t=3 / p=4。
+    // 凍結向量；argon2 參數 64 MiB / t=3 / p=4。
     let password = b"correct horse battery staple";
     let salt = [0x11u8; 16];
     let master = [0x42u8; 32];

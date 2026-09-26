@@ -11,8 +11,8 @@
 //! m 1..=8。shard hash 用無 key 的 BLAKE3-256（與 pack 名稱同一函式）。
 //!
 //! RS 數學用 `reed-solomon-erasure`（Backblaze JavaReedSolomon 的移植）；
-//! 已用固定向量雙向驗證與 Go 的 klauspost/reedsolomon 逐 byte 相容
-//! （Go 寫 Rust 修、Rust 寫 Go 修），跨實作修復可行。
+//! 曾以固定向量驗證與 klauspost/reedsolomon 逐 byte 相容。編碼輸出由凍結
+//! golden `tests/testdata/parity-golden.txt` 釘住，矩陣漂移會讓測試變紅。
 
 use reed_solomon_erasure::galois_8::Field;
 use reed_solomon_erasure::ReedSolomon;
@@ -33,9 +33,9 @@ pub const MAX_PARITY_SHARDS: usize = 8;
 
 /// 單一 shard 長度的上限（16 資料片 → parity 最後支援到 1 GiB 的 pack）。
 /// 擋下偽造 header 要求的大分配；`encode` 對超過此界限的 pack 直接拒絕
-/// （否則會寫出 `parse` 永遠拒收、修復端用不了的 sidecar）。與 Go 的
-/// maxShardLen 一致。注意：parse 層面偽造 header 仍可要求 pack_size 到
-/// 16 × MAX_SHARD_LEN，repair 的瞬時分配上界約 3 GiB——fuzz 時要知道。
+/// （否則會寫出 `parse` 永遠拒收、修復端用不了的 sidecar）。
+/// 注意：parse 層面偽造 header 仍可要求 pack_size 到 16 × MAX_SHARD_LEN，
+/// repair 的瞬時分配上界約 3 GiB——fuzz 時要知道。
 const MAX_SHARD_LEN: usize = 64 << 20;
 
 /// parity 物件的 key（`parity/<pack hex>`）。
@@ -43,7 +43,7 @@ pub fn key(pack_id: &ObjectId) -> String {
     format!("{PREFIX}/{}", pack_id.to_hex())
 }
 
-/// parity sidecar 物件。欄位宣告順序 = 規格欄位表順序 = Go struct 宣告順序。
+/// parity sidecar 物件。欄位宣告順序 = 規格欄位表順序（= CBOR 輸出順序）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Object {
     pub v: u32,
@@ -260,7 +260,7 @@ fn split(pack: &[u8], shard_len: usize, m: usize) -> Vec<Vec<u8>> {
 }
 
 /// 讓 damaged 恰好是 pack_size 長：過短補零、過長截斷。差異會以損壞 shard
-/// 的形式在 hash 檢查中現形，與 Go 的 padOrTrim 相同。
+/// 的形式在 hash 檢查中現形。
 fn pad_or_trim(damaged: &[u8], size: usize) -> Vec<u8> {
     let mut out = vec![0u8; size];
     let n = damaged.len().min(size);

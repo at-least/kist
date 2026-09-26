@@ -82,7 +82,7 @@ async fn superseded_index_blobs_are_ignored() {
 
 /// 寫入端必須擋住讀取端會拒絕的 tree（讀取路徑有 `Tree::validate`，seal 沒有）：
 /// 來源端冒出 `..`、重複或未排序的名稱時，backup 要當場失敗，而不是把
-/// 「兩種實作的讀取端都拒讀」的 tree 寫進 repo（Go 的 Encode 會擋）。
+/// 「所有讀取端都拒讀」的 tree 寫進 repo。
 #[tokio::test]
 async fn seal_tree_rejects_trees_readers_would_reject() {
     use kist_format::tree::{content_type, meta_kind, node_type, Entry, Tree};

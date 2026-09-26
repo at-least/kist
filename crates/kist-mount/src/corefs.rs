@@ -2,7 +2,7 @@
 //! —— [`FsCore`] 吃 `Repository`、吐 `Attr`/`Listing`/bytes，`crate::fuse` 只做
 //! fuser 回覆的轉接；測試直接開 `FsCore`，不用真的掛載。
 //!
-//! 佈局（對齊 Go 參考實作）：`<client id hex>/<timestamp>/<備份的樹>`。頂兩層
+//! 佈局：`<client id hex>/<timestamp>/<備份的樹>`。頂兩層
 //! volatile（每次看都重列、TTL 1 秒）、snapshot 內容 immutable（內容定址，TTL
 //! 24 小時）。看到沒見過的 snapshot key 就主動重載一次 index——新 snapshot 可能
 //! 引用 mount 當下那份 index 沒有的 pack（限流 1 秒一次，key 一律記為「看過」，
@@ -424,8 +424,7 @@ impl FsCore {
                     };
                     pairs.push((root.clone(), contents));
                 }
-                // 敵意 locator（NUL 等非法組件）在這裡拒成 I/O 錯——
-                // 與 Go 的 mount Lookup（ErrInvalid）同款。
+                // 敵意 locator（NUL 等非法組件）在這裡拒成 I/O 錯。
                 let vroot = Arc::new(VirtualRoot::build(pairs).map_err(|_| FsError::InvalidInput)?);
                 let attr = Attr::dir(0o555, info.time_ns);
                 let ino = {

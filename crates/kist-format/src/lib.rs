@@ -2,8 +2,8 @@
 //! 其他 crate 只能透過這裡讀寫 repo 內容。
 //!
 //! 這個 crate 只描述「bytes 長什麼樣」，**不持有任何金鑰**：加密／解密由
-//! `kist-crypto` 負責。完整規格見 `docs/format.md`（v3 定案，與 Go 實作
-//! 共用同一份）；任何改動都必須同步更新該文件、golden files，**以及 Go 實作**。
+//! `kist-crypto` 負責。完整規格見 `docs/format.md`（v3 定案）；任何改動
+//! 都必須同步更新該文件與 golden files。
 //!
 //! 模組一覽：
 //! - [`ids`]：`ChunkId` / `TreeId`（keyed hash）與 `ObjectId`（pack/index 的密文 hash）。

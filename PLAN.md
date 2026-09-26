@@ -8,12 +8,11 @@
 去重、加密、可多台機器共用 repo 的備份工具，對象是 object storage（S3 相容）優先，其次本機與 SFTP。
 設計目標依序：資料安全性 > 還原可靠性 > 抗勒索 > 效能 > 功能數量。
 
-**本 repo 是 monorepo：根目錄的 Rust 工作區是正式產品與格式標竿**；`go/`
-（同一 repo 內的 Go 參考實作）只用来交叉驗證格式與抓 bug，不單獨演進。
-兩邊共用同一份 `docs/format.md`（v3，權威規格）與跨語言 conformance
-向量；任何格式改動都要同時改兩邊、golden、向量與 E2E。設計取捨以產品
-（Rust）為優先，不為遷就 Go 選次級方案（2026-09-05 的 CBOR 欄位順序
-修訂就是這個原則的執行）。
+**本 repo 只有一份實作：根目錄的 Rust 工作區，是正式產品與格式標竿。**
+`docs/format.md`（v3）是權威規格；格式相容性由凍結的 v3 fixture repo
+（`crates/kist-core/tests/fixtures/`，永不重生、只在格式升版時換）把關。
+原本的 Go 參考實作已於 2026-09-27 移除（見下方 M9 與 ADR 018）；需要時
+可從 commit `80b89ed` 取回：`git checkout 80b89ed -- go`。
 
 競品參考：restic（穩定但有鎖、記憶體重）、Kopia（pack + 無鎖，最接近我們）、Duplicacy（無鎖 GC 但一 chunk 一檔）。
 我們要的是 Kopia 的儲存效率 + Duplicacy 的無鎖 GC + 原生抗勒索設計 + Rust 帶來的低記憶體與安全性。
@@ -342,6 +341,27 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   -race/lint、Rust fmt/clippy/test --workspace/deny、MinIO 整合、
   format.md 同步）皆在本 session 以實機重驗綠燈。
 
+## M9：移除 Go 參考實作（2026-09-27）【完成】
+
+依 git 歷史稽核（42 個跨語言事件逐件對抗複核）：Go 是「必要」的只有 1 件
+（51be5ed，安全失敗方向、重試自癒）；自動化跨語言檢查歷來抓到 0 件，且設計上
+擋不住 Rust 單邊改格式；同作者互抄，移植複製 bug 多於抓出 bug；成本約佔 repo
+手寫程式 48%。決定與數字見 ADR 018。
+
+- 刪除 `go/`（170 個檔）、`ci.yml`（Go CI）、`release.yml`（goreleaser）、
+  `ci-rust.yml` 的 interop job、`.gitignore` 的 Go 區塊。
+- 補償一：凍結的 v3 fixture repo ＋ `crates/kist-core/tests/fixture_v3.rs`
+  （開啟、`check --read-data`、還原比對、重新編碼逐 byte、零新 chunk、parity
+  修復、`.r1` 讀回）。反向對照：CBOR 欄位改名、`CTX_HASH_KEY` 改字、gear 表改
+  一個值，各自讓對應測試變紅。
+- 補償二：唯一「必要」案例的 Go 測試改寫移植成
+  `prune.rs::backup_and_prune_recover_from_a_crashed_sweep`（backup 移到第二輪
+  prune 之前，才走得到 touch 分支；差異見 ADR 018 決定 3）；拿掉 51be5ed 的
+  修正時它以 `TreeMarked` 失敗。
+- Rust 原始碼裡指向 Go 的註解改成直接陳述規則；`docs/format.md` 只改流程
+  敘述（單一實作、fixture），規範性規則未動。原本共用的向量檔（tree-canonical、
+  chunker 邊界、parity golden、金鑰向量）留下當凍結 golden。
+
 ## 已接受的限制（非待辦）
 
 - **Windows VSS 與 Windows 路徑語意驗證**：裁示為已接受的限制，自路線圖移除
@@ -383,7 +403,7 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   M8 monorepo 重排後 ci.yml 第一次真正跑，暴露的問題：lint 三平台全敗
   與 setup-go 快取永遠 miss——`defaults.run.working-directory` 不作用於
   `uses:` action（golangci-lint-action 與 setup-go 快取都要自帶路徑），
-  當天已修（actionlint 過）。**真實 bug 兩件待辦**：① Windows 上
+  當天已修（actionlint 過）。**真實 bug 兩件待辦**（2026-09-27 後記：① 只存在於 Go，隨 M9 移除而失效；② 兩端當時都已修）：① Windows 上
   `internal/cmd`／`internal/repo` 測試全敗——來源根路徑 `C:\Users\…`
   被整段寫成 tree entry 名稱，違反 v3「entry 名稱＝單一路徑元件」，
   restore 據此拒絕（Windows 路徑切分未處理倒斜線與磁碟機代號）；

@@ -125,16 +125,16 @@ fn locator_components(path: &[u8]) -> Result<Vec<&[u8]>, String> {
     };
     rest.split(|&b| b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
-        // `..` 映射成 `__parent__`：與 fsmeta::locator_to_relative、Go 端
-        // locatorComponents 同一套規則——字面 `..` 是 FUSE 核心自己的
-        // 東西，虛擬層重複吐一個只會是不可達的同名 entry。
+        // `..` 映射成 `__parent__`：與 fsmeta::locator_to_relative 同一套
+        // 規則——字面 `..` 是 FUSE 核心自己的東西，虛擬層重複吐一個只會是
+        // 不可達的同名 entry。
         .map(|c| {
             if c == b".." {
                 Ok(b"__parent__" as &[u8])
             } else if c.contains(&0u8) {
-                // NUL 不是合法的 FUSE 目錄項位元組：Go 端的
-                // locatorComponents 在這裡回 ErrInvalid，mount 不得是
-                // 三個消費者（Go mount、兩端 restore）中唯一收下的。
+                // NUL 不是合法的 FUSE 目錄項位元組：restore 的
+                // fsmeta::locator_to_relative 也拒，mount 不得是讀取
+                // 通路中唯一收下的。
                 Err(format!("locator contains a NUL byte: {c:?}"))
             } else {
                 Ok(c)
@@ -255,9 +255,8 @@ mod tests {
         assert!(root.top().is_empty());
     }
 
-    /// 敵意 locator 帶 NUL：Go 的 locatorComponents 與 Rust 的
-    /// fsmeta::locator_to_relative 都拒，mount 不得是唯一收下的通路
-    /// （NUL 不是合法的 FUSE 目錄項位元組）。
+    /// 敵意 locator 帶 NUL：fsmeta::locator_to_relative 拒，mount 不得是
+    /// 唯一收下的通路（NUL 不是合法的 FUSE 目錄項位元組）。
     #[test]
     fn nul_in_locator_is_rejected() {
         let mut path = b"/a/b".to_vec();
@@ -323,8 +322,8 @@ mod tests {
         );
     }
 
-    /// `..` 組件的對映必須與 fsmeta::locator_to_relative（和 Go 端的
-    /// locatorComponents）同一套：映射成 `__parent__`，不是留下字面 `..`。
+    /// `..` 組件的對映必須與 fsmeta::locator_to_relative 同一套：
+    /// 映射成 `__parent__`，不是留下字面 `..`。
     /// 字面 `..` 在 FUSE 目錄裡是核心自己的東西，虛擬層重複吐一個
     /// 不可達的同名 entry。
     #[test]

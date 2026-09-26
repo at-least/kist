@@ -1,5 +1,8 @@
-# Sources and goldens are byte-exact on every platform: gofmt rejects
-# CRLF, and the golden tests compare bytes.
+# Sources and goldens are byte-exact on every platform: the golden tests
+# compare bytes, so no CRLF conversion.
 * text=auto eol=lf
 *.hex text eol=lf
 *.txt text eol=lf
+# The frozen fixture repo is raw repository bytes (encrypted objects and
+# 8-byte marker files): never normalize or diff it.
+crates/kist-core/tests/fixtures/** -text -diff

@@ -103,7 +103,7 @@ async fn modified_file_is_picked_up_and_only_it_is_new() {
     assert_same_tree(&src, &restored);
 }
 
-/// FIFO 這類非正規檔案必須跳過並記一筆略過（與 Go 實作同款）；
+/// FIFO 這類非正規檔案必須跳過並記一筆略過；
 /// 不能把 open（FIFO 無寫端會無限阻塞）帶進 backup——那會讓整個備份掛死。
 #[cfg(unix)]
 #[tokio::test]
@@ -477,7 +477,7 @@ async fn xattrs_survive_backup_restore() {
 
 /// docs/format.md §9 釘的 stats 口徑：`dirs` 含來源目錄本身、不含合成根
 /// tree；`files` 依名字計（hard link 各算一個）；`bytes` 同一份 hard link
-/// 內容只算一次。Go 參考實作以同一組數字斷言（internal/repo/backup_test.go）。
+/// 內容只算一次。
 #[cfg(unix)]
 #[tokio::test]
 async fn stats_count_dirs_without_root_tree_and_hard_link_bytes_once() {

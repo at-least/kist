@@ -351,13 +351,12 @@ impl Source for ObjectStoreSource {
         // 根列舉時先 HEAD prefix 本身：若它是「檔案來源」（prefix 即一顆
         // 物件），list_with_delimiter 會把同名物件藏起來、回傳空清單——
         // 實機測試（MinIO）證實。此時回傳該物件單一條目，走訪端即可走
-        // 檔案來源分支（與 Go 實作一致）。
-        // 與 Go 同守衛（go/internal/source/s3.go）：定位以 `/` 收尾是
+        // 檔案來源分支。
+        // 守衛：定位以 `/` 收尾是
         // 「目錄」的明示，不能拿去 HEAD 同名物件——s3fs 一類工具會放
         // 0-byte folder marker，HEAD 200 會讓整個來源退化成單一空檔案、
         // 真正的內容全部不見；裸 bucket（空 root）也沒有可 HEAD 的鍵。
-        // sftp 來源的 root 恆為空（本守衛因此不啟動）：Go 端的 sftp
-        // source 本來就沒有 probe，兩端收斂。
+        // sftp 來源的 root 恆為空，本守衛因此不啟動。
         if dir.is_empty() && !self.root.as_ref().is_empty() && !self.locator.ends_with(b"/") {
             if let Some(item) = self.head_root_file()? {
                 return Ok(Box::new(StoreListing {
@@ -584,8 +583,8 @@ mod s3_root_probe_tests {
 
     /// `s3://bucket/data/`（尾巴的 `/`＝明示「這是目錄」）不可以拿去 HEAD
     /// 同名物件：s3fs 一類工具會放 0-byte folder marker，HEAD 200 會讓整個
-    /// 來源退化成單一空檔案、`data/` 的真正內容全部不見。與 Go 同守衛
-    /// （go/internal/source/s3.go：`Prefix != "" && !HasSuffix(spec, "/")`）。
+    /// 來源退化成單一空檔案、`data/` 的真正內容全部不見。守衛：root 非空
+    /// 且定位不以 `/` 收尾，才 HEAD。
     #[tokio::test]
     async fn trailing_slash_locator_skips_the_root_file_probe() {
         let store = object_store::memory::InMemory::new();

@@ -267,8 +267,8 @@ async fn symlink_in_the_way_of_a_file_is_refused() {
     );
 }
 
-/// 定位組件含 NUL 必須回錯（與 Go 端 restore.go 的 locatorComponents
-/// 同判斷）：NUL 不是路徑元件，Unix 上會在 syscall 層 EINVAL。
+/// 定位組件含 NUL 必須回錯：NUL 不是路徑元件，
+/// Unix 上會在 syscall 層 EINVAL。
 #[test]
 fn locator_with_nul_component_is_rejected() {
     use kist_core::fsmeta::locator_to_relative;
@@ -280,7 +280,7 @@ fn locator_with_nul_component_is_rejected() {
 }
 
 /// 讀取端對 snapshot 內容也要跑結構驗證（`Snapshot::validate`：roots 非空、
-/// 排序、唯一；Go 在 save 與 load 都跑）：解得開但結構不合法的 snapshot
+/// 排序、唯一；save 與 load 都跑）：解得開但結構不合法的 snapshot
 /// 要以 Corrupt 拒絕，不能被 restore/mount 當正常資料。
 #[tokio::test]
 async fn snapshot_with_invalid_structure_is_rejected_on_read() {
@@ -316,8 +316,8 @@ async fn snapshot_with_invalid_structure_is_rejected_on_read() {
 /// 下一層；金鑰持有者寫得出，見 threat model「owns the repository」）。
 /// restore 與 check 的走訪是有界堆疊上的遞迴：超過深度上限必須**乾淨回錯**
 /// （restore 記進 summary.errors、check 記進 report.errors），不是把整個
-/// process 墊進 stack overflow。上限 [`kist_core::MAX_TREE_DEPTH`] 與 Go
-/// 實作的 `maxTreeDepth` 是同一個數，文件寡在 docs/format.md §8.4。
+/// process 墊進 stack overflow。上限 [`kist_core::MAX_TREE_DEPTH`] 文件寡在
+/// docs/format.md §8.4。
 /// 測試本體在明確指定大小的執行緒上跑：debug build 的遞迴 frame 是 release
 /// 的好幾倍大（實測 256 層深就要 >2 MiB，release 下的 2 MiB tokio worker
 /// 綽綽有餘），libtest 預設執行緒的堆疊承載不了深鏈的 debug frame。
