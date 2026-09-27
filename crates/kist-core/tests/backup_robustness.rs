@@ -316,3 +316,35 @@ async fn bytes_stored_counts_the_indirect_chunk_list_too() {
         "bytes_stored 要等於 pack 裡實存 chunk 的明文 bytes（含間接清單 chunk）"
     );
 }
+
+/// ADR 019 A12：parity 份數超出 0..=MAX_PARITY_SHARDS 時，backup 在入口就回 Usage，
+/// repo 裡一個物件都不多。過去是照常備份成功、parity::encode 失敗只記 warn，
+/// 靜默變成沒有冗餘。對照組：上限 8 仍然寫出 sidecar。
+#[tokio::test]
+async fn parity_out_of_range_is_rejected_before_writing_anything() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+
+    for m in [9u8, 255] {
+        let before = walk_files(&t.repo_path());
+        let mut opts = backup_options();
+        opts.parity = m;
+        let got = repo.backup(std::slice::from_ref(&src), opts).await;
+        assert!(
+            matches!(got, Err(kist_core::CoreError::Usage(_))),
+            "parity {m} 應該回 Usage，實際：{got:?}"
+        );
+        assert_eq!(
+            walk_files(&t.repo_path()),
+            before,
+            "parity {m} 被拒時不得寫任何物件"
+        );
+    }
+
+    let mut opts = backup_options();
+    opts.parity = 8;
+    repo.backup(std::slice::from_ref(&src), opts).await.unwrap();
+    assert!(t.count("parity") > 0, "parity 8 應該寫出 sidecar");
+}

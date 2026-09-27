@@ -167,8 +167,11 @@ impl Config {
                 ));
             }
             self.schedule_of(b.schedule.as_deref(), "[backup]")?;
-            if b.parity > 8 {
-                return Err(AppError::Config("[backup] parity must be 0..=8".to_owned()));
+            if usize::from(b.parity) > kist_core::MAX_PARITY_SHARDS {
+                return Err(AppError::Config(format!(
+                    "[backup] parity must be 0..={}",
+                    kist_core::MAX_PARITY_SHARDS
+                )));
             }
         }
         if let Some(f) = &self.forget {
@@ -381,5 +384,25 @@ mod gc_grace_tests {
             cfg("[prune]\nrepack_below = 40\n").gc_grace(),
             kist_core::PruneOptions::default().grace
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod parity_tests {
+    use super::*;
+
+    fn with_parity(m: u32) -> Config {
+        Config::parse(&format!(
+            "repo = \"x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nparity = {m}\n"
+        ))
+        .unwrap()
+    }
+
+    /// `[backup] parity` 的上限就是 MAX_PARITY_SHARDS（ADR 019 A12）：8 收、9 拒。
+    #[test]
+    fn parity_above_max_is_rejected() {
+        assert!(with_parity(8).validate().is_ok());
+        assert!(with_parity(9).validate().is_err());
     }
 }

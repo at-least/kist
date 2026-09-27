@@ -35,6 +35,9 @@ pub use backup::{
 pub use check::{CheckOptions, CheckReport};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
+/// parity 份數的上限。CLI 與 kist-app 的設定檢查都用它，不各寫字面值
+/// （kist-app 不直接依賴 kist-format，所以從這裡轉出去）。
+pub use kist_format::parity::MAX_PARITY_SHARDS;
 pub use prune::{PruneOptions, PrunePlan, PruneReport, MAX_EFFECTIVE_BLOBS};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};

@@ -113,7 +113,8 @@ pub struct BackupOptions {
     pub now: Option<time::OffsetDateTime>,
     /// 標記超過這麼久的 pack 視同已刪（commit 前的驗證）。必須與 prune 用的一致。
     pub gc_grace: std::time::Duration,
-    /// 每個 pack 旁要存幾片 Reed-Solomon 同位（0..=8；0 = 不存，預設）。
+    /// 每個 pack 旁要存幾片 Reed-Solomon 同位（0..=MAX_PARITY_SHARDS，即 0..=8；
+    /// 0 = 不存，預設）。超出範圍時 backup 一開始就回 `CoreError::Usage`。
     /// 同位寫失敗只警告、不讓 backup 失敗：資料已安全，缺的只是冗餘。
     pub parity: u8,
     /// 進度回報（給 UI 顯示）；`None` = 不回報。
@@ -699,6 +700,16 @@ impl Repository {
         paths: &[PathBuf],
         opts: BackupOptions,
     ) -> Result<PreparedBackup> {
+        // parity 份數超出範圍：parity::encode 會失敗、只記 warn，整次 backup 靜默
+        // 變成沒有冗餘。在寫任何東西之前擋下（CLI 與設定檔各擋一次，這裡是函式庫層）。
+        if usize::from(opts.parity) > parity::MAX_PARITY_SHARDS {
+            return Err(CoreError::Usage(format!(
+                "parity must be 0..={}, got {}",
+                parity::MAX_PARITY_SHARDS,
+                opts.parity
+            )));
+        }
+
         // snapshot 的時間 = 開始時間：任何在這之後改動的檔案，下一次都必須重讀
         let started = opts.now.unwrap_or_else(time::OffsetDateTime::now_utc);
 

@@ -451,8 +451,8 @@ async fn run(cli: Cli) -> Result<()> {
             gc_grace,
             parity,
         } => {
-            if parity > 8 {
-                anyhow::bail!("--parity must be 0..=8");
+            if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
+                anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
             }
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
