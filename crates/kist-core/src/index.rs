@@ -339,22 +339,22 @@ impl ChunkIndex {
         }
     }
 
-    /// 同 [`Self::add_pack`]，但合併規則帶 rank（例如「未標記優先，
-    /// 其次名稱最小」）：`rank` 對 pack 名稱回傳排序鍵的前半，越小越
-    /// 優先。同一 chunk 出現在多個 blob 時，保留 rank 最小的位置——
-    /// 與 prune 的正本選擇同一個排序。既有與新來的位置都用同一個
-    /// `rank` 計算，合併結果才是 pack 集合的純函數、與 blob 載入順序
-    /// 無關（[`Self::add_pack`] 文件所述的不變量）。
+    /// 同 [`Self::add_pack`]，但合併規則帶 rank：「未標記優先，其次名稱
+    /// 最小」（`canonical_rank`），`rank` 回答某個 pack 是否被標記。
+    /// 同一 chunk 出現在多個 blob 時，保留 rank 最小的位置——與 prune 的
+    /// 正本選擇同一個排序。既有與新來的位置都用同一個 `rank` 計算，合併
+    /// 結果才是 pack 集合的純函數、與 blob 載入順序無關（[`Self::add_pack`]
+    /// 文件所述的不變量）。
     pub fn add_pack_ranked(&mut self, pack: &IndexPack, rank: impl Fn(&ObjectId) -> bool) {
         self.packs.insert(pack.pack, pack.size);
-        let new_rank = (rank(&pack.pack), pack.pack);
+        let new_rank = canonical_rank(pack.pack, &rank);
         for e in &pack.entries {
             match self.overlay.get(&e.id) {
                 // 既有位置也要算真 rank（它在哪個 pack、該 pack 是否被標記），
                 // 才是與 prune 同一個全序；寫死 `false` 會讓「先進來的
                 // 被標記位置」永遠贏過後到的未標記位置，結果隨 blob
                 // 載入順序擺盪。
-                Some(existing) if (rank(&existing.pack), existing.pack) <= new_rank => {}
+                Some(existing) if canonical_rank(existing.pack, &rank) <= new_rank => {}
                 Some(_) | None => {
                     self.overlay.insert(e.id, location(pack.pack, e));
                 }
@@ -395,6 +395,17 @@ fn location(pack: ObjectId, e: &PackEntry) -> ChunkLocation {
         length: e.length,
         raw_len: e.raw_len,
     }
+}
+
+/// 同一個 chunk 有多個持有 pack 時的正本排序鍵（規格 §10）：**未標記優先，
+/// 其次名稱最小**。鍵越小越優先（`false < true`）。
+/// backup 的 index 合併（[`ChunkIndex::add_pack_ranked`]）與 prune 的正本選擇
+/// 都用這一個函式：同一條規則只寫一次，兩邊才不會各自寫出不同的比較式。
+pub(crate) fn canonical_rank(
+    pack: ObjectId,
+    is_marked: &dyn Fn(&ObjectId) -> bool,
+) -> (bool, ObjectId) {
+    (is_marked(&pack), pack)
 }
 
 /// 走訪（check/prune 共用）對 chunk 查詢的最小介面。check 用完整的

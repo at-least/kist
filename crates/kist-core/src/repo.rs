@@ -544,6 +544,8 @@ impl Repository {
     /// **未標記 pack 優先、其次名稱最小**——與 prune 的正本選擇同一個
     /// rank（規格 §10、§13.1）。沒有這條規則，smallest-wins 會把 chunk
     /// 導向被標記的舊副本，backup 在 prune 收掉它之前每次都重傳。
+    /// commit gate 重新解析時也用它：與開始時同一條 rank，否則會解析到
+    /// 被標記的舊副本而誤拒。
     /// 不走本地快取：快取的位置是歷史選擇，不知道標記集合。
     pub(crate) async fn load_index_for_backup(
         &self,

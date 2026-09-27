@@ -571,6 +571,10 @@ impl Repository {
     /// 為什麼要逐 chunk 而不是逐 pack：prune 的 repack 只搬「有 snapshot 引用」的 chunk，
     /// 進行中的 backup 去重到的 chunk 在它看來是死的，會被丟掉；舊 pack 雖然還在（孤兒、等 grace），
     /// 但 index 已經不指它，下一輪 GC 就會刪。這裡抓到就安全失敗（不寫 snapshot），重跑會重傳那些 chunk。
+    ///
+    /// 重新解析必須用與 backup 開始時同一條 rank（未標記優先，其次名稱最小，規格 §10）：
+    /// 不看標記的 `load_index` 在舊 pack 名稱排在前面時會解析到被標記、已過 grace 的
+    /// 舊副本而誤拒，即使 chunk 在未標記的新 pack 裡好好的（ADR 019 C1）。
     async fn verify_referenced_chunks(
         &self,
         referenced: &HashMap<ObjectId, Vec<ChunkId>>,
@@ -586,7 +590,8 @@ impl Repository {
             return Ok(());
         }
         let expired = |pack: &ObjectId| marks.get(pack).is_some_and(|m| *m + grace <= now);
-        let fresh = self.load_index().await?;
+        let marked: HashSet<ObjectId> = marks.keys().copied().collect();
+        let fresh = self.load_index_for_backup(&marked).await?;
         let mut pack_ok: HashMap<ObjectId, bool> = HashMap::new();
         for (old_pack, chunks) in referenced {
             if own_packs.contains(old_pack) {

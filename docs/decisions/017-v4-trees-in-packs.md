@@ -162,9 +162,6 @@ V3-KEYS-1、V3-TREE-1；跨語言實際存在的是 tree-canonical.hex、chunker
 - 壞掉的 index blob 目前讓所有 client 停擺且 rebuild-index 清不掉（只寫新 blob
   不刪舊的）：backup 與 restore 改寬鬆跳過並記錄，prune 維持嚴格拒絕，補一個
   維護命令刪掉解不開的 blob。
-- canonical rank 函數單一來源加向量：同一條規則在兩份實作裡以不同方式出錯
-  ——Rust 2026-09-13 修的是比較式把既有位置的標記寫死成 false；Go 185ed78 則是
-  照 Rust 補上 Go 在 v2 從未實作的標記 rank（測試名稱從 Rust 搬過去）。
 
 ## 決定 3：不改格式就能先做的債
 
@@ -181,6 +178,16 @@ V3-KEYS-1、V3-TREE-1；跨語言實際存在的是 tree-canonical.hex、chunker
   角色零；維護：config、`check --repair` 同名重寫）。
 - ADR 014 表格的 O_EXCL 列要改：查證者實測 rclone v1.75.0 是**靜默忽略**
   O_EXCL，不是回 OpUnsupported；`rclone://` 維持明確降級模式不變。
+- canonical rank 函數單一來源（**已做**，ADR 019 C1，與這段改寫同一個 commit）：
+  規格 §10「未標記優先，其次名稱最小」在 Rust 內部手寫了兩份（add_pack_ranked
+  與 prune 的正本選擇），改成共用 index.rs 的 `canonical_rank`。而且已實測誤拒：
+  commit gate 用不看標記的 `load_index` 重新解析，會解析到被標記、已過 grace 的
+  舊 pack 而拒絕 commit（ADR 019 的真 prune repack 探針：修正前 11/32 回誤拒，
+  離線 client 擋住下一輪 prune 時重跑仍失敗；gate 改用有 rank 的
+  `load_index_for_backup` 之後 0/32），回歸測試是 commit_gate_rank.rs。這條與
+  格式無關，不必等 v4；決定 1 的 GC 時間線第 3 步「commit gate 確認 T 解析到 M2」
+  也以它為前提。原本附帶的「加向量」不在 C1 範圍，未做；快取「新的贏」的合併
+  規則要不要改另案。
 
 ## Go 參考實作（已決定：2026-09-27 移除）
 

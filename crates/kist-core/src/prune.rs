@@ -43,7 +43,7 @@ use kist_format::pack::PackEntry;
 use kist_format::{keys, ChunkId, ObjectId};
 use time::OffsetDateTime;
 
-use crate::index::{ChunkLocation, ChunkLocator, TableRecord};
+use crate::index::{canonical_rank, ChunkLocation, ChunkLocator, TableRecord};
 use crate::pack::{decode_chunk, PackWriter};
 use crate::repo::{IndexBlobs, Repository};
 use crate::{blocking, CoreError, Result};
@@ -204,10 +204,11 @@ impl PruneIndex {
             while i < self.records.len() && self.records[i].id == *chunk {
                 let pid = self.records[i].location.pack;
                 if !phantoms.contains(&pid) {
-                    let rank = (is_marked(&pid), pid);
                     let better = match best {
                         None => true,
-                        Some((bp, _)) => rank < (is_marked(&bp), bp),
+                        Some((bp, _)) => {
+                            canonical_rank(pid, is_marked) < canonical_rank(bp, is_marked)
+                        }
                     };
                     if better {
                         best = Some((pid, self.records[i].location.length));
