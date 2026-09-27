@@ -249,12 +249,18 @@ pub fn apply_xattrs(
             continue;
         }
         let name = std::ffi::OsStr::from_bytes(name);
-        file.set_xattr(name, value.as_ref())
-            .map_err(|e| CoreError::io(path, e))
-            .map_err(|e| CoreError::Corrupt {
-                key: path.display().to_string(),
-                reason: format!("setting xattr {}: {e}", name.to_string_lossy()),
-            })?;
+        // 本機的 I/O 錯誤，不是 repo 損壞（ADR 019 A30）：維持 Io、保留錯誤
+        // 種類，訊息帶 xattr 名稱（寫法同 owner_error）。
+        file.set_xattr(name, value.as_ref()).map_err(|e| {
+            let kind = e.kind();
+            CoreError::io(
+                path,
+                std::io::Error::new(
+                    kind,
+                    format!("setting xattr {}: {e}", name.to_string_lossy()),
+                ),
+            )
+        })?;
     }
     Ok(())
 }
@@ -418,6 +424,28 @@ mod xattr_tests {
             b"1"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR 019 A30：xattr 設不上去是本機的 I/O 錯誤，不是 repo 物件損壞：回
+    /// Io、訊息帶 xattr 名稱。名稱超過 XATTR_NAME_MAX（255 bytes）設不上去
+    /// （btrfs 實測 ERANGE）；檔案系統不支援 user.* 也一樣失敗，所以不看 errno。
+    #[test]
+    fn xattr_failure_is_an_io_error_not_corrupt() {
+        use serde_bytes::ByteBuf;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        let name = format!("user.{}", "x".repeat(300));
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            ByteBuf::from(name.as_bytes().to_vec()),
+            ByteBuf::from(b"v".to_vec()),
+        );
+        let err = super::apply_xattrs(&file, &path, Some(&map)).expect_err("名稱過長要失敗");
+        assert!(matches!(err, crate::CoreError::Io { .. }), "{err:?}");
+        let msg = err.to_string();
+        assert!(!msg.contains("corrupt"), "{msg}");
+        assert!(msg.contains(&name), "要點名哪個 xattr：{msg}");
     }
 }
 

@@ -103,14 +103,15 @@ impl DirHandle {
     }
 
     /// 回報「`name` 處擋著一個 symlink／非目錄」。unix 開目錄失敗之後才呼叫，
-    /// 那時只為了挑訊息再看一眼；看不到就當非目錄。
+    /// 那時只為了挑訊息再看一眼；看不到就當非目錄。這是本機的擋路物，不是
+    /// repo 損壞（ADR 019 A30）。
     fn in_the_way_of_dir(&self, name: &OsStr) -> CoreError {
         let what = match self.kind_of(name) {
             Ok(Some(Kind::Symlink)) => "a symlink",
             _ => "a non-directory",
         };
-        CoreError::Corrupt {
-            key: self.child_path(name).display().to_string(),
+        CoreError::RestoreBlocked {
+            path: self.child_path(name),
             reason: format!("{what} is in the way of a restored directory"),
         }
     }

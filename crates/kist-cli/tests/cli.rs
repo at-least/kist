@@ -306,6 +306,39 @@ fn backup_with_unreadable_file_writes_snapshot_but_exits_nonzero() {
     assert_eq!(snaps, 1);
 }
 
+/// ADR 019 A30：還原目標處擋著使用者自己的 symlink：那一項失敗、結束碼 3（與
+/// 以前相同），訊息點名擋路的本機路徑，不說 repo 物件損壞。
+#[cfg(unix)]
+#[test]
+fn restore_with_a_symlink_in_the_way_exits_3_without_blaming_the_repo() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let target = env.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    std::fs::create_dir_all(&restored).unwrap();
+    let link = restored.join("a.txt");
+    std::os::unix::fs::symlink(env.dir.path().join("elsewhere"), &link).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["restore", "latest", target.to_str().unwrap()])
+        .env("KIST_REPO", env.repo())
+        .env("KIST_PASSWORD", "cli test password")
+        .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&link.display().to_string()),
+        "要點名擋路的路徑：{stderr}"
+    );
+    assert!(!stderr.contains("corrupt"), "本機擋路被報成損壞：{stderr}");
+}
+
 #[cfg(unix)]
 fn nix_is_root() -> bool {
     use std::os::unix::fs::MetadataExt;

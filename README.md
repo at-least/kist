@@ -50,6 +50,9 @@ kist forget --keep-last 10 --prune      # 一次做完
 時目標處原有的檔不動（以前會被刪掉），擋路的 symlink、目錄或特殊檔回報錯誤、不動它；再還原到先前
 還原出的唯讀目錄（例如 0555）時，會暫時加上擁有者寫入權，最後套回記錄的 mode。覆寫大檔時新舊兩份
 會同時佔空間；Ctrl-C 中斷的 restore 可能留下 `.kist-restore-*`，可以直接刪掉。
+這類本機擋路（含目錄位置上擋著的 symlink 或非目錄）與 xattr 設不上去的錯誤，訊息不再說「object …
+is corrupt」，改成「<路徑>: a symlink is in the way of a restored file」之類（`restore --json` 的
+`errors` 字串同樣改變）；結束碼不變。
 
 `restore` 在目標之下逐層開著目錄往下寫（unix；Windows 不變）：還原途中某一層被換成 symlink，寫入仍落在
 原本開著的那個目錄，不會跟著 symlink 寫到目標之外（以前會）。因此目標本身與其下既有的目錄都要可讀——

@@ -274,7 +274,8 @@ fn link_over(
 
 /// 正式檔名處已有的東西：沒有、或是一般檔（會被 rename 取代）→ 放行；
 /// symlink、目錄、特殊檔（FIFO、socket、裝置）→ 拒絕，而且不刪它、不跟隨
-/// （ADR 019 A2 裁定：擋路的 symlink 維持拒絕）。
+/// （ADR 019 A2 裁定：擋路的 symlink 維持拒絕）。擋路的是本機的東西，不是
+/// repo 損壞（ADR 019 A30）。
 fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
     let what = match dir.kind_of(name)? {
         None | Some(Kind::File) => return Ok(()),
@@ -282,8 +283,8 @@ fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
         Some(Kind::Dir) => "a directory",
         Some(Kind::Special) => "a special file",
     };
-    Err(CoreError::Corrupt {
-        key: dir.child_path(name).display().to_string(),
+    Err(CoreError::RestoreBlocked {
+        path: dir.child_path(name),
         reason: format!("{what} is in the way of a restored file"),
     })
 }
@@ -705,12 +706,12 @@ impl Repository {
 }
 
 /// 建 symlink 前先移除既有的檔案或 symlink（第二次 restore 到同一目錄）；既有的是
-/// 目錄則回錯。都經 `dir` 這一層的 handle（ADR 019 A4）。
+/// 目錄則回本機擋路的錯（ADR 019 A30）。都經 `dir` 這一層的 handle（ADR 019 A4）。
 fn replace_with_symlink(dir: &DirHandle, name: &OsStr, link_target: &Path) -> Result<()> {
     match dir.kind_of(name) {
         Ok(Some(Kind::Dir)) => {
-            return Err(CoreError::Corrupt {
-                key: dir.child_path(name).display().to_string(),
+            return Err(CoreError::RestoreBlocked {
+                path: dir.child_path(name),
                 reason: "a directory is in the way of a symlink".to_owned(),
             });
         }

@@ -267,6 +267,97 @@ async fn symlink_in_the_way_of_a_file_is_refused() {
     );
 }
 
+/// ADR 019 A30：目標處本機的擋路物（使用者自己放的 symlink、目錄）不是 repo
+/// 損壞：錯誤不能說「object … is corrupt」，要點名擋路的本機路徑。控制流程
+/// 不變：檔案、子目錄、symlink 各記一筆節點錯誤，其餘照常還原。
+#[cfg(unix)]
+#[tokio::test]
+async fn local_obstacles_in_the_tree_are_not_reported_as_corrupt() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src); // small.txt、sub/、link -> small.txt
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let outside = t.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = t.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    std::fs::create_dir_all(&restored).unwrap();
+    let file_link = restored.join("small.txt");
+    let dir_link = restored.join("sub");
+    let dir_on_symlink = restored.join("link");
+    std::os::unix::fs::symlink(outside.join("f"), &file_link).unwrap();
+    std::os::unix::fs::symlink(&outside, &dir_link).unwrap();
+    std::fs::create_dir(&dir_on_symlink).unwrap();
+
+    let summary = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.errors.len(), 3, "{summary:?}");
+    for (path, what) in [
+        (&file_link, "a symlink is in the way of a restored file"),
+        (&dir_link, "a symlink is in the way of a restored directory"),
+        (&dir_on_symlink, "a directory is in the way of a symlink"),
+    ] {
+        let line = summary
+            .errors
+            .iter()
+            .find(|e| e.contains(what))
+            .unwrap_or_else(|| panic!("少了「{what}」：{summary:?}"));
+        assert!(!line.contains("corrupt"), "本機擋路被報成損壞：{line}");
+        assert!(
+            line.contains(&path.display().to_string()),
+            "要點名擋路的路徑：{line}"
+        );
+    }
+    // 其餘照常還原，擋路的 symlink 沒被跟隨。
+    assert_eq!(
+        std::fs::read(restored.join("empty.txt")).unwrap(),
+        Vec::<u8>::new()
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+/// ADR 019 A30：root 定位上的某一層被使用者的 symlink 佔住：整個 restore 回錯
+/// （與以前相同），錯誤是本機擋路、點名那個路徑，不說 repo 物件損壞。
+#[cfg(unix)]
+#[tokio::test]
+async fn local_obstacle_on_the_root_path_is_not_reported_as_corrupt() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let outside = t.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = t.dir.path().join("out");
+    let root_path = target.join(src.strip_prefix("/").unwrap_or(&src));
+    std::fs::create_dir_all(root_path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &root_path).unwrap();
+
+    let err = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .expect_err("root 定位被 symlink 擋住，restore 整體回錯");
+    let msg = err.to_string();
+    assert!(!msg.contains("corrupt"), "本機擋路被報成損壞：{msg}");
+    assert!(
+        msg.contains(&root_path.display().to_string()),
+        "要點名擋路的路徑：{msg}"
+    );
+    assert!(format!("{err:?}").starts_with("RestoreBlocked"), "{err:?}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
 /// 定位組件含 NUL 必須回錯：NUL 不是路徑元件，
 /// Unix 上會在 syscall 層 EINVAL。
 #[test]
