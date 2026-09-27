@@ -362,6 +362,17 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   敘述（單一實作、fixture），規範性規則未動。原本共用的向量檔（tree-canonical、
   chunker 邊界、parity golden、金鑰向量）留下當凍結 golden。
 
+## M10：拿掉 Go 之後的 Rust 盤點與修正（2026-09-27 起）【第一批完成】
+
+- 盤點：ADR 019（48 條發現逐條三鏡頭複核；沒有要改格式的項目；v4 清單不變）。
+- 第一批八項（分支 `adr-019-batch1`，每項先紅後綠）：C1 commit gate 用有 rank 的
+  index、A1 遠端來源路徑不再百分比編碼、A5 `kist run` 的 backup 閘門取 `[prune] grace`、
+  A8 check／prune 不把 HEAD 錯誤當不存在、A6 mount 同名 lookup 同一 inode、A10
+  ChunkList 版本檢查與 trailer 解碼收一條、A12 parity 範圍入口檢查、A11 密碼檔規則
+  統一。gate：fmt／clippy 乾淨、nextest 357 過（原 333）、fixture_v3 4 過、deny ok。
+- 另：rustls 升 0.23.45（e9e06e6，RUSTSEC-2026-0285）。
+- 待辦：ADR 019「待負責人決定」第 1 點的第二～五批（restore 線 A2／A3／A43／A4 起）。
+
 ## 已接受的限制（非待辦）
 
 - **Windows VSS 與 Windows 路徑語意驗證**：裁示為已接受的限制，自路線圖移除

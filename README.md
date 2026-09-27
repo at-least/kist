@@ -12,7 +12,8 @@
 > （[ADR 009](docs/decisions/009-m5-parity.md)）、設定檔／排程／webhook（`kist run`）、`--json`、
 > Prometheus metrics 與 Web UI（`kist serve`）。格式相容性由一份凍結的 v3 fixture repo 把關
 > （`crates/kist-core/tests/fixtures/`；原本的 Go 參考實作已移除，見
-> [ADR 018](docs/decisions/018-remove-go-reference.md)）。
+> [ADR 018](docs/decisions/018-remove-go-reference.md)）。拿掉 Go 之後的 Rust 端盤點與修正清單見
+> [ADR 019](docs/decisions/019-rust-after-go.md)。
 > 已接受的限制：Windows VSS（不在路線圖上，見 [PLAN.md](PLAN.md)）。
 
 ## 建置
