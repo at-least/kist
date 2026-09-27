@@ -155,7 +155,10 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
 - **提案**：metadata 一律經已開的 handle 套用：`File::set_times`、
   `File::set_permissions`、`xattr::FileExt::set_xattr`，保留 xattr → 時間 → mode 的
   順序；目錄以 `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` 開 handle。只用 std 與既有 crate。
-  與 A2 同一次做。
+  與 A2 同一次做。【實作後：A3 先於 A2 單獨做——檔案用寫內容的同一個 handle；目錄
+  在子項目寫完後才開，ENOTDIR／ELOOP 回報「a non-directory is in the way of a restored
+  directory」（錯誤變體仍是 Corrupt，留給 A30）。Windows 的目錄照舊用 filetime 的
+  開法（會跟隨 reparse point），只做了交叉編譯，沒在 Windows 上跑過。】
 - **代價的證據**：實測（探針，非 kist 本身）：寫完、drop、把路徑換成指向外部檔的
   symlink 後以路徑套用，外部檔被改成 mode 4755、mtime 1000000；改用 fd 則外部檔
   不受影響。目錄變體已實測可行。路徑被換成 FIFO 時 set_file_times 會卡住（實測

@@ -5,6 +5,7 @@
 //! - mtime：兩邊都做，奈秒精度。
 
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use kist_format::tree::Entry;
@@ -209,16 +210,19 @@ pub fn read_xattrs(
     None
 }
 
-/// 還原延伸屬性。只套 `user.` namespace（與記錄端同一道防線：惡意 repo 不能
+/// 還原延伸屬性，經已開的 `file`（fsetxattr；`path` 只用在錯誤訊息）。只套
+/// `user.` namespace（與記錄端同一道防線：惡意 repo 不能
 /// 指揮我們寫 security./trusted. 之類需要特權的 namespace）。任何一顆失敗
 /// （檔案系統不支援、權限）就整節點回錯——與 times/mode 的 policy 一致：
 /// metadata 丢了就是錯，其他檔案繼續。
 #[cfg(unix)]
 pub fn apply_xattrs(
+    file: &File,
     path: &Path,
     xattrs: Option<&std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>>,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
+    use xattr::FileExt;
     let Some(map) = xattrs else {
         return Ok(());
     };
@@ -232,7 +236,7 @@ pub fn apply_xattrs(
             continue;
         }
         let name = std::ffi::OsStr::from_bytes(name);
-        xattr::set(path, name, value.as_ref())
+        file.set_xattr(name, value.as_ref())
             .map_err(|e| CoreError::io(path, e))
             .map_err(|e| CoreError::Corrupt {
                 key: path.display().to_string(),
@@ -245,42 +249,58 @@ pub fn apply_xattrs(
 /// Windows：xattr 是 Unix 的 user.* namespace，沒有對應物（備份端也不記錄）。
 #[cfg(not(unix))]
 pub fn apply_xattrs(
+    _: &File,
     _: &Path,
     _: Option<&std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>>,
 ) -> Result<()> {
     Ok(())
 }
 
-/// 還原 mode（Unix）與 mtime。symlink 只還原 mtime（且不跟隨連結）。
-pub fn apply(path: &Path, meta: &FsMeta, is_symlink: bool) -> Result<()> {
-    let mtime = filetime::FileTime::from_unix_time(
-        meta.mtime_ns.div_euclid(1_000_000_000),
-        meta.mtime_ns.rem_euclid(1_000_000_000) as u32,
-    );
-    if is_symlink {
-        // 有些平台不支援設定 symlink 本身的時間；失敗不算錯。
-        let _ = filetime::set_symlink_file_times(path, mtime, mtime);
-        return Ok(());
-    }
-    // 先設時間再設 mode：`set_file_times` 走 utimensat（路徑），不需要打開檔案，
-    // 所以 mode 是 0o000 的目錄也設得了；`set_file_mtime` 會先 open 檔案，對這種目錄會失敗。
-    filetime::set_file_times(path, mtime, mtime).map_err(|e| CoreError::io(path, e))?;
-    apply_mode(path, meta.mode)?;
-    Ok(())
+fn file_time(mtime_ns: i64) -> filetime::FileTime {
+    filetime::FileTime::from_unix_time(
+        mtime_ns.div_euclid(1_000_000_000),
+        mtime_ns.rem_euclid(1_000_000_000) as u32,
+    )
+}
+
+/// 還原 mtime（atime 設成同一個值）與 mode（Unix），一律經已開的 `file`
+/// （`path` 只用在錯誤訊息）。以路徑套用的話，路徑在內容寫完之後被換成
+/// symlink，時間與 mode（含 setuid／setgid 位）就套到連結指向的檔上
+/// （ADR 019 A3）。呼叫端先套 xattr（[`apply_xattrs`]）再呼叫這裡：記錄的
+/// mode 可能是唯讀，之後 user.* 就設不進去。
+///
+/// 先時間後 mode。以前以路徑設時間時這個順序是必要的：filetime 0.2.29 的
+/// `set_file_times` 會先開檔再 futimens，mode 已是 0o000 就開不起來。經 handle
+/// 設指定的時間只要求是擁有者、不看 mode，順序照舊只為了不意外。
+pub fn apply(file: &File, path: &Path, meta: &FsMeta) -> Result<()> {
+    // 與 filetime 的 set_file_times 同一個換算（1970 年前的負值照實）。
+    let mtime = std::time::SystemTime::from(file_time(meta.mtime_ns));
+    let times = std::fs::FileTimes::new()
+        .set_accessed(mtime)
+        .set_modified(mtime);
+    file.set_times(times).map_err(|e| CoreError::io(path, e))?;
+    apply_mode(file, path, meta.mode)
+}
+
+/// symlink 條目：只還原 mtime，以路徑設在連結本身、不跟隨連結；不設 mode。
+pub fn apply_symlink(path: &Path, meta: &FsMeta) {
+    let mtime = file_time(meta.mtime_ns);
+    // 有些平台不支援設定 symlink 本身的時間；失敗不算錯。
+    let _ = filetime::set_symlink_file_times(path, mtime, mtime);
 }
 
 #[cfg(unix)]
-fn apply_mode(path: &Path, mode: u32) -> Result<()> {
+fn apply_mode(file: &File, path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if mode == 0 {
         return Ok(()); // 來自沒有 mode 的平台
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+    file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
         .map_err(|e| CoreError::io(path, e))
 }
 
 #[cfg(not(unix))]
-fn apply_mode(_: &Path, _: u32) -> Result<()> {
+fn apply_mode(_: &File, _: &Path, _: u32) -> Result<()> {
     Ok(())
 }
 
