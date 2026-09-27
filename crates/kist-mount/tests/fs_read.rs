@@ -556,3 +556,69 @@ async fn vanished_snapshot_is_not_found_after_lookup() {
     );
     assert_eq!(core.inode_count(), count);
 }
+
+/// snapshot lookup 時讀 root tree 失敗（暫時性），corefs 退回目錄形態：檔案來源
+/// 顯示成目錄、`/` 攤平顯示成空的。這個 view 不能記進去重表——否則同一個
+/// （client, ts）整個 session 都回這個錯的形態，錯誤消失了也好不了、只能重新掛載
+/// （ADR 019 A6 複核）。退回形態的 lookup 用 1 秒 TTL，kernel 很快就會重查。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn degraded_snapshot_view_is_not_pinned() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"file source").unwrap();
+    // 檔案來源：正常情況下葉子就是 f.txt 本身（檔案）
+    t.backup(&src.join("f.txt")).await;
+    let tmpname = t
+        .dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let core = t.fs_core().await;
+    let ts = timestamps(&core).await.remove(0);
+    let client_ino = core.lookup(1, CLIENT.as_bytes()).await.unwrap().ino;
+
+    // snapshot 目錄 → tmp → <tmpname> → src → f.txt
+    async fn leaf(core: &FsCore, snap_ino: u64, tmpname: &str) -> kist_mount::corefs::Lookup {
+        let mut cur = snap_ino;
+        for p in ["tmp", tmpname, "src"] {
+            cur = core.lookup(cur, p.as_bytes()).await.unwrap().ino;
+        }
+        core.lookup(cur, b"f.txt").await.unwrap()
+    }
+
+    // tree 物件暫時讀不到（模擬後端的暫時性錯誤）時 lookup snapshot
+    let repo = t.dir.path().join("repo");
+    std::fs::rename(repo.join("trees"), repo.join("trees.away")).unwrap();
+    let first = core.lookup(client_ino, ts.as_bytes()).await;
+    std::fs::rename(repo.join("trees.away"), repo.join("trees")).unwrap();
+    let first = first.unwrap();
+    // 確認真的走到退回形態（不然這個測試什麼都沒驗）
+    assert_eq!(leaf(&core, first.ino, &tmpname).await.attr.kind, Kind::Dir);
+
+    // 錯誤消失後重查：要拿到真正的形態——f.txt 是檔案、讀得到內容
+    let second = core.lookup(client_ino, ts.as_bytes()).await.unwrap();
+    let f = leaf(&core, second.ino, &tmpname).await;
+    assert_eq!(f.attr.kind, Kind::File, "錯誤消失後重查要回真正的形態");
+    assert_eq!(core.read_file(f.ino, 0, 64).await.unwrap(), b"file source");
+    assert_ne!(second.ino, first.ino, "退回形態的 view 不能被去重表記住");
+
+    // 退回形態：entry 與 attr 都是 1 秒 TTL；正常的是 immutable
+    assert_eq!(first.ttl, kist_mount::corefs::VOLATILE_TTL);
+    assert_eq!(
+        core.getattr(first.ino).unwrap().1,
+        kist_mount::corefs::VOLATILE_TTL
+    );
+    assert_eq!(second.ttl, kist_mount::corefs::IMMUTABLE_TTL);
+
+    // 正常的 view 照樣去重：再查回同一個 ino、表不長大
+    let count = core.inode_count();
+    assert_eq!(
+        core.lookup(client_ino, ts.as_bytes()).await.unwrap().ino,
+        second.ino
+    );
+    assert_eq!(core.inode_count(), count);
+}

@@ -172,6 +172,9 @@ impl InodeTable {
     /// lookup；每次配新號的話，底下已快取的整棵子樹都跟著作廢（真掛載 `cp -r`
     /// 兩萬個檔會漏檔，mount 的記憶體也一路長，ADR 019 A6）。同一個（父, 名稱）
     /// 的內容不會變：snapshot 名是唯一的 timestamp，snapshot 內容定址。
+    ///
+    /// 例外：讀 tree 失敗、退回目錄形態建出來的 snapshot view 不是真貌，呼叫端
+    /// 要改用 [`Self::insert`]（不記名）——記下去的話錯的形態會釘住整個 session。
     fn insert_named(
         &mut self,
         parent: u64,
@@ -192,7 +195,8 @@ impl InodeTable {
 
     /// 配一個全新的 inode 號：**永不重用**，所以 generation 恆為 0、
     /// forget 可以是 no-op（不回收：記憶體上限 = 這個 session 瀏覽過的不同
-    /// （父, 名稱）數）。lookup 一律走 [`Self::insert_named`]，這裡只給根目錄直接用。
+    /// （父, 名稱）數，加上退回形態的 snapshot lookup 次數）。lookup 一律走
+    /// [`Self::insert_named`]，這裡只給根目錄與退回形態的 snapshot view 直接用。
     fn insert(
         &mut self,
         node: Node,
@@ -424,6 +428,9 @@ impl FsCore {
                 // 落點一致）；定位沒有組件（`/`）→ 內容攤平到頂層；否則目錄
                 // 來源（葉子 = 攜帶 subtree 的合成 DIR，children 懶載入）。
                 let mut pairs = Vec::with_capacity(info.roots.len());
+                // 有 root 的 tree 讀失敗、退回目錄形態：這個 view 可能不是真貌
+                // （檔案來源顯示成目錄、`/` 攤平顯示成空的）。
+                let mut degraded = false;
                 for root in &info.roots {
                     let comps: Vec<&[u8]> = root
                         .path
@@ -433,12 +440,13 @@ impl FsCore {
                         .collect();
                     let contents = match comps.split_last() {
                         // 定位沒有組件：攤平（`kist backup /` 的 v3 形態）。
-                        None => self
-                            .repo
-                            .read_tree_chain(&root.tree)
-                            .await
-                            .map(RootContents::Flatten)
-                            .unwrap_or(RootContents::Dir),
+                        None => match self.repo.read_tree_chain(&root.tree).await {
+                            Ok(entries) => RootContents::Flatten(entries),
+                            Err(_) => {
+                                degraded = true;
+                                RootContents::Dir
+                            }
+                        },
                         Some((last, _)) => {
                             let leaf = match self.repo.read_tree_chain(&root.tree).await {
                                 Ok(entries) => matches!(
@@ -446,7 +454,10 @@ impl FsCore {
                                     [e] if e.kind != node_type::DIR && e.name == *last
                                 )
                                 .then(|| Box::new(entries[0].clone())),
-                                Err(_) => None,
+                                Err(_) => {
+                                    degraded = true;
+                                    None
+                                }
                             };
                             match leaf {
                                 Some(e) => RootContents::Leaf(e),
@@ -459,23 +470,26 @@ impl FsCore {
                 // 敵意 locator（NUL 等非法組件）在這裡拒成 I/O 錯。
                 let vroot = Arc::new(VirtualRoot::build(pairs).map_err(|_| FsError::InvalidInput)?);
                 let attr = Attr::dir(0o555, info.time_ns);
+                let node = Node::SnapshotRoot { vroot };
                 let ino = {
-                    self.inodes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert_named(
-                            parent_ino,
-                            name,
-                            Node::SnapshotRoot { vroot },
-                            attr,
-                            false,
-                            None,
-                        )
+                    let mut table = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+                    if degraded {
+                        // 退回形態不記進去重表、TTL 1 秒：記下去的話同一個
+                        // （client, ts）整個 session 都回這個錯的形態，錯誤消失
+                        // 了也好不了（ADR 019 A6 複核）。下次 lookup 重讀 tree。
+                        table.insert(node, attr, true, None)
+                    } else {
+                        table.insert_named(parent_ino, name, node, attr, false, None)
+                    }
                 };
                 Ok(Lookup {
                     ino,
                     attr,
-                    ttl: IMMUTABLE_TTL,
+                    ttl: if degraded {
+                        VOLATILE_TTL
+                    } else {
+                        IMMUTABLE_TTL
+                    },
                 })
             }
             Node::SnapshotRoot { vroot } => {
