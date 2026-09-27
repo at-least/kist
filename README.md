@@ -93,6 +93,15 @@ kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端�
 
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
 
+grace（見下節「空間回收」）：`[backup] gc_grace` 沒寫時，backup 取**同一份設定**的 `[prune] grace`，
+兩個都沒寫才是 72h。`[backup] gc_grace` 不得比 `[prune] grace` 長（載入設定時就報錯）；比它短可以。
+backup 與 prune 分在兩台主機時，兩份設定互相看不到，grace 要自己設成一致。
+
+> **行為變更**：以前 `kist run` 的 backup 只看 `[backup] gc_grace`、沒寫就是 72h。現在只把
+> `[prune] grace` 設短的設定，backup 也會用那個較短的 grace：跑得比它久的 backup 會以
+> BackupTooLong 結束、不寫 snapshot（重跑即可，已上傳的資料會沿用）。真的有這麼長的 backup，
+> 就把 `[prune] grace` 調長。
+
 ### Prometheus metrics（`kist serve`）
 
 `kist serve` = `kist run`（照排程跑工作）+ 一個 HTTP 端口（`--http`，預設 `127.0.0.1:9898`）：
@@ -154,7 +163,7 @@ UI 密碼走明文 HTTP：預設只綁 loopback，要遠端存取請放在有 TL
 第二次執行才真的刪。中間任何一台機器重新用到那些資料，標記就撤銷。所以 `prune` 可以跟 backup
 同時跑、可以排程每天跑，不需要鎖；剛 forget 完馬上 prune 不會釋放空間，那是設計。
 
-- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值）。
+- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值；設定檔的寫法見上節）。
   跑得更久的 backup 不會悄悄壞掉，會在最後以錯誤結束，重跑即可。
 - 超過 `--inactive-after`（預設 30 天）沒備份的機器不再擋住刪除；它回來備份時若用到已刪的資料，
   同樣會在最後失敗、重跑。

@@ -10,7 +10,7 @@
 //! [backup]
 //! paths = ["/home", "/etc"]
 //! schedule = "0 2 * * *"      # 5 或 6 欄（秒選填）cron；省略 = 只在 `run --once` 時跑
-//! gc_grace = "72h"
+//! gc_grace = "72h"            # 選填；沒寫取同檔的 [prune] grace，不得比它長
 //!
 //! [forget]                     # 選填；需要 Delete 權限，建議放在維護主機的設定裡
 //! keep_daily = 7
@@ -191,6 +191,23 @@ impl Config {
             }
             self.schedule_of(p.schedule.as_deref(), "[prune]")?;
         }
+        // grace 的交叉檢查只看一個方向（ADR 019 A5）：backup 以為的 grace 比 prune 給的長，
+        // prune 就可能刪掉 backup 還在用的資料，屬「壞 snapshot」那一邊。反方向（backup
+        // 較短）只會讓 backup 早一點以 BackupTooLong 失敗，是安全的，不擋。
+        // 沒有 [prune] 的設定（prune 放在另一台主機）無從比較。
+        if let (Some(b), Some(p)) = (&self.backup, &self.prune) {
+            if let Some(backup_grace) = b.gc_grace {
+                let prune_grace = p.options().grace;
+                if backup_grace > prune_grace {
+                    return Err(AppError::Config(format!(
+                        "[backup] gc_grace ({}s) must not be longer than [prune] grace ({}s); \
+                         remove [backup] gc_grace to use [prune] grace",
+                        backup_grace.as_secs(),
+                        prune_grace.as_secs()
+                    )));
+                }
+            }
+        }
         if let Some(n) = &self.notify {
             for ev in &n.on {
                 if !matches!(ev.as_str(), "success" | "incomplete" | "failure") {
@@ -213,6 +230,17 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// backup 閘門用的 grace，唯一的解析點（ADR 019 A5）：`[backup] gc_grace` 優先，
+    /// 沒寫就取同一份設定的 `[prune] grace`，兩個都沒寫才用預設 72h。
+    /// 只把 `[prune] grace` 設短時若閘門仍用 72h，prune 可能刪掉 backup 還在用的資料。
+    pub fn gc_grace(&self) -> std::time::Duration {
+        self.backup
+            .as_ref()
+            .and_then(|b| b.gc_grace)
+            .or_else(|| self.prune.as_ref().and_then(|p| p.grace))
+            .unwrap_or(kist_core::DEFAULT_GC_GRACE)
     }
 
     /// 某一節的排程（解析過的）；沒寫 schedule 就 `None`。
@@ -314,6 +342,44 @@ mod scheme_case_tests {
         assert_eq!(
             cfg.prune.as_ref().unwrap().clock_skew,
             Some(std::time::Duration::from_secs(30 * 60))
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod gc_grace_tests {
+    use super::*;
+
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    fn cfg(sections: &str) -> Config {
+        Config::parse(&format!(
+            "repo = \"x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n{sections}"
+        ))
+        .unwrap()
+    }
+
+    /// 只寫 `[prune] grace`：backup 閘門取它（ADR 019 A5）。
+    #[test]
+    fn falls_back_to_prune_grace() {
+        assert_eq!(cfg("[prune]\ngrace = \"1h\"\n").gc_grace(), HOUR);
+    }
+
+    /// `[backup] gc_grace` 有寫就用它（較短是安全方向）。
+    #[test]
+    fn backup_gc_grace_wins() {
+        let c = cfg("gc_grace = \"1h\"\n[prune]\ngrace = \"72h\"\n");
+        assert_eq!(c.gc_grace(), HOUR);
+    }
+
+    /// 兩個都沒寫（或沒有 `[prune]`）：預設 72h，與 prune 的預設相同。
+    #[test]
+    fn defaults_to_72h() {
+        assert_eq!(cfg("").gc_grace(), kist_core::DEFAULT_GC_GRACE);
+        assert_eq!(
+            cfg("[prune]\nrepack_below = 40\n").gc_grace(),
+            kist_core::PruneOptions::default().grace
         );
     }
 }
