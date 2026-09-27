@@ -249,9 +249,7 @@ impl ObjectStoreSource {
                 None => (rest.to_owned(), String::new()),
             };
             let store = s3_store_for_prefix(&bucket, &prefix)?;
-            // 與 to_store_path 同理：prefix 是遠端上的原始名稱，用 parse 不編碼。
-            let root = object_store::path::Path::parse(prefix.as_str())
-                .map_err(|e| BackendError::Source(format!("{spec}: {e}")))?;
+            let root = s3_source_root(spec, &prefix)?;
             (
                 store,
                 root,
@@ -344,6 +342,14 @@ fn s3_store_for_prefix(bucket: &str, prefix: &str) -> Result<Arc<dyn ObjectStore
     // （實機 E2E 抓到：讀檔變成 prefix/prefix/key）。
     let _ = prefix;
     crate::s3_store(bucket, "", None)
+}
+
+/// `s3://bucket/<prefix>` 的 prefix → 來源的 root。與 to_store_path 同理：
+/// prefix 是遠端上的原始名稱，用 parse 不編碼（ADR 019 A1）。
+/// 獨立成函式是為了不建 S3 client 就能測（建 client 會讀 `AWS_*` 環境變數）。
+fn s3_source_root(spec: &str, prefix: &str) -> Result<object_store::path::Path> {
+    object_store::path::Path::parse(prefix)
+        .map_err(|e| BackendError::Source(format!("{spec}: {e}")))
 }
 
 impl Source for ObjectStoreSource {
@@ -727,13 +733,16 @@ mod store_path_tests {
     }
 
     /// `s3://bucket/<prefix>` 的 prefix 也是遠端上的原始名稱：root 必須原樣
-    /// 保存，不能被編碼成 `photos%5B2024%5D`。
-    #[tokio::test]
-    async fn s3_root_prefix_keeps_reserved_chars() {
-        let src = ObjectStoreSource::open("s3://bucket/photos[2024]")
-            .await
-            .unwrap();
-        assert_eq!(src.root.as_ref(), "photos[2024]");
+    /// 保存，不能被編碼成 `photos%5B2024%5D`。直接測 s3_source_root，不走
+    /// open：open 會建 S3 client、讀 `AWS_*` 環境變數，殘缺的環境（例如只設
+    /// 了 AWS_ACCESS_KEY_ID）會讓這個純字串的測試誤失敗。
+    #[test]
+    fn s3_root_prefix_keeps_reserved_chars() {
+        let root = s3_source_root("s3://bucket/photos[2024]", "photos[2024]").unwrap();
+        assert_eq!(root.as_ref(), "photos[2024]");
+        // 沒有 prefix（`s3://bucket`）＝整個 bucket，root 是空的。
+        let root = s3_source_root("s3://bucket", "").unwrap();
+        assert_eq!(root, StorePath::default());
     }
 
     /// 名稱不合 object_store 的命名規則（控制字元、`.`、`..`）時，回
