@@ -145,6 +145,16 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   隱藏的暫存檔（比正式檔名下的半截檔好）；還原到先前還原出來的唯讀目錄（0555）時
   建暫存檔會 EACCES，現行原地寫入反而成功（實測），實作要選退回原地寫或明確報錯。
   非 Go 所致（「殘檔移除」來自 25600ac）。
+  【實作後：唯讀目錄兩者都沒選——既有目錄擁有者不可寫、而且記錄了 mode（之後會
+  重新套上）時，讀完子 tree 後先經 O_NOFOLLOW 的 handle 暫時加上擁有者寫入權，子
+  項目寫完照常套回記錄的 mode；套 metadata 失敗時放回原本的權限，chmod 本身失敗只
+  記 warn、讓子項目各自回報。硬連結：「複製那條路」之外，EEXIST（第二次還原到同一
+  目標的常態）改成以暫存名 link 再 rename——只改走複製的話，第二次還原後硬連結
+  關係就斷了（實測兩個 inode、nlink 1；HEAD 是同一個 inode、nlink 2）。擋路的
+  symlink 照裁定拒絕；目錄與特殊檔（FIFO、socket、裝置）在寫之前、rename 之前也都
+  拒絕（以前 FIFO 會卡在開檔）。暫存檔名的亂數用 kist_crypto::random_bytes（rand
+  在 kist-core 只是 dev-dependency）。非 unix 走同一條暫存＋rename，只少了
+  O_NOFOLLOW；只做了交叉 clippy，沒在 Windows 上跑過。】
 
 **A3　restore 的 mode 與時間以路徑套用，會跟隨被換上的 symlink（repo-2）**
 

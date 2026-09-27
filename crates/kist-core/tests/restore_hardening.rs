@@ -585,3 +585,307 @@ fn plain_entry() -> kist_format::tree::Entry {
         vern: None,
     }
 }
+
+/// ADR 019 A2：restore 先寫同目錄的隱藏暫存檔（`.kist-restore-*`），成功才
+/// rename 成正式名；失敗時暫存檔要被刪掉，不能留在目錄裡。
+fn assert_no_restore_temp(dir: &std::path::Path) {
+    let left: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".kist-restore-"))
+        .collect();
+    assert!(left.is_empty(), "暫存檔沒清掉：{left:?}");
+}
+
+/// 借真 snapshot `like` 的形狀，換成單一 root（`root_path` → 由 `entries` 組成
+/// 的手工 tree）另存一份，回傳新 snapshot 的 key。時間選在 1 小時後（key 的
+/// 時間戳與 time_ns 讀取端會核對），不與真 snapshot 撞 key。
+async fn hand_snapshot(
+    repo: &kist_core::Repository,
+    like: &str,
+    root_path: &[u8],
+    entries: Vec<kist_format::tree::Entry>,
+) -> String {
+    use kist_format::cbor;
+    use kist_format::keys;
+    use kist_format::snapshot::{format_key_timestamp, Root};
+    use kist_format::tree::Tree;
+    use serde_bytes::ByteBuf;
+
+    let (tree_id, sealed_tree) = repo.seal_tree(Tree::new(entries, None)).await.unwrap();
+    repo.backend()
+        .put(&keys::tree(&tree_id), sealed_tree)
+        .await
+        .unwrap();
+    let mut snap = repo.read_snapshot_by_key(like).await.unwrap();
+    snap.roots = vec![Root {
+        path: ByteBuf::from(root_path.to_vec()),
+        tree: tree_id,
+    }];
+    let at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let ts = format_key_timestamp(at).unwrap();
+    snap.time_ns = at.unix_timestamp_nanos() as i64; // i128 → i64：時間軸遠在範圍內
+    let key_path = keys::snapshot(&backup_options().client_id, &ts);
+    let sealed = repo
+        .keys()
+        .seal_snapshot(&key_path, &cbor::encode(&snap).unwrap())
+        .unwrap();
+    repo.backend().put(&key_path, sealed).await.unwrap();
+    key_path
+}
+
+/// ADR 019 A2：間接內容的 chunk 清單讀不到（pack 全刪）時，還原在開檔之前就
+/// 失敗——目標處使用者原有的檔從頭到尾沒被碰過，不能因為「清掉寫到一半的
+/// 檔」被刪掉。
+#[tokio::test]
+async fn failed_indirect_restore_keeps_the_existing_file() {
+    use kist_format::tree::content_type;
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // 超過 MAX_INLINE_CHUNKS（256）個 chunk 才是間接內容：測試 chunker 平均
+    // 16 KiB，8 MiB 約 500 個。
+    std::fs::write(src.join("big.bin"), random_bytes(3, 8 << 20)).unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+    let entries = repo.read_tree_chain(&snap.roots[0].tree).await.unwrap();
+    assert_eq!(
+        entries[0].content,
+        content_type::INDIRECT,
+        "前提：big.bin 是間接內容"
+    );
+    for pack in walk_files(&t.repo_path().join("packs")) {
+        if pack.is_file() {
+            std::fs::remove_file(&pack).unwrap();
+        }
+    }
+
+    let target = t.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    std::fs::create_dir_all(&restored).unwrap();
+    std::fs::write(restored.join("big.bin"), b"PRECIOUS user data").unwrap();
+
+    let summary = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.errors.len(), 1, "{summary:?}");
+    assert_eq!(
+        std::fs::read(restored.join("big.bin")).ok().as_deref(),
+        Some(&b"PRECIOUS user data"[..]),
+        "還原失敗不能動到使用者原有的檔；{summary:?}"
+    );
+    assert_no_restore_temp(&restored);
+}
+
+/// ADR 019 A2：直接內容寫到一半才發現缺 chunk——正式檔名底下必須仍是原本
+/// 的內容，不能是寫了一半的檔，也不能被刪掉。
+#[tokio::test]
+async fn failed_direct_restore_keeps_the_existing_file() {
+    use kist_format::tree::{content_type, meta_kind, node_type, Entry};
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    // 一顆真的 chunk（先寫得進暫存檔）＋一顆 repo 裡沒有的。
+    let payload = b"first chunk exists in the repo".to_vec();
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("payload.bin"), &payload).unwrap();
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let key = hand_snapshot(
+        &repo,
+        &s.snapshot_key,
+        b"/hand",
+        vec![Entry {
+            name: b"file.bin".to_vec(),
+            kind: node_type::FILE,
+            meta_kind: meta_kind::GENERIC,
+            size: payload.len() as u64 + 7,
+            content: content_type::DIRECT,
+            chunks: vec![
+                repo.keys().chunk_id(&payload),
+                repo.keys().chunk_id(b"missing"),
+            ],
+            ..plain_entry()
+        }],
+    )
+    .await;
+
+    let target = t.dir.path().join("out");
+    let dir = target.join("hand");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("file.bin"), b"PRECIOUS user data").unwrap();
+
+    let summary = repo
+        .restore(&key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.errors.len(), 1, "{summary:?}");
+    assert_eq!(
+        std::fs::read(dir.join("file.bin")).ok().as_deref(),
+        Some(&b"PRECIOUS user data"[..]),
+        "缺 chunk 的還原不能毀掉原本的內容；{summary:?}"
+    );
+    assert_no_restore_temp(&dir);
+}
+
+/// ADR 019 A2 裁定：正式檔名處擋著 symlink 維持「拒絕」——回報節點錯誤，
+/// symlink 本身留著、不跟隨，它指向的檔內容不變。
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_symlink_in_the_way_is_left_alone() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("small.txt"), b"hello kist\n").unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let outside = t.dir.path().join("outside.txt");
+    std::fs::write(&outside, b"outside content").unwrap();
+    let target = t.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    std::fs::create_dir_all(&restored).unwrap();
+    let link = restored.join("small.txt");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let summary = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.errors.len(), 1, "{summary:?}");
+    assert!(
+        summary.errors[0].contains("symlink is in the way"),
+        "{summary:?}"
+    );
+    let still_link = std::fs::symlink_metadata(&link)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    assert!(still_link, "擋路的 symlink 被刪掉或換掉了；{summary:?}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside content");
+    assert_no_restore_temp(&restored);
+}
+
+/// ADR 019 A2：同一個 snapshot 還原兩次到同一個目標，snapshot 裡有唯讀檔
+/// （0o444）與唯讀目錄（0o555，裡面也是 0o444 的檔）。第一次還原後它們就是
+/// 唯讀的；第二次必須照樣成功、什麼都不刪，最後的 mode 等於記錄的值。
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_twice_over_read_only_files_and_dirs() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode_of = |p: &std::path::Path| {
+        std::fs::symlink_metadata(p)
+            .map(|m| format!("{:o}", m.permissions().mode() & 0o7777))
+            .unwrap_or_else(|e| format!("<{e}>"))
+    };
+    let chmod = |p: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("rodir")).unwrap();
+    std::fs::write(src.join("ro.txt"), b"read-only file").unwrap();
+    std::fs::write(src.join("rodir").join("inner.txt"), b"inside read-only dir").unwrap();
+    chmod(&src.join("ro.txt"), 0o444);
+    chmod(&src.join("rodir").join("inner.txt"), 0o444);
+    chmod(&src.join("rodir"), 0o555);
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let target = t.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    let first = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let second = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+
+    // 先把觀察值收齊、把目錄改回可寫，再斷言：斷言失敗時 TempDir 才刪得掉
+    // 0o555 目錄裡的檔（否則靜靜留在 /tmp）。
+    let modes = [
+        mode_of(&restored.join("ro.txt")),
+        mode_of(&restored.join("rodir")),
+        mode_of(&restored.join("rodir").join("inner.txt")),
+    ];
+    let contents = [
+        std::fs::read(restored.join("ro.txt")).ok(),
+        std::fs::read(restored.join("rodir").join("inner.txt")).ok(),
+    ];
+    chmod(&src.join("rodir"), 0o755);
+    if restored.join("rodir").is_dir() {
+        chmod(&restored.join("rodir"), 0o755);
+    }
+
+    assert_eq!(
+        modes,
+        ["444", "555", "444"],
+        "(ro.txt, rodir, inner.txt)；第二次：{second:?}"
+    );
+    assert!(first.errors.is_empty(), "第一次：{first:?}");
+    assert!(second.errors.is_empty(), "第二次：{second:?}");
+    assert_eq!(
+        contents,
+        [
+            Some(b"read-only file".to_vec()),
+            Some(b"inside read-only dir".to_vec()),
+        ]
+    );
+    assert_no_restore_temp(&restored);
+    assert_no_restore_temp(&restored.join("rodir"));
+}
+
+/// 同一個 snapshot 還原兩次，硬連結關係要還在（ADR 019 A2）。第二次時正式名
+/// 都已存在：第一個名字以暫存檔＋rename 換成新的 inode，後面的名字 link(2)
+/// 回 EEXIST——改走複製的話兩個名字就各自獨立了；要以暫存名 link 再 rename。
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_twice_keeps_hard_links() {
+    use std::os::unix::fs::MetadataExt;
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.bin"), b"shared").unwrap();
+    std::fs::hard_link(src.join("a.bin"), src.join("b.bin")).unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let target = t.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    for round in 1..=2 {
+        let summary = repo
+            .restore(&s.snapshot_key, &target, RestoreOptions::default())
+            .await
+            .unwrap();
+        let a = std::fs::symlink_metadata(restored.join("a.bin")).unwrap();
+        let b = std::fs::symlink_metadata(restored.join("b.bin")).unwrap();
+        assert!(summary.errors.is_empty(), "第 {round} 次：{summary:?}");
+        assert_eq!(
+            (a.ino(), a.nlink()),
+            (b.ino(), 2),
+            "第 {round} 次：a.bin 與 b.bin 要是同一個 inode、nlink 2"
+        );
+        assert_eq!(std::fs::read(restored.join("b.bin")).unwrap(), b"shared");
+        assert_no_restore_temp(&restored);
+    }
+}

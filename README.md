@@ -46,6 +46,11 @@ kist forget --keep-last 10 --prune      # 一次做完
 結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
 請看警告。
 
+`restore` 先把每個檔寫進同目錄的隱藏暫存檔 `.kist-restore-*`，完整寫好才 rename 成正式名：還原失敗
+時目標處原有的檔不動（以前會被刪掉），擋路的 symlink、目錄或特殊檔回報錯誤、不動它；再還原到先前
+還原出的唯讀目錄（例如 0555）時，會暫時加上擁有者寫入權，最後套回記錄的 mode。覆寫大檔時新舊兩份
+會同時佔空間；Ctrl-C 中斷的 restore 可能留下 `.kist-restore-*`，可以直接刪掉。
+
 密碼檔（`--password-file` 與設定檔的 `password_file` 同一份規則）：只取第一行、去掉結尾的 `\r`，
 空的算錯誤。
 
