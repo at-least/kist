@@ -202,6 +202,23 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   ADR 018:34-35 指的是另一件已修的事。
   【需負責人同意：新增直接依賴 rustix（不是換技術選型）；「只接受空目標」的替代案
   會改產品契約】
+  【實作後：照裁定做 fd 錨定、不恢復空目標規則。新模組 dirhandle.rs 的 DirHandle：
+  目標本身照常跟隨地開（O_RDONLY|O_DIRECTORY），之下每層 `mkdirat` 後
+  `openat(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`；暫存檔
+  `openat(O_CREAT|O_EXCL|O_NOFOLLOW)`、`renameat`、`unlinkat`、`linkat`、`symlinkat`，
+  symlink 本身的時間改用 `utimensat(AT_SYMLINK_NOFOLLOW)`。目錄的 metadata 改套在往下
+  走時開的那個 handle 上、不再以路徑重開：A3 的目錄測試因此改成斷言 metadata 落在
+  被搬開的真目錄、沒有錯誤（A3 時是回報擋路錯誤）。硬連結表**不照**上面寫的存
+  （目錄 handle, name）——每筆開著一個 fd，大樹會把 fd 用光——改存相對於目標的
+  路徑元件，連結時從目標的 handle 逐層 O_NOFOLLOW 重開再 `linkat`；同時開著的
+  handle 以深度為上限（測試：RLIMIT_NOFILE 64 下還原 300 對硬連結）。rustix 1.1
+  （fs、process；process 留給 A43）成為 kist-core 的直接依賴，Cargo.lock 仍只有
+  1.1.4 一份；libc 不再是 kist-core 的直接依賴。代價：目錄 handle 以 O_RDONLY 開，
+  目標本身與其下既有的目錄都要可讀——實測擁有者 0311 的目標或中間目錄，HEAD 還原
+  成功，之後回 Permission denied。實測競態（同 uid、2000 個檔、中間目錄反覆換成外指
+  symlink）：HEAD 10 次全紅，每次 780–830 個項目寫到外面；之後 20 次全綠，2000 個檔
+  全數還原、沒有錯誤。非 unix 維持兩步檢查（改成往下走時逐層檢查）；Windows 與
+  macOS 只做了交叉 clippy，沒在上面跑過。】
 
 **A5　`kist run` 的 backup 閘門不看 `[prune].grace`（backup-8）**
 

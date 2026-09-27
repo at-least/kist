@@ -17,6 +17,7 @@
 pub mod backup;
 pub mod cache;
 pub mod check;
+mod dirhandle;
 pub mod forget;
 pub mod fsmeta;
 pub mod index;

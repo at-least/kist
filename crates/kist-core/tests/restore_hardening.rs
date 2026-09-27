@@ -889,3 +889,101 @@ async fn restore_twice_keeps_hard_links() {
         assert_no_restore_temp(&restored);
     }
 }
+
+/// ADR 019 A4：restore 途中，本機攻擊者（同 uid）反覆把目標之下的中間目錄
+/// 換成指向目標之外的 symlink。以前逐段 lstat 檢查完就以完整路徑開檔，換上
+/// symlink 之後的檔都經它寫到外面（ADR 實測：2000 個檔有 1999 個）。以目錄
+/// handle 為錨逐層開檔之後，寫入一律落在已開的那個真目錄——它被搬到哪都
+/// 一樣——外面永遠是空的。
+///
+/// 換的那一方等 `sub/` 裡出現第一個項目（restore 已經在寫它的子項目）才開始，
+/// 之後反覆「真目錄搬到旁邊（仍在目標之內）、原位換上外指 symlink、稍等、
+/// 換回來」。每一輪結束時真目錄都回到原位，最後的斷言與 TempDir 清理都是
+/// 確定的。
+#[cfg(unix)]
+#[tokio::test]
+async fn swapping_an_intermediate_dir_for_a_symlink_never_writes_outside() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    const FILES: usize = 2000;
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    for i in 0..FILES {
+        std::fs::write(
+            src.join("sub").join(format!("f{i:04}")),
+            format!("file {i}"),
+        )
+        .unwrap();
+    }
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    // 「外面」：同一個 tempdir 裡、目標之外的目錄。
+    let outside = t.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = t.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    let victim = restored.join("sub");
+    let moved = restored.join("sub.moved");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let swapper = {
+        let stop = Arc::clone(&stop);
+        let (victim, moved, outside) = (victim.clone(), moved.clone(), outside.clone());
+        std::thread::spawn(move || {
+            let started = |p: &std::path::Path| {
+                std::fs::read_dir(p).is_ok_and(|mut entries| entries.next().is_some())
+            };
+            while !stop.load(Ordering::Relaxed) && !started(&victim) {
+                std::thread::yield_now();
+            }
+            let mut swaps = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                std::fs::rename(&victim, &moved).unwrap();
+                std::os::unix::fs::symlink(&outside, &victim).unwrap();
+                swaps += 1;
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                std::fs::remove_file(&victim).unwrap();
+                std::fs::rename(&moved, &victim).unwrap();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            swaps
+        })
+    };
+
+    let summary = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let swaps = swapper.join().unwrap();
+
+    let leaked: Vec<String> = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let placed = walk_files(&restored)
+        .into_iter()
+        .filter(|p| std::fs::symlink_metadata(p).unwrap().is_file())
+        .count();
+    assert!(swaps >= 1, "restore 在換第一次之前就結束了，這次沒測到競態");
+    assert!(
+        leaked.is_empty(),
+        "換了 {swaps} 次；{} 個檔寫到目標之外，例如 {:?}；summary：files {} errors {}",
+        leaked.len(),
+        &leaked[..leaked.len().min(3)],
+        summary.files,
+        summary.errors.len()
+    );
+    assert_eq!(
+        placed as u64, summary.files,
+        "算成還原成功的檔，都要真的在目標之內"
+    );
+    assert!(summary.errors.is_empty(), "換了 {swaps} 次：{summary:?}");
+    assert_eq!(summary.files, FILES as u64);
+}

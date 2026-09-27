@@ -3,6 +3,7 @@
 //! 目標目錄底下會重建完整的絕對路徑（`<target>/home/user/data/...`），
 //! 這樣一個 snapshot 含多個來源路徑時不會互相覆蓋。
 
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
 use kist_format::{keys, ChunkId};
 
+use crate::dirhandle::{DirHandle, Kind};
 use crate::fsmeta;
 use crate::index::{ChunkIndex, ChunkLocator};
 use crate::pack::decode_chunk;
@@ -77,51 +79,6 @@ impl ReloadableIndex {
 
 const RELOAD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// 在 `anchor` 之下建立 `dir`（含缺失的中間目錄），但從 anchor 往下**拒絕
-/// 穿過 symlink**：`create_dir_all` 會跟隨 symlink，snapshot 自己種的 symlink
-/// （另一個 root 的定位恰好穿過它）就能把寫入帶出使用者指名的目標——這是
-/// 檔案路徑既有防護（symlink-in-the-way 拒絕、`replace_with_symlink` 先移除）
-/// 的目錄版。anchor 本身與其之上是使用者自己的路徑，照常跟隨。
-fn create_dir_nofollow(anchor: &Path, dir: &Path) -> Result<()> {
-    let refuse = |cur: &Path, what: &str| {
-        Err(CoreError::Corrupt {
-            key: cur.display().to_string(),
-            reason: format!("{what} is in the way of a restored directory"),
-        })
-    };
-    let rel = dir.strip_prefix(anchor).map_err(|_| CoreError::Corrupt {
-        key: dir.display().to_string(),
-        reason: format!("restore path is not under the target {}", anchor.display()),
-    })?;
-    let mut cur = anchor.to_path_buf();
-    for comp in rel.components() {
-        cur.push(comp);
-        match std::fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => return refuse(&cur, "a symlink"),
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => return refuse(&cur, "a non-directory"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match std::fs::create_dir(&cur) {
-                    Ok(()) => {}
-                    // 同一路徑可能在另一個 root 已經建好：只要它是真目錄就放行。
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        match std::fs::symlink_metadata(&cur) {
-                            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-                            Ok(m) if m.file_type().is_symlink() => {
-                                return refuse(&cur, "a symlink");
-                            }
-                            _ => return refuse(&cur, "a non-directory"),
-                        }
-                    }
-                    Err(e) => return Err(CoreError::io(&cur, e)),
-                }
-            }
-            Err(e) => return Err(CoreError::io(&cur, e)),
-        }
-    }
-    Ok(())
-}
-
 /// restore 的結果：單一檔案失敗不會中止整個 restore，而是記在 `errors` 裡。
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RestoreSummary {
@@ -130,6 +87,12 @@ pub struct RestoreSummary {
     pub symlinks: u64,
     pub errors: Vec<String>,
 }
+
+/// 硬連結表：(dev, inode) → 第一個還原出來的名字相對於還原目標的路徑元件。
+/// 記路徑、不記目錄 handle（ADR 019 A4）：大樹裡硬連結多，每筆開著一個 fd
+/// 會把 fd 用光；後續名字到時再從目標的 handle 沿路徑逐層重新開
+/// （[`link_to_first`]）。
+type HardLinks = std::collections::HashMap<(u64, u64), Vec<OsString>>;
 
 /// 套用 metadata（mtime；mode 一起），經已開的 `file`（ADR 019 A3；`path` 只
 /// 用在錯誤訊息）。mtime **沒記錄**的 entry（§8 聯集裡
@@ -143,99 +106,59 @@ fn apply_meta(file: &std::fs::File, path: &Path, node: &Entry) -> Result<()> {
     fsmeta::apply(file, path, &fsmeta::meta_of_entry(node))
 }
 
-/// symlink 條目的 metadata：只有 mtime，設在連結本身（不跟隨）。mtime 沒記錄
-/// 就不動，理由同 [`apply_meta`]。
-fn apply_symlink_meta(path: &Path, node: &Entry) {
-    if node.mtime_ns.is_none() {
-        return;
+/// symlink 條目的 metadata：只有 mtime，設在連結本身（不跟隨），經它所在
+/// 那層的 handle（ADR 019 A4）。mtime 沒記錄就不動，理由同 [`apply_meta`]。
+fn apply_symlink_meta(dir: &DirHandle, name: &OsStr, node: &Entry) {
+    if let Some(mtime_ns) = node.mtime_ns {
+        dir.set_symlink_mtime(name, mtime_ns);
     }
-    fsmeta::apply_symlink(path, &fsmeta::meta_of_entry(node));
-}
-
-/// 開目錄的 handle 來套 metadata（ADR 019 A3）。unix 以
-/// `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` 開：路徑的最末段在子項目寫完之後被換成
-/// symlink 或其他非目錄，就開不起來，時間與 mode 不會套到別處。Linux 對
-/// symlink 回的是 ENOTDIR，不是 ELOOP（實測；其他 unix 可能回 ELOOP），兩個都
-/// 當「擋路的不是目錄」。換成 FIFO 也是立刻 ENOTDIR，不會卡住（實測）。
-#[cfg(unix)]
-fn open_dir_for_meta(path: &Path) -> Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(dir) => Ok(dir),
-        Err(e)
-            if e.raw_os_error() == Some(libc::ENOTDIR) || e.raw_os_error() == Some(libc::ELOOP) =>
-        {
-            Err(CoreError::Corrupt {
-                key: path.display().to_string(),
-                reason: "a non-directory is in the way of a restored directory".to_owned(),
-            })
-        }
-        Err(e) => Err(CoreError::io(path, e)),
-    }
-}
-
-/// Windows：與以前 filetime 以路徑設目錄時間時開 handle 的方式相同（寫入權、
-/// FILE_FLAG_BACKUP_SEMANTICS 才開得了目錄；filetime 0.2.29 windows.rs 的
-/// `open`），行為不變：會跟隨 reparse point。
-#[cfg(windows)]
-fn open_dir_for_meta(path: &Path) -> Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .map_err(|e| CoreError::io(path, e))
 }
 
 /// 還原用的暫存名（ADR 019 A2）：內容或硬連結先放在正式名同目錄的隱藏
 /// 暫存名下，最後 [`TempPath::commit`] 才 rename 成正式名。在那之前任何一步
 /// 失敗，drop 就把暫存名刪掉——正式名底下使用者原有的檔從頭到尾沒被碰過。
-/// SIGINT 不會跑 drop，會留下 `.kist-restore-*`（README 有寫）。
+/// SIGINT 不會跑 drop，會留下 `.kist-restore-*`（README 有寫）。rename 與
+/// 刪除都經那一層目錄的 handle（ADR 019 A4）。
 struct TempPath {
-    path: PathBuf,
+    dir: DirHandle,
+    name: OsString,
     committed: bool,
 }
 
 impl TempPath {
-    /// rename 成正式名 `dest`。rename 前再看一次 `dest`（[`refuse_in_the_way`]）：
-    /// 擋路的 symlink 照舊拒絕；一般檔被取代（「既有檔案會被覆寫」）。這次檢查
-    /// 與 rename 之間仍有視窗，輸掉的後果只是 rename 取代了那個 symlink 目錄項
-    /// 本身——rename 不跟隨 symlink，寫不到目標之外。
-    fn commit(mut self, dest: &Path) -> Result<()> {
-        refuse_in_the_way(dest)?;
-        std::fs::rename(&self.path, dest).map_err(|e| CoreError::io(dest, e))?;
+    /// rename 成同一層的正式名 `dest`。rename 前再看一次 `dest`
+    /// （[`refuse_in_the_way`]）：擋路的 symlink 照舊拒絕；一般檔被取代（「既有
+    /// 檔案會被覆寫」）。這次檢查與 rename 之間仍有視窗，輸掉的後果只是 rename
+    /// 取代了那個 symlink 目錄項本身——rename 不跟隨 symlink，寫不到目標之外。
+    fn commit(mut self, dest: &OsStr) -> Result<()> {
+        refuse_in_the_way(&self.dir, dest)?;
+        self.dir
+            .rename(&self.name, dest)
+            .map_err(|e| CoreError::io(self.dir.child_path(dest), e))?;
         self.committed = true;
         Ok(())
+    }
+
+    /// 暫存名的完整路徑（錯誤訊息與測試接縫用）。
+    #[cfg(all(test, unix))]
+    fn path(&self) -> PathBuf {
+        self.dir.child_path(&self.name)
     }
 }
 
 impl Drop for TempPath {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = self.dir.remove_file(&self.name);
         }
     }
 }
 
-/// `path` 同目錄裡一個新的隱藏暫存名 `.kist-restore-<16 位 hex>`（亂數直接向
-/// 作業系統要，與 repo id 同一個來源）。只產生名字，不建檔。
-fn temp_name_for(path: &Path) -> Result<PathBuf> {
-    let Some(dir) = path.parent() else {
-        return Err(CoreError::Corrupt {
-            key: path.display().to_string(),
-            reason: "restored file has no parent directory".to_owned(),
-        });
-    };
-    let name = format!(
-        ".kist-restore-{}",
-        hex::encode(kist_crypto::random_bytes::<8>()?)
-    );
-    Ok(dir.join(name))
+/// 新的隱藏暫存名 `.kist-restore-<16 位 hex>`（亂數直接向作業系統要，與
+/// repo id 同一個來源）。只產生名字，不建檔。
+fn temp_name() -> Result<OsString> {
+    let random = hex::encode(kist_crypto::random_bytes::<8>()?);
+    Ok(OsString::from(format!(".kist-restore-{random}")))
 }
 
 /// 寫著內容的暫存檔：寫入用的 handle 加上負責刪檔的 [`TempPath`]。`file`
@@ -246,81 +169,93 @@ struct TempFile {
 }
 
 impl TempFile {
-    /// 在正式名 `dest` 的同目錄建一個新的暫存檔。`create_new`＝O_CREAT|O_EXCL：
-    /// 名字已被佔用（含 symlink，O_EXCL 不跟隨）就失敗，不會打開別人放的東西；
-    /// unix 另加 O_NOFOLLOW。
-    fn create_for(dest: &Path) -> Result<Self> {
-        let path = temp_name_for(dest)?;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
+    /// 在 `dir` 這一層建一個新的暫存檔（[`DirHandle::create_new_file`]：
+    /// O_CREAT|O_EXCL，unix 另加 O_NOFOLLOW——名字已被佔用就失敗，不會打開
+    /// 別人放的東西）。
+    fn create_in(dir: &DirHandle) -> Result<Self> {
+        let name = temp_name()?;
         // 開檔成功才交給 TempPath：失敗時那個名字不是我們的，drop 不能去刪它。
-        let file = opts.open(&path).map_err(|e| CoreError::io(&path, e))?;
+        let file = dir
+            .create_new_file(&name)
+            .map_err(|e| CoreError::io(dir.child_path(&name), e))?;
         Ok(Self {
             file,
             temp: TempPath {
-                path,
+                dir: dir.clone(),
+                name,
                 committed: false,
             },
         })
     }
 }
 
-/// 硬連結的第二個以後的名字，正式名處已經有東西時 link(2) 回 EEXIST（最常見：
-/// 同一個 snapshot 再還原一次）。這時先以同目錄的暫存名 link，再 rename 蓋過
-/// 去：與一般檔同一套「暫存＋rename」（ADR 019 A2），擋路的 symlink 照樣拒絕，
+/// 硬連結的第二個以後的名字：從還原目標的 handle 沿第一個名字的相對路徑
+/// `first` 逐層重新開到它所在的那一層（O_NOFOLLOW；途中被換成 symlink 就開
+/// 不起來，呼叫端退回複製），再 linkat 到 `dir` 的 `name`（ADR 019 A4）。
+/// 正式名處已經有東西時 linkat 回 EEXIST（最常見：同一個 snapshot 再還原
+/// 一次），改走 [`link_over`]。
+fn link_to_first(
+    target_dir: &DirHandle,
+    first: &[OsString],
+    dir: &DirHandle,
+    name: &OsStr,
+) -> Result<()> {
+    let Some((first_name, first_parents)) = first.split_last() else {
+        return Err(CoreError::Corrupt {
+            key: dir.child_path(name).display().to_string(),
+            reason: "empty hard-link source".to_owned(),
+        });
+    };
+    let first_dir = target_dir.open_rel(first_parents)?;
+    match first_dir.hard_link(first_name, dir, name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            link_over(&first_dir, first_name, dir, name)
+        }
+        Err(e) => Err(CoreError::io(dir.child_path(name), e)),
+    }
+}
+
+/// 硬連結的正式名處已經有東西：先以同一層的暫存名 link，再 rename 蓋過去：
+/// 與一般檔同一套「暫存＋rename」（ADR 019 A2），擋路的 symlink 照樣拒絕，
 /// 硬連結關係也保住——改走複製的話，第二次還原後兩個名字就各自獨立了。
-fn link_over(first: &Path, path: &Path) -> Result<()> {
+fn link_over(
+    first_dir: &DirHandle,
+    first_name: &OsStr,
+    dir: &DirHandle,
+    name: &OsStr,
+) -> Result<()> {
     // 兩個名字已經是同一個 inode（例如兩個 root 落在同一個位置，同一個名字
     // 還原兩次）：rename 對同一個 inode 的兩個名字什麼都不做、暫存名會留下
     // 來，所以先擋掉——已經是要的結果。
-    if same_file(first, path) {
+    if first_dir.same_file(first_name, dir, name) {
         return Ok(());
     }
-    let temp_path = temp_name_for(path)?;
-    // link 成功才交給 TempPath，理由同 TempFile::create_for。
-    std::fs::hard_link(first, &temp_path).map_err(|e| CoreError::io(&temp_path, e))?;
+    let temp = temp_name()?;
+    // link 成功才交給 TempPath，理由同 TempFile::create_in。
+    first_dir
+        .hard_link(first_name, dir, &temp)
+        .map_err(|e| CoreError::io(dir.child_path(&temp), e))?;
     TempPath {
-        path: temp_path,
+        dir: dir.clone(),
+        name: temp,
         committed: false,
     }
-    .commit(path)
-}
-
-/// 兩個路徑（不跟隨 symlink）是不是同一個 inode。
-#[cfg(unix)]
-fn same_file(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
-        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
-        _ => false,
-    }
-}
-
-/// 非 unix 的 std 沒有穩定的 inode 比對；當成不同，照常 link＋rename。
-#[cfg(not(unix))]
-fn same_file(_: &Path, _: &Path) -> bool {
-    false
+    .commit(name)
 }
 
 /// 正式檔名處已有的東西：沒有、或是一般檔（會被 rename 取代）→ 放行；
 /// symlink、目錄、特殊檔（FIFO、socket、裝置）→ 拒絕，而且不刪它、不跟隨
 /// （ADR 019 A2 裁定：擋路的 symlink 維持拒絕）。
-fn refuse_in_the_way(path: &Path) -> Result<()> {
-    let what = match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => "a symlink",
-        Ok(m) if m.is_dir() => "a directory",
-        Ok(m) if !m.is_file() => "a special file",
-        Ok(_) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(CoreError::io(path, e)),
+fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
+    let what = match dir.kind_of(name)? {
+        None | Some(Kind::File) => return Ok(()),
+        Some(Kind::Symlink) => "a symlink",
+        Some(Kind::Dir) => "a directory",
+        Some(Kind::Special) => "a special file",
     };
     Err(CoreError::Corrupt {
-        key: path.display().to_string(),
+        key: dir.child_path(name).display().to_string(),
         reason: format!("{what} is in the way of a restored file"),
     })
 }
@@ -329,31 +264,30 @@ fn refuse_in_the_way(path: &Path) -> Result<()> {
 /// 出的 0o555）時，子項目的暫存檔建不進去。這個目錄記錄的 mode 會在子項目
 /// 寫完後重新套上（[`apply_meta`]），所以先暫時加上擁有者寫入權，回傳原本的
 /// 權限（套 metadata 失敗時放回去）。不會被重新套 mode 的目錄（s3/generic
-/// 來源沒有 mode 或 mtime）不動。chmod 經 O_NOFOLLOW 開的 handle（同 A3）。
+/// 來源沒有 mode 或 mtime）不動。fstat 與 chmod 都經往下走時開的那個 handle
+/// （ADR 019 A3、A4）。
 #[cfg(unix)]
-fn make_owner_writable(path: &Path, node: &Entry) -> Result<Option<std::fs::Permissions>> {
+fn make_owner_writable(dir: &DirHandle, node: &Entry) -> Result<Option<std::fs::Permissions>> {
     use std::os::unix::fs::PermissionsExt;
     let mode_will_be_applied = node.mtime_ns.is_some() && node.mode.is_some_and(|m| m != 0);
     if !mode_will_be_applied {
         return Ok(None);
     }
-    // 先以路徑 lstat 看一眼（一般情況是可寫的，不必多開一個 handle）。
-    let current = std::fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
-    if current.permissions().mode() & 0o200 != 0 {
+    let handle = dir.meta_handle()?;
+    let original = handle
+        .metadata()
+        .map_err(|e| CoreError::io(dir.path(), e))?
+        .permissions();
+    if original.mode() & 0o200 != 0 {
         return Ok(None);
     }
-    let dir = open_dir_for_meta(path)?;
-    let original = dir
-        .metadata()
-        .map_err(|e| CoreError::io(path, e))?
-        .permissions();
     let writable = std::fs::Permissions::from_mode((original.mode() & 0o7777) | 0o200);
     // chmod 失敗（例如目錄不是我們的）不擋整個目錄：群組或其他人的寫入權
     // 也許就夠；不夠的話，每個子項目各自回報寫不進去。
-    if let Err(e) = dir.set_permissions(writable) {
+    if let Err(e) = handle.set_permissions(writable) {
         tracing::warn!(
             "{}: cannot make the existing directory writable for the restore: {e}",
-            path.display()
+            dir.path().display()
         );
         return Ok(None);
     }
@@ -362,7 +296,7 @@ fn make_owner_writable(path: &Path, node: &Entry) -> Result<Option<std::fs::Perm
 
 /// 非 unix 沒有 mode 可還原（fsmeta 的 apply_mode 是空的），不需要。
 #[cfg(not(unix))]
-fn make_owner_writable(_: &Path, _: &Entry) -> Result<Option<std::fs::Permissions>> {
+fn make_owner_writable(_: &DirHandle, _: &Entry) -> Result<Option<std::fs::Permissions>> {
     Ok(None)
 }
 
@@ -373,6 +307,11 @@ impl Repository {
     /// root 的定位穿過它）；目錄路徑遇到 symlink 回錯，與檔案路徑的
     /// symlink-in-the-way 防護一致。`target` 本身與其之上是使用者自己的
     /// 路徑，照常跟隨。
+    ///
+    /// 目標之下以目錄 handle 為錨逐層走（ADR 019 A4，[`DirHandle`]）：每一層
+    /// 以 O_NOFOLLOW 開好之後，子項目都相對於它建立，不再以完整路徑重新解析。
+    /// 還原途中某一層被搬走、原位換成外指 symlink，寫入仍落在已開的那個
+    /// 真目錄，不會跟著 symlink 到目標之外。
     pub async fn restore(
         &self,
         snapshot_key: &str,
@@ -382,11 +321,12 @@ impl Repository {
         let snapshot = self.read_snapshot(snapshot_key).await?;
         let index = ReloadableIndex::new(self.load_index().await?);
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
+        // 目標本身的 handle，整個 restore 都開著：每個 root 從它往下走；硬連結
+        // 跨 roots，後續名字也從它重新找第一個名字。
+        let target_dir = DirHandle::open_target(target)?;
         let mut summary = RestoreSummary::default();
-        // 硬連結：(dev, inode) → 第一個還原出來的路徑；後續名字 hard_link 過去。
         // 範圍是**整個 snapshot、跨 roots**（docs/format.md §8.3）。
-        let mut hardlinks: std::collections::HashMap<(u64, u64), PathBuf> =
-            std::collections::HashMap::new();
+        let mut hardlinks = HardLinks::new();
         for root in &snapshot.roots {
             let rel = fsmeta::locator_to_relative(root.path.as_slice())?;
             let entries = self.read_tree_chain(&root.tree).await?;
@@ -399,21 +339,22 @@ impl Repository {
                 && entries[0].kind != node_type::DIR
                 && rel.file_name().map(|f| f.as_encoded_bytes().to_vec())
                     == Some(entries[0].name.clone());
-            let base = if file_root {
-                target.join(rel.parent().unwrap_or(Path::new("")))
+            let base_rel = if file_root {
+                rel.parent().unwrap_or(Path::new(""))
             } else {
-                target.join(&rel)
+                rel.as_path()
             };
-            create_dir_nofollow(target, &base)?;
+            let base = target_dir.create_dirs(base_rel)?;
             for entry in entries {
                 // v3：節點名一律是單一路徑元件（合成根已淘汰）。
                 fsmeta::validate_child_name(&entry.name)?;
-                let path = base.join(fsmeta::bytes_to_name(&entry.name)?);
+                let name = fsmeta::bytes_to_name(&entry.name)?;
                 self.restore_node(
                     &entry,
-                    &path,
+                    &base,
+                    &name,
                     1,
-                    target,
+                    &target_dir,
                     &index,
                     &mut summary,
                     &mut hardlinks,
@@ -424,22 +365,27 @@ impl Repository {
         Ok(summary)
     }
 
-    /// 還原一個節點。錯誤記進 summary，不往上拋：一個壞掉的 chunk 不該讓其他 99% 的檔案也拿不回來。
+    /// 還原一個節點：`dir` 這一層裡的 `name`。錯誤記進 summary，不往上拋：一個
+    /// 壞掉的 chunk 不該讓其他 99% 的檔案也拿不回來。
     /// `depth`：DIR 巢狀深度（root 的子女 = 1）；超過 [`MAX_TREE_DEPTH`] 的
     /// chain 只能出自腐壞或敵意 repo——記錄錯誤、不深入，否則遞迴會把
-    /// process 墊進 stack overflow。
-    #[allow(clippy::too_many_arguments)] // depth 是深度上限帶進來的第 8 個參數
+    /// process 墊進 stack overflow。這個上限同時是同時開著的目錄 handle 數的
+    /// 上限（每層一個，ADR 019 A4）。
+    #[allow(clippy::too_many_arguments)] // depth 與目標的 handle 都得帶進遞迴
     fn restore_node<'a>(
         &'a self,
         node: &'a Entry,
-        path: &'a Path,
+        dir: &'a DirHandle,
+        name: &'a OsStr,
         depth: usize,
-        target: &'a Path,
+        target_dir: &'a DirHandle,
         index: &'a ReloadableIndex,
         summary: &'a mut RestoreSummary,
-        hardlinks: &'a mut std::collections::HashMap<(u64, u64), PathBuf>,
+        hardlinks: &'a mut HardLinks,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
+            // 完整路徑只用在錯誤訊息；實際操作都經 `dir`（ADR 019 A4）。
+            let path = dir.child_path(name);
             let result = match node.kind {
                 node_type::DIR if !node.subtree.is_zero() => {
                     if depth >= MAX_TREE_DEPTH {
@@ -451,8 +397,10 @@ impl Repository {
                             ),
                         })
                     } else {
-                        self.restore_dir(node, path, depth, target, index, summary, hardlinks)
-                            .await
+                        self.restore_dir(
+                            node, dir, name, depth, target_dir, index, summary, hardlinks,
+                        )
+                        .await
                     }
                 }
                 node_type::FILE => {
@@ -461,32 +409,18 @@ impl Repository {
                         .filter(|k| k.1 != 0);
                     if let Some(k) = hardlink_key {
                         if let Some(first) = hardlinks.get(&k) {
-                            match std::fs::hard_link(first, path) {
+                            match link_to_first(target_dir, first, dir, name) {
                                 Ok(()) => {
                                     summary.files += 1;
                                     return;
                                 }
-                                // 正式名處已有東西：暫存名 link 再 rename（ADR 019 A2）。
-                                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                    match link_over(first, path) {
-                                        Ok(()) => {
-                                            summary.files += 1;
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "{}: cannot hard-link to {}: {e}; restoring a copy",
-                                                path.display(),
-                                                first.display()
-                                            );
-                                        }
-                                    }
-                                }
                                 Err(e) => {
+                                    let first_path =
+                                        target_dir.path().join(first.iter().collect::<PathBuf>());
                                     tracing::warn!(
                                         "{}: cannot hard-link to {}: {e}; restoring a copy",
                                         path.display(),
-                                        first.display()
+                                        first_path.display()
                                     );
                                 }
                             }
@@ -494,29 +428,30 @@ impl Repository {
                     }
                     // 硬連結失敗後的複製也走這裡：同樣是暫存檔＋rename（ADR 019 A2）。
                     match self
-                        .restore_file(path, node.size, &node.chunks, node.content, index)
+                        .restore_file(dir, name, node.size, &node.chunks, node.content, index)
                         .await
                     {
                         Ok(temp) => {
                             #[cfg(all(test, unix))]
-                            meta_via_handle_tests::before_meta(&temp.temp.path, path);
+                            meta_via_handle_tests::before_meta(&temp.temp.path(), &path);
                             // metadata 經寫入內容的同一個 handle 套用（ADR 019 A3）：
                             // 路徑在寫完之後被換成 symlink，也改不到外面的檔。
                             // xattr 在 times/mode **之前**：記錄的 mode 可能是唯讀，
                             // 之後 user.* 會設不進去（EACCES）。
-                            let meta = fsmeta::apply_xattrs(&temp.file, path, node.xattrs.as_ref())
-                                .and_then(|()| apply_meta(&temp.file, path, node));
+                            let meta =
+                                fsmeta::apply_xattrs(&temp.file, &path, node.xattrs.as_ref())
+                                    .and_then(|()| apply_meta(&temp.file, &path, node));
                             // metadata 套不上（例如目標檔案系統不收 xattr）時內容仍是
                             // 對的：照樣 rename 成正式名、記下這個錯——與以前在正式名
                             // 上原地寫時一樣。先關檔再 rename：Windows 上 rename 開著
                             // 的檔要看共用模式，關掉最單純；unix 沒有差別。
                             let TempFile { file, temp } = temp;
                             drop(file);
-                            match temp.commit(path) {
+                            match temp.commit(name) {
                                 Ok(()) => {
                                     summary.files += 1;
                                     if let Some(k) = hardlink_key {
-                                        hardlinks.insert(k, path.to_path_buf());
+                                        hardlinks.insert(k, dir.child_rel(name));
                                     }
                                     meta
                                 }
@@ -529,20 +464,22 @@ impl Repository {
                     }
                 }
                 node_type::SYMLINK => match fsmeta::bytes_to_name(&node.target) {
-                    Ok(name) => match replace_with_symlink(&PathBuf::from(name), path) {
-                        Ok(()) => {
-                            summary.symlinks += 1;
-                            if node.xattrs.is_some() {
-                                tracing::warn!(
-                                    "{}: snapshot has extended attributes for this symlink;                                      Linux cannot set user.* on a symlink and following it would                                      write to the target, so they are not restored",
-                                    path.display()
-                                );
+                    Ok(link_target) => {
+                        match replace_with_symlink(dir, name, Path::new(&link_target)) {
+                            Ok(()) => {
+                                summary.symlinks += 1;
+                                if node.xattrs.is_some() {
+                                    tracing::warn!(
+                                        "{}: snapshot has extended attributes for this symlink;                                      Linux cannot set user.* on a symlink and following it would                                      write to the target, so they are not restored",
+                                        path.display()
+                                    );
+                                }
+                                apply_symlink_meta(dir, name, node);
+                                Ok(())
                             }
-                            apply_symlink_meta(path, node);
-                            Ok(())
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
-                    },
+                    }
                     Err(e) => Err(e),
                 },
                 other => Err(CoreError::Corrupt {
@@ -557,35 +494,44 @@ impl Repository {
         })
     }
 
+    /// 還原 `parent` 這一層裡的目錄 `name`：建立（或沿用）並開著它，子項目都
+    /// 經這個 handle 建立，metadata 最後也套在它上面（ADR 019 A3、A4）。這一層
+    /// 之後被搬走、原位換成 symlink，子項目與 metadata 都跟著真目錄走，不會
+    /// 落到 symlink 指的地方。handle 在子項目還原期間一直開著：同時開著的
+    /// 數目是遞迴深度，不是 entry 數。
     #[allow(clippy::too_many_arguments)] // 同 restore_node
     async fn restore_dir(
         &self,
         node: &Entry,
-        path: &Path,
+        parent: &DirHandle,
+        name: &OsStr,
         depth: usize,
-        target: &Path,
+        target_dir: &DirHandle,
         index: &ReloadableIndex,
         summary: &mut RestoreSummary,
-        hardlinks: &mut std::collections::HashMap<(u64, u64), PathBuf>,
+        hardlinks: &mut HardLinks,
     ) -> Result<()> {
-        create_dir_nofollow(target, path)?;
+        let dir = parent.create_child_dir(name)?;
         let children = self.read_tree_chain(&node.subtree).await?;
         // 既有的唯讀目錄先暫時加上擁有者寫入權（ADR 019 A2）。放在讀完子 tree
         // 之後：從這裡到下面重新套 mode 之間沒有提早 return——子項目的錯誤記進
         // summary、不往上拋；迴圈裡的 bytes_to_name 在 unix（唯一會加寫入權的
         // 平台）不會失敗。
-        let loosened = make_owner_writable(path, node)?;
+        let loosened = make_owner_writable(&dir, node)?;
         for child in children {
             if let Err(e) = fsmeta::validate_child_name(&child.name) {
-                summary.errors.push(format!("{}: {e}", path.display()));
+                summary
+                    .errors
+                    .push(format!("{}: {e}", dir.path().display()));
                 continue;
             }
-            let child_path = path.join(fsmeta::bytes_to_name(&child.name)?);
+            let child_name = fsmeta::bytes_to_name(&child.name)?;
             self.restore_node(
                 &child,
-                &child_path,
+                &dir,
+                &child_name,
                 depth + 1,
-                target,
+                target_dir,
                 index,
                 summary,
                 hardlinks,
@@ -594,39 +540,39 @@ impl Repository {
         }
         summary.dirs += 1;
         #[cfg(all(test, unix))]
-        meta_via_handle_tests::before_meta(path, path);
+        meta_via_handle_tests::before_meta(dir.path(), dir.path());
         // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋；xattr 在 times/mode 之前。
-        // 沒有要套的 metadata（s3/generic 來源的目錄）就不開 handle，與以前一樣
-        // 一個 syscall 都不做（這種目錄 make_owner_writable 也不會動）。
+        // 沒有要套的 metadata（s3/generic 來源的目錄）就不動，與以前一樣。
         if node.xattrs.is_none() && node.mtime_ns.is_none() {
             return Ok(());
         }
-        let dir = open_dir_for_meta(path)?;
-        let applied = fsmeta::apply_xattrs(&dir, path, node.xattrs.as_ref())
-            .and_then(|()| apply_meta(&dir, path, node));
+        let handle = dir.meta_handle()?;
+        let applied = fsmeta::apply_xattrs(&handle, dir.path(), node.xattrs.as_ref())
+            .and_then(|()| apply_meta(&handle, dir.path(), node));
         // 記錄的 mode 沒套上（xattr 或時間先失敗）：至少把暫時加的寫入權拿掉。
         if applied.is_err() {
             if let Some(original) = loosened {
-                let _ = dir.set_permissions(original);
+                let _ = handle.set_permissions(original);
             }
         }
         applied
     }
 
-    /// 把檔案內容寫進正式名 `path` 同目錄的暫存檔，回傳它（ADR 019 A2）：
-    /// 呼叫端在同一個 handle 上套 metadata（ADR 019 A3），再 commit（rename）
-    /// 成正式名。任何一步失敗，暫存檔隨錯誤被 drop 刪掉，正式名底下原有的檔
-    /// 不受影響。
+    /// 把檔案內容寫進 `dir` 這一層的暫存檔，回傳它（ADR 019 A2）：呼叫端在同一個
+    /// handle 上套 metadata（ADR 019 A3），再 commit（rename）成正式名 `name`。
+    /// 任何一步失敗，暫存檔隨錯誤被 drop 刪掉，正式名底下原有的檔不受影響。
     async fn restore_file(
         &self,
-        path: &Path,
+        dir: &DirHandle,
+        name: &OsStr,
         size: u64,
         chunks: &[ChunkId],
         content: u8,
         index: &ReloadableIndex,
     ) -> Result<TempFile> {
+        let path = dir.child_path(name);
         // 先看一眼正式名處：擋著 symlink 之類就不必下載內容（commit 前會再看一次）。
-        refuse_in_the_way(path)?;
+        refuse_in_the_way(dir, name)?;
         let chunk_ids = if content == content_type::DIRECT {
             chunks.to_vec()
         } else {
@@ -643,17 +589,17 @@ impl Repository {
         // 內容寫進新建的暫存檔，不開正式名：以前以 write＋create＋truncate
         // 開正式名，失敗後呼叫端再 remove_file，連還沒開檔就失敗（間接內容的
         // 清單讀不到）的情況也會刪掉使用者原有的檔。
-        let temp = TempFile::create_for(path)?;
+        let temp = TempFile::create_in(dir)?;
         let mut writer = std::io::BufWriter::new(&temp.file);
         let mut written = 0u64;
         for id in &chunk_ids {
             let data = self.read_chunk_reloading(id, index).await?;
             writer
                 .write_all(&data)
-                .map_err(|e| CoreError::io(path, e))?;
+                .map_err(|e| CoreError::io(&path, e))?;
             written += data.len() as u64;
         }
-        writer.flush().map_err(|e| CoreError::io(path, e))?;
+        writer.flush().map_err(|e| CoreError::io(&path, e))?;
         drop(writer); // writer 借用著 temp.file；回傳 temp 之前先放掉
         if written != size {
             return Err(CoreError::Corrupt {
@@ -733,30 +679,39 @@ impl Repository {
     }
 }
 
-/// 建 symlink 前先移除既有的檔案或 symlink（第二次 restore 到同一目錄）；既有的是目錄則回錯。
-fn replace_with_symlink(target: &Path, link: &Path) -> Result<()> {
-    if let Ok(meta) = std::fs::symlink_metadata(link) {
-        if meta.is_dir() {
+/// 建 symlink 前先移除既有的檔案或 symlink（第二次 restore 到同一目錄）；既有的是
+/// 目錄則回錯。都經 `dir` 這一層的 handle（ADR 019 A4）。
+fn replace_with_symlink(dir: &DirHandle, name: &OsStr, link_target: &Path) -> Result<()> {
+    match dir.kind_of(name) {
+        Ok(Some(Kind::Dir)) => {
             return Err(CoreError::Corrupt {
-                key: link.display().to_string(),
+                key: dir.child_path(name).display().to_string(),
                 reason: "a directory is in the way of a symlink".to_owned(),
             });
         }
-        std::fs::remove_file(link).map_err(|e| CoreError::io(link, e))?;
+        Ok(Some(_)) => dir
+            .remove_file(name)
+            .map_err(|e| CoreError::io(dir.child_path(name), e))?,
+        // 沒有、或看不到：直接建，建不起來由建 symlink 那一步回報（與以前相同）。
+        Ok(None) | Err(_) => {}
     }
-    create_symlink(target, link)
+    create_symlink(dir, name, link_target)
 }
 
 #[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link).map_err(|e| CoreError::io(link, e))
+fn create_symlink(dir: &DirHandle, name: &OsStr, link_target: &Path) -> Result<()> {
+    dir.symlink(link_target, name)
+        .map_err(|e| CoreError::io(dir.child_path(name), e))
 }
 
 #[cfg(windows)]
-fn create_symlink(target: &Path, link: &Path) -> Result<()> {
+fn create_symlink(dir: &DirHandle, name: &OsStr, link_target: &Path) -> Result<()> {
     // Windows 建 symlink 需要特權；失敗只警告，不讓整個 restore 中止。
-    if let Err(e) = std::os::windows::fs::symlink_file(target, link) {
-        tracing::warn!("{}: cannot create symlink: {e}", link.display());
+    if let Err(e) = dir.symlink(link_target, name) {
+        tracing::warn!(
+            "{}: cannot create symlink: {e}",
+            dir.child_path(name).display()
+        );
     }
     Ok(())
 }
@@ -924,8 +879,9 @@ mod meta_via_handle_tests {
     }
 
     /// 目錄：子項目寫完後路徑被換成指向外面目錄的 symlink。外面的目錄不能被
-    /// 改 mode 與 mtime；這個目錄的 metadata 回報為擋路錯誤（以 O_NOFOLLOW
-    /// 開目錄遇到 symlink，Linux 回的是 ENOTDIR，不是 ELOOP）。
+    /// 改 mode 與 mtime。ADR 019 A4 之後目錄的 metadata 套在往下走時開的那個
+    /// handle 上，不再以路徑重開：metadata 落在被搬到旁邊的真目錄，與檔案
+    /// 一樣，也就沒有錯誤（A3 時重開遇到 symlink 回報擋路錯誤）。
     #[tokio::test]
     async fn dir_meta_does_not_follow_a_swapped_in_symlink() {
         let s = setup().await;
@@ -948,10 +904,11 @@ mod meta_via_handle_tests {
             std::fs::read(moved(&path).join("inner.txt")).unwrap(),
             b"inner"
         );
-        assert_eq!(summary.errors.len(), 1, "{summary:?}");
-        assert!(
-            summary.errors[0].contains("a non-directory is in the way of a restored directory"),
-            "{summary:?}"
+        assert_eq!(
+            mode_and_mtime(&moved(&path)),
+            ("700".to_owned(), RECORDED_MTIME),
+            "metadata 應該套在還原出的那個目錄上"
         );
+        assert!(summary.errors.is_empty(), "{summary:?}");
     }
 }

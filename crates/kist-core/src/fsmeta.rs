@@ -256,7 +256,9 @@ pub fn apply_xattrs(
     Ok(())
 }
 
-fn file_time(mtime_ns: i64) -> filetime::FileTime {
+/// 記錄的奈秒 mtime → filetime 的時間（1970 年前的負值照實）。symlink 本身的
+/// 時間在 restore 那一層的目錄 handle 上設（dirhandle.rs，ADR 019 A4）。
+pub(crate) fn file_time(mtime_ns: i64) -> filetime::FileTime {
     filetime::FileTime::from_unix_time(
         mtime_ns.div_euclid(1_000_000_000),
         mtime_ns.rem_euclid(1_000_000_000) as u32,
@@ -280,13 +282,6 @@ pub fn apply(file: &File, path: &Path, meta: &FsMeta) -> Result<()> {
         .set_modified(mtime);
     file.set_times(times).map_err(|e| CoreError::io(path, e))?;
     apply_mode(file, path, meta.mode)
-}
-
-/// symlink 條目：只還原 mtime，以路徑設在連結本身、不跟隨連結；不設 mode。
-pub fn apply_symlink(path: &Path, meta: &FsMeta) {
-    let mtime = file_time(meta.mtime_ns);
-    // 有些平台不支援設定 symlink 本身的時間；失敗不算錯。
-    let _ = filetime::set_symlink_file_times(path, mtime, mtime);
 }
 
 #[cfg(unix)]
