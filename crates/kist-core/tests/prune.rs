@@ -694,3 +694,134 @@ async fn refuses_when_a_referenced_chunk_is_only_in_a_missing_pack() {
     assert!(ids_under(&t, "gc").is_empty());
     assert_eq!(t.count("indexes"), 1);
 }
+
+/// pack 與根 tree 已刪、它們的標記還在、index blob 沒動（Go 的「清掃做到一半
+/// 當機」狀態；Rust 的 execute 先寫 index 再刪，單一 prune 當機造不出來，
+/// 物件被外力刪掉才會）。改寫自已移除的 Go 參考實作
+/// （`TestPruneRewritesTheIndexAfterACrashedSweep`）：2026-09 的稽核裡，這是唯一
+/// 「沒有 Go 就抓不到」的案例（51be5ed，見 ADR 018）。backup 放在第二輪 prune
+/// 之前：Rust 的標記隨物件一起刪，照 Go 的順序走不到 touch 分支。Go 的第三個
+/// 斷言（清掉孤兒標記後的 backup 必須重傳）不在這裡；「有幽靈 pack 就重寫
+/// index」由 `phantom_packs_do_not_steal_canonical_from_real_holders` 釘住。
+/// 釘住三件事：
+/// 1. 同內容再備份時，根 tree 以主體身分重寫、卻帶著開始時就在的標記 → 必須補
+///    touch，commit 一次成功（否則 commit gate 會安全失敗一次）；
+/// 2. 下一輪 prune 把孤兒標記清掉，並重寫 index 丟掉幽靈 pack；
+/// 3. 之後 repo 一致、可還原。
+#[tokio::test]
+async fn backup_and_prune_recover_from_a_crashed_sweep() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    let out = t.dir.path().join("out");
+    make_src(&src);
+    let repo = t.open().await;
+    let r = OffsetDateTime::now_utc();
+    let b1 = repo
+        .backup(std::slice::from_ref(&src), client(1, r))
+        .await
+        .unwrap();
+    repo.forget(kist_core::ForgetOptions {
+        snapshots: vec![b1.snapshot_key.clone()],
+        policy: Default::default(),
+        dry_run: false,
+    })
+    .await
+    .unwrap();
+    settle().await;
+    settle().await;
+    let p1 = repo.prune(prune_opts(r + Duration::days(4))).await.unwrap();
+    assert!(p1.marked > 0, "{p1:?}");
+    let root = b1.roots[0].tree;
+    let root_obj = ObjectId::from_bytes(*root.as_bytes());
+    let marks = ids_under(&t, "gc");
+    assert!(marks.contains(&root_obj), "根 tree 應該被標記：{p1:?}");
+    let crashed_pack = *marks
+        .intersection(&ids_under(&t, "packs"))
+        .next()
+        .expect("至少一個 pack 被標記");
+
+    // 當機狀態：清掃刪了 pack 與根 tree，還沒刪到它們的標記；index blob 原封不動。
+    std::fs::remove_file(t.repo_path().join(keys::pack(&crashed_pack))).unwrap();
+    std::fs::remove_file(t.repo_path().join(keys::tree(&root))).unwrap();
+    settle().await;
+
+    let b2 = t
+        .open()
+        .await
+        .backup(
+            std::slice::from_ref(&src),
+            client(1, r + Duration::days(4) + Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(b2.roots[0].tree, root, "內容沒變，根 tree 應該同 ID");
+    assert!(
+        t.repo_path().join(keys::touch(&root)).exists(),
+        "重寫的主體 tree 帶著開始時的標記，要補 touch"
+    );
+    assert!(b2.report.packs_new > 0, "{:?}", b2.report);
+
+    settle().await;
+    let p2 = repo
+        .prune(prune_opts(r + Duration::days(4) + Duration::hours(2)))
+        .await
+        .unwrap();
+    assert!(p2.stale_marks >= 1, "{p2:?}");
+    assert!(p2.skipped.is_empty(), "{p2:?}");
+    let marks = ids_under(&t, "gc");
+    assert!(!marks.contains(&crashed_pack), "孤兒標記沒清掉：{p2:?}");
+    assert!(
+        !marks.contains(&root_obj),
+        "b2 引用的根 tree 應該復活：{p2:?}"
+    );
+    let fresh = t.open().await;
+    let index = fresh.load_index().await.unwrap();
+    assert!(
+        !index.packs().any(|(p, _)| *p == crashed_pack),
+        "新開的 repo 仍在 index 裡看到已消失的 pack {crashed_pack}"
+    );
+    let report = fresh
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    restore_matches(&fresh, &b2.snapshot_key, &src, &out).await;
+}
+
+/// ADR 019 A8：第 13 步（parity 孤兒清掃）刪 sidecar 前會再看一眼 pack 在不在；
+/// 那一眼的錯誤不是 NotFound（暫時性錯誤）時，不得當成「pack 不在」而刪掉
+/// sidecar，要讓 prune 回錯（同第 14 步的分法）。
+/// 注入：`packs/<id>` 放一個 Unix socket。本機後端的 list 只列一般檔案，所以它
+/// 不在清單裡（像並發 backup 剛 Put、還沒列到的 pack）；head 的 open(2) 對
+/// socket 回 ENXIO，不是 NotFound。
+#[cfg(unix)]
+#[tokio::test]
+async fn parity_sweep_keeps_the_sidecar_when_the_pack_head_fails() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let r = OffsetDateTime::now_utc();
+    repo.backup(std::slice::from_ref(&src), client(1, r))
+        .await
+        .unwrap();
+
+    let id = ObjectId::from_bytes([0xCD; 32]);
+    let sidecar = t.repo_path().join(kist_format::parity::key(&id));
+    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    std::fs::write(&sidecar, b"parity").unwrap();
+    // socket 路徑有長度上限（sun_path 108 bytes）：先在短路徑建，再搬到 pack 的位置。
+    let short = t.dir.path().join("s");
+    drop(std::os::unix::net::UnixListener::bind(&short).unwrap());
+    std::fs::rename(&short, t.repo_path().join(keys::pack(&id))).unwrap();
+
+    let res = repo.prune(prune_opts(r + Duration::hours(1))).await;
+    assert!(
+        sidecar.exists(),
+        "pack 的 HEAD 失敗不等於 pack 不在：sidecar 不得刪：{res:?}"
+    );
+    assert!(res.is_err(), "HEAD 的錯誤要讓 prune 回錯：{res:?}");
+}

@@ -81,5 +81,5 @@ header 觸發巨大配置；觸發時 abort stack 指向 target 配置點）。�
 ## 種子
 
 `fuzz/seeds/`：golden CBOR（pack_trailer、index、tree、snapshot、config，
-前面加 selector byte）、parity Go golden sidecar（原檔/截斷）、固定與
+前面加 selector byte）、parity golden sidecar（原檔/截斷）、固定與
 隨機圖樣。新增格式結構或 golden 時，記得在這裡補對應種子。

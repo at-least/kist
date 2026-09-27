@@ -1,6 +1,6 @@
 //! SFTP 後端：把遠端目錄當成 kist 的 key-value 命名空間，一個 key 一個檔案。
 //!
-//! 語意對齊 Go 參考實作（kist `internal/backend/sftp.go`）：
+//! 語意要點：
 //! - **寫入一律走暫存檔**：同目錄下 `.tmp-<16hex>`（O_EXCL 建檔）→ 寫完 `fsync`
 //!   （伺服器支援 `fsync@openssh.com` 時）→
 //!   - `put`（覆蓋）：`posix-rename@openssh.com` 原子換名；
@@ -14,7 +14,7 @@
 //!   `KIST_SFTP_KNOWN_HOSTS` 指定）裡有的 key；不在裡面一律拒絕連線（不做 TOFU）。
 //!   連線前先從 known_hosts 取該主機的 key 類型做演算法預選——OpenSSH 伺服器只會
 //!   從客戶端提案的類型裡挑，不預選的話，known_hosts 只記了 ed25519 的主機可能
-//!   一直收到 ECDSA key 而被自己拒絕（Go 版用兩次撥接解同一件事）。
+//!   一直收到 ECDSA key 而被自己拒絕。
 //! - **認證順序**：`$SSH_AUTH_SOCK` 的 agent → key 檔（`KIST_SFTP_KEY`，可配
 //!   `KIST_SFTP_KEY_PASSPHRASE`）→ 密碼（`KIST_SFTP_PASSWORD`）。全缺則報錯。
 //!
@@ -79,7 +79,7 @@ pub struct SftpConfig {
 ///
 /// - 不帶 user：連線時用目前使用者（`USER` / `LOGNAME`）。
 /// - 帳密寫在 URL（`user:pass@`）直接拒絕：密碼會留在 shell 歷史與 process 清單裡，
-///   請用 `KIST_SFTP_PASSWORD`（與 Go 參考實作同一理由、同一變數名）。
+///   請用 `KIST_SFTP_PASSWORD`。
 /// - 支援 `[ipv6]` 形式的主機；不做 percent-decoding，路徑就是字面內容。
 pub fn parse_sftp_url(s: &str) -> Result<SftpConfig> {
     let rest = match s.strip_prefix("sftp://") {
@@ -87,7 +87,7 @@ pub fn parse_sftp_url(s: &str) -> Result<SftpConfig> {
         None => return Err(BackendError::InvalidUrl(s.to_owned())),
     };
     // `@` 只在 authority（第一個 `/` 之前）裡才算 userinfo：路徑是字面內容，
-    // 裡面的 `@` 與帳號無關（與 Go 端 url.Parse 同一語意）。
+    // 裡面的 `@` 與帳號無關。
     let (user, hostport) = {
         let authority_end = rest.find('/').unwrap_or(rest.len());
         match rest[..authority_end].split_once('@') {
@@ -158,7 +158,7 @@ pub struct SftpAuth {
 }
 
 /// 從環境變數讀認證素材：`KIST_SFTP_KNOWN_HOSTS` / `KIST_SFTP_KEY` /
-/// `KIST_SFTP_KEY_PASSPHRASE` / `KIST_SFTP_PASSWORD`（名稱對齊 Go 參考實作）。
+/// `KIST_SFTP_KEY_PASSPHRASE` / `KIST_SFTP_PASSWORD`。
 /// 只給 [`crate::Backend::from_url`] 用；其他管道請直接構造 [`SftpAuth`]。
 pub fn auth_from_env() -> SftpAuth {
     let known_hosts = std::env::var("KIST_SFTP_KNOWN_HOSTS")
@@ -376,7 +376,7 @@ async fn connect(cfg: &SftpConfig, auth: &SftpAuth) -> Result<(Keepalive, Arc<Sf
         .await
         .map_err(|e| BackendError::Sftp(format!("start sftp: {e}")))?;
 
-    // 伺服器能力檢查：兩個擴充都是寫入語意的根基，缺一個都不行（訊息對齊 Go 版）。
+    // 伺服器能力檢查：兩個擴充都是寫入語意的根基，缺一個都不行。
     if !sftp.support_hardlink() || !sftp.support_posix_rename() {
         return Err(BackendError::Sftp(
             "the server does not offer hardlink@openssh.com and posix-rename@openssh.com, \
@@ -960,7 +960,7 @@ fn bytes_of(payload: &PutPayload) -> Vec<u8> {
 fn skip_in_listing(list_all: bool, name: &str) -> bool {
     // `.`/`..` 永遠跳：伺服器可以送（filexfer 草稿允許）、
     // openssh-sftp-client 不過濾——`.` 當目錄會無限遞迴、`..` 會走出
-    // root。（Go 端由 pkg/sftp 客戶端在協議層過濾，見其測試釘。）
+    // root。
     if name == "." || name == ".." {
         return true;
     }

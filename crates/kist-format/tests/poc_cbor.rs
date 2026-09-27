@@ -1,9 +1,9 @@
 //! CBOR 編碼行為測試（v2 修訂後：欄位表順序，不做排序）。
 //!
 //! 歷史：v2 草案曾採「map keys 排序」的 Core Deterministic（P1 驗證過
-//! ciborium Value 層排序可與 Go fxamacker CoreDet 逐 byte 相同），但那是
-//! 「Go 免費、Rust 付 20 倍 encode 成本」的選擇。2026-09-05 修訂為規格釘
-//! 死欄位順序；跨語言一致性由 `tests/interop.rs` 的 tree 向量承擔。
+//! ciborium Value 層排序可與 fxamacker/cbor CoreDet 逐 byte 相同），但排序
+//! 要 Rust 付 20 倍 encode 成本。2026-09-05 修訂為規格釘死欄位順序；編碼
+//! 一致性由 `tests/interop.rs` 的凍結 tree 向量承擔。
 
 use serde::{Deserialize, Serialize};
 

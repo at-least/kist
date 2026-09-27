@@ -131,7 +131,7 @@ async fn run_job_inner(
                 hostname: client_id::hostname(),
                 username: client_id::username(),
                 now: None,
-                gc_grace: b.gc_grace.unwrap_or(kist_core::DEFAULT_GC_GRACE),
+                gc_grace: cfg.gc_grace(),
                 parity: b.parity,
                 progress,
                 source: kist_core::SourceSpec::default(),

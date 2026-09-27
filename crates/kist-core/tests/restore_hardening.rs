@@ -267,8 +267,8 @@ async fn symlink_in_the_way_of_a_file_is_refused() {
     );
 }
 
-/// 定位組件含 NUL 必須回錯（與 Go 端 restore.go 的 locatorComponents
-/// 同判斷）：NUL 不是路徑元件，Unix 上會在 syscall 層 EINVAL。
+/// 定位組件含 NUL 必須回錯：NUL 不是路徑元件，
+/// Unix 上會在 syscall 層 EINVAL。
 #[test]
 fn locator_with_nul_component_is_rejected() {
     use kist_core::fsmeta::locator_to_relative;
@@ -280,7 +280,7 @@ fn locator_with_nul_component_is_rejected() {
 }
 
 /// 讀取端對 snapshot 內容也要跑結構驗證（`Snapshot::validate`：roots 非空、
-/// 排序、唯一；Go 在 save 與 load 都跑）：解得開但結構不合法的 snapshot
+/// 排序、唯一；save 與 load 都跑）：解得開但結構不合法的 snapshot
 /// 要以 Corrupt 拒絕，不能被 restore/mount 當正常資料。
 #[tokio::test]
 async fn snapshot_with_invalid_structure_is_rejected_on_read() {
@@ -316,8 +316,8 @@ async fn snapshot_with_invalid_structure_is_rejected_on_read() {
 /// 下一層；金鑰持有者寫得出，見 threat model「owns the repository」）。
 /// restore 與 check 的走訪是有界堆疊上的遞迴：超過深度上限必須**乾淨回錯**
 /// （restore 記進 summary.errors、check 記進 report.errors），不是把整個
-/// process 墊進 stack overflow。上限 [`kist_core::MAX_TREE_DEPTH`] 與 Go
-/// 實作的 `maxTreeDepth` 是同一個數，文件寡在 docs/format.md §8.4。
+/// process 墊進 stack overflow。上限 [`kist_core::MAX_TREE_DEPTH`] 文件寡在
+/// docs/format.md §8.4。
 /// 測試本體在明確指定大小的執行緒上跑：debug build 的遞迴 frame 是 release
 /// 的好幾倍大（實測 256 層深就要 >2 MiB，release 下的 2 MiB tokio worker
 /// 綽綽有餘），libtest 預設執行緒的堆疊承載不了深鏈的 debug frame。
@@ -457,6 +457,106 @@ async fn overly_deep_tree_chain_body() {
         summary.errors.iter().any(|e| e.contains(&msg)),
         "restore 要在上限處回錯：{:?}",
         summary.errors.first()
+    );
+}
+
+/// 間接內容的 chunk 清單同樣要比 `v`（format.md §16：≠3 拒絕；ADR 019 A10）。
+/// 泛型 `cbor::decode` 不看版本：v=4 的清單以前會被 restore 照 v3 的讀法
+/// 還原出內容、check 也看不出異狀。restore 要記節點錯誤、不寫檔；check
+/// （不讀資料也會走 reach 解開清單）要回報。
+#[tokio::test]
+async fn chunk_list_with_unknown_version_is_rejected() {
+    use kist_core::CheckOptions;
+    use kist_format::cbor;
+    use kist_format::keys;
+    use kist_format::snapshot::{format_key_timestamp, Root};
+    use kist_format::tree::{content_type, meta_kind, node_type, ChunkList, Entry, Tree};
+    use serde_bytes::ByteBuf;
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    // 兩個小檔各自成一顆 chunk：一顆是資料，一顆的明文正好是 v=4 的清單。
+    let payload = b"payload listed by a v4 chunk list".to_vec();
+    let list = cbor::encode(&ChunkList {
+        version: 4,
+        chunks: vec![repo.keys().chunk_id(&payload)],
+    })
+    .unwrap();
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("payload.bin"), &payload).unwrap();
+    std::fs::write(src.join("list.cbor"), &list).unwrap();
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    // 手工組一棵 tree：一個間接內容的檔案，chunks 指向那顆清單 chunk。
+    let tree = Tree::new(
+        vec![Entry {
+            name: b"file.bin".to_vec(),
+            kind: node_type::FILE,
+            meta_kind: meta_kind::GENERIC,
+            size: payload.len() as u64,
+            content: content_type::INDIRECT,
+            chunks: vec![repo.keys().chunk_id(&list)],
+            ..plain_entry()
+        }],
+        None,
+    );
+    let (tree_id, sealed_tree) = repo.seal_tree(tree).await.unwrap();
+    repo.backend()
+        .put(&keys::tree(&tree_id), sealed_tree)
+        .await
+        .unwrap();
+
+    // 借真 snapshot 的形狀，換 root 與時間（key 的時間戳與 time_ns 讀取端核對）。
+    let mut snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+    snap.roots = vec![Root {
+        path: ByteBuf::from(b"/evil".to_vec()),
+        tree: tree_id,
+    }];
+    let at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let ts = format_key_timestamp(at).unwrap();
+    snap.time_ns = at.unix_timestamp_nanos() as i64; // i128 → i64：時間軸遠在範圍內
+    let key_path = keys::snapshot(&backup_options().client_id, &ts);
+    let sealed = repo
+        .keys()
+        .seal_snapshot(&key_path, &cbor::encode(&snap).unwrap())
+        .unwrap();
+    repo.backend().put(&key_path, sealed).await.unwrap();
+
+    // check 走 reach → resolve_chunks：要指出清單的版本不對。
+    let report = repo
+        .check(CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("chunk list") && e.contains("version 4")),
+        "check 要回報 v=4 的 chunk 清單：{:?}",
+        report.errors
+    );
+
+    // restore：這個檔記節點錯誤，不照 v3 的讀法寫出內容。
+    let target = t.dir.path().join("out");
+    let summary = repo
+        .restore(&key_path, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        summary.errors.iter().any(|e| e.contains("version 4")),
+        "restore 要拒絕 v=4 的 chunk 清單：{:?}",
+        summary.errors
+    );
+    assert!(
+        !target.join("evil").join("file.bin").exists(),
+        "v=4 的清單不能被還原成檔案"
     );
 }
 

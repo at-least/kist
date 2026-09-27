@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
-use kist_format::tree::{content_type, node_type, ChunkList, Entry};
-use kist_format::{cbor, keys, ChunkId};
+use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
+use kist_format::{keys, ChunkId};
 
 use crate::fsmeta;
 use crate::index::{ChunkIndex, ChunkLocator};
@@ -351,17 +351,16 @@ impl Repository {
             for id in chunks {
                 bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
             }
-            let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+            let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
                 key: "<chunk list>".to_owned(),
                 reason: e.to_string(),
             })?;
             list.chunks
         };
-        // 開檔不跟隨最終元件的 symlink（與 Go 端 O_EXCL 同族的最終元件
-        // 防護；這裡保留「覆寫既有一般檔」的契約）。unix 以 O_NOFOLLOW
-        // 讓拒絕發生在開檔瞬間——先 symlink_metadata 再 File::create 的
-        // 兩步之間有競態窗口，本地攻擊者能把寫入轉到目標之外；其餘平台
-        // 退回兩步檢查（與原行為相同，無窗口防護）。
+        // 開檔不跟隨最終元件的 symlink（保留「覆寫既有一般檔」的契約）。
+        // unix 以 O_NOFOLLOW 讓拒絕發生在開檔瞬間——先 symlink_metadata
+        // 再 File::create 的兩步之間有競態窗口，本地攻擊者能把寫入轉到目標
+        // 之外；其餘平台退回兩步檢查（與原行為相同，無窗口防護）。
         #[cfg(unix)]
         let file = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -414,7 +413,7 @@ impl Repository {
         Ok(())
     }
 
-    /// 直接內容回傳原清單；間接內容先把清單 chunk 讀出來解成 ChunkList。
+    /// 直接內容回傳原清單；間接內容先把清單 chunk 讀出來解成 ChunkList（含版本檢查）。
     pub(crate) async fn resolve_chunks<I>(
         &self,
         chunks: &[ChunkId],
@@ -431,7 +430,7 @@ impl Repository {
         for id in chunks {
             bytes.extend_from_slice(&self.read_chunk(id, index).await?);
         }
-        let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+        let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
             key: "<chunk list>".to_owned(),
             reason: e.to_string(),
         })?;

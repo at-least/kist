@@ -32,8 +32,7 @@ fn system_time(ns: i64) -> SystemTime {
         // 帶負號的合法 mtime（1970 年前）照實表示——fuser 的 Attr.mtime
         // 是 SystemTime，表示得出；夾成 epoch 會讓 mount 顯示 1970-01-01
         // （4d97250 修了 capture/restore，這裡是同一修正在 mount 端的
-        // 缺口，Go 端 setAttr 一直照實傳）。平台表示不了的下限（理論
-        // 極端）落回 epoch。
+        // 缺口）。平台表示不了的下限（理論極端）落回 epoch。
         UNIX_EPOCH
             .checked_sub(Duration::from_nanos(ns.unsigned_abs()))
             .unwrap_or(UNIX_EPOCH)

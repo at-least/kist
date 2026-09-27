@@ -12,7 +12,7 @@
 //!   解鎖即取得權威的 repo_id/chunker 參數，與明文 config 比對（v2 把欄位
 //!   列舉進 AAD，每加不變式都要改排版；AAD 現在是常數 [`kist_format::AAD_MASTER`]）。
 //!
-//! 金鑰推導的跨語言測試向量見 `tests/poc_keys.rs`。
+//! 金鑰推導的凍結測試向量見 `tests/poc_keys.rs`。
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
@@ -73,7 +73,7 @@ impl From<kist_format::FormatError> for CryptoError {
 }
 
 /// Argon2id 的成本參數。`Default` = 64 MiB / t=3 / p=4（RFC 9106 第二組建議），
-/// 與 Go 實作一致（跨語言向量見 tests/poc_keys.rs）。
+/// 即 `docs/format.md` §3 的預設值（凍結向量見 tests/poc_keys.rs）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfCost {
     pub m_cost_kib: u32,
@@ -226,7 +226,7 @@ pub struct UnlockedMaster {
 
 /// 用密碼解開 key slot：master key 與認證過的不變式。
 pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<UnlockedMaster> {
-    // 版本捲動的絆線：Go 端同款硬拒（keys.go），不能讓版本錯落進
+    // 版本捲動的絆線：解密前先硬拒，不能讓版本錯落進
     // AEAD 開失敗被謊報成密碼錯。
     if slot.version != kist_format::config::KEY_SLOT_VERSION {
         return Err(CryptoError::UnsupportedSlotVersion {

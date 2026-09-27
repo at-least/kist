@@ -1,13 +1,3 @@
-# Built binary (see `make build`).
-/kist-go
-/kist-go.exe
-
-# Go test artifacts.
-*.test
-*.out
-dist/
-
-# --- rust/（已升根：以下路徑從 repo 根算）---
 /target/
 /fuzz/target/
 /fuzz/corpus/
@@ -17,3 +7,8 @@ dist/
 __pycache__/
 dhat-heap.json
 /dist/
+
+# 本機工具（code-index MCP 索引、zcode session）
+.mcp-index/
+.mcp-index.json
+.zcode/

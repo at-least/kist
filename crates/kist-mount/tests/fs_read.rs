@@ -368,3 +368,257 @@ async fn slash_root_entry_flattens_to_top() {
     assert!(core.readdir(fh, 0, 10).unwrap().is_empty());
     core.releasedir(fh);
 }
+
+/// 間接內容的 chunk 清單要比 `v`（format.md §16：≠3 拒絕；ADR 019 A10）：
+/// v=4 的清單不能被 mount 照 v3 的讀法讀出內容。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunk_list_with_unknown_version_is_rejected() {
+    use kist_format::snapshot::{format_key_timestamp, Root, Snapshot};
+    use kist_format::tree::{content_type, meta_kind, node_type, ChunkList, Entry, Tree};
+    use kist_format::FORMAT_VERSION;
+    use time::OffsetDateTime;
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    // 兩個小檔各自成一顆 chunk：一顆是資料，一顆的明文正好是 v=4 的清單。
+    let payload = b"payload listed by a v4 chunk list".to_vec();
+    let list = kist_format::cbor::encode(&ChunkList {
+        version: 4,
+        chunks: vec![repo.keys().chunk_id(&payload)],
+    })
+    .unwrap();
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("payload.bin"), &payload).unwrap();
+    std::fs::write(src.join("list.cbor"), &list).unwrap();
+    t.backup(&src).await;
+
+    // 手工組：root "/evil" 的內容樹只有一個間接內容的檔案，chunks 指向清單 chunk。
+    let tree = Tree::new(
+        vec![Entry {
+            name: b"file.bin".to_vec(),
+            kind: node_type::FILE,
+            meta_kind: meta_kind::GENERIC,
+            size: payload.len() as u64,
+            target: Vec::new(),
+            content: content_type::INDIRECT,
+            chunks: vec![repo.keys().chunk_id(&list)],
+            subtree: kist_format::TreeId::ZERO,
+            mode: None,
+            uid: None,
+            gid: None,
+            mtime_ns: None,
+            ctime_ns: None,
+            dev: None,
+            inode: None,
+            nlink: None,
+            xattrs: None,
+            etag: None,
+            vern: None,
+        }],
+        None,
+    );
+    let (tree_id, tree_bytes) = repo.seal_tree(tree).await.unwrap();
+    t.backend
+        .put(&kist_format::keys::tree(&tree_id), tree_bytes)
+        .await
+        .unwrap();
+    // snapshot：time_ns 必須與 key 的時間戳一致（讀取端核對）
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let ts = format_key_timestamp(t0).unwrap();
+    let key = kist_format::keys::snapshot(&[0x22; 16], &ts);
+    let snapshot = Snapshot {
+        version: FORMAT_VERSION,
+        roots: vec![Root {
+            path: b"/evil".to_vec().into(),
+            tree: tree_id,
+        }],
+        time_ns: t0.unix_timestamp_nanos() as i64,
+        host: "handcraft".to_owned(),
+        user: String::new(),
+        client_id: vec![0x22; 16],
+        parent: None,
+        stats: Default::default(),
+    };
+    repo.write_snapshot(&key, snapshot).await.unwrap();
+
+    let core = t.fs_core().await;
+    let client_ino = core.lookup(1, CLIENT.as_bytes()).await.unwrap().ino;
+    let snap_ino = core.lookup(client_ino, ts.as_bytes()).await.unwrap().ino;
+    let evil_ino = core.lookup(snap_ino, b"evil").await.unwrap().ino;
+    let file_ino = core.lookup(evil_ino, b"file.bin").await.unwrap().ino;
+    assert_eq!(
+        core.read_file(file_ino, 0, 4096).await,
+        Err(kist_mount::FsError::Io),
+        "v=4 的 chunk 清單不能被讀出內容"
+    );
+}
+
+/// 同一個（父 ino, 名稱）再 lookup 要回同一個 ino，inode 表不長大（ADR 019 A6）。
+/// 每次都配新號的話，頂層 client 目錄的 entry TTL（1 秒）一過期，kernel 重新
+/// lookup 拿到新號，底下已快取的整棵子樹就作廢：真掛載 `cp -r` 兩萬個檔會漏檔，
+/// mount 的記憶體也一路長。四個配號點都要走到：client、snapshot、合成的中介
+/// 目錄、真實條目。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_lookup_returns_same_inode() {
+    let t = TestRepo::new().await;
+    // 同名檔放在兩個不同目錄底下：a/x.txt、b/x.txt
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("a")).unwrap();
+    std::fs::create_dir_all(src.join("b")).unwrap();
+    std::fs::write(src.join("a").join("x.txt"), b"in a").unwrap();
+    std::fs::write(src.join("a").join("y.txt"), b"also in a").unwrap();
+    std::fs::write(src.join("b").join("x.txt"), b"in b").unwrap();
+    t.backup(&src).await;
+
+    let core = t.fs_core().await;
+    let ts = timestamps(&core).await.remove(0);
+    let tmpname = t
+        .dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // 第一次走完整條路徑，記下每一層的 ino
+    let client = core.lookup(1, CLIENT.as_bytes()).await.unwrap();
+    let snap = core.lookup(client.ino, ts.as_bytes()).await.unwrap();
+    let tmp = core.lookup(snap.ino, b"tmp").await.unwrap();
+    let a = walk(&core, &ts, &tmpname, &["src", "a"]).await;
+    let ax = core.lookup(a, b"x.txt").await.unwrap();
+    let count = core.inode_count();
+
+    // 同一條路再走一次：每一層都回同一個 ino，表不長大
+    let client_again = core.lookup(1, CLIENT.as_bytes()).await.unwrap();
+    assert_eq!(
+        client_again.ino, client.ino,
+        "頂層 client（TTL 1 秒）過期重查要回同一個 ino"
+    );
+    assert_eq!(client_again.ttl, kist_mount::corefs::VOLATILE_TTL);
+    assert_eq!(
+        core.lookup(client.ino, ts.as_bytes()).await.unwrap().ino,
+        snap.ino,
+        "snapshot 目錄"
+    );
+    assert_eq!(
+        core.lookup(snap.ino, b"tmp").await.unwrap().ino,
+        tmp.ino,
+        "合成的中介目錄"
+    );
+    assert_eq!(walk(&core, &ts, &tmpname, &["src", "a"]).await, a);
+    assert_eq!(
+        core.lookup(a, b"x.txt").await.unwrap().ino,
+        ax.ino,
+        "真實條目"
+    );
+    assert_eq!(core.inode_count(), count, "重複 lookup 不能配新 inode");
+
+    // 同一個 ino 照樣讀得到內容
+    assert_eq!(core.read_file(ax.ino, 0, 64).await.unwrap(), b"in a");
+
+    // 不同名字、不同父目錄仍是不同的 inode
+    let ay = core.lookup(a, b"y.txt").await.unwrap();
+    assert_ne!(ay.ino, ax.ino, "同一個目錄底下的不同名字");
+    let b = walk(&core, &ts, &tmpname, &["src", "b"]).await;
+    assert_ne!(b, a);
+    let bx = core.lookup(b, b"x.txt").await.unwrap();
+    assert_ne!(bx.ino, ax.ino, "不同父目錄底下的同名條目");
+    assert_eq!(core.read_file(bx.ino, 0, 64).await.unwrap(), b"in b");
+}
+
+/// 去重只管身分，不管存在：snapshot 被刪掉之後，同一個（父, 名稱）再 lookup
+/// 仍要回 NotFound，不能因為表裡記過就回舊的 ino。client 底下一個 snapshot
+/// 都不剩時，client 本身也一樣。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vanished_snapshot_is_not_found_after_lookup() {
+    let (t, _big) = setup().await;
+    let core = t.fs_core().await;
+    let ts = timestamps(&core).await.remove(0);
+
+    let client_ino = core.lookup(1, CLIENT.as_bytes()).await.unwrap().ino;
+    core.lookup(client_ino, ts.as_bytes()).await.unwrap();
+    let count = core.inode_count();
+
+    // 測試 repo 不寫 `.r1` 副本，刪主體就是整個 snapshot 不見
+    let key = format!("{}/{}/{}", kist_format::keys::SNAPSHOTS_PREFIX, CLIENT, ts);
+    t.backend.delete(&key).await.unwrap();
+
+    assert_eq!(
+        core.lookup(client_ino, ts.as_bytes()).await.unwrap_err(),
+        kist_mount::FsError::NotFound,
+        "被刪掉的 snapshot 要回 NotFound"
+    );
+    assert_eq!(
+        core.lookup(1, CLIENT.as_bytes()).await.unwrap_err(),
+        kist_mount::FsError::NotFound,
+        "沒有 snapshot 的 client 要回 NotFound"
+    );
+    assert_eq!(core.inode_count(), count);
+}
+
+/// snapshot lookup 時讀 root tree 失敗（暫時性），corefs 退回目錄形態：檔案來源
+/// 顯示成目錄、`/` 攤平顯示成空的。這個 view 不能記進去重表——否則同一個
+/// （client, ts）整個 session 都回這個錯的形態，錯誤消失了也好不了、只能重新掛載
+/// （ADR 019 A6 複核）。退回形態的 lookup 用 1 秒 TTL，kernel 很快就會重查。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn degraded_snapshot_view_is_not_pinned() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"file source").unwrap();
+    // 檔案來源：正常情況下葉子就是 f.txt 本身（檔案）
+    t.backup(&src.join("f.txt")).await;
+    let tmpname = t
+        .dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let core = t.fs_core().await;
+    let ts = timestamps(&core).await.remove(0);
+    let client_ino = core.lookup(1, CLIENT.as_bytes()).await.unwrap().ino;
+
+    // snapshot 目錄 → tmp → <tmpname> → src → f.txt
+    async fn leaf(core: &FsCore, snap_ino: u64, tmpname: &str) -> kist_mount::corefs::Lookup {
+        let mut cur = snap_ino;
+        for p in ["tmp", tmpname, "src"] {
+            cur = core.lookup(cur, p.as_bytes()).await.unwrap().ino;
+        }
+        core.lookup(cur, b"f.txt").await.unwrap()
+    }
+
+    // tree 物件暫時讀不到（模擬後端的暫時性錯誤）時 lookup snapshot
+    let repo = t.dir.path().join("repo");
+    std::fs::rename(repo.join("trees"), repo.join("trees.away")).unwrap();
+    let first = core.lookup(client_ino, ts.as_bytes()).await;
+    std::fs::rename(repo.join("trees.away"), repo.join("trees")).unwrap();
+    let first = first.unwrap();
+    // 確認真的走到退回形態（不然這個測試什麼都沒驗）
+    assert_eq!(leaf(&core, first.ino, &tmpname).await.attr.kind, Kind::Dir);
+
+    // 錯誤消失後重查：要拿到真正的形態——f.txt 是檔案、讀得到內容
+    let second = core.lookup(client_ino, ts.as_bytes()).await.unwrap();
+    let f = leaf(&core, second.ino, &tmpname).await;
+    assert_eq!(f.attr.kind, Kind::File, "錯誤消失後重查要回真正的形態");
+    assert_eq!(core.read_file(f.ino, 0, 64).await.unwrap(), b"file source");
+    assert_ne!(second.ino, first.ino, "退回形態的 view 不能被去重表記住");
+
+    // 退回形態：entry 與 attr 都是 1 秒 TTL；正常的是 immutable
+    assert_eq!(first.ttl, kist_mount::corefs::VOLATILE_TTL);
+    assert_eq!(
+        core.getattr(first.ino).unwrap().1,
+        kist_mount::corefs::VOLATILE_TTL
+    );
+    assert_eq!(second.ttl, kist_mount::corefs::IMMUTABLE_TTL);
+
+    // 正常的 view 照樣去重：再查回同一個 ino、表不長大
+    let count = core.inode_count();
+    assert_eq!(
+        core.lookup(client_ino, ts.as_bytes()).await.unwrap().ino,
+        second.ino
+    );
+    assert_eq!(core.inode_count(), count);
+}

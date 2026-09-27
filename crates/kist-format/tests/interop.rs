@@ -1,17 +1,17 @@
-//! 跨語言 conformance（tree 向量）：與 Go 端 internal/interop 同一棵樹，
-//! 兩邊必須編出相同的規範 CBOR。
+//! conformance（tree 向量，V3-TREE-1..3）：這棵樹的規範 CBOR 必須逐 byte
+//! 等於 `tests/testdata/tree-canonical.hex`。該檔是凍結 golden（原為與已
+//! 移除的 Go 實作共用的跨語言向量），檔名 `interop` 由此而來。
 //!
-//! v3 起向量由 **Rust（產品／規格管理者）錄製**：`UPDATE_VECTOR=1 cargo test
-//! -p kist-format --test interop` 重寫 `tests/testdata/tree-canonical.hex`，
-//! Go 端移植時必須對同一棵樹編出相同 bytes（V3-TREE-1..3）。
+//! `UPDATE_VECTOR=1 cargo test -p kist-format --test interop` 會重寫向量；
+//! 只有格式版本升級時才可重錄——平常編碼變了就是格式被改了。
 
 use kist_format::tree::{content_type, meta_kind, node_type, Entry, Tree};
 use kist_format::TreeId;
 
 #[test]
 fn interop_tree_canonical_cbor() {
-    // 與 Go 端同一棵樹（每種欄位、每種 metadata kind 都有）：兩邊必須編出
-    // 相同的規範 CBOR（tree ID 依賴它）。
+    // 每種欄位、每種 metadata kind 都有的一棵樹：必須編出與凍結向量相同的
+    // 規範 CBOR（tree ID 依賴它）。
     let mut id1 = [0u8; 32];
     for (i, b) in id1.iter_mut().enumerate() {
         *b = i as u8;

@@ -10,8 +10,10 @@
 > （[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接（[ADR 014](docs/decisions/014-rclone-bridge.md)）。
 > 另有：唯讀 FUSE 掛載（[ADR 015](docs/decisions/015-mount-fuse.md)）、選配 Reed-Solomon parity
 > （[ADR 009](docs/decisions/009-m5-parity.md)）、設定檔／排程／webhook（`kist run`）、`--json`、
-> Prometheus metrics 與 Web UI（`kist serve`）。Go 參考實作在同一個 repo 的 [go/](go/)（monorepo），
-> 跨語言互通有雙向 E2E 與 `go test ./internal/interop/...`（本機 gate）背書。
+> Prometheus metrics 與 Web UI（`kist serve`）。格式相容性由一份凍結的 v3 fixture repo 把關
+> （`crates/kist-core/tests/fixtures/`；原本的 Go 參考實作已移除，見
+> [ADR 018](docs/decisions/018-remove-go-reference.md)）。拿掉 Go 之後的 Rust 端盤點與修正清單見
+> [ADR 019](docs/decisions/019-rust-after-go.md)。
 > 已接受的限制：Windows VSS（不在路線圖上，見 [PLAN.md](PLAN.md)）。
 
 ## 建置
@@ -43,6 +45,16 @@ kist forget --keep-last 10 --prune      # 一次做完
 
 結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
 請看警告。
+
+密碼檔（`--password-file` 與設定檔的 `password_file` 同一份規則）：只取第一行、去掉結尾的 `\r`，
+空的算錯誤。
+
+> **行為變更**：以前 CLI 的 `--password-file` 不去 `\r`。密碼檔第一行結尾是孤立的 `\r`（後面沒有
+> `\n`）時，以前用這個檔 `kist init` 建的 repo，密碼其實帶著那個 `\r`；現在同一個檔讀出來不含
+> `\r`，會回「wrong password」。這種 repo 改用 `KIST_PASSWORD` 給出含 `\r` 的密碼（bash／zsh：
+> `KIST_PASSWORD=$'你的密碼\r'`）；改密碼檔沒有用，任何密碼檔都讀不出結尾的 `\r`。
+> `--password-file` 優先於 `KIST_PASSWORD`，而它也吃環境變數 `KIST_PASSWORD_FILE`：有匯出的話先
+> `unset KIST_PASSWORD_FILE`。`kist run` 一直是這個讀法，不受影響。
 
 ### `--json`
 
@@ -91,6 +103,17 @@ kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端�
 ```
 
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
+
+grace（見「空間回收（GC）」一節）：`[backup] gc_grace` 沒寫時，backup 取**同一份設定**的 `[prune] grace`，
+兩個都沒寫才是 72h。`[backup] gc_grace` 不得比 `[prune] grace` 長（載入設定時就報錯）；比它短可以。
+backup 與 prune 分在兩台主機時，兩份設定互相看不到，grace 要自己設成一致。
+
+> **行為變更**：以前 `kist run` 的 backup 只看 `[backup] gc_grace`、沒寫就是 72h。現在只把
+> `[prune] grace` 設短的設定，backup 也會用那個較短的 grace：跑得比它久的 backup 會以
+> BackupTooLong 結束、不寫 snapshot（重跑即可，已上傳的資料會沿用）。真的有這麼長的 backup，
+> 就把 `[prune] grace` 調長。另外，`[backup] gc_grace` 比 prune 實際採用的 grace 長的設定（包括有
+> `[prune]` 段但沒寫 `grace`、`gc_grace` 卻超過 72h）以前載入得了，現在載入時就報錯，`kist run`／
+> `kist serve` 不會啟動。
 
 ### Prometheus metrics（`kist serve`）
 
@@ -153,7 +176,7 @@ UI 密碼走明文 HTTP：預設只綁 loopback，要遠端存取請放在有 TL
 第二次執行才真的刪。中間任何一台機器重新用到那些資料，標記就撤銷。所以 `prune` 可以跟 backup
 同時跑、可以排程每天跑，不需要鎖；剛 forget 完馬上 prune 不會釋放空間，那是設計。
 
-- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值）。
+- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值；設定檔的寫法見「設定檔與排程」）。
   跑得更久的 backup 不會悄悄壞掉，會在最後以錯誤結束，重跑即可。
 - 超過 `--inactive-after`（預設 30 天）沒備份的機器不再擋住刪除；它回來備份時若用到已刪的資料，
   同樣會在最後失敗、重跑。
@@ -231,8 +254,8 @@ TCP port、不用 known_hosts，rclone 的設定就是全部。`KIST_RCLONE_BIN`
 
 ## 開發
 
-Rust 端四道關卡（與 `ci-rust.yml` 同款；該 workflow 還含 MinIO 整合測試、
-fuzz smoke 與跨語言 interop，但只開 `workflow_dispatch` 手動觸發，避免吃配額）：
+四道關卡（與 `ci-rust.yml` 同款；該 workflow 還含 MinIO 整合測試與 fuzz smoke，
+但只開 `workflow_dispatch` 手動觸發，避免吃配額——本機 gate 是平時的準則）：
 
 ```sh
 cargo fmt --all --check
@@ -243,10 +266,10 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 
 S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
-Go 端（`go/`）的關卡是 `cd go && make verify`（build / vet / lint / test / -race）；
-兩個 workflow（`ci.yml`、`ci-rust.yml`）都只手動觸發（私有 repo 的 Actions 額度
-留給真正需要的時候），本機 gate 是平時的準則。跨語言 interop（conformance 向量
-與兩份 `format.md` 逐 byte 一致）本機快速 gate：`cd go && go test ./internal/interop/...`。
+格式相容性：`cargo test` 會跑 `crates/kist-core/tests/fixture_v3.rs`，讀一份提交在 git 裡、
+**永不重生**的 v3 repo（開啟、`check --read-data`、還原比對、重新編碼逐 byte 比對、
+同內容再備份零新 chunk）。golden 與向量會隨程式重錄，這份不會；它只在格式升版時換
+（見 [ADR 018](docs/decisions/018-remove-go-reference.md)）。
 
 ## Workspace 結構
 
@@ -262,7 +285,6 @@ Go 端（`go/`）的關卡是 `cd go && make verify`（build / vet / lint / test
 | `kist-cli` | `kist` 執行檔（clap） |
 
 格式規格：[docs/format.md](docs/format.md)。設計決策：[docs/decisions/](docs/decisions/)。
-Go 參考實作在 [go/](go/)，開發與驗證都在 `go/` 內進行（見〈開發〉一節）。
 
 ## M1 驗收數據
 

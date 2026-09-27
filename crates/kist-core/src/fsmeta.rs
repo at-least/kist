@@ -52,7 +52,7 @@ pub fn bytes_to_relative_path(bytes: &[u8]) -> Result<PathBuf> {
 /// v3 的 root 定位字串（`Root.path`）→ restore 目標底下的相對路徑。
 /// 本機絕對路徑 `/srv/data` → `srv/data`；帶 scheme 的遠端定位去掉 scheme
 /// 後切段：`s3://bucket/prefix` → `bucket/prefix`、`sftp://host/path` →
-/// `host/path`（docs/format.md §9 的 restore 映射，兩實作必須一致）。
+/// `host/path`（docs/format.md §9 的 restore 映射）。
 pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
     // 去掉 `scheme://`（有 scheme 且後接 // 才剝；Windows 的 `C:` 不會中）。
     let rest = match bytes.iter().position(|&b| b == b':') {
@@ -64,7 +64,7 @@ pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
         match comp {
             b"" | b"." => {}
             b".." => rel.push("__parent__"),
-            // NUL 不是路徑元件（Go 端同判斷）：Unix 的 bytes_to_name 什麼
+            // NUL 不是路徑元件：Unix 的 bytes_to_name 什麼
             // 都收，得在這裡擋。
             name if name.contains(&0) => {
                 return Err(crate::CoreError::Corrupt {
@@ -177,7 +177,7 @@ pub fn unchanged(previous: &FsMeta, now: &FsMeta, parent_start_ns: i64) -> bool 
     true
 }
 
-/// 擷取 `user.*` 擴充屬性（與 Go 端同一個 namespace 約定）。
+/// 擷取 `user.*` 擴充屬性。
 /// 鍵與值都是 bytes：xattr 名稱不保證是 UTF-8。讀不到（不支援、無權限）
 /// 一律視為沒有——xattr 記錄是盡力而為，不讓備份因此失敗。
 #[cfg(unix)]

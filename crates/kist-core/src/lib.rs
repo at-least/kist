@@ -35,6 +35,9 @@ pub use backup::{
 pub use check::{CheckOptions, CheckReport};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
+/// parity 份數的上限。CLI 與 kist-app 的設定檢查都用它，不各寫字面值
+/// （kist-app 不直接依賴 kist-format，所以從這裡轉出去）。
+pub use kist_format::parity::MAX_PARITY_SHARDS;
 pub use prune::{PruneOptions, PrunePlan, PruneReport, MAX_EFFECTIVE_BLOBS};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
@@ -84,7 +87,7 @@ pub enum CoreError {
     #[error("refusing to prune: {0}")]
     Unsafe(String),
     /// backup 跑得比 GC 的 grace 還久：它寫過的東西可能已經被標記甚至刪掉，不寫 snapshot。
-    #[error("backup took {elapsed_secs}s, longer than the GC grace period ({grace_secs}s); rerun it (uploaded data is reused) or raise --gc-grace and prune --grace")]
+    #[error("backup took {elapsed_secs}s, longer than the GC grace period ({grace_secs}s); rerun it (uploaded data is reused) or raise --gc-grace and prune --grace (config file: [prune] grace, and [backup] gc_grace if set)")]
     BackupTooLong { elapsed_secs: i64, grace_secs: u64 },
     /// backup 寫過的 tree 在寫之前就被標記且標記已超過 grace：可能隨時被刪，不寫 snapshot。
     #[error("tree {0} written by this backup is about to be garbage-collected; rerun the backup")]
@@ -119,8 +122,7 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 /// 其實可以合法超過它——Linux 上 PATH_MAX 內疊得出約 2 000 層——所以
 /// backup 寫入端套同一把尺：過深的來源子目錄跳過並記警告，寫出的樹因此
 /// 永不超限；超過上限的 chain 只能出自腐壞或敵意 repo：乾淨回錯，不是
-/// process 陣亡。數值必須與 Go 參考實作的 `maxTreeDepth`（go/internal/repo）
-/// 一致；見 docs/format.md §8.4。
+/// process 陣亡。數值見 docs/format.md §8.4。
 pub const MAX_TREE_DEPTH: usize = 256;
 
 /// 把 CPU 密集工作丟到 blocking thread pool。

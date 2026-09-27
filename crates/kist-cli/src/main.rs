@@ -311,7 +311,7 @@ async fn run(cli: Cli) -> Result<()> {
             let cfg = kist_app::Config::load(&config)?;
             let mut daemon = kist_app::Daemon::new(cfg)?;
             if once {
-                // 與 Go 端同約定：Ctrl-C 是乾淨收工（不再開下一件工作、
+                // 約定：Ctrl-C 是乾淨收工（不再開下一件工作、
                 // 進行中的做完），不是 unit 失敗。
                 let (tx, rx) = tokio::sync::watch::channel(false);
                 spawn_ctrl_c(tx.clone());
@@ -451,8 +451,8 @@ async fn run(cli: Cli) -> Result<()> {
             gc_grace,
             parity,
         } => {
-            if parity > 8 {
-                anyhow::bail!("--parity must be 0..=8");
+            if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
+                anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
             }
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。

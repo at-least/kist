@@ -18,9 +18,8 @@ fn deeply_nested_cbor_is_rejected_not_crashing() {
 }
 
 /// §4 第 2、4 條：indefinite length 與 tag 都是解碼拒絕。ciborium 對兩者
-/// 靜默容受（indef 照解、tag 跳過），Go 端（fxamacker
-/// IndefLengthForbidden + TagsForbidden）則拒絕——同一份 bytes 不能在
-/// 兩個實作得到不同判斷。
+/// 靜默容受（indef 照解、tag 跳過），規格則要求拒絕——同一份 bytes 在
+/// 任何符合規格的讀取端都必須得到同一判斷。
 #[test]
 fn indefinite_lengths_and_tags_are_rejected() {
     #[derive(serde::Deserialize)]

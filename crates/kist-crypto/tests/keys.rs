@@ -383,7 +383,7 @@ fn absurd_kdf_parameters_are_rejected_before_running_argon2() {
 fn default_kdf_cost_is_above_owasp_floor() {
     let c = kist_crypto::KdfCost::default();
     assert!(c.m_cost_kib >= 64 * 1024 && c.t_cost >= 3, "{c:?}");
-    assert_eq!(c.p_cost, 4, "v2 與 Go 端一致的預設平行度");
+    assert_eq!(c.p_cost, 4, "規格 §3 的預設平行度");
 }
 
 #[test]
@@ -398,9 +398,9 @@ fn cache_id_is_derived_from_master_key() {
     assert_ne!(a.cache_id(), [0; 16]);
 }
 
-// KeySlot.version 是版本捲動的絆線：Go 端硬拒 `≠3`（keys.go「key slot:
-// version %d is not supported」），Rust 端也要在同一個位置拒——否則敵意
-// repo 改掉明文 `v` 欄位，兩端給出不同類別的錯誤（版本錯 vs 密碼錯）。
+// KeySlot.version 是版本捲動的絆線：讀取端硬拒 `≠3`（`docs/format.md`
+// §11、§16），而且要在解密前拒——否則敵意 repo 改掉明文 `v` 欄位，
+// 版本錯會落進 AEAD 開失敗，被謊報成密碼錯。
 #[test]
 fn key_slot_version_is_checked_before_decrypting() {
     let (mut slot, _) = create_key_slot(

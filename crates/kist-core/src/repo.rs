@@ -8,8 +8,8 @@ use kist_backend::{Backend, BackendError};
 use kist_crypto::{create_key_slot, unlock_key_slot, KdfCost, KeyBinding, RepoKeys};
 use kist_format::config::{ChunkerParams, RepoConfig};
 use kist_format::index::IndexBlob;
-use kist_format::snapshot::{parse_key_timestamp, Snapshot};
-use kist_format::tree::{Entry, Tree};
+use kist_format::snapshot::{parse_key_timestamp, parse_snapshot, Snapshot};
+use kist_format::tree::{parse_tree, Entry, Tree};
 use kist_format::{cbor, keys, Algorithm, ObjectId, TreeId};
 use zeroize::Zeroizing;
 
@@ -120,7 +120,7 @@ fn encode_index_blob(blob: &IndexBlob) -> Result<Vec<u8>> {
     }
 }
 
-/// index blob 解壓上限（與 Go 端同一數字）：一個 blob 描述 repo 裡每個
+/// index blob 解壓上限：一個 blob 描述 repo 裡每個
 /// pack，真實 blob 遠遠不到，壞掉的長度欄位不該能要到 GiB 級記憶體。
 const MAX_INDEX_PLAIN: u64 = 1 << 30;
 
@@ -381,25 +381,11 @@ impl Repository {
                     reason: format!("content hash {actual} does not match its name"),
                 });
             }
-            let tree: Tree = cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
-                key: key_owned.clone(),
+            // 解碼＋版本＋結構驗證在格式層一次做完（tree::parse_tree）。
+            parse_tree(&plain).map_err(|e| CoreError::Corrupt {
+                key: key_owned,
                 reason: e.to_string(),
-            })?;
-            if tree.version != kist_format::FORMAT_VERSION {
-                return Err(CoreError::Corrupt {
-                    key: key_owned,
-                    reason: format!(
-                        "tree declares version {}, this build reads {}",
-                        tree.version,
-                        kist_format::FORMAT_VERSION
-                    ),
-                });
-            }
-            tree.validate().map_err(|e| CoreError::Corrupt {
-                key: keys::tree(&expected),
-                reason: e.to_string(),
-            })?;
-            Ok(tree)
+            })
         })
         .await
     }
@@ -421,8 +407,7 @@ impl Repository {
         let keys = Arc::clone(&self.keys);
         blocking(move || {
             // 寫入端跑與讀取端同一套結構不變式（§8.1）：來源端冒出的 `..`／
-            // 重複／未排序名稱在這裡當場失敗，不寫出所有讀取端都拒讀的 tree
-            // （Go 的 Encode 同款）。
+            // 重複／未排序名稱在這裡當場失敗，不寫出所有讀取端都拒讀的 tree。
             tree.validate()?;
             let plain = cbor::encode(&tree)?;
             let id = keys.tree_id(&plain);
@@ -545,6 +530,8 @@ impl Repository {
     /// **未標記 pack 優先、其次名稱最小**——與 prune 的正本選擇同一個
     /// rank（規格 §10、§13.1）。沒有這條規則，smallest-wins 會把 chunk
     /// 導向被標記的舊副本，backup 在 prune 收掉它之前每次都重傳。
+    /// commit gate 重新解析時也用它：與開始時同一條 rank，否則會解析到
+    /// 被標記的舊副本而誤拒。
     /// 不走本地快取：快取的位置是歷史選擇，不知道標記集合。
     pub(crate) async fn load_index_for_backup(
         &self,
@@ -638,27 +625,12 @@ impl Repository {
                     key: key_owned.clone(),
                     reason: e.to_string(),
                 })?;
-            let snap: Snapshot = cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
-                key: key_owned.clone(),
-                reason: e.to_string(),
-            })?;
-            if snap.version != kist_format::FORMAT_VERSION {
-                return Err(CoreError::Corrupt {
-                    key: key_owned.clone(),
-                    reason: format!(
-                        "snapshot declares version {}, this build reads {}",
-                        snap.version,
-                        kist_format::FORMAT_VERSION
-                    ),
-                });
-            }
-            // 結構驗證與 Go 的 load 同款（roots 非空、排序、唯一）：
+            // 解碼＋版本＋結構驗證（roots 非空、排序、唯一）在格式層一次做完：
             // 解得開不等於合法，structurally-invalid 的 snapshot 不能往下走。
-            snap.validate().map_err(|e| CoreError::Corrupt {
-                key: key_owned.clone(),
+            parse_snapshot(&plain).map_err(|e| CoreError::Corrupt {
+                key: key_owned,
                 reason: e.to_string(),
-            })?;
-            Ok(snap)
+            })
         })
         .await?;
         // snapshot 不是以內容命名：用內容裡的 client 與時間反算 key，必須一致。
@@ -692,7 +664,7 @@ mod index_cap_tests {
     use crate::repo::decode_index_blob_limited;
     use kist_format::Algorithm;
 
-    /// index blob 的解壓上限（Go 端 1 GiB 同款）：超過上限的 frame 是
+    /// index blob 的解壓上限（1 GiB）：超過上限的 frame 是
     /// 炸彈不是 blob。正式上限太大，測試以小上限釘同一條規則。
     #[test]
     fn index_blob_over_the_limit_is_refused() {

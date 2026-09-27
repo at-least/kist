@@ -1,13 +1,14 @@
-//! parity sidecar 的測試。golden 向量（`parity-golden.txt`）與 Go
-//! `internal/parity` 的 testdata 是同一份：pack 由與 Go
-//! `crypto.DeterministicReader` 相同的 BLAKE3 XOF 流（"kist/test/<seed>"）
-//! 產生，所以這個檔案同時是「Go 寫、Rust 讀/修」的跨語言向量。
+//! parity sidecar 的測試。golden 向量（`parity-golden.txt`）已凍結
+//! （原為與已移除的 Go 實作共用的跨語言向量）：pack 由 BLAKE3 XOF 流
+//! （"kist/test/<seed>"）確定性產生，parity 必須逐 byte 等於向量；只有
+//! 格式版本升級時才可重錄。
 
 use kist_format::parity::{self, Object, DATA_SHARDS, MAX_PARITY_SHARDS};
 use kist_format::{FormatError, ObjectId};
 use proptest::prelude::*;
 
-/// 與 Go crypto.DeterministicReader 相同的測試用位元組流。
+/// 測試用的確定性位元組流（輸入 "kist/test/<seed>" 的 BLAKE3 XOF）；
+/// golden 向量的 pack 由它產生，改了就對不上向量。
 fn fake_pack(seed: &str, n: usize) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(format!("kist/test/{seed}").as_bytes());
@@ -31,9 +32,13 @@ fn golden_go_parity_repairs_rust_side() {
     let raw = hex::decode(lines.next().unwrap().strip_prefix("parity ").unwrap()).unwrap();
 
     let pack = fake_pack("golden", 4321);
-    assert_eq!(ObjectId::of(&pack), id, "pack stream diverged from Go");
+    assert_eq!(
+        ObjectId::of(&pack),
+        id,
+        "pack stream diverged from the frozen golden"
+    );
 
-    // v3 起向量由 Rust 錄製（UPDATE_VECTOR=1），Go 端 testdata 保持同份拷貝。
+    // 向量以 UPDATE_VECTOR=1 錄製；凍結 golden，只在格式版本升級時重錄。
     if std::env::var_os("UPDATE_VECTOR").is_some() {
         let ours = parity::encode(&id, &pack, 2).unwrap();
         std::fs::write(
@@ -49,10 +54,10 @@ fn golden_go_parity_repairs_rust_side() {
     assert_eq!(obj.parity_shards(), 2);
     assert_eq!(obj.pack_size(), 4321);
 
-    // 同一個 pack、同一個 m，Rust 必須編出與 Go 相同的 bytes（矩陣相容 +
-    // CBOR 欄位順序一致的共同證明）。
+    // 同一個 pack、同一個 m，必須編出與 golden 相同的 bytes（RS 矩陣未漂移 +
+    // CBOR 欄位順序未變的共同證明）。
     let ours = parity::encode(&id, &pack, 2).unwrap();
-    assert_eq!(ours, raw, "Rust encode differs from Go golden");
+    assert_eq!(ours, raw, "encode differs from the frozen golden");
 
     let mut bad = pack.clone();
     bad[100] ^= 0x5a;
@@ -83,7 +88,7 @@ fn encode_is_deterministic_and_validates_inputs() {
     assert!(parity::encode(&id, &[], 2).is_err(), "accepted empty pack");
 }
 
-/// shard 邊界附近的尺寸。178 是 Go 端曾經出錯的那個（下界寫成
+/// shard 邊界附近的尺寸。178 是曾經出錯的那個（下界寫成
 /// shard_len*15 而不是 ceil(size/16)）。
 #[test]
 fn roundtrip_at_awkward_sizes() {

@@ -88,8 +88,7 @@ fn sftp_url_parses_user_host_port_path() {
 }
 
 /// `@` 只在 authority（第一個 `/` 之前）裡才算 userinfo；路徑是字面內容，
-/// 裡面的 `@`（目錄名帶年份帳號寫法等）與帳號無關——與 Go 端 `url.Parse`
-/// 同一語意。
+/// 裡面的 `@`（目錄名帶年份帳號寫法等）與帳號無關。
 #[test]
 fn sftp_url_at_sign_in_path_is_not_userinfo() {
     use kist_backend::sftp::parse_sftp_url;
@@ -109,7 +108,7 @@ fn sftp_url_at_sign_in_path_is_not_userinfo() {
     assert_eq!(cfg.user, None);
     assert_eq!(cfg.path, "a@b@c");
 
-    // authority 裡兩個 @：與 Go 的 url.Parse 同樣拒絕（不是合法 userinfo 寫法）
+    // authority 裡兩個 @：拒絕（不是合法 userinfo 寫法）
     assert!(parse_sftp_url("sftp://a@b@example.com/repo").is_err());
 }
 

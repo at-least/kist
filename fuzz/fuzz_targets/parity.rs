@@ -2,7 +2,7 @@
 //!
 //! - 任意 bytes = sidecar：`parse` 的邊界檢查必須在配置之前擋住
 //!   偽造 header（v/k/m/shard_len/pack_size 一致性）。
-//! - Go golden sidecar + 任意 bytes = 損壞的 pack：`repair` 不 panic，
+//! - 凍結的 golden sidecar + 任意 bytes = 損壞的 pack：`repair` 不 panic，
 //!   且**成功必蘊涵**重算 hash == pack 名（修錯是不可能的，這裡從外部
 //!   再驗一次那個不變量）。
 //! - 任意 bytes = pack：`encode` → `parse` → `repair`（零損毀）roundtrip

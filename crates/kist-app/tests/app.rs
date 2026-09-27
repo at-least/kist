@@ -108,6 +108,48 @@ on = ["failure", "success"]
     }
 }
 
+/// grace 的交叉檢查有方向（ADR 019 A5）：backup 以為的 grace 比 prune 給的長才是錯
+/// （prune 可能刪掉 backup 還在用的資料）；反方向只會讓 backup 早一點以 BackupTooLong
+/// 失敗，是安全的，要接受。
+#[test]
+fn gc_grace_longer_than_prune_grace_is_rejected() {
+    let longer = "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"72h\"\n[prune]\ngrace = \"1h\"\n";
+    let err = Config::parse(longer)
+        .and_then(|c| c.validate())
+        .expect_err("backup.gc_grace > prune.grace 要報錯");
+    assert!(
+        err.to_string()
+            .contains("must not be longer than [prune] grace"),
+        "{err}"
+    );
+
+    // [prune] 沒寫 grace：prune 用預設 72h，backup 設得更長一樣是危險方向。
+    let longer_than_default = "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"96h\"\n[prune]\nrepack_below = 40\n";
+    let err = Config::parse(longer_than_default)
+        .and_then(|c| c.validate())
+        .expect_err("backup.gc_grace > prune 的預設 grace 要報錯");
+    assert!(
+        err.to_string()
+            .contains("must not be longer than [prune] grace"),
+        "{err}"
+    );
+
+    // 安全方向與相等：接受。
+    for (backup, prune) in [("1h", "72h"), ("72h", "72h")] {
+        let text = format!(
+            "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"{backup}\"\n[prune]\ngrace = \"{prune}\"\n"
+        );
+        Config::parse(&text).unwrap().validate().unwrap();
+    }
+    // 沒有 [prune]（prune 在另一台維護主機）：無從比較，不檢查。
+    Config::parse(
+        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"96h\"\n",
+    )
+    .unwrap()
+    .validate()
+    .unwrap();
+}
+
 /// `[serve]`：選填的 UI 密碼檔與額外允許的 Host；沒有排程也算合法設定。
 #[test]
 fn serve_section_parses_and_reads_ui_password() {
@@ -187,12 +229,15 @@ async fn run_once_executes_backup_forget_prune_in_order() {
     let src = dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("a.txt"), b"hello").unwrap();
+    // `[prune] grace` 會轉給 backup 閘門（ADR 019 A5）：0s 會讓 backup 必然
+    // BackupTooLong（見 run_once_backup_gate_uses_prune_grace）。這裡只驗工作順序，
+    // 用一個 backup 跑得完的 grace。
     let text = config_text(
         &repo,
         &password,
         dir.path(),
         &format!(
-            "[backup]\npaths = [{:?}]\n[forget]\nkeep_last = 1\n[prune]\ngrace = \"0s\"\n",
+            "[backup]\npaths = [{:?}]\n[forget]\nkeep_last = 1\n[prune]\ngrace = \"1h\"\n",
             src.display().to_string()
         ),
     );
@@ -215,6 +260,35 @@ async fn run_once_executes_backup_forget_prune_in_order() {
         outcomes[1].detail["removed"].as_array().map(|a| a.len()),
         Some(1)
     );
+}
+
+/// 同一份設定只寫 `[prune] grace`：backup 的閘門要用它（ADR 019 A5），不是 72h 預設。
+/// grace 0 時閘門是 `elapsed + 0 >= 0`，恆真，所以 backup 必然 BackupTooLong；
+/// 錯誤訊息要點名設定檔的 key，不只 CLI 旗標。
+#[tokio::test]
+async fn run_once_backup_gate_uses_prune_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path()).await;
+    let password = write_password(dir.path());
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"hello").unwrap();
+    let text = config_text(
+        &repo,
+        &password,
+        dir.path(),
+        &format!(
+            "[backup]\npaths = [{:?}]\n[prune]\ngrace = \"0s\"\n",
+            src.display().to_string()
+        ),
+    );
+    let daemon = Daemon::new(Config::parse(&text).unwrap()).unwrap();
+    let outcomes = daemon.run_once(None, |_| {}).await;
+    assert_eq!(outcomes[0].job, JobKind::Backup);
+    assert_eq!(outcomes[0].status, JobStatus::Failure, "{:?}", outcomes[0]);
+    let err = outcomes[0].error.as_deref().unwrap_or("");
+    assert!(err.contains("longer than the GC grace period"), "{err}");
+    assert!(err.contains("[prune] grace"), "{err}");
 }
 
 #[tokio::test]

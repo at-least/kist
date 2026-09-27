@@ -210,6 +210,59 @@ fn password_file_and_client_id_file_are_honoured() {
     );
 }
 
+/// 密碼檔的規則 CLI 與 `kist run` 共用一份（ADR 019 A11）：取第一行、去掉結尾的 `\r`。
+/// 檔案內容是「密碼 + `\r`」、後面沒有 `\n` 時，daemon 讀成不含 `\r` 的密碼；CLI 以前
+/// 保留 `\r`，於是 daemon 每晚備份正常，拿同一個檔跑 CLI 卻被告知密碼錯。
+#[test]
+fn password_file_trailing_cr_is_read_like_the_daemon() {
+    let env = Env::new();
+    env.ok(&["init"]); // repo 密碼是 KIST_PASSWORD 的 "cli test password"
+    let src = env.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"hello\n").unwrap();
+    let pw = env.dir.path().join("pw.txt");
+    std::fs::write(&pw, "cli test password\r").unwrap();
+
+    // daemon 這條路：kist run --once 讀同一個密碼檔，能開 repo、寫出 snapshot。
+    let cfg = env.dir.path().join("kist.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "repo = \"{}\"\npassword_file = \"{}\"\nclient_id_file = \"{}\"\ncache_dir = \"{}\"\n\n[backup]\npaths = [\"{}\"]\n",
+            env.repo().display(),
+            pw.display(),
+            env.dir.path().join("client-id").display(),
+            env.dir.path().join("cache").display(),
+            src.display(),
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["run", "--once", "--config", cfg.to_str().unwrap()])
+        .env_remove("KIST_REPO")
+        .env_remove("KIST_PASSWORD")
+        .env_remove("KIST_CLIENT_ID_FILE")
+        .env_remove("KIST_CACHE_DIR")
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "run --once: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // CLI 這條路：同一個檔交給 --password-file，必須讀出同一個密碼。
+    let out = env.ok(&["snapshots", "--password-file", pw.to_str().unwrap()]);
+    assert_eq!(
+        out.lines()
+            .filter(|l| l.contains(src.to_str().unwrap()))
+            .count(),
+        1,
+        "{out}"
+    );
+}
+
 /// 讀不到的檔案：snapshot 照寫、有警告、結束碼非 0（restic 的行為）。
 #[cfg(unix)]
 #[test]

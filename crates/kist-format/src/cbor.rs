@@ -3,14 +3,14 @@
 //! 規則：
 //! - struct 依「規格中各結構的欄位表順序」輸出——serde 的欄位宣告順序
 //!   就是那個順序，所以這裡**不做任何排序**（曾用 Value 層排序正規化，
-//!   實測慢 20 倍；欄位表釘順序後兩個實作都零成本）。
+//!   實測慢 20 倍；欄位表釘順序後零成本）。
 //! - 解碼忽略未知欄位（向前相容），拒絕重複欄位（serde struct visitor）
 //!   與尾端多餘 bytes。wire 型別都是 struct，直接解進 `T` 不走 Value 中繼。
 //! - **絕不回寫**：讀出的物件不得重新編碼後寫回；寫入端一律從事實來源
 //!   重新構造。
 //!
 //! 守則：**struct 欄位的宣告順序是格式**。重排欄位 = 改變 tree ID 等所有
-//! 內容定址；golden 測試與跨語言向量（Go `internal/interop`）會抓到。
+//! 內容定址；golden 測試與凍結向量（`tests/testdata/tree-canonical.hex`）會抓到。
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -55,8 +55,8 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 /// 規範編碼的結構守門（§4 第 2、4 條）：解碼前走一遍 CBOR **結構**，
 /// 拒絕 indefinite length（任何 major 的 additional info 31）與 tag
-/// （major 6）。ciborium 對兩者靜默容受，Go 端則明文拒絕——同一份
-/// bytes 不能在兩個實作得到不同判斷。
+/// （major 6）。ciborium 對兩者靜默容受，但 §4 第 8 條要求解碼明文
+/// 拒絕——非規範 bytes 不能被默默接受。
 ///
 /// 只走結構不解值：byte/text string 的 payload 整段跳過（內容裡的
 /// 0xbf/0xc0 是位元組，不是標頭）；array/map 遞迴，深度上限防堆疊

@@ -10,7 +10,7 @@
 //! [backup]
 //! paths = ["/home", "/etc"]
 //! schedule = "0 2 * * *"      # 5 或 6 欄（秒選填）cron；省略 = 只在 `run --once` 時跑
-//! gc_grace = "72h"
+//! gc_grace = "72h"            # 選填；沒寫取同檔的 [prune] grace，不得比它長
 //!
 //! [forget]                     # 選填；需要 Delete 權限，建議放在維護主機的設定裡
 //! keep_daily = 7
@@ -100,8 +100,8 @@ pub struct PruneSection {
     #[serde(default, with = "crate::duration::serde_opt")]
     pub grace: Option<std::time::Duration>,
     /// Tolerated client/prune clock difference. Unset takes the 1 h default;
-    /// an explicit 0 is honored literally (zero tolerance), matching the Go
-    /// implementation where zero is a real setting.
+    /// an explicit 0 is honored literally (zero tolerance): zero is a real
+    /// setting.
 
     #[serde(default, with = "crate::duration::serde_opt")]
     pub clock_skew: Option<std::time::Duration>,
@@ -167,8 +167,11 @@ impl Config {
                 ));
             }
             self.schedule_of(b.schedule.as_deref(), "[backup]")?;
-            if b.parity > 8 {
-                return Err(AppError::Config("[backup] parity must be 0..=8".to_owned()));
+            if usize::from(b.parity) > kist_core::MAX_PARITY_SHARDS {
+                return Err(AppError::Config(format!(
+                    "[backup] parity must be 0..={}",
+                    kist_core::MAX_PARITY_SHARDS
+                )));
             }
         }
         if let Some(f) = &self.forget {
@@ -191,6 +194,23 @@ impl Config {
             }
             self.schedule_of(p.schedule.as_deref(), "[prune]")?;
         }
+        // grace 的交叉檢查只看一個方向（ADR 019 A5）：backup 以為的 grace 比 prune 給的長，
+        // prune 就可能刪掉 backup 還在用的資料，屬「壞 snapshot」那一邊。反方向（backup
+        // 較短）只會讓 backup 早一點以 BackupTooLong 失敗，是安全的，不擋。
+        // 沒有 [prune] 的設定（prune 放在另一台主機）無從比較。
+        if let (Some(b), Some(p)) = (&self.backup, &self.prune) {
+            if let Some(backup_grace) = b.gc_grace {
+                let prune_grace = p.options().grace;
+                if backup_grace > prune_grace {
+                    return Err(AppError::Config(format!(
+                        "[backup] gc_grace ({}s) must not be longer than [prune] grace ({}s); \
+                         remove [backup] gc_grace to use [prune] grace",
+                        backup_grace.as_secs(),
+                        prune_grace.as_secs()
+                    )));
+                }
+            }
+        }
         if let Some(n) = &self.notify {
             for ev in &n.on {
                 if !matches!(ev.as_str(), "success" | "incomplete" | "failure") {
@@ -199,8 +219,7 @@ impl Config {
                     )));
                 }
             }
-            // scheme 大小寫不拘（URL scheme 本就 case-insensitive；Go 端
-            // url.Parse 會先 lower-case——兩個實作同判斷）。
+            // scheme 大小寫不拘（URL scheme 本就 case-insensitive）。
             let scheme = n.webhook_url.to_ascii_lowercase();
             if !(scheme.starts_with("http://") || scheme.starts_with("https://")) {
                 return Err(AppError::Config(
@@ -214,6 +233,17 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// backup 閘門用的 grace，唯一的解析點（ADR 019 A5）：`[backup] gc_grace` 優先，
+    /// 沒寫就取同一份設定的 `[prune] grace`，兩個都沒寫才用預設 72h。
+    /// 只把 `[prune] grace` 設短時若閘門仍用 72h，prune 可能刪掉 backup 還在用的資料。
+    pub fn gc_grace(&self) -> std::time::Duration {
+        self.backup
+            .as_ref()
+            .and_then(|b| b.gc_grace)
+            .or_else(|| self.prune.as_ref().and_then(|p| p.grace))
+            .unwrap_or(kist_core::DEFAULT_GC_GRACE)
     }
 
     /// 某一節的排程（解析過的）；沒寫 schedule 就 `None`。
@@ -240,12 +270,15 @@ impl Config {
     }
 }
 
-/// 密碼檔的規則（repo 密碼與 UI 密碼共用）：取第一行、去掉 `\r`，空的算設定錯誤。
-fn read_password_file(path: &Path) -> Result<zeroize::Zeroizing<String>> {
+/// 密碼檔的規則（repo 密碼與 UI 密碼共用；CLI 的 `--password-file` 也走這裡，
+/// ADR 019 A11）：取第一行、去掉 `\r`，空的算設定錯誤。
+/// 整個檔的內容與取出的密碼都包 `Zeroizing`，離開作用域時清零（ADR 007）。
+pub fn read_password_file(path: &Path) -> Result<zeroize::Zeroizing<String>> {
     let text = std::fs::read_to_string(path).map_err(|e| AppError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
+    let text = zeroize::Zeroizing::new(text);
     let first = text.lines().next().unwrap_or("").trim_end_matches('\r');
     if first.is_empty() {
         return Err(AppError::Config(format!(
@@ -294,8 +327,7 @@ pub fn duration(s: &str) -> Result<std::time::Duration> {
 mod scheme_case_tests {
     use super::*;
 
-    /// scheme 大小寫不拘（URL scheme 本就 case-insensitive；Go 端的
-    /// url.Parse 會先 lower-case——兩個實作要同判斷）。
+    /// scheme 大小寫不拘（URL scheme 本就 case-insensitive）。
     #[test]
     fn webhook_scheme_is_case_insensitive() {
         let cfg = Config::parse(
@@ -317,5 +349,63 @@ mod scheme_case_tests {
             cfg.prune.as_ref().unwrap().clock_skew,
             Some(std::time::Duration::from_secs(30 * 60))
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod gc_grace_tests {
+    use super::*;
+
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    fn cfg(sections: &str) -> Config {
+        Config::parse(&format!(
+            "repo = \"x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n{sections}"
+        ))
+        .unwrap()
+    }
+
+    /// 只寫 `[prune] grace`：backup 閘門取它（ADR 019 A5）。
+    #[test]
+    fn falls_back_to_prune_grace() {
+        assert_eq!(cfg("[prune]\ngrace = \"1h\"\n").gc_grace(), HOUR);
+    }
+
+    /// `[backup] gc_grace` 有寫就用它（較短是安全方向）。
+    #[test]
+    fn backup_gc_grace_wins() {
+        let c = cfg("gc_grace = \"1h\"\n[prune]\ngrace = \"72h\"\n");
+        assert_eq!(c.gc_grace(), HOUR);
+    }
+
+    /// 兩個都沒寫（或沒有 `[prune]`）：預設 72h，與 prune 的預設相同。
+    #[test]
+    fn defaults_to_72h() {
+        assert_eq!(cfg("").gc_grace(), kist_core::DEFAULT_GC_GRACE);
+        assert_eq!(
+            cfg("[prune]\nrepack_below = 40\n").gc_grace(),
+            kist_core::PruneOptions::default().grace
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod parity_tests {
+    use super::*;
+
+    fn with_parity(m: u32) -> Config {
+        Config::parse(&format!(
+            "repo = \"x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nparity = {m}\n"
+        ))
+        .unwrap()
+    }
+
+    /// `[backup] parity` 的上限就是 MAX_PARITY_SHARDS（ADR 019 A12）：8 收、9 拒。
+    #[test]
+    fn parity_above_max_is_rejected() {
+        assert!(with_parity(8).validate().is_ok());
+        assert!(with_parity(9).validate().is_err());
     }
 }

@@ -299,3 +299,130 @@ async fn replica_read_error_is_not_masked_as_not_found() {
         "副本的 I/O 錯誤不能被吞成 SnapshotNotFound：{err}"
     );
 }
+
+/// 權限注入的還原：測試結束（含斷言失敗的 panic）時把檔案改回 0o644，
+/// tempdir 才能照常清掉。
+#[cfg(unix)]
+struct RestorePerms(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestorePerms {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, PermissionsExt::from_mode(0o644));
+    }
+}
+
+/// 把 `path` 設成 0o000：本機後端的 head 走 `File::open`，會回 EACCES 而不是
+/// NotFound——物件其實在，只是 HEAD 失敗。root（或 CAP_DAC_OVERRIDE）無視
+/// 0o000、注入不了時回 `None`，呼叫端誠實跳過（同上一個測試的 canary）。
+#[cfg(unix)]
+fn deny_access(scratch: &Path, path: &Path) -> Option<RestorePerms> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let canary = scratch.join(".dac-canary");
+    std::fs::write(&canary, b"x").unwrap();
+    let canary_guard = RestorePerms(canary.clone());
+    std::fs::set_permissions(&canary, PermissionsExt::from_mode(0o000)).unwrap();
+    let privileged = std::fs::read(&canary).is_ok();
+    drop(canary_guard);
+    std::fs::remove_file(&canary).unwrap();
+    if privileged {
+        return None;
+    }
+
+    let guard = RestorePerms(path.to_path_buf());
+    std::fs::set_permissions(path, PermissionsExt::from_mode(0o000)).unwrap();
+    Some(guard)
+}
+
+/// replicas=1 的 repo 做一次 backup；回傳 repo、repo 目錄、根 tree。
+#[cfg(unix)]
+async fn replica_repo_with_backup(
+    dir: &Path,
+) -> (Repository, std::path::PathBuf, kist_format::TreeId) {
+    let backend = kist_backend::Backend::local(&dir.join("repo")).unwrap();
+    Repository::init(backend.clone(), PASSWORD.as_bytes(), replica_init_options())
+        .await
+        .unwrap();
+    let src = dir.join("src");
+    make_source(&src);
+    let repo = Repository::open(backend, PASSWORD.as_bytes())
+        .await
+        .unwrap();
+    let b1 = repo
+        .backup(std::slice::from_ref(&src), common::backup_options())
+        .await
+        .unwrap();
+    (repo, dir.join("repo"), b1.roots[0].tree)
+}
+
+/// ADR 019 A8：`.r1` 在、主體樹也在，只是主體的 HEAD 失敗（EACCES）時，
+/// check 不得謊報「主體不見（可能的資料遺失）」，要把真實的 I/O 錯誤記進
+/// report；也不能因為這個錯誤丟掉整份 report（check 仍回 Ok）。
+#[cfg(unix)]
+#[tokio::test]
+async fn orphan_replica_check_reports_the_head_error_not_data_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, repo_dir, root_tree) = replica_repo_with_backup(dir.path()).await;
+    let primary = repo_dir.join(keys::tree(&root_tree));
+    let replica_key = keys::tree_replica(&root_tree);
+    assert!(
+        primary.exists() && repo_dir.join(&replica_key).exists(),
+        "主體與副本都要在"
+    );
+    let Some(_restore) = deny_access(dir.path(), &primary) else {
+        return;
+    };
+
+    let report = repo.check(CheckOptions::default()).await.unwrap();
+    assert!(
+        !report
+            .errors
+            .iter()
+            .any(|e| e.contains("primary tree is missing")),
+        "主體樹在、只是 HEAD 失敗：不得回報成資料遺失：{:?}",
+        report.errors
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.starts_with(&replica_key) && e.contains("Permission denied")),
+        "要把真實的 I/O 錯誤記進 report：{:?}",
+        report.errors
+    );
+}
+
+/// ADR 019 A8：活樹的 `.r1` 在，只是它的 HEAD 失敗（EACCES）時，check 不得
+/// 回報「副本缺失」，要把真實的 I/O 錯誤記進 report。
+#[cfg(unix)]
+#[tokio::test]
+async fn missing_replica_check_reports_the_head_error_not_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, repo_dir, root_tree) = replica_repo_with_backup(dir.path()).await;
+    let replica_key = keys::tree_replica(&root_tree);
+    let replica = repo_dir.join(&replica_key);
+    assert!(replica.exists(), "副本要在");
+    let Some(_restore) = deny_access(dir.path(), &replica) else {
+        return;
+    };
+
+    let report = repo.check(CheckOptions::default()).await.unwrap();
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("tree replica is missing")),
+        "副本在、只是 HEAD 失敗：不得回報成副本缺失：{:?}",
+        report.warnings
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.starts_with(&replica_key) && e.contains("Permission denied")),
+        "要把真實的 I/O 錯誤記進 report：{:?}",
+        report.errors
+    );
+}

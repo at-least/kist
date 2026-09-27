@@ -1,9 +1,9 @@
 # kist repo 格式（v3）
 
-> **狀態：v3，2026-09-09 定案。** 本文件是唯一權威副本，由 kist-rs（產品）
-> 持有；kist-go 的 `docs/format.md` 是它的逐 byte 拷貝，由該 repo 的 CI
-> 檢查一致性（§0.9）。改動格式必須同時改兩邊的程式碼、golden files 與
-> 本文件。
+> **狀態：v3，2026-09-09 定案。** 本文件是唯一權威副本。2026-09-27 起只有
+> 一份實作（Rust）；原本的 Go 參考實作已移除（ADR 018），格式相容性改由
+> 凍結的 v3 fixture repo 把關（§18）。改動格式必須同時改程式碼、golden
+> files 與本文件；凍結的 fixture 只在格式升版時換。
 
 v3 = v2 的外科手術修訂 ＋「備份兩個遠端之間」需求（遠端來源）的格式支援。
 v2 的核心架構（pack、每 chunk AEAD、明文 keyed tree 命名、欄位表 CBOR、
@@ -99,8 +99,8 @@ master ─BLAKE3 DeriveKey─▶
 
 ## 4. CBOR 慣例（規範編碼——條件完整版）
 
-所有 metadata 都是 CBOR（RFC 8949）。**規範編碼的完整條件**（第三個實作
-憑本節就必須能編出與兩個現有實作逐 byte 相同的 bytes；違反任一條＝解碼
+所有 metadata 都是 CBOR（RFC 8949）。**規範編碼的完整條件**（另一個實作
+憑本節就必須能編出與現有實作逐 byte 相同的 bytes；違反任一條＝解碼
 拒絕或編碼非法）：
 
 1. 整數一律最短編碼。
@@ -116,8 +116,7 @@ master ─BLAKE3 DeriveKey─▶
    bytes、欄位表宣告「必須缺席」卻在場的欄位（§8 的 per-kind 規則）。
 9. 忽略未知欄位（向前相容），但**絕不回寫**：寫入端一律從事實來源重新
    構造，讀出的物件永不重編碼後寫回。
-10. 新增欄位：一律可省略語意（零值省略），插入位置依欄位表更新並同步
-    兩個實作。
+10. 新增欄位：一律可省略語意（零值省略），插入位置依欄位表更新。
 
 ### 4.1 欄位表（＝輸出順序）
 
@@ -227,14 +226,14 @@ ChunkList { v:3, chunks:[ChunkId] }
 
 | 來源 | 沿用條件 | 依據 |
 | --- | --- | --- |
-| mk=0 posix | size + mtime + ctime + inode 都沒變（dev 只在 `nlink>1` 時記錄，供硬連結識別，不參與快速路徑比較） | kernel 維護，使用者改不了（v2 規則；size 在兩個實作的外層判斷比較） |
+| mk=0 posix | size + mtime + ctime + inode 都沒變（dev 只在 `nlink>1` 時記錄，供硬連結識別，不參與快速路徑比較） | kernel 維護，使用者改不了（v2 規則；size 在實作的外層判斷比較） |
 | mk=2 s3 | etag 相同 + size 相同 | etag 是來源**計算並保證**的內容指紋（單段上傳＝MD5；多段/KMS 的 etag 仍是來源定義的確定性指紋） |
 | mk=1 sftp / mk=3 | **無安全快速路徑**——一律重讀，靠 chunk 去重吸收 | mtime/size 皆 client 可設（`cp -p` 陷阱） |
 
 mtime-only 沿用**非法**（任何來源）。client 可提供 `--trust-mtime` 顯式
 opt-in，但那是 client 政策，規格不背書其安全性。`etag`/`vern` 存在 Entry
 裡就是為了下一次 backup 能做這個比較——這是格式欄位，不是 client 記憶體
-狀態（兩個實作、兩台機器都要能比）。
+狀態（不同機器、不同版本的 client 都要能比）。
 
 ### 8.3 硬連結範圍
 
@@ -244,8 +243,8 @@ opt-in，但那是 client 政策，規格不背書其安全性。`etag`/`vern` �
 
 ### 8.4 巢狀深度（實作上限）
 
-tree 的 DIR 巢狀**沒有格式上的深度限制**；但兩個參考實作都設有實作上限
-256 層（Rust `kist_core::MAX_TREE_DEPTH`、Go `repo.maxTreeDepth`，兩邊必須一致）。
+tree 的 DIR 巢狀**沒有格式上的深度限制**；但參考實作設有實作上限
+256 層（`kist_core::MAX_TREE_DEPTH`）。
 這不是格式規則：來源路徑長度允許的巢狀其實可以超過它（ext4 單元件可以短到
 2 bytes，PATH_MAX 內疊得出約 2000 層），所以 backup 的寫入端套同一把尺——
 超過上限的來源子目錄跳過並記警告，寫出的樹因此永不超限。還原／check／prune
@@ -277,7 +276,7 @@ Root {
 
 - **沒有合成根**：根目錄本身不是任何 tree 的 entry（v2 的絕對路徑節點消
   失）；`paths` 欄位刪除（roots 取代）。
-- restore 映射（兩實作必須一致）：root `path` 去掉 scheme 後以 `/` 切
+- restore 映射（任何實作都必須一致）：root `path` 去掉 scheme 後以 `/` 切
   段、映射到 `<target>/` 之下（`/srv/data` → `target/srv/data`；
   `s3://bucket/prefix` → `target/bucket/prefix`）。**檔案/symlink 來源**
   （root tree 恰好一個非目錄 entry、名稱＝定位末段）落在
@@ -342,7 +341,7 @@ KeySlot {
 
 **逐 byte 沿用 v2 §12**：gear 表（fastcdc-go v0.2.0，digest 釘死）、
 normalized level 2、min 起算、mask_s/mask_l 由 avg 推導、硬邊界 max、
-緩衝無關性、參數進 config、跨語言 golden。v3 不改切塊——上游 crate 的
+緩衝無關性、參數進 config、凍結 golden。v3 不改切塊——上游 crate 的
 多變體現象恰是「凍結的東西必須擁有」的證明，而自殖碼已消除該風險類。
 
 ## 13. GC
@@ -453,9 +452,8 @@ snapshot 主體是唯一 commit point：它出現之前的新物件都是可回�
 
 ## 18. 規則 × 向量登記表
 
-每條規範性規則至少掛一個跨語言 conformance 向量（兩邊 testdata 各持一
-份逐 byte 相同的拷貝；由 kist-rs 的生成腳本產出）。草案階段 ID 已編、
-向量待生成：
+每條規範性規則至少掛一個 conformance 向量（由產品端錄製、提交進
+testdata）。草案階段 ID 已編、多數向量待生成：
 
 | 向量 ID | 涵蓋規則 |
 | --- | --- |
@@ -473,6 +471,13 @@ snapshot 主體是唯一 commit point：它出現之前的新物件都是可回�
 
 行為級驗證（非向量）：gc_race proptest 200 cases 必須在 v3 語意下重跑
 全綠（touch 取代重 put 之後，競態空間重新驗證——這是 §0.4 的實作義務）。
+
+**凍結 fixture repo**（`crates/kist-core/tests/fixtures/v3/repo`）：由產品
+寫出一次、提交進 git、永不重生，每次 `cargo test` 以目前的程式開啟、
+`check --read-data`、還原比對、解碼後重新編碼逐 byte 比對、同內容再備份
+零新 chunk。向量與 golden 會隨程式重錄，這份不會——它抓的是「程式自己
+前後一致、但格式悄悄變了」。只在格式升版時換：升版時舊 fixture 改當反向
+向量（新版讀取端必須以 `min_reader`／版本錯誤拒絕），另凍結一份新版的。
 
 ## 19. 設計決定 × 教訓對照
 

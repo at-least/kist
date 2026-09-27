@@ -2,7 +2,7 @@
 //! —— [`FsCore`] 吃 `Repository`、吐 `Attr`/`Listing`/bytes，`crate::fuse` 只做
 //! fuser 回覆的轉接；測試直接開 `FsCore`，不用真的掛載。
 //!
-//! 佈局（對齊 Go 參考實作）：`<client id hex>/<timestamp>/<備份的樹>`。頂兩層
+//! 佈局：`<client id hex>/<timestamp>/<備份的樹>`。頂兩層
 //! volatile（每次看都重列、TTL 1 秒）、snapshot 內容 immutable（內容定址，TTL
 //! 24 小時）。看到沒見過的 snapshot key 就主動重載一次 index——新 snapshot 可能
 //! 引用 mount 當下那份 index 沒有的 pack（限流 1 秒一次，key 一律記為「看過」，
@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use kist_core::restore::ReloadableIndex;
 use kist_core::{CoreError, Repository};
 use kist_format::keys;
-use kist_format::tree::{content_type, node_type, ChunkList, Entry};
-use kist_format::{cbor, ChunkId};
+use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
+use kist_format::ChunkId;
 
 use crate::offsets::ChunkOffsets;
 use crate::vpath::{RootContents, VEntry, VirtualRoot};
@@ -148,6 +148,8 @@ struct Inode {
 struct InodeTable {
     next: u64,
     map: HashMap<u64, Arc<Inode>>,
+    /// （父 ino, 名稱）→ ino：同名再 lookup 回同一個號，見 [`Self::insert_named`]。
+    names: HashMap<(u64, Vec<u8>), u64>,
 }
 
 impl InodeTable {
@@ -156,13 +158,45 @@ impl InodeTable {
         let mut t = Self {
             next: 0,
             map: HashMap::new(),
+            names: HashMap::new(),
         };
         t.insert(Node::Root, Attr::dir(0o555, 0), true, None);
         t
     }
 
+    /// lookup 用的配號：同一個（父 ino, 名稱）配過就回原來的號（新建的 node
+    /// 丟掉，保留舊的），沒配過才配新號並記下。只管身分、不管存在——名字現在
+    /// 還在不在，由呼叫端在這之前檢查。
+    ///
+    /// 為什麼要去重：頂層 client 目錄的 entry TTL 只有 1 秒，過期後 kernel 重新
+    /// lookup；每次配新號的話，底下已快取的整棵子樹都跟著作廢（真掛載 `cp -r`
+    /// 兩萬個檔會漏檔，mount 的記憶體也一路長，ADR 019 A6）。同一個（父, 名稱）
+    /// 的內容不會變：snapshot 名是唯一的 timestamp，snapshot 內容定址。
+    ///
+    /// 例外：讀 tree 失敗、退回目錄形態建出來的 snapshot view 不是真貌，呼叫端
+    /// 要改用 [`Self::insert`]（不記名）——記下去的話錯的形態會釘住整個 session。
+    fn insert_named(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        node: Node,
+        attr: Attr,
+        volatile: bool,
+        xattrs: Option<Arc<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    ) -> u64 {
+        let key = (parent, name.to_vec());
+        if let Some(&ino) = self.names.get(&key) {
+            return ino;
+        }
+        let ino = self.insert(node, attr, volatile, xattrs);
+        self.names.insert(key, ino);
+        ino
+    }
+
     /// 配一個全新的 inode 號：**永不重用**，所以 generation 恆為 0、
-    /// forget 可以是 no-op（記憶體上限 = 這個 session 瀏覽過的條目數）。
+    /// forget 可以是 no-op（不回收：記憶體上限 = 這個 session 瀏覽過的不同
+    /// （父, 名稱）數，加上退回形態的 snapshot lookup 次數）。lookup 一律走
+    /// [`Self::insert_named`]，這裡只給根目錄與退回形態的 snapshot view 直接用。
     fn insert(
         &mut self,
         node: Node,
@@ -346,8 +380,8 @@ impl FsCore {
 
     // —— lookup ——
 
-    pub async fn lookup(&self, parent: u64, name: &[u8]) -> Result<Lookup, FsError> {
-        let parent = self.node(parent).ok_or(FsError::NotFound)?;
+    pub async fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Lookup, FsError> {
+        let parent = self.node(parent_ino).ok_or(FsError::NotFound)?;
         match &parent.node {
             Node::Root => {
                 let client = std::str::from_utf8(name).map_err(|_| FsError::NotFound)?;
@@ -360,7 +394,9 @@ impl FsCore {
                     self.inodes
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(
+                        .insert_named(
+                            parent_ino,
+                            name,
                             Node::Client {
                                 client: client.to_owned(),
                             },
@@ -392,6 +428,9 @@ impl FsCore {
                 // 落點一致）；定位沒有組件（`/`）→ 內容攤平到頂層；否則目錄
                 // 來源（葉子 = 攜帶 subtree 的合成 DIR，children 懶載入）。
                 let mut pairs = Vec::with_capacity(info.roots.len());
+                // 有 root 的 tree 讀失敗、退回目錄形態：這個 view 可能不是真貌
+                // （檔案來源顯示成目錄、`/` 攤平顯示成空的）。
+                let mut degraded = false;
                 for root in &info.roots {
                     let comps: Vec<&[u8]> = root
                         .path
@@ -401,12 +440,13 @@ impl FsCore {
                         .collect();
                     let contents = match comps.split_last() {
                         // 定位沒有組件：攤平（`kist backup /` 的 v3 形態）。
-                        None => self
-                            .repo
-                            .read_tree_chain(&root.tree)
-                            .await
-                            .map(RootContents::Flatten)
-                            .unwrap_or(RootContents::Dir),
+                        None => match self.repo.read_tree_chain(&root.tree).await {
+                            Ok(entries) => RootContents::Flatten(entries),
+                            Err(_) => {
+                                degraded = true;
+                                RootContents::Dir
+                            }
+                        },
                         Some((last, _)) => {
                             let leaf = match self.repo.read_tree_chain(&root.tree).await {
                                 Ok(entries) => matches!(
@@ -414,7 +454,10 @@ impl FsCore {
                                     [e] if e.kind != node_type::DIR && e.name == *last
                                 )
                                 .then(|| Box::new(entries[0].clone())),
-                                Err(_) => None,
+                                Err(_) => {
+                                    degraded = true;
+                                    None
+                                }
                             };
                             match leaf {
                                 Some(e) => RootContents::Leaf(e),
@@ -424,20 +467,29 @@ impl FsCore {
                     };
                     pairs.push((root.clone(), contents));
                 }
-                // 敵意 locator（NUL 等非法組件）在這裡拒成 I/O 錯——
-                // 與 Go 的 mount Lookup（ErrInvalid）同款。
+                // 敵意 locator（NUL 等非法組件）在這裡拒成 I/O 錯。
                 let vroot = Arc::new(VirtualRoot::build(pairs).map_err(|_| FsError::InvalidInput)?);
                 let attr = Attr::dir(0o555, info.time_ns);
+                let node = Node::SnapshotRoot { vroot };
                 let ino = {
-                    self.inodes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(Node::SnapshotRoot { vroot }, attr, false, None)
+                    let mut table = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+                    if degraded {
+                        // 退回形態不記進去重表、TTL 1 秒：記下去的話同一個
+                        // （client, ts）整個 session 都回這個錯的形態，錯誤消失
+                        // 了也好不了（ADR 019 A6 複核）。下次 lookup 重讀 tree。
+                        table.insert(node, attr, true, None)
+                    } else {
+                        table.insert_named(parent_ino, name, node, attr, false, None)
+                    }
                 };
                 Ok(Lookup {
                     ino,
                     attr,
-                    ttl: IMMUTABLE_TTL,
+                    ttl: if degraded {
+                        VOLATILE_TTL
+                    } else {
+                        IMMUTABLE_TTL
+                    },
                 })
             }
             Node::SnapshotRoot { vroot } => {
@@ -446,7 +498,8 @@ impl FsCore {
                 let mut child_key = Vec::with_capacity(name.len() + 1);
                 child_key.push(b'/');
                 child_key.extend_from_slice(name);
-                self.vchild_inode(v, Arc::clone(vroot), child_key).await
+                self.vchild_inode(parent_ino, name, v, Arc::clone(vroot), child_key)
+                    .await
             }
             Node::SyntheticDir { vroot, level_key } => {
                 let level = vroot.level(level_key);
@@ -454,11 +507,12 @@ impl FsCore {
                 let mut child_key = level_key.clone();
                 child_key.push(b'/');
                 child_key.extend_from_slice(name);
-                self.vchild_inode(v, Arc::clone(vroot), child_key).await
+                self.vchild_inode(parent_ino, name, v, Arc::clone(vroot), child_key)
+                    .await
             }
             Node::Dir { entries } => {
                 let e = lookup_entry(entries, name).ok_or(FsError::NotFound)?;
-                self.real_inode(e).await
+                self.real_inode(parent_ino, name, e).await
             }
             Node::File { .. } | Node::Symlink { .. } => Err(FsError::NotFound),
         }
@@ -467,6 +521,8 @@ impl FsCore {
     /// 虛擬層級裡的條目 → inode（合成的中介目錄或真實的子樹）。
     async fn vchild_inode(
         &self,
+        parent_ino: u64,
+        name: &[u8],
         v: &VEntry,
         vroot: Arc<VirtualRoot>,
         level_key: Vec<u8>,
@@ -478,7 +534,14 @@ impl FsCore {
                     self.inodes
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(Node::SyntheticDir { vroot, level_key }, attr, false, None)
+                        .insert_named(
+                            parent_ino,
+                            name,
+                            Node::SyntheticDir { vroot, level_key },
+                            attr,
+                            false,
+                            None,
+                        )
                 };
                 Ok(Lookup {
                     ino,
@@ -486,12 +549,12 @@ impl FsCore {
                     ttl: IMMUTABLE_TTL,
                 })
             }
-            VEntry::Real(e) => self.real_inode(e).await,
+            VEntry::Real(e) => self.real_inode(parent_ino, name, e).await,
         }
     }
 
     /// 真實 tree entry → inode。目錄在這裡就載好整段 chain（immutable）。
-    async fn real_inode(&self, e: &Entry) -> Result<Lookup, FsError> {
+    async fn real_inode(&self, parent_ino: u64, name: &[u8], e: &Entry) -> Result<Lookup, FsError> {
         let xattrs = e.xattrs.as_ref().map(|m| {
             Arc::new(
                 m.iter()
@@ -536,7 +599,7 @@ impl FsCore {
             self.inodes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(node, attr, false, xattrs)
+                .insert_named(parent_ino, name, node, attr, false, xattrs)
         };
         Ok(Lookup {
             ino,
@@ -683,7 +746,7 @@ impl FsCore {
         Ok(buf)
     }
 
-    /// 直接內容回原清單；間接內容把清單 chunk 讀出來解成 `ChunkList`，
+    /// 直接內容回原清單；間接內容把清單 chunk 讀出來解成 `ChunkList`（含版本檢查），
     /// 再用 index 的 raw_len 建邊界表。
     async fn resolve_file(
         &self,
@@ -697,7 +760,7 @@ impl FsCore {
             for id in chunks {
                 bytes.extend_from_slice(&self.repo.read_chunk_reloading(id, &self.index).await?);
             }
-            let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+            let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
                 key: "<chunk list>".to_owned(),
                 reason: e.to_string(),
             })?;
