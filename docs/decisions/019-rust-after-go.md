@@ -155,6 +155,13 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   拒絕（以前 FIFO 會卡在開檔）。暫存檔名的亂數用 kist_crypto::random_bytes（rand
   在 kist-core 只是 dev-dependency）。非 unix 走同一條暫存＋rename，只少了
   O_NOFOLLOW；只做了交叉 clippy，沒在 Windows 上跑過。】
+  【實作後（審查）：暫存檔起初以 umask 預設（0o644）建立，比原地寫差——覆寫使用者
+  0o600 的檔時內容先落在別人讀得到的暫存檔，metadata（xattr）套不上時就停在 0o644；
+  沒記錄 mode 的條目（s3／generic）覆寫後也從 0o600 變 0o644、不報錯（兩者對
+  619e500 之前的版本實測都維持 0o600）。改成：記錄的 mode 之後會套上時以 0o600 建
+  暫存檔（套不上就停在 0o600）；不會套時沿用正式名處原有一般檔的權限，沒有才是
+  0o666（皆再經 umask）。不以記錄的 mode 建檔：唯讀的 mode 會讓之後的 user.* 設不
+  進去。】
 
 **A3　restore 的 mode 與時間以路徑套用，會跟隨被換上的 symlink（repo-2）**
 

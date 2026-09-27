@@ -199,12 +199,12 @@ struct TempFile {
 impl TempFile {
     /// 在 `dir` 這一層建一個新的暫存檔（[`DirHandle::create_new_file`]：
     /// O_CREAT|O_EXCL，unix 另加 O_NOFOLLOW——名字已被佔用就失敗，不會打開
-    /// 別人放的東西）。
-    fn create_in(dir: &DirHandle) -> Result<Self> {
+    /// 別人放的東西），建檔權限 `mode`（[`temp_file_mode`]）。
+    fn create_in(dir: &DirHandle, mode: u32) -> Result<Self> {
         let name = temp_name()?;
         // 開檔成功才交給 TempPath：失敗時那個名字不是我們的，drop 不能去刪它。
         let file = dir
-            .create_new_file(&name)
+            .create_new_file(&name, mode)
             .map_err(|e| CoreError::io(dir.child_path(&name), e))?;
         Ok(Self {
             file,
@@ -215,6 +215,23 @@ impl TempFile {
             },
         })
     }
+}
+
+/// 暫存檔的建檔權限（unix 再經 umask；非 unix 沒有 mode，不看）。內容寫進
+/// 暫存檔之後、記錄的 mode 套上之前，它不能比該有的寬鬆（ADR 019 A2 審查：
+/// 以 umask 預設建的話，覆寫使用者 0o600 的檔時內容會先放在 0o644 的暫存檔，
+/// metadata 套不上時就停在 0o644）：
+/// - 記錄的 mode 之後會套上（條件與 [`apply_meta`] 相同：有 mtime、mode 不是 0，
+///   否則 `fsmeta::apply_mode` 不動）→ 0o600。metadata 套不上時就停在 0o600。
+///   不以記錄的 mode 建檔：唯讀的 mode 會讓之後的 user.* xattr 設不進去。
+/// - 不會套 mode（s3／generic 來源）→ 正式名處原有一般檔的權限（以前原地寫時
+///   就是保留它），沒有就是 0o666（與 std 新建的檔相同）。
+fn temp_file_mode(dir: &DirHandle, name: &OsStr, node: &Entry) -> Result<u32> {
+    let mode_applies = node.mtime_ns.is_some() && node.mode.unwrap_or(0) != 0;
+    if mode_applies {
+        return Ok(0o600);
+    }
+    Ok(dir.file_mode(name)?.unwrap_or(0o666))
 }
 
 /// 硬連結的第二個以後的名字：從還原目標的 handle 沿第一個名字的相對路徑
@@ -456,10 +473,7 @@ impl Repository {
                         }
                     }
                     // 硬連結失敗後的複製也走這裡：同樣是暫存檔＋rename（ADR 019 A2）。
-                    match self
-                        .restore_file(dir, name, node.size, &node.chunks, node.content, index)
-                        .await
-                    {
+                    match self.restore_file(dir, name, node, index).await {
                         Ok(temp) => {
                             #[cfg(all(test, unix))]
                             meta_via_handle_tests::before_meta(&temp.temp.path(), &path);
@@ -469,9 +483,10 @@ impl Repository {
                             let (applied, owner) = apply_meta(&temp.file, &path, node);
                             let meta = applied.and(owner);
                             // metadata 套不上（例如目標檔案系統不收 xattr）時內容仍是
-                            // 對的：照樣 rename 成正式名、記下這個錯——與以前在正式名
-                            // 上原地寫時一樣。先關檔再 rename：Windows 上 rename 開著
-                            // 的檔要看共用模式，關掉最單純；unix 沒有差別。
+                            // 對的：照樣 rename 成正式名、記下這個錯。那時記錄的 mode
+                            // 沒套上，檔案停在建檔時的權限（temp_file_mode：0o600）。
+                            // 先關檔再 rename：Windows 上 rename 開著的檔要看共用模式，
+                            // 關掉最單純；unix 沒有差別。
                             let TempFile { file, temp } = temp;
                             drop(file);
                             match temp.commit(name) {
@@ -584,26 +599,25 @@ impl Repository {
         applied.and(owner)
     }
 
-    /// 把檔案內容寫進 `dir` 這一層的暫存檔，回傳它（ADR 019 A2）：呼叫端在同一個
-    /// handle 上套 metadata（ADR 019 A3），再 commit（rename）成正式名 `name`。
-    /// 任何一步失敗，暫存檔隨錯誤被 drop 刪掉，正式名底下原有的檔不受影響。
+    /// 把檔案條目 `node` 的內容寫進 `dir` 這一層的暫存檔，回傳它（ADR 019 A2）：
+    /// 呼叫端在同一個 handle 上套 metadata（ADR 019 A3），再 commit（rename）成
+    /// 正式名 `name`。任何一步失敗，暫存檔隨錯誤被 drop 刪掉，正式名底下原有的
+    /// 檔不受影響。
     async fn restore_file(
         &self,
         dir: &DirHandle,
         name: &OsStr,
-        size: u64,
-        chunks: &[ChunkId],
-        content: u8,
+        node: &Entry,
         index: &ReloadableIndex,
     ) -> Result<TempFile> {
         let path = dir.child_path(name);
         // 先看一眼正式名處：擋著 symlink 之類就不必下載內容（commit 前會再看一次）。
         refuse_in_the_way(dir, name)?;
-        let chunk_ids = if content == content_type::DIRECT {
-            chunks.to_vec()
+        let chunk_ids = if node.content == content_type::DIRECT {
+            node.chunks.clone()
         } else {
             let mut bytes = Vec::new();
-            for id in chunks {
+            for id in &node.chunks {
                 bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
             }
             let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
@@ -615,7 +629,7 @@ impl Repository {
         // 內容寫進新建的暫存檔，不開正式名：以前以 write＋create＋truncate
         // 開正式名，失敗後呼叫端再 remove_file，連還沒開檔就失敗（間接內容的
         // 清單讀不到）的情況也會刪掉使用者原有的檔。
-        let temp = TempFile::create_in(dir)?;
+        let temp = TempFile::create_in(dir, temp_file_mode(dir, name, node)?)?;
         let mut writer = std::io::BufWriter::new(&temp.file);
         let mut written = 0u64;
         for id in &chunk_ids {
@@ -627,10 +641,10 @@ impl Repository {
         }
         writer.flush().map_err(|e| CoreError::io(&path, e))?;
         drop(writer); // writer 借用著 temp.file；回傳 temp 之前先放掉
-        if written != size {
+        if written != node.size {
             return Err(CoreError::Corrupt {
                 key: path.display().to_string(),
-                reason: format!("restored {written} bytes but snapshot says {size}"),
+                reason: format!("restored {written} bytes but snapshot says {}", node.size),
             });
         }
         Ok(temp)
@@ -758,6 +772,8 @@ mod meta_via_handle_tests {
         /// `#[tokio::test]` 是單執行緒 runtime，restore 的走訪跑在測試自己的
         /// 執行緒上，所以 thread_local 只影響設定它的那個測試。
         static SWAP: RefCell<Option<(PathBuf, PathBuf)>> = const { RefCell::new(None) };
+        /// 每次呼叫 [`before_meta`] 時 `written` 的權限位元：(path, mode)。
+        static SEEN_MODES: RefCell<Vec<(PathBuf, u32)>> = const { RefCell::new(Vec::new()) };
     }
 
     /// restore 在內容寫完（目錄：子項目都寫完）、metadata 還沒套之前呼叫。
@@ -765,6 +781,8 @@ mod meta_via_handle_tests {
     /// `path`。`path` 符合設定時，把 `written` 搬到旁邊（`<path>.moved`），
     /// 原位換成指向外面的 symlink——模擬本機攻擊者在這個空檔動手。
     pub(super) fn before_meta(written: &Path, path: &Path) {
+        let mode = std::fs::symlink_metadata(written).unwrap().mode() & 0o7777;
+        SEEN_MODES.with(|seen| seen.borrow_mut().push((path.to_path_buf(), mode)));
         SWAP.with(|swap| {
             if let Some((victim, outside)) = swap.borrow().as_ref() {
                 if victim == path {
@@ -901,6 +919,36 @@ mod meta_via_handle_tests {
             ("4755".to_owned(), RECORDED_MTIME),
             "metadata 應該套在寫入的那個檔上"
         );
+        assert!(summary.errors.is_empty(), "{summary:?}");
+    }
+
+    /// ADR 019 A2（審查）：內容寫進暫存檔之後、記錄的 mode 套上之前，暫存檔
+    /// 不能讓群組與其他人讀得到——那段時間別的本機使用者開了它，之後的 fchmod
+    /// 收不回已開的 fd。以 umask 預設（0o644）建暫存檔時，覆寫使用者 0o600 的
+    /// 檔也會經過這一段。記錄的 mode（f.bin：4755）之後照常套上。
+    #[tokio::test]
+    async fn temp_file_is_private_until_the_recorded_mode_is_applied() {
+        let s = setup().await;
+        let path = s.restored.join("f.bin");
+
+        let summary = s
+            .repo
+            .restore(&s.snapshot, &s.target, RestoreOptions::default())
+            .await
+            .unwrap();
+
+        let before = SEEN_MODES.with(|seen| {
+            seen.borrow()
+                .iter()
+                .find(|(p, _)| p == &path)
+                .map(|(_, mode)| format!("{mode:o}"))
+        });
+        assert_eq!(
+            before.as_deref(),
+            Some("600"),
+            "套 metadata 之前暫存檔的權限；summary：{summary:?}"
+        );
+        assert_eq!(mode_and_mtime(&path), ("4755".to_owned(), RECORDED_MTIME));
         assert!(summary.errors.is_empty(), "{summary:?}");
     }
 

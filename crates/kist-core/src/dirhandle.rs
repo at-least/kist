@@ -134,7 +134,9 @@ mod imp {
     use std::path::Path;
     use std::sync::Arc;
 
-    use rustix::fs::{AtFlags, FileType, Gid, Mode, Nsecs, OFlags, Timespec, Timestamps, Uid};
+    use rustix::fs::{
+        AtFlags, FileType, Gid, Mode, Nsecs, OFlags, RawMode, Timespec, Timestamps, Uid,
+    };
     use rustix::io::Errno;
 
     use super::{DirHandle, Kind};
@@ -207,13 +209,30 @@ mod imp {
         }
 
         /// 新建檔案 `name` 來寫：O_CREAT|O_EXCL（名字已被佔用——含 symlink——
-        /// 就失敗，不會打開別人放的東西）加 O_NOFOLLOW。權限 0o666 再經 umask，
-        /// 與 std 的預設相同。
-        pub(crate) fn create_new_file(&self, name: &OsStr) -> std::io::Result<File> {
+        /// 就失敗，不會打開別人放的東西）加 O_NOFOLLOW。建檔權限 `mode` 由呼叫端
+        /// 決定（restore.rs 的 temp_file_mode），再經 umask。
+        pub(crate) fn create_new_file(&self, name: &OsStr, mode: u32) -> std::io::Result<File> {
             let flags =
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let fd = rustix::fs::openat(&*self.file, name, flags, Mode::from_raw_mode(0o666))?;
+            // RawMode 在 Linux 是 u32、在 macOS 是 u16；只取 0o777 以內，放得進去。
+            let mode = Mode::from_raw_mode((mode & 0o777) as RawMode);
+            let fd = rustix::fs::openat(&*self.file, name, flags, mode)?;
             Ok(File::from(fd))
+        }
+
+        /// `name` 處若是一般檔，回傳它的權限位元（0o777 以內，不跟隨 symlink）；
+        /// 沒有東西、或不是一般檔就是 `None`。
+        pub(crate) fn file_mode(&self, name: &OsStr) -> Result<Option<u32>> {
+            let stat = match rustix::fs::statat(&*self.file, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(e) if e == Errno::NOENT => return Ok(None),
+                Err(e) => return Err(CoreError::io(self.child_path(name), e.into())),
+            };
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Ok(None);
+            }
+            // st_mode 的型別因平台而異（Linux u32、macOS u16），放得進 u32。
+            Ok(Some(stat.st_mode as u32 & 0o777))
         }
 
         /// 同一層裡把 `from` 改名成 `to`（`to` 已存在就取代它；rename 不跟隨
@@ -385,11 +404,17 @@ mod imp {
         }
 
         /// `create_new`＝O_CREAT|O_EXCL：名字已被佔用（含 symlink）就失敗。
-        pub(crate) fn create_new_file(&self, name: &OsStr) -> std::io::Result<File> {
+        /// 非 unix 沒有 mode 位元，`mode` 不看。
+        pub(crate) fn create_new_file(&self, name: &OsStr, _mode: u32) -> std::io::Result<File> {
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(self.child_path(name))
+        }
+
+        /// 非 unix 沒有 mode 位元（[`DirHandle::create_new_file`] 也不看）。
+        pub(crate) fn file_mode(&self, _: &OsStr) -> Result<Option<u32>> {
+            Ok(None)
         }
 
         pub(crate) fn rename(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
@@ -476,7 +501,7 @@ mod tests {
         std::fs::rename(target.join("real"), &moved).unwrap();
         std::os::unix::fs::symlink(&outside, target.join("real")).unwrap();
 
-        let mut f = real.create_new_file(OsStr::new(".tmp")).unwrap();
+        let mut f = real.create_new_file(OsStr::new(".tmp"), 0o600).unwrap();
         f.write_all(b"content").unwrap();
         drop(f);
         real.rename(OsStr::new(".tmp"), OsStr::new("f")).unwrap();
@@ -485,7 +510,7 @@ mod tests {
         real.symlink(Path::new("f"), OsStr::new("s")).unwrap();
         real.set_symlink_mtime(OsStr::new("s"), 1_000_000 * 1_000_000_000);
         let sub = real.create_child_dir(OsStr::new("sub")).unwrap();
-        drop(sub.create_new_file(OsStr::new("inner")).unwrap());
+        drop(sub.create_new_file(OsStr::new("inner"), 0o600).unwrap());
         assert!(real.same_file(OsStr::new("f"), &real, OsStr::new("g")));
 
         assert_eq!(names(&outside), Vec::<String>::new(), "寫到目標之外了");

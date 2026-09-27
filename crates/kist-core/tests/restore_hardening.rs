@@ -981,6 +981,147 @@ async fn restore_twice_keeps_hard_links() {
     }
 }
 
+/// ADR 019 A2（審查）：覆寫使用者原有的 0o600 檔，而這個條目的 metadata 套不上
+/// （xattr 名稱超過 XATTR_NAME_MAX，set_xattr 回 ERANGE；記錄的 mode 就不會套）。
+/// 內容照舊 rename 成正式名、記一個錯；但裝著它的檔不能比記錄的 mode 寬鬆——
+/// 暫存檔以 umask 預設（0o644）建立的話，0o600 的檔就此變成誰都讀得到。以前
+/// 原地寫時原有的 0o600 一直都在。
+#[cfg(unix)]
+#[tokio::test]
+async fn overwriting_a_private_file_stays_private_when_metadata_fails() {
+    use kist_format::tree::{content_type, meta_kind, node_type, Entry};
+    use serde_bytes::ByteBuf;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let payload = b"secret payload".to_vec();
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("payload.bin"), &payload).unwrap();
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let me = std::fs::metadata(&src).unwrap();
+    let mut too_long = b"user.".to_vec();
+    too_long.extend(vec![b'x'; 300]);
+    let xattrs = [(ByteBuf::from(too_long), ByteBuf::from(b"v".to_vec()))]
+        .into_iter()
+        .collect();
+    let key = hand_snapshot(
+        &repo,
+        &s.snapshot_key,
+        b"/hand",
+        vec![Entry {
+            name: b"secret.txt".to_vec(),
+            kind: node_type::FILE,
+            meta_kind: meta_kind::POSIX,
+            size: payload.len() as u64,
+            content: content_type::DIRECT,
+            chunks: vec![repo.keys().chunk_id(&payload)],
+            mode: Some(0o100600),
+            uid: Some(me.uid()),
+            gid: Some(me.gid()),
+            mtime_ns: Some(1_700_000_000_000_000_000),
+            xattrs: Some(xattrs),
+            ..plain_entry()
+        }],
+    )
+    .await;
+
+    let target = t.dir.path().join("out");
+    let dir = target.join("hand");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("secret.txt"), b"old secret").unwrap();
+    std::fs::set_permissions(dir.join("secret.txt"), PermissionsExt::from_mode(0o600)).unwrap();
+
+    let summary = repo
+        .restore(&key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let mode = std::fs::symlink_metadata(dir.join("secret.txt"))
+        .unwrap()
+        .mode()
+        & 0o7777;
+    assert_eq!(summary.errors.len(), 1, "{summary:?}");
+    assert!(summary.errors[0].contains("setting xattr"), "{summary:?}");
+    assert_eq!(
+        std::fs::read(dir.join("secret.txt")).unwrap(),
+        payload,
+        "內容照舊還原（只有 metadata 失敗）"
+    );
+    assert_eq!(
+        format!("{mode:o}"),
+        "600",
+        "0o600 的檔被覆寫後變寬鬆了；{summary:?}"
+    );
+    assert_no_restore_temp(&dir);
+}
+
+/// ADR 019 A2（審查）：沒有記錄 mode 的條目（s3／generic 來源）——restore 不套
+/// mode，檔案的權限就是建檔時的權限。覆寫使用者原有的 0o600 檔時要維持 0o600
+/// （以前原地寫時就是如此）；新建的檔維持 umask 預設（與 std 新建的檔相同）。
+#[cfg(unix)]
+#[tokio::test]
+async fn entries_without_a_recorded_mode_keep_the_existing_mode() {
+    use kist_format::tree::{content_type, meta_kind, node_type, Entry};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let payload = b"from a generic source".to_vec();
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("payload.bin"), &payload).unwrap();
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let generic = |name: &[u8]| Entry {
+        name: name.to_vec(),
+        kind: node_type::FILE,
+        meta_kind: meta_kind::GENERIC,
+        size: payload.len() as u64,
+        content: content_type::DIRECT,
+        chunks: vec![repo.keys().chunk_id(&payload)],
+        ..plain_entry()
+    };
+    let key = hand_snapshot(
+        &repo,
+        &s.snapshot_key,
+        b"/hand",
+        vec![generic(b"fresh.txt"), generic(b"private.txt")],
+    )
+    .await;
+
+    let target = t.dir.path().join("out");
+    let dir = target.join("hand");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("private.txt"), b"old secret").unwrap();
+    std::fs::set_permissions(dir.join("private.txt"), PermissionsExt::from_mode(0o600)).unwrap();
+    // 對照：std 在同一層新建的檔（0o666 經 umask）。
+    std::fs::write(dir.join("reference"), b"").unwrap();
+
+    let summary = repo
+        .restore(&key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let mode_of = |name: &str| {
+        let m = std::fs::symlink_metadata(dir.join(name)).unwrap();
+        format!("{:o}", m.mode() & 0o7777)
+    };
+    assert!(summary.errors.is_empty(), "{summary:?}");
+    assert_eq!(std::fs::read(dir.join("private.txt")).unwrap(), payload);
+    assert_eq!(std::fs::read(dir.join("fresh.txt")).unwrap(), payload);
+    assert_eq!(
+        [mode_of("private.txt"), mode_of("fresh.txt")],
+        ["600".to_owned(), mode_of("reference")],
+        "(覆寫的 0o600 檔, 新建的檔)"
+    );
+    assert_no_restore_temp(&dir);
+}
+
 /// ADR 019 A4：restore 途中，本機攻擊者（同 uid）反覆把目標之下的中間目錄
 /// 換成指向目標之外的 symlink。以前逐段 lstat 檢查完就以完整路徑開檔，換上
 /// symlink 之後的檔都經它寫到外面（ADR 實測：2000 個檔有 1999 個）。以目錄
