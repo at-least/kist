@@ -270,12 +270,15 @@ impl Config {
     }
 }
 
-/// 密碼檔的規則（repo 密碼與 UI 密碼共用）：取第一行、去掉 `\r`，空的算設定錯誤。
-fn read_password_file(path: &Path) -> Result<zeroize::Zeroizing<String>> {
+/// 密碼檔的規則（repo 密碼與 UI 密碼共用；CLI 的 `--password-file` 也走這裡，
+/// ADR 019 A11）：取第一行、去掉 `\r`，空的算設定錯誤。
+/// 整個檔的內容與取出的密碼都包 `Zeroizing`，離開作用域時清零（ADR 007）。
+pub fn read_password_file(path: &Path) -> Result<zeroize::Zeroizing<String>> {
     let text = std::fs::read_to_string(path).map_err(|e| AppError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
+    let text = zeroize::Zeroizing::new(text);
     let first = text.lines().next().unwrap_or("").trim_end_matches('\r');
     if first.is_empty() {
         return Err(AppError::Config(format!(

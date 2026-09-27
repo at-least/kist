@@ -8,15 +8,9 @@ use zeroize::Zeroizing;
 /// 回傳的字串離開作用域時會被清零。
 pub fn obtain(password_file: &Option<PathBuf>, confirm: bool) -> Result<Zeroizing<String>> {
     if let Some(path) = password_file {
-        let content = Zeroizing::new(
-            std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read password file {}", path.display()))?,
-        );
-        let first = Zeroizing::new(content.lines().next().unwrap_or("").to_owned());
-        if first.is_empty() {
-            bail!("password file {} is empty", path.display());
-        }
-        return Ok(first);
+        // 與 `kist run` 的設定檔 password_file 同一份規則（取第一行、去掉 `\r`），
+        // 否則 daemon 寫下的 repo，拿同一個檔跑 CLI 會被告知密碼錯（ADR 019 A11）。
+        return Ok(kist_app::config::read_password_file(path)?);
     }
     if let Ok(pw) = std::env::var("KIST_PASSWORD") {
         let pw = Zeroizing::new(pw);

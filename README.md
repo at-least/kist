@@ -45,6 +45,15 @@ kist forget --keep-last 10 --prune      # 一次做完
 結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
 請看警告。
 
+密碼檔（`--password-file` 與設定檔的 `password_file` 同一份規則）：只取第一行、去掉結尾的 `\r`，
+空的算錯誤。
+
+> **行為變更**：以前 CLI 的 `--password-file` 不去 `\r`。密碼檔第一行結尾是孤立的 `\r`（後面沒有
+> `\n`）時，以前用這個檔 `kist init` 建的 repo，密碼其實帶著那個 `\r`；現在同一個檔讀出來不含
+> `\r`，會回「wrong password」。這種 repo 改用 `KIST_PASSWORD` 給出含 `\r` 的密碼（bash／zsh：
+> `KIST_PASSWORD=$'你的密碼\r'`）；改密碼檔沒有用，任何密碼檔都讀不出結尾的 `\r`。`kist run`
+> 一直是這個讀法，不受影響。
+
 ### `--json`
 
 `backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild-index` / `run` 都支援
