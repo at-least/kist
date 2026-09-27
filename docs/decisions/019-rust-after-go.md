@@ -663,6 +663,17 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   （fsmeta.rs:4「M1 不做」）：root 還原攻擊者擁有的 4755 檔，會得到 root 擁有的
   setuid 檔。Go 在 restore.go:431-447 先 chown 再 chmod。UNVERIFIED（需要 root，
   只讀碼）。複核者認為優先序高於 A3，建議另立一條。
+  【實作後（A43）：照裁定做。euid 0 時檔案與目錄經已開的 handle fchown、symlink
+  經所在那層的 handle `fchownat(AT_SYMLINK_NOFOLLOW)`；要套的 mode 由純函式
+  `fsmeta::mode_to_apply` 決定。順序 xattr → 擁有者 → 時間 → mode：Go 把時間放
+  最後的理由是 chown 會動 ctime，與 mtime 無關，所以不照搬。uid 與 gid 都記錄了
+  才 chown（只有一個當成沒記錄）；id 為 -1（`u32::MAX`）對 chown 是「不改」，當成
+  失敗。目錄只在擁有者失敗時，mode 已套上（清掉 0o6000），不再放回暫時加的寫入權。
+  與 Go 不同：Go 不分身分都 chown、失敗只警告、不處理 symlink、0:0 略過；這裡只有
+  root 才 chown，失敗記節點錯誤。真 root 的行為 UNVERIFIED；user namespace 探針
+  （euid 0）：`unshare -r` 下 chown 回 EINVAL → 755 加節點錯誤、exit 3（HEAD 是 4755、
+  exit 0）；`unshare --map-auto -r` 下擁有者成為 100999、仍是 4755；把 chmod 移到
+  chown 之前 → 755。】
 - format.md:283-284 與 vpath.rs:53-56 說 `s3://bucket/` 切不出組件、內容直接落在
   target；探針顯示兩份實作都切出 `["bucket"]`。文件與程式不符，改哪一邊交負責人
   （A14 合併時要保留現行程式行為）。

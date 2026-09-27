@@ -133,7 +133,7 @@ mod imp {
     use std::path::Path;
     use std::sync::Arc;
 
-    use rustix::fs::{AtFlags, FileType, Mode, Nsecs, OFlags, Timespec, Timestamps};
+    use rustix::fs::{AtFlags, FileType, Gid, Mode, Nsecs, OFlags, Timespec, Timestamps, Uid};
     use rustix::io::Errno;
 
     use super::{DirHandle, Kind};
@@ -280,6 +280,25 @@ mod imp {
             };
             let _ = rustix::fs::utimensat(&*self.file, name, &times, AtFlags::SYMLINK_NOFOLLOW);
         }
+
+        /// 設 symlink `name` 本身的擁有者，不跟隨（fchownat＋AT_SYMLINK_NOFOLLOW，
+        /// ADR 019 A43）。只在以 root 還原時呼叫。
+        pub(crate) fn chown_symlink(
+            &self,
+            name: &OsStr,
+            uid: u32,
+            gid: u32,
+        ) -> std::io::Result<()> {
+            // -1 先擋掉：它對 chown 是「不改」，Uid::from_raw 在 debug 下也會 panic。
+            crate::fsmeta::check_owner_ids(uid, gid)?;
+            Ok(rustix::fs::chownat(
+                &*self.file,
+                name,
+                Some(Uid::from_raw(uid)),
+                Some(Gid::from_raw(gid)),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )?)
+        }
     }
 }
 
@@ -403,6 +422,12 @@ mod imp {
         pub(crate) fn set_symlink_mtime(&self, name: &OsStr, mtime_ns: i64) {
             let mtime = crate::fsmeta::file_time(mtime_ns);
             let _ = filetime::set_symlink_file_times(self.child_path(name), mtime, mtime);
+        }
+
+        /// 非 unix 不還原擁有者（[`crate::fsmeta::running_as_root`] 一律是 false，
+        /// 不會呼叫到這裡）。
+        pub(crate) fn chown_symlink(&self, _: &OsStr, _: u32, _: u32) -> std::io::Result<()> {
+            Ok(())
         }
     }
 }

@@ -94,24 +94,52 @@ pub struct RestoreSummary {
 /// （[`link_to_first`]）。
 type HardLinks = std::collections::HashMap<(u64, u64), Vec<OsString>>;
 
-/// 套用 metadata（mtime；mode 一起），經已開的 `file`（ADR 019 A3；`path` 只
-/// 用在錯誤訊息）。mtime **沒記錄**的 entry（§8 聯集裡
-/// s3/generic 的缺席＝來源未知）不動目標的時間——設成 epoch 比不設更糟；
-/// 這種 entry 也不會帶 mode（§8.1），所以整個 apply 可以省。posix/sftp 的
-/// mtime 必填，行為不變。
-fn apply_meta(file: &std::fs::File, path: &Path, node: &Entry) -> Result<()> {
-    if node.mtime_ns.is_none() {
-        return Ok(());
+/// 套用 metadata，一律經已開的 `file`（ADR 019 A3；`path` 只用在錯誤訊息）。
+/// 順序：xattr → 擁有者 → 時間 → mode。xattr 在 mode 之前：記錄的 mode 可能是
+/// 唯讀，之後 user.* 會設不進去（EACCES）。擁有者在 mode 之前（ADR 019 A43，
+/// 與已移除的 Go restore.go 同順序）：chown 會清掉 setuid／setgid。擁有者只有
+/// 以 root 還原時才設（[`fsmeta::apply_owner`]）；設不回去時 mode 照樣套，
+/// 但清掉 0o6000（[`fsmeta::mode_to_apply`]）。
+///
+/// mtime **沒記錄**的 entry（§8 聯集裡 s3/generic 的缺席＝來源未知）不動目標的
+/// 時間——設成 epoch 比不設更糟；這種 entry 也不會帶 mode 與 uid/gid（§8.1），
+/// 所以時間與 mode 可以省。posix/sftp 的 mtime 必填，行為不變。
+///
+/// 回傳兩個結果：(xattr／時間／mode, 擁有者)。分開交回是因為 restore_dir 只在
+/// 前者失敗（記錄的 mode 沒套上）時放回暫時加的寫入權；擁有者設不回去時 mode
+/// 已經套上，不能再被蓋掉。
+fn apply_meta(file: &std::fs::File, path: &Path, node: &Entry) -> (Result<()>, Result<()>) {
+    if let Err(e) = fsmeta::apply_xattrs(file, path, node.xattrs.as_ref()) {
+        return (Err(e), Ok(()));
     }
-    fsmeta::apply(file, path, &fsmeta::meta_of_entry(node))
+    let as_root = fsmeta::running_as_root();
+    let owner = fsmeta::apply_owner(file, path, fsmeta::owner_of_entry(node), as_root);
+    let owner_restored = matches!(owner, Ok(true));
+    let applied = if node.mtime_ns.is_none() {
+        Ok(())
+    } else {
+        let mut meta = fsmeta::meta_of_entry(node);
+        meta.mode = fsmeta::mode_to_apply(meta.mode, as_root, owner_restored);
+        fsmeta::apply(file, path, &meta)
+    };
+    (applied, owner.map(|_| ()))
 }
 
-/// symlink 條目的 metadata：只有 mtime，設在連結本身（不跟隨），經它所在
-/// 那層的 handle（ADR 019 A4）。mtime 沒記錄就不動，理由同 [`apply_meta`]。
-fn apply_symlink_meta(dir: &DirHandle, name: &OsStr, node: &Entry) {
+/// symlink 條目的 metadata，設在連結本身（不跟隨），經它所在那層的 handle
+/// （ADR 019 A4）：擁有者（只有 root，ADR 019 A43）→ mtime；symlink 沒有 mode
+/// 可套。mtime 沒記錄就不動，理由同 [`apply_meta`]；設不了 mtime 不算錯（有些
+/// 平台不支援），擁有者設不回去算這個節點的錯。
+fn apply_symlink_meta(dir: &DirHandle, name: &OsStr, node: &Entry) -> Result<()> {
+    let owner = match fsmeta::owner_of_entry(node) {
+        Some((uid, gid)) if fsmeta::running_as_root() => dir
+            .chown_symlink(name, uid, gid)
+            .map_err(|e| fsmeta::owner_error(&dir.child_path(name), uid, gid, e)),
+        _ => Ok(()),
+    };
     if let Some(mtime_ns) = node.mtime_ns {
         dir.set_symlink_mtime(name, mtime_ns);
     }
+    owner
 }
 
 /// 還原用的暫存名（ADR 019 A2）：內容或硬連結先放在正式名同目錄的隱藏
@@ -436,11 +464,9 @@ impl Repository {
                             meta_via_handle_tests::before_meta(&temp.temp.path(), &path);
                             // metadata 經寫入內容的同一個 handle 套用（ADR 019 A3）：
                             // 路徑在寫完之後被換成 symlink，也改不到外面的檔。
-                            // xattr 在 times/mode **之前**：記錄的 mode 可能是唯讀，
-                            // 之後 user.* 會設不進去（EACCES）。
-                            let meta =
-                                fsmeta::apply_xattrs(&temp.file, &path, node.xattrs.as_ref())
-                                    .and_then(|()| apply_meta(&temp.file, &path, node));
+                            // 順序與擁有者見 apply_meta（ADR 019 A43）。
+                            let (applied, owner) = apply_meta(&temp.file, &path, node);
+                            let meta = applied.and(owner);
                             // metadata 套不上（例如目標檔案系統不收 xattr）時內容仍是
                             // 對的：照樣 rename 成正式名、記下這個錯——與以前在正式名
                             // 上原地寫時一樣。先關檔再 rename：Windows 上 rename 開著
@@ -474,8 +500,7 @@ impl Repository {
                                         path.display()
                                     );
                                 }
-                                apply_symlink_meta(dir, name, node);
-                                Ok(())
+                                apply_symlink_meta(dir, name, node)
                             }
                             Err(e) => Err(e),
                         }
@@ -541,21 +566,21 @@ impl Repository {
         summary.dirs += 1;
         #[cfg(all(test, unix))]
         meta_via_handle_tests::before_meta(dir.path(), dir.path());
-        // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋；xattr 在 times/mode 之前。
+        // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋；順序見 apply_meta。
         // 沒有要套的 metadata（s3/generic 來源的目錄）就不動，與以前一樣。
         if node.xattrs.is_none() && node.mtime_ns.is_none() {
             return Ok(());
         }
         let handle = dir.meta_handle()?;
-        let applied = fsmeta::apply_xattrs(&handle, dir.path(), node.xattrs.as_ref())
-            .and_then(|()| apply_meta(&handle, dir.path(), node));
+        let (applied, owner) = apply_meta(&handle, dir.path(), node);
         // 記錄的 mode 沒套上（xattr 或時間先失敗）：至少把暫時加的寫入權拿掉。
+        // 只有擁有者設不回去時 mode 已經套上（清掉 0o6000），不動它。
         if applied.is_err() {
             if let Some(original) = loosened {
                 let _ = handle.set_permissions(original);
             }
         }
-        applied
+        applied.and(owner)
     }
 
     /// 把檔案內容寫進 `dir` 這一層的暫存檔，回傳它（ADR 019 A2）：呼叫端在同一個

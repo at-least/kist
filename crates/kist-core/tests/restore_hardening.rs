@@ -987,3 +987,83 @@ async fn swapping_an_intermediate_dir_for_a_symlink_never_writes_outside() {
     assert!(summary.errors.is_empty(), "換了 {swaps} 次：{summary:?}");
     assert_eq!(summary.files, FILES as u64);
 }
+
+/// ADR 019 A43：非 root 還原維持現狀——不 chown（還原出的東西屬於還原者本人，
+/// 記錄的擁有者是別人也一樣、也不因此回錯），記錄的 setuid／setgid 照套
+/// （setuid 指向自己不構成提權）。snapshot 裡的擁有者換成別人，另加一個有
+/// mode、沒有 uid／gid 的 sftp 條目。以 root 跑就略過：root 會真的 chown，
+/// 那部分這裡驗不了（UNVERIFIED，沒有 root）。
+#[cfg(unix)]
+#[tokio::test]
+async fn non_root_restore_keeps_setid_bits_and_does_not_chown() {
+    use kist_format::tree::{meta_kind, node_type};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let euid = rustix::process::geteuid().as_raw();
+    if euid == 0 {
+        eprintln!("skipping: running as root");
+        return;
+    }
+    let other = if euid == 4242 { 4243 } else { 4242 };
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("sgid")).unwrap();
+    std::fs::write(src.join("suid.bin"), b"payload").unwrap();
+    std::fs::write(src.join("sgid").join("inner.txt"), b"inner").unwrap();
+    std::os::unix::fs::symlink("suid.bin", src.join("link")).unwrap();
+    std::fs::set_permissions(src.join("suid.bin"), PermissionsExt::from_mode(0o4755)).unwrap();
+    std::fs::set_permissions(src.join("sgid"), PermissionsExt::from_mode(0o2755)).unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    // 同一份內容，擁有者全換成別人（sgid/ 裡的 inner.txt 在原本的子 tree，不動）。
+    let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+    let mut entries = repo.read_tree_chain(&snap.roots[0].tree).await.unwrap();
+    for e in &mut entries {
+        assert!(
+            e.uid.is_some() && e.gid.is_some(),
+            "前提：posix 條目記錄擁有者"
+        );
+        e.uid = Some(other);
+        e.gid = Some(other);
+    }
+    let mut sftp = plain_entry();
+    sftp.name = b"sftp.bin".to_vec();
+    sftp.kind = node_type::FILE;
+    sftp.meta_kind = meta_kind::SFTP;
+    sftp.mode = Some(0o104755);
+    sftp.mtime_ns = Some(1_000_000_000_000_000_000);
+    entries.push(sftp);
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let key = hand_snapshot(&repo, &s.snapshot_key, b"/foreign", entries).await;
+
+    let target = t.dir.path().join("out");
+    let summary = repo
+        .restore(&key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let restored = target.join("foreign");
+    // restore 自己建的那層目錄：還原者新建的東西都該是這個 gid。
+    let own_gid = std::fs::metadata(&restored).unwrap().gid();
+    let stat = |name: &str| {
+        let m = std::fs::symlink_metadata(restored.join(name)).unwrap();
+        (format!("{:o}", m.mode() & 0o7777), m.uid(), m.gid())
+    };
+
+    assert!(summary.errors.is_empty(), "{summary:?}");
+    assert_eq!((summary.files, summary.symlinks), (3, 1), "{summary:?}");
+    assert_eq!(stat("suid.bin"), ("4755".to_owned(), euid, own_gid));
+    assert_eq!(stat("sgid"), ("2755".to_owned(), euid, own_gid));
+    assert_eq!(stat("sftp.bin"), ("4755".to_owned(), euid, own_gid));
+    let link = std::fs::symlink_metadata(restored.join("link")).unwrap();
+    assert!(link.file_type().is_symlink());
+    assert_eq!((link.uid(), link.gid()), (euid, own_gid));
+    assert_eq!(
+        std::fs::read(restored.join("sgid").join("inner.txt")).unwrap(),
+        b"inner"
+    );
+}

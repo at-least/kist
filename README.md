@@ -55,6 +55,11 @@ kist forget --keep-last 10 --prune      # 一次做完
 原本開著的那個目錄，不會跟著 symlink 寫到目標之外（以前會）。因此目標本身與其下既有的目錄都要可讀——
 只能進入、不能讀的目錄（例如 0311）以前可以還原進去，現在回報 Permission denied。
 
+以 root（euid 0）執行 `restore` 時，記錄了 uid/gid 的條目（posix 來源）會先設回記錄的擁有者、再套
+mode（以前從不 chown：別人的 4755 檔會還原成 root 擁有的 setuid 檔）。擁有者設不回去的條目回報錯誤
+（結束碼 3），mode 照套但去掉 setuid／setgid；沒記錄 uid/gid 的條目（遠端來源）同樣去掉這兩個位。
+非 root 還原不變：檔案屬於還原者本人，mode 照記錄的值。
+
 密碼檔（`--password-file` 與設定檔的 `password_file` 同一份規則）：只取第一行、去掉結尾的 `\r`，
 空的算錯誤。
 
