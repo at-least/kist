@@ -148,6 +148,8 @@ struct Inode {
 struct InodeTable {
     next: u64,
     map: HashMap<u64, Arc<Inode>>,
+    /// （父 ino, 名稱）→ ino：同名再 lookup 回同一個號，見 [`Self::insert_named`]。
+    names: HashMap<(u64, Vec<u8>), u64>,
 }
 
 impl InodeTable {
@@ -156,13 +158,41 @@ impl InodeTable {
         let mut t = Self {
             next: 0,
             map: HashMap::new(),
+            names: HashMap::new(),
         };
         t.insert(Node::Root, Attr::dir(0o555, 0), true, None);
         t
     }
 
+    /// lookup 用的配號：同一個（父 ino, 名稱）配過就回原來的號（新建的 node
+    /// 丟掉，保留舊的），沒配過才配新號並記下。只管身分、不管存在——名字現在
+    /// 還在不在，由呼叫端在這之前檢查。
+    ///
+    /// 為什麼要去重：頂層 client 目錄的 entry TTL 只有 1 秒，過期後 kernel 重新
+    /// lookup；每次配新號的話，底下已快取的整棵子樹都跟著作廢（真掛載 `cp -r`
+    /// 兩萬個檔會漏檔，mount 的記憶體也一路長，ADR 019 A6）。同一個（父, 名稱）
+    /// 的內容不會變：snapshot 名是唯一的 timestamp，snapshot 內容定址。
+    fn insert_named(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        node: Node,
+        attr: Attr,
+        volatile: bool,
+        xattrs: Option<Arc<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    ) -> u64 {
+        let key = (parent, name.to_vec());
+        if let Some(&ino) = self.names.get(&key) {
+            return ino;
+        }
+        let ino = self.insert(node, attr, volatile, xattrs);
+        self.names.insert(key, ino);
+        ino
+    }
+
     /// 配一個全新的 inode 號：**永不重用**，所以 generation 恆為 0、
-    /// forget 可以是 no-op（記憶體上限 = 這個 session 瀏覽過的條目數）。
+    /// forget 可以是 no-op（不回收：記憶體上限 = 這個 session 瀏覽過的不同
+    /// （父, 名稱）數）。lookup 一律走 [`Self::insert_named`]，這裡只給根目錄直接用。
     fn insert(
         &mut self,
         node: Node,
@@ -346,8 +376,8 @@ impl FsCore {
 
     // —— lookup ——
 
-    pub async fn lookup(&self, parent: u64, name: &[u8]) -> Result<Lookup, FsError> {
-        let parent = self.node(parent).ok_or(FsError::NotFound)?;
+    pub async fn lookup(&self, parent_ino: u64, name: &[u8]) -> Result<Lookup, FsError> {
+        let parent = self.node(parent_ino).ok_or(FsError::NotFound)?;
         match &parent.node {
             Node::Root => {
                 let client = std::str::from_utf8(name).map_err(|_| FsError::NotFound)?;
@@ -360,7 +390,9 @@ impl FsCore {
                     self.inodes
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(
+                        .insert_named(
+                            parent_ino,
+                            name,
                             Node::Client {
                                 client: client.to_owned(),
                             },
@@ -431,7 +463,14 @@ impl FsCore {
                     self.inodes
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(Node::SnapshotRoot { vroot }, attr, false, None)
+                        .insert_named(
+                            parent_ino,
+                            name,
+                            Node::SnapshotRoot { vroot },
+                            attr,
+                            false,
+                            None,
+                        )
                 };
                 Ok(Lookup {
                     ino,
@@ -445,7 +484,8 @@ impl FsCore {
                 let mut child_key = Vec::with_capacity(name.len() + 1);
                 child_key.push(b'/');
                 child_key.extend_from_slice(name);
-                self.vchild_inode(v, Arc::clone(vroot), child_key).await
+                self.vchild_inode(parent_ino, name, v, Arc::clone(vroot), child_key)
+                    .await
             }
             Node::SyntheticDir { vroot, level_key } => {
                 let level = vroot.level(level_key);
@@ -453,11 +493,12 @@ impl FsCore {
                 let mut child_key = level_key.clone();
                 child_key.push(b'/');
                 child_key.extend_from_slice(name);
-                self.vchild_inode(v, Arc::clone(vroot), child_key).await
+                self.vchild_inode(parent_ino, name, v, Arc::clone(vroot), child_key)
+                    .await
             }
             Node::Dir { entries } => {
                 let e = lookup_entry(entries, name).ok_or(FsError::NotFound)?;
-                self.real_inode(e).await
+                self.real_inode(parent_ino, name, e).await
             }
             Node::File { .. } | Node::Symlink { .. } => Err(FsError::NotFound),
         }
@@ -466,6 +507,8 @@ impl FsCore {
     /// 虛擬層級裡的條目 → inode（合成的中介目錄或真實的子樹）。
     async fn vchild_inode(
         &self,
+        parent_ino: u64,
+        name: &[u8],
         v: &VEntry,
         vroot: Arc<VirtualRoot>,
         level_key: Vec<u8>,
@@ -477,7 +520,14 @@ impl FsCore {
                     self.inodes
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(Node::SyntheticDir { vroot, level_key }, attr, false, None)
+                        .insert_named(
+                            parent_ino,
+                            name,
+                            Node::SyntheticDir { vroot, level_key },
+                            attr,
+                            false,
+                            None,
+                        )
                 };
                 Ok(Lookup {
                     ino,
@@ -485,12 +535,12 @@ impl FsCore {
                     ttl: IMMUTABLE_TTL,
                 })
             }
-            VEntry::Real(e) => self.real_inode(e).await,
+            VEntry::Real(e) => self.real_inode(parent_ino, name, e).await,
         }
     }
 
     /// 真實 tree entry → inode。目錄在這裡就載好整段 chain（immutable）。
-    async fn real_inode(&self, e: &Entry) -> Result<Lookup, FsError> {
+    async fn real_inode(&self, parent_ino: u64, name: &[u8], e: &Entry) -> Result<Lookup, FsError> {
         let xattrs = e.xattrs.as_ref().map(|m| {
             Arc::new(
                 m.iter()
@@ -535,7 +585,7 @@ impl FsCore {
             self.inodes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(node, attr, false, xattrs)
+                .insert_named(parent_ino, name, node, attr, false, xattrs)
         };
         Ok(Lookup {
             ino,

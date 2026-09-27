@@ -368,3 +368,106 @@ async fn slash_root_entry_flattens_to_top() {
     assert!(core.readdir(fh, 0, 10).unwrap().is_empty());
     core.releasedir(fh);
 }
+
+/// 同一個（父 ino, 名稱）再 lookup 要回同一個 ino，inode 表不長大（ADR 019 A6）。
+/// 每次都配新號的話，頂層 client 目錄的 entry TTL（1 秒）一過期，kernel 重新
+/// lookup 拿到新號，底下已快取的整棵子樹就作廢：真掛載 `cp -r` 兩萬個檔會漏檔，
+/// mount 的記憶體也一路長。四個配號點都要走到：client、snapshot、合成的中介
+/// 目錄、真實條目。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_lookup_returns_same_inode() {
+    let t = TestRepo::new().await;
+    // 同名檔放在兩個不同目錄底下：a/x.txt、b/x.txt
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("a")).unwrap();
+    std::fs::create_dir_all(src.join("b")).unwrap();
+    std::fs::write(src.join("a").join("x.txt"), b"in a").unwrap();
+    std::fs::write(src.join("a").join("y.txt"), b"also in a").unwrap();
+    std::fs::write(src.join("b").join("x.txt"), b"in b").unwrap();
+    t.backup(&src).await;
+
+    let core = t.fs_core().await;
+    let ts = timestamps(&core).await.remove(0);
+    let tmpname = t
+        .dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // 第一次走完整條路徑，記下每一層的 ino
+    let client = core.lookup(1, CLIENT.as_bytes()).await.unwrap();
+    let snap = core.lookup(client.ino, ts.as_bytes()).await.unwrap();
+    let tmp = core.lookup(snap.ino, b"tmp").await.unwrap();
+    let a = walk(&core, &ts, &tmpname, &["src", "a"]).await;
+    let ax = core.lookup(a, b"x.txt").await.unwrap();
+    let count = core.inode_count();
+
+    // 同一條路再走一次：每一層都回同一個 ino，表不長大
+    let client_again = core.lookup(1, CLIENT.as_bytes()).await.unwrap();
+    assert_eq!(
+        client_again.ino, client.ino,
+        "頂層 client（TTL 1 秒）過期重查要回同一個 ino"
+    );
+    assert_eq!(client_again.ttl, kist_mount::corefs::VOLATILE_TTL);
+    assert_eq!(
+        core.lookup(client.ino, ts.as_bytes()).await.unwrap().ino,
+        snap.ino,
+        "snapshot 目錄"
+    );
+    assert_eq!(
+        core.lookup(snap.ino, b"tmp").await.unwrap().ino,
+        tmp.ino,
+        "合成的中介目錄"
+    );
+    assert_eq!(walk(&core, &ts, &tmpname, &["src", "a"]).await, a);
+    assert_eq!(
+        core.lookup(a, b"x.txt").await.unwrap().ino,
+        ax.ino,
+        "真實條目"
+    );
+    assert_eq!(core.inode_count(), count, "重複 lookup 不能配新 inode");
+
+    // 同一個 ino 照樣讀得到內容
+    assert_eq!(core.read_file(ax.ino, 0, 64).await.unwrap(), b"in a");
+
+    // 不同名字、不同父目錄仍是不同的 inode
+    let ay = core.lookup(a, b"y.txt").await.unwrap();
+    assert_ne!(ay.ino, ax.ino, "同一個目錄底下的不同名字");
+    let b = walk(&core, &ts, &tmpname, &["src", "b"]).await;
+    assert_ne!(b, a);
+    let bx = core.lookup(b, b"x.txt").await.unwrap();
+    assert_ne!(bx.ino, ax.ino, "不同父目錄底下的同名條目");
+    assert_eq!(core.read_file(bx.ino, 0, 64).await.unwrap(), b"in b");
+}
+
+/// 去重只管身分，不管存在：snapshot 被刪掉之後，同一個（父, 名稱）再 lookup
+/// 仍要回 NotFound，不能因為表裡記過就回舊的 ino。client 底下一個 snapshot
+/// 都不剩時，client 本身也一樣。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vanished_snapshot_is_not_found_after_lookup() {
+    let (t, _big) = setup().await;
+    let core = t.fs_core().await;
+    let ts = timestamps(&core).await.remove(0);
+
+    let client_ino = core.lookup(1, CLIENT.as_bytes()).await.unwrap().ino;
+    core.lookup(client_ino, ts.as_bytes()).await.unwrap();
+    let count = core.inode_count();
+
+    // 測試 repo 不寫 `.r1` 副本，刪主體就是整個 snapshot 不見
+    let key = format!("{}/{}/{}", kist_format::keys::SNAPSHOTS_PREFIX, CLIENT, ts);
+    t.backend.delete(&key).await.unwrap();
+
+    assert_eq!(
+        core.lookup(client_ino, ts.as_bytes()).await.unwrap_err(),
+        kist_mount::FsError::NotFound,
+        "被刪掉的 snapshot 要回 NotFound"
+    );
+    assert_eq!(
+        core.lookup(1, CLIENT.as_bytes()).await.unwrap_err(),
+        kist_mount::FsError::NotFound,
+        "沒有 snapshot 的 client 要回 NotFound"
+    );
+    assert_eq!(core.inode_count(), count);
+}
