@@ -587,7 +587,7 @@ impl Repository {
         if referenced.is_empty() {
             // 沒有沿用任何舊 chunk（例如對空 repo 的第一次 backup）：
             // 沒有要驗證的引用，連 index 都不必載入——這一步在 100 萬
-            // chunk 的 repo 上會觸發一次完整 index 讀取與快取重建。
+            // chunk 的 repo 上會觸發一次完整 index 讀取（不走本地快取）。
             return Ok(());
         }
         let expired = |pack: &ObjectId| marks.get(pack).is_some_and(|m| *m + grace <= now);

@@ -264,7 +264,9 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   check 卻報「replica exists but its primary tree is missing (possible data-loss event…)」；
   副本存在卻報「tree replica is missing (repairable)」。prune.rs:758 在並發 backup
   加暫時性錯誤時刪掉活 pack 的 parity：UNVERIFIED（沒有注入接縫，只讀碼；損失的是
-  冗餘，主資料不受影響）。
+  冗餘，主資料不受影響）。【實作後（45c2d05）：找到接縫——`packs/<id>` 放一個 Unix
+  socket，本機後端的 list 不列它、head 回 ENXIO——並補了 RED→GREEN 測試
+  `parity_sweep_keeps_the_sidecar_when_the_pack_head_fails`。】
 - **工作量**：S
 - **複核**：CONFIRMED。check 的兩處現在就能用 gc_touch_replica.rs:281-291 的 chmod
   手法寫 RED→GREEN 測試。
@@ -327,6 +329,9 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
 - **工作量**：S
 - **複核**：CONFIRMED。一次性相容破壞：用 CLI `--password-file` 建立、密碼檔尾帶
   孤立 `\r` 的 repo，統一後要改用 KIST_PASSWORD 或修密碼檔，需附遷移說明。
+  【實作後更正（d8ec619）：這種 repo 的密碼**含**那個 `\r`，所以要用
+  `KIST_PASSWORD=$'…\r'`；修密碼檔沒有用（共用的讀法會去掉所有結尾 `\r`）。README 的
+  遷移說明以此為準。】
 
 **A12　parity 份數超出 0..=8 時，靜默變成沒有冗餘（backup-7）**
 

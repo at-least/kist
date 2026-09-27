@@ -51,8 +51,9 @@ kist forget --keep-last 10 --prune      # 一次做完
 > **行為變更**：以前 CLI 的 `--password-file` 不去 `\r`。密碼檔第一行結尾是孤立的 `\r`（後面沒有
 > `\n`）時，以前用這個檔 `kist init` 建的 repo，密碼其實帶著那個 `\r`；現在同一個檔讀出來不含
 > `\r`，會回「wrong password」。這種 repo 改用 `KIST_PASSWORD` 給出含 `\r` 的密碼（bash／zsh：
-> `KIST_PASSWORD=$'你的密碼\r'`）；改密碼檔沒有用，任何密碼檔都讀不出結尾的 `\r`。`kist run`
-> 一直是這個讀法，不受影響。
+> `KIST_PASSWORD=$'你的密碼\r'`）；改密碼檔沒有用，任何密碼檔都讀不出結尾的 `\r`。
+> `--password-file` 優先於 `KIST_PASSWORD`，而它也吃環境變數 `KIST_PASSWORD_FILE`：有匯出的話先
+> `unset KIST_PASSWORD_FILE`。`kist run` 一直是這個讀法，不受影響。
 
 ### `--json`
 
@@ -102,14 +103,16 @@ kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端�
 
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
 
-grace（見下節「空間回收」）：`[backup] gc_grace` 沒寫時，backup 取**同一份設定**的 `[prune] grace`，
+grace（見「空間回收（GC）」一節）：`[backup] gc_grace` 沒寫時，backup 取**同一份設定**的 `[prune] grace`，
 兩個都沒寫才是 72h。`[backup] gc_grace` 不得比 `[prune] grace` 長（載入設定時就報錯）；比它短可以。
 backup 與 prune 分在兩台主機時，兩份設定互相看不到，grace 要自己設成一致。
 
 > **行為變更**：以前 `kist run` 的 backup 只看 `[backup] gc_grace`、沒寫就是 72h。現在只把
 > `[prune] grace` 設短的設定，backup 也會用那個較短的 grace：跑得比它久的 backup 會以
 > BackupTooLong 結束、不寫 snapshot（重跑即可，已上傳的資料會沿用）。真的有這麼長的 backup，
-> 就把 `[prune] grace` 調長。
+> 就把 `[prune] grace` 調長。另外，`[backup] gc_grace` 比 prune 實際採用的 grace 長的設定（包括有
+> `[prune]` 段但沒寫 `grace`、`gc_grace` 卻超過 72h）以前載入得了，現在載入時就報錯，`kist run`／
+> `kist serve` 不會啟動。
 
 ### Prometheus metrics（`kist serve`）
 
@@ -172,7 +175,7 @@ UI 密碼走明文 HTTP：預設只綁 loopback，要遠端存取請放在有 TL
 第二次執行才真的刪。中間任何一台機器重新用到那些資料，標記就撤銷。所以 `prune` 可以跟 backup
 同時跑、可以排程每天跑，不需要鎖；剛 forget 完馬上 prune 不會釋放空間，那是設計。
 
-- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值；設定檔的寫法見上節）。
+- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值；設定檔的寫法見「設定檔與排程」）。
   跑得更久的 backup 不會悄悄壞掉，會在最後以錯誤結束，重跑即可。
 - 超過 `--inactive-after`（預設 30 天）沒備份的機器不再擋住刪除；它回來備份時若用到已刪的資料，
   同樣會在最後失敗、重跑。
