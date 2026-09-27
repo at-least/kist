@@ -369,6 +369,91 @@ async fn slash_root_entry_flattens_to_top() {
     core.releasedir(fh);
 }
 
+/// 間接內容的 chunk 清單要比 `v`（format.md §16：≠3 拒絕；ADR 019 A10）：
+/// v=4 的清單不能被 mount 照 v3 的讀法讀出內容。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunk_list_with_unknown_version_is_rejected() {
+    use kist_format::snapshot::{format_key_timestamp, Root, Snapshot};
+    use kist_format::tree::{content_type, meta_kind, node_type, ChunkList, Entry, Tree};
+    use kist_format::FORMAT_VERSION;
+    use time::OffsetDateTime;
+
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    // 兩個小檔各自成一顆 chunk：一顆是資料，一顆的明文正好是 v=4 的清單。
+    let payload = b"payload listed by a v4 chunk list".to_vec();
+    let list = kist_format::cbor::encode(&ChunkList {
+        version: 4,
+        chunks: vec![repo.keys().chunk_id(&payload)],
+    })
+    .unwrap();
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("payload.bin"), &payload).unwrap();
+    std::fs::write(src.join("list.cbor"), &list).unwrap();
+    t.backup(&src).await;
+
+    // 手工組：root "/evil" 的內容樹只有一個間接內容的檔案，chunks 指向清單 chunk。
+    let tree = Tree::new(
+        vec![Entry {
+            name: b"file.bin".to_vec(),
+            kind: node_type::FILE,
+            meta_kind: meta_kind::GENERIC,
+            size: payload.len() as u64,
+            target: Vec::new(),
+            content: content_type::INDIRECT,
+            chunks: vec![repo.keys().chunk_id(&list)],
+            subtree: kist_format::TreeId::ZERO,
+            mode: None,
+            uid: None,
+            gid: None,
+            mtime_ns: None,
+            ctime_ns: None,
+            dev: None,
+            inode: None,
+            nlink: None,
+            xattrs: None,
+            etag: None,
+            vern: None,
+        }],
+        None,
+    );
+    let (tree_id, tree_bytes) = repo.seal_tree(tree).await.unwrap();
+    t.backend
+        .put(&kist_format::keys::tree(&tree_id), tree_bytes)
+        .await
+        .unwrap();
+    // snapshot：time_ns 必須與 key 的時間戳一致（讀取端核對）
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let ts = format_key_timestamp(t0).unwrap();
+    let key = kist_format::keys::snapshot(&[0x22; 16], &ts);
+    let snapshot = Snapshot {
+        version: FORMAT_VERSION,
+        roots: vec![Root {
+            path: b"/evil".to_vec().into(),
+            tree: tree_id,
+        }],
+        time_ns: t0.unix_timestamp_nanos() as i64,
+        host: "handcraft".to_owned(),
+        user: String::new(),
+        client_id: vec![0x22; 16],
+        parent: None,
+        stats: Default::default(),
+    };
+    repo.write_snapshot(&key, snapshot).await.unwrap();
+
+    let core = t.fs_core().await;
+    let client_ino = core.lookup(1, CLIENT.as_bytes()).await.unwrap().ino;
+    let snap_ino = core.lookup(client_ino, ts.as_bytes()).await.unwrap().ino;
+    let evil_ino = core.lookup(snap_ino, b"evil").await.unwrap().ino;
+    let file_ino = core.lookup(evil_ino, b"file.bin").await.unwrap().ino;
+    assert_eq!(
+        core.read_file(file_ino, 0, 4096).await,
+        Err(kist_mount::FsError::Io),
+        "v=4 的 chunk 清單不能被讀出內容"
+    );
+}
+
 /// 同一個（父 ino, 名稱）再 lookup 要回同一個 ino，inode 表不長大（ADR 019 A6）。
 /// 每次都配新號的話，頂層 client 目錄的 entry TTL（1 秒）一過期，kernel 重新
 /// lookup 拿到新號，底下已快取的整棵子樹就作廢：真掛載 `cp -r` 兩萬個檔會漏檔，

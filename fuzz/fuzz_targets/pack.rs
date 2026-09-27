@@ -21,18 +21,18 @@ fn test_keys() -> RepoKeys {
 fuzz_target!(|data: &[u8]| {
     let keys = test_keys();
 
-    let _ = kist_core::pack::read_trailer(&keys, data);
+    let _ = kist_core::pack::read_trailer(&keys, "packs/fuzz", data);
 
     if let Ok(trailer) = cbor::decode::<PackTrailer>(data) {
-        let _ = kist_core::pack::validate_trailer(&trailer, data.len());
-        let _ = kist_core::pack::validate_trailer(&trailer, 0);
+        let _ = kist_core::pack::validate_trailer("packs/fuzz", &trailer, data.len());
+        let _ = kist_core::pack::validate_trailer("packs/fuzz", &trailer, 0);
         if let Ok(plain) = cbor::encode(&trailer) {
             if let Ok(sealed) = keys.seal_pack_trailer(&plain) {
                 let mut p = pack::begin().to_vec();
                 p.extend_from_slice(&sealed);
                 p.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
                 p.extend_from_slice(&pack::magic());
-                let _ = kist_core::pack::read_trailer(&keys, &p);
+                let _ = kist_core::pack::read_trailer(&keys, "packs/fuzz", &p);
             }
         }
     }

@@ -3,7 +3,7 @@
 //! 寫入端 [`PackWriter`] 把 chunk 一個個加進 buffer（先壓縮、再加密），滿了或 backup 結束時
 //! [`PackWriter::finish`] 封上 trailer 並算出 pack 名稱；上傳由呼叫端負責。
 //! 讀取端只需要 [`decode_chunk`]（單一 entry → 明文並驗證 chunk ID）與
-//! [`read_trailer`]（整個 pack → trailer）。
+//! [`read_trailer`]（整個 pack → trailer；只有 trailer bytes 時用 [`decode_trailer`]）。
 //!
 //! 壓縮的演算法 byte 是 AEAD 明文的第一個 byte（self-describing），
 //! trailer entry 不需要 flags。壓縮門檻：zstd-3，沒省下 > 1/16 就存原文。
@@ -201,38 +201,60 @@ pub fn decode_chunk(
     Ok(plaintext)
 }
 
-/// 從整個 pack 的 bytes 讀出 trailer，並驗證版本與 trailer 的一致性
-/// （規格 §7：entries 從檔頭 magic 之後連續排列、完整覆蓋資料區、無重複
-/// ID、長度在格式上限內）。trailer 是認證過的，但「認證」不等於「一致」：
-/// 有 bug 的 client 寫出的 pack 一樣有有效 tag。
-pub fn read_trailer(keys: &RepoKeys, pack_bytes: &[u8]) -> Result<PackTrailer> {
-    let sealed = pack::trailer_bytes(pack_bytes)?;
-    let plain = keys.open_pack_trailer(sealed)?;
+/// 從整個 pack 的 bytes 讀出 trailer 並完整驗證（見 [`decode_trailer`]）。
+/// `key` 是這個 pack 的 repo key，所有錯誤直接帶它。
+pub fn read_trailer(keys: &RepoKeys, key: &str, pack_bytes: &[u8]) -> Result<PackTrailer> {
+    let sealed = pack::trailer_bytes(pack_bytes).map_err(|e| CoreError::Corrupt {
+        key: key.to_owned(),
+        reason: format!("trailer: {e}"),
+    })?;
     let data_end = pack_bytes.len() - pack::FOOTER_LEN - sealed.len();
-    let trailer: PackTrailer = cbor::decode(&plain)?;
+    decode_trailer(keys, key, sealed, data_end)
+}
+
+/// 解開已密封的 trailer：開啟 → 解碼 → 版本 → 一致性檢查（規格 §7：
+/// entries 從檔頭 magic 之後連續排列、完整覆蓋資料區、無重複 ID、長度在
+/// 格式上限內）。trailer 是認證過的，但「認證」不等於「一致」：有 bug 的
+/// client 寫出的 pack 一樣有有效 tag。
+///
+/// [`read_trailer`]（整個 pack）與 rebuild-index（只 range read 檔尾與
+/// trailer）共用這一條路。`key` 是 pack 的 repo key，所有錯誤直接帶它；
+/// `data_end` 是 chunk 資料區的結尾（＝ trailer 的起點）。
+pub fn decode_trailer(
+    keys: &RepoKeys,
+    key: &str,
+    sealed: &[u8],
+    data_end: usize,
+) -> Result<PackTrailer> {
+    let corrupt = |reason: String| CoreError::Corrupt {
+        key: key.to_owned(),
+        reason,
+    };
+    let plain = keys
+        .open_pack_trailer(sealed)
+        .map_err(|e| corrupt(format!("trailer: {e}")))?;
+    let trailer: PackTrailer =
+        cbor::decode(&plain).map_err(|e| corrupt(format!("trailer: {e}")))?;
     if trailer.version != kist_format::FORMAT_VERSION {
-        return Err(CoreError::Corrupt {
-            key: "<pack trailer>".to_owned(),
-            reason: format!(
-                "trailer declares version {}, this build reads {}",
-                trailer.version,
-                kist_format::FORMAT_VERSION
-            ),
-        });
+        return Err(corrupt(format!(
+            "trailer declares version {}, this build reads {}",
+            trailer.version,
+            kist_format::FORMAT_VERSION
+        )));
     }
-    validate_trailer(&trailer, data_end)?;
+    validate_trailer(key, &trailer, data_end)?;
     Ok(trailer)
 }
 
 /// trailer 一致性檢查。`max_entry_len` 的格式上限 = chunker.max
 /// (最大 64 MiB) + 1 (algorithm byte) + 40 (nonce+tag)；這裡用格式允許
 /// 的最大 chunker.max 推導，避免 trailer 檢查反過來依賴每個 repo 的 config。
-pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
+pub fn validate_trailer(key: &str, trailer: &PackTrailer, data_end: usize) -> Result<()> {
     const MAX_CHUNKER_MAX: u64 = 64 * 1024 * 1024;
     const MAX_ENTRY_LEN: u64 = MAX_CHUNKER_MAX + 1 + (pack::CHUNK_NONCE_LEN + pack::TAG_LEN) as u64;
     if trailer.entries.is_empty() {
         return Err(CoreError::Corrupt {
-            key: "<pack trailer>".to_owned(),
+            key: key.to_owned(),
             reason: "trailer lists no chunks".to_owned(),
         });
     }
@@ -241,13 +263,13 @@ pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
     for (i, e) in trailer.entries.iter().enumerate() {
         if e.offset != next {
             return Err(CoreError::Corrupt {
-                key: "<pack trailer>".to_owned(),
+                key: key.to_owned(),
                 reason: format!("entry {i} starts at {}, expected {next}", e.offset),
             });
         }
         if e.length < pack::MIN_ENTRY_LEN as u64 {
             return Err(CoreError::Corrupt {
-                key: "<pack trailer>".to_owned(),
+                key: key.to_owned(),
                 reason: format!(
                     "entry {i} is {} bytes, shorter than an empty sealed chunk",
                     e.length
@@ -256,7 +278,7 @@ pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
         }
         if e.length > MAX_ENTRY_LEN {
             return Err(CoreError::Corrupt {
-                key: "<pack trailer>".to_owned(),
+                key: key.to_owned(),
                 reason: format!(
                     "entry {i} is {} bytes, over the {MAX_ENTRY_LEN} a sealed chunk can be",
                     e.length
@@ -266,13 +288,13 @@ pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
         let end = e.offset + e.length;
         if end > data_end as u64 {
             return Err(CoreError::Corrupt {
-                key: "<pack trailer>".to_owned(),
+                key: key.to_owned(),
                 reason: format!("entry {i} ends at {end}, past the {data_end} bytes of chunk data"),
             });
         }
         if !seen.insert(e.id) {
             return Err(CoreError::Corrupt {
-                key: "<pack trailer>".to_owned(),
+                key: key.to_owned(),
                 reason: format!("chunk {} is listed twice", e.id),
             });
         }
@@ -282,7 +304,7 @@ pub fn validate_trailer(trailer: &PackTrailer, data_end: usize) -> Result<()> {
         // 規格 §7：entries 連續排列且**完整覆蓋**資料區——夾縫位元組是
         // 有 bug 的 client 或損壞的表，不是可略的填充。
         return Err(CoreError::Corrupt {
-            key: "<pack trailer>".to_owned(),
+            key: key.to_owned(),
             reason: format!(
                 "entries cover {next} bytes but the pack holds {data_end} of chunk data"
             ),
@@ -431,12 +453,44 @@ mod tests {
             }],
         };
         // 資料區比 entry 多出 64 bytes 的縫隙：必須拒絕。
-        let err = validate_trailer(&trailer, pack::HEADER_LEN + 128 + 64).unwrap_err();
+        let err =
+            validate_trailer("packs/test", &trailer, pack::HEADER_LEN + 128 + 64).unwrap_err();
         assert!(
             matches!(err, CoreError::Corrupt { .. }),
             "縫隙要回 Corrupt：{err:?}"
         );
         // 恰好覆蓋：放行。
-        validate_trailer(&trailer, pack::HEADER_LEN + 128).unwrap();
+        validate_trailer("packs/test", &trailer, pack::HEADER_LEN + 128).unwrap();
+    }
+
+    /// trailer 的錯誤直接帶 pack 的真 key（ADR 019 A10）：以前先塞佔位字串
+    /// `"<pack trailer>"`、由 rebuild 再改寫，沒改寫的呼叫端就丟了名字。
+    /// 這裡用 tag 有效、但 `v`=4 的 trailer 走 read_trailer。
+    #[test]
+    fn trailer_errors_carry_the_real_pack_key() {
+        let keys = test_keys();
+        let mut w = PackWriter::new(Arc::clone(&keys), 1024 * 1024, 64 * 1024);
+        let data = b"chunk in a pack whose trailer says v4";
+        w.add(keys.chunk_id(data), data).unwrap();
+        let finished = w.finish().unwrap().unwrap();
+        // 重封一份 v=4 的 trailer，接回同一段資料區。
+        let sealed = pack::trailer_bytes(&finished.bytes).unwrap();
+        let data_end = finished.bytes.len() - pack::FOOTER_LEN - sealed.len();
+        let mut trailer: PackTrailer =
+            cbor::decode(&keys.open_pack_trailer(sealed).unwrap()).unwrap();
+        trailer.version = 4;
+        let resealed = keys
+            .seal_pack_trailer(&cbor::encode(&trailer).unwrap())
+            .unwrap();
+        let bytes = pack::finish(finished.bytes[..data_end].to_vec(), &resealed);
+        let key = kist_format::keys::pack(&ObjectId::of(&bytes));
+
+        match read_trailer(&keys, &key, &bytes) {
+            Err(CoreError::Corrupt { key: got, reason }) => {
+                assert_eq!(got, key, "錯誤要帶 pack 的真 key");
+                assert!(reason.contains("version 4"), "{reason}");
+            }
+            other => panic!("v=4 的 trailer 要回 Corrupt：{other:?}"),
+        }
     }
 }

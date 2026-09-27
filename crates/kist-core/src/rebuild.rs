@@ -93,52 +93,18 @@ impl Repository {
             .backend()
             .get_range(&key, trailer_start..size - FOOTER_LEN as u64)
             .await?;
+        let data_end = usize::try_from(trailer_start).map_err(|_| {
+            corrupt(format!(
+                "pack size {trailer_start} exceeds addressable range"
+            ))
+        })?;
         let keys_ = Arc::clone(self.keys());
         let key_for_task = key.clone();
+        // 「認證」不等於「一致」：與 pack::read_trailer 同一條路（開啟、解碼、
+        // 版本、連續、完整覆蓋、無重複），否則有 bug 的 client 寫出的 pack
+        // 會被收進重建的 index，之後每個相關 chunk 都讀失敗。
         let trailer = blocking(move || {
-            keys_
-                .open_pack_trailer(&trailer_bytes)
-                .map_err(|e| CoreError::Corrupt {
-                    key: key_for_task.clone(),
-                    reason: format!("trailer: {e}"),
-                })
-                .and_then(|plain| {
-                    kist_format::cbor::decode::<kist_format::pack::PackTrailer>(&plain).map_err(
-                        |e| CoreError::Corrupt {
-                            key: key_for_task.clone(),
-                            reason: format!("trailer: {e}"),
-                        },
-                    )
-                })
-                // 「認證」不等於「一致」：與 pack::read_trailer 同一套檢查
-                // （版本、連續、完整覆蓋、無重複），否則有 bug 的 client 寫出的
-                // pack 會被收進重建的 index，之後每個相關 chunk 都讀失敗。
-                .and_then(|trailer| {
-                    if trailer.version != kist_format::FORMAT_VERSION {
-                        return Err(CoreError::Corrupt {
-                            key: key_for_task.clone(),
-                            reason: format!(
-                                "trailer declares version {}, this build reads {}",
-                                trailer.version,
-                                kist_format::FORMAT_VERSION
-                            ),
-                        });
-                    }
-                    let data_end =
-                        usize::try_from(trailer_start).map_err(|_| CoreError::Corrupt {
-                            key: key_for_task.clone(),
-                            reason: format!("pack size {trailer_start} exceeds addressable range"),
-                        })?;
-                    crate::pack::validate_trailer(&trailer, data_end)
-                        .map_err(|e| match e {
-                            CoreError::Corrupt { key: _, reason } => CoreError::Corrupt {
-                                key: key_for_task.clone(),
-                                reason,
-                            },
-                            other => other,
-                        })
-                        .map(|()| trailer)
-                })
+            crate::pack::decode_trailer(&keys_, &key_for_task, &trailer_bytes, data_end)
         })
         .await?;
         Ok(IndexPack {

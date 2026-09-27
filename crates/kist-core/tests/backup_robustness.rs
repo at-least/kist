@@ -307,7 +307,8 @@ async fn bytes_stored_counts_the_indirect_chunk_list_too() {
     let mut trailer_raw = 0u64;
     for pack in walk_files(&t.repo_path().join("packs")) {
         let bytes = std::fs::read(&pack).unwrap();
-        let trailer = kist_core::pack::read_trailer(&keys, &bytes).unwrap();
+        let key = kist_format::keys::pack(&kist_format::ObjectId::of(&bytes));
+        let trailer = kist_core::pack::read_trailer(&keys, &key, &bytes).unwrap();
         trailer_raw += trailer.entries.iter().map(|e| e.raw_len).sum::<u64>();
     }
     assert_eq!(

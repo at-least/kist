@@ -55,6 +55,15 @@ pub struct Snapshot {
     pub stats: SnapshotStats,
 }
 
+/// 解碼並驗證 snapshot 的明文（版本、roots 規則，見 [`Snapshot::validate`]）。
+/// 讀取端一律走這裡，不自己接 decode 與 validate。key 與內容的核對
+/// （client、時間戳）要 key，由呼叫端做。
+pub fn parse_snapshot(data: &[u8]) -> Result<Snapshot> {
+    let snap: Snapshot = crate::cbor::decode(data)?;
+    snap.validate()?;
+    Ok(snap)
+}
+
 impl Snapshot {
     /// 目前格式版本的 `version` 欄位值。
     pub const VERSION: u32 = FORMAT_VERSION;

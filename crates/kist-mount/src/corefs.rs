@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use kist_core::restore::ReloadableIndex;
 use kist_core::{CoreError, Repository};
 use kist_format::keys;
-use kist_format::tree::{content_type, node_type, ChunkList, Entry};
-use kist_format::{cbor, ChunkId};
+use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
+use kist_format::ChunkId;
 
 use crate::offsets::ChunkOffsets;
 use crate::vpath::{RootContents, VEntry, VirtualRoot};
@@ -732,7 +732,7 @@ impl FsCore {
         Ok(buf)
     }
 
-    /// 直接內容回原清單；間接內容把清單 chunk 讀出來解成 `ChunkList`，
+    /// 直接內容回原清單；間接內容把清單 chunk 讀出來解成 `ChunkList`（含版本檢查），
     /// 再用 index 的 raw_len 建邊界表。
     async fn resolve_file(
         &self,
@@ -746,7 +746,7 @@ impl FsCore {
             for id in chunks {
                 bytes.extend_from_slice(&self.repo.read_chunk_reloading(id, &self.index).await?);
             }
-            let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+            let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
                 key: "<chunk list>".to_owned(),
                 reason: e.to_string(),
             })?;

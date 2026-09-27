@@ -43,6 +43,14 @@ pub struct Tree {
     pub prev: Option<TreeId>,
 }
 
+/// 解碼並驗證 tree 的明文（版本、排序、每個 entry 的 kind 規則，見
+/// [`Tree::validate`]）。讀取端一律走這裡，不自己接 decode 與 validate。
+pub fn parse_tree(data: &[u8]) -> Result<Tree> {
+    let tree: Tree = crate::cbor::decode(data)?;
+    tree.validate()?;
+    Ok(tree)
+}
+
 impl Tree {
     pub fn new(entries: Vec<Entry>, prev: Option<TreeId>) -> Self {
         Self {
@@ -533,6 +541,49 @@ mod tests {
             "間接 entry 的清單 chunk 數不是 inline 數"
         );
     }
+
+    /// §16：各明文 `v` ≠ 3 就拒絕。泛型 `cbor::decode` 不看版本，讀取端
+    /// 的解碼函式要看（ADR 019 A10：ChunkList 以前沒人比）。
+    #[test]
+    fn parse_rejects_other_versions() {
+        let good = ChunkList::new(vec![ChunkId::ZERO]);
+        let bytes = crate::cbor::encode(&good).unwrap();
+        assert_eq!(parse_chunk_list(&bytes).unwrap(), good);
+
+        let v4 = ChunkList {
+            version: 4,
+            chunks: vec![ChunkId::ZERO],
+        };
+        let bytes = crate::cbor::encode(&v4).unwrap();
+        assert!(
+            crate::cbor::decode::<ChunkList>(&bytes).is_ok(),
+            "泛型 decode 本來就不看版本"
+        );
+        assert!(
+            matches!(
+                parse_chunk_list(&bytes),
+                Err(FormatError::UnsupportedVersion {
+                    what: "chunk list",
+                    version: 4
+                })
+            ),
+            "v=4 的清單必須被拒"
+        );
+
+        let mut tree = Tree::new(vec![posix_file(b"a")], None);
+        assert!(parse_tree(&crate::cbor::encode(&tree).unwrap()).is_ok());
+        tree.version = 4;
+        assert!(
+            matches!(
+                parse_tree(&crate::cbor::encode(&tree).unwrap()),
+                Err(FormatError::UnsupportedVersion {
+                    what: "tree",
+                    version: 4
+                })
+            ),
+            "v=4 的 tree 必須被拒"
+        );
+    }
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -579,4 +630,18 @@ impl ChunkList {
             chunks,
         }
     }
+}
+
+/// 解碼間接內容的 chunk 清單並比對版本（format.md §16：各明文 `v` ≠ 3
+/// 就拒絕）。泛型 `cbor::decode` 不看版本：restore、check、mount 解清單
+/// 一律走這裡。
+pub fn parse_chunk_list(data: &[u8]) -> Result<ChunkList> {
+    let list: ChunkList = crate::cbor::decode(data)?;
+    if list.version != FORMAT_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            what: "chunk list",
+            version: list.version,
+        });
+    }
+    Ok(list)
 }

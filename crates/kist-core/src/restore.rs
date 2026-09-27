@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
-use kist_format::tree::{content_type, node_type, ChunkList, Entry};
-use kist_format::{cbor, keys, ChunkId};
+use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
+use kist_format::{keys, ChunkId};
 
 use crate::fsmeta;
 use crate::index::{ChunkIndex, ChunkLocator};
@@ -351,7 +351,7 @@ impl Repository {
             for id in chunks {
                 bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
             }
-            let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+            let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
                 key: "<chunk list>".to_owned(),
                 reason: e.to_string(),
             })?;
@@ -413,7 +413,7 @@ impl Repository {
         Ok(())
     }
 
-    /// 直接內容回傳原清單；間接內容先把清單 chunk 讀出來解成 ChunkList。
+    /// 直接內容回傳原清單；間接內容先把清單 chunk 讀出來解成 ChunkList（含版本檢查）。
     pub(crate) async fn resolve_chunks<I>(
         &self,
         chunks: &[ChunkId],
@@ -430,7 +430,7 @@ impl Repository {
         for id in chunks {
             bytes.extend_from_slice(&self.read_chunk(id, index).await?);
         }
-        let list: ChunkList = cbor::decode(&bytes).map_err(|e| CoreError::Corrupt {
+        let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
             key: "<chunk list>".to_owned(),
             reason: e.to_string(),
         })?;

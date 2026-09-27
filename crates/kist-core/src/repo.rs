@@ -8,8 +8,8 @@ use kist_backend::{Backend, BackendError};
 use kist_crypto::{create_key_slot, unlock_key_slot, KdfCost, KeyBinding, RepoKeys};
 use kist_format::config::{ChunkerParams, RepoConfig};
 use kist_format::index::IndexBlob;
-use kist_format::snapshot::{parse_key_timestamp, Snapshot};
-use kist_format::tree::{Entry, Tree};
+use kist_format::snapshot::{parse_key_timestamp, parse_snapshot, Snapshot};
+use kist_format::tree::{parse_tree, Entry, Tree};
 use kist_format::{cbor, keys, Algorithm, ObjectId, TreeId};
 use zeroize::Zeroizing;
 
@@ -381,25 +381,11 @@ impl Repository {
                     reason: format!("content hash {actual} does not match its name"),
                 });
             }
-            let tree: Tree = cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
-                key: key_owned.clone(),
+            // 解碼＋版本＋結構驗證在格式層一次做完（tree::parse_tree）。
+            parse_tree(&plain).map_err(|e| CoreError::Corrupt {
+                key: key_owned,
                 reason: e.to_string(),
-            })?;
-            if tree.version != kist_format::FORMAT_VERSION {
-                return Err(CoreError::Corrupt {
-                    key: key_owned,
-                    reason: format!(
-                        "tree declares version {}, this build reads {}",
-                        tree.version,
-                        kist_format::FORMAT_VERSION
-                    ),
-                });
-            }
-            tree.validate().map_err(|e| CoreError::Corrupt {
-                key: keys::tree(&expected),
-                reason: e.to_string(),
-            })?;
-            Ok(tree)
+            })
         })
         .await
     }
@@ -639,27 +625,12 @@ impl Repository {
                     key: key_owned.clone(),
                     reason: e.to_string(),
                 })?;
-            let snap: Snapshot = cbor::decode(&plain).map_err(|e| CoreError::Corrupt {
-                key: key_owned.clone(),
-                reason: e.to_string(),
-            })?;
-            if snap.version != kist_format::FORMAT_VERSION {
-                return Err(CoreError::Corrupt {
-                    key: key_owned.clone(),
-                    reason: format!(
-                        "snapshot declares version {}, this build reads {}",
-                        snap.version,
-                        kist_format::FORMAT_VERSION
-                    ),
-                });
-            }
-            // 結構驗證（roots 非空、排序、唯一）：
+            // 解碼＋版本＋結構驗證（roots 非空、排序、唯一）在格式層一次做完：
             // 解得開不等於合法，structurally-invalid 的 snapshot 不能往下走。
-            snap.validate().map_err(|e| CoreError::Corrupt {
-                key: key_owned.clone(),
+            parse_snapshot(&plain).map_err(|e| CoreError::Corrupt {
+                key: key_owned,
                 reason: e.to_string(),
-            })?;
-            Ok(snap)
+            })
         })
         .await?;
         // snapshot 不是以內容命名：用內容裡的 client 與時間反算 key，必須一致。

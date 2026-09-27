@@ -246,7 +246,7 @@ impl Repository {
         let key_for_task = key.clone();
         let result: Result<Vec<String>> = blocking(move || {
             let mut errs = Vec::new();
-            let trailer = match read_trailer(&keys, &bytes) {
+            let trailer = match read_trailer(&keys, &key_for_task, &bytes) {
                 Ok(t) => t,
                 Err(e) => {
                     errs.push(format!("{key_for_task}: trailer: {e}"));
