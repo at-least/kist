@@ -130,6 +130,9 @@ impl Repository {
         //     那是「主體意外遺失」的災難訊號，prune 刻意不自動清理，這裡回報
         //     （restore 端會自動落到副本）。replicas=1 時，活樹缺副本 → 警告
         //     （可修補，不影響資料安全）。
+        //     「不在」只認 NotFound；HEAD 的其他錯誤（暫時性網路、權限）不知道
+        //     在不在，把真實錯誤記進 report。不能用 `?`：這一步在讀資料與
+        //     parity 修復之前，一個 `?` 會丟掉整份 report。
         let replica_keys: Vec<String> = self
             .backend()
             .list(keys::TREES_PREFIX)
@@ -142,21 +145,29 @@ impl Repository {
             let Some(base) = kist_format::keys::strip_replica(&rk) else {
                 continue;
             };
-            if self.backend().head(base).await.is_err() {
-                report.errors.push(format!(
+            match self.backend().exists(base).await {
+                Ok(true) => {}
+                Ok(false) => report.errors.push(format!(
                     "{rk}: replica exists but its primary tree is missing \
                      (possible data-loss event; data can be recovered from the replica)"
-                ));
+                )),
+                Err(e) => report
+                    .errors
+                    .push(format!("{rk}: cannot check its primary tree {base}: {e}")),
             }
         }
         if self.config().replicas > 0 {
             for tid in &reach.live_trees {
                 let tree_id = kist_format::TreeId::from_bytes(*tid.as_bytes());
                 let rk = keys::tree_replica(&tree_id);
-                if self.backend().head(&rk).await.is_err() {
-                    report
+                match self.backend().exists(&rk).await {
+                    Ok(true) => {}
+                    Ok(false) => report
                         .warnings
-                        .push(format!("{}: tree replica is missing (repairable)", rk));
+                        .push(format!("{}: tree replica is missing (repairable)", rk)),
+                    Err(e) => report
+                        .errors
+                        .push(format!("{rk}: cannot check the tree replica: {e}")),
                 }
             }
         }

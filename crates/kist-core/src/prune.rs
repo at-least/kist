@@ -754,9 +754,11 @@ impl PrunePlan {
                 if orphan {
                     // 名單是剛才列的：並發 backup 可能「pack 已 Put、parity 尚未
                     // 列進我們的名單但已存在」。刪之前再看一眼 pack 還在不在，
-                    // pack 在就不動它的 sidecar。
+                    // pack 在就不動它的 sidecar。只有 NotFound 算「pack 不在」；
+                    // 其他錯誤（暫時性網路）不得當成不在——會刪掉活 pack 的
+                    // parity，回錯（同第 14 步的分法）。
                     let pack_gone = match keys::object_id_from_key(&key) {
-                        Ok(id) => repo.backend().head(&keys::pack(&id)).await.is_err(),
+                        Ok(id) => !repo.backend().exists(&keys::pack(&id)).await?,
                         Err(_) => true,
                     };
                     if !pack_gone {
@@ -787,8 +789,11 @@ impl PrunePlan {
                     continue;
                 };
                 let Ok(tree_id) = kist_format::TreeId::from_hex(hex) else {
-                    // 不是 touch 命名：當垃圾清
-                    let _ = repo.backend().delete(&key).await;
+                    // 不是 touch 命名：當垃圾清；刪不掉不擋 prune，但要留下紀錄
+                    match repo.backend().delete(&key).await {
+                        Ok(()) | Err(BackendError::NotFound(_)) => {}
+                        Err(e) => tracing::warn!("{key}: cannot delete stray touch object: {e}"),
+                    }
                     continue;
                 };
                 // 樹不在了才清 touch；head 的**其他**錯誤（暫時性網路）不得

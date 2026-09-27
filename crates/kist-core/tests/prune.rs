@@ -790,3 +790,38 @@ async fn backup_and_prune_recover_from_a_crashed_sweep() {
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     restore_matches(&fresh, &b2.snapshot_key, &src, &out).await;
 }
+
+/// ADR 019 A8：第 13 步（parity 孤兒清掃）刪 sidecar 前會再看一眼 pack 在不在；
+/// 那一眼的錯誤不是 NotFound（暫時性錯誤）時，不得當成「pack 不在」而刪掉
+/// sidecar，要讓 prune 回錯（同第 14 步的分法）。
+/// 注入：`packs/<id>` 放一個 Unix socket。本機後端的 list 只列一般檔案，所以它
+/// 不在清單裡（像並發 backup 剛 Put、還沒列到的 pack）；head 的 open(2) 對
+/// socket 回 ENXIO，不是 NotFound。
+#[cfg(unix)]
+#[tokio::test]
+async fn parity_sweep_keeps_the_sidecar_when_the_pack_head_fails() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    make_source(&src);
+    let repo = t.open().await;
+    let r = OffsetDateTime::now_utc();
+    repo.backup(std::slice::from_ref(&src), client(1, r))
+        .await
+        .unwrap();
+
+    let id = ObjectId::from_bytes([0xCD; 32]);
+    let sidecar = t.repo_path().join(kist_format::parity::key(&id));
+    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    std::fs::write(&sidecar, b"parity").unwrap();
+    // socket 路徑有長度上限（sun_path 108 bytes）：先在短路徑建，再搬到 pack 的位置。
+    let short = t.dir.path().join("s");
+    drop(std::os::unix::net::UnixListener::bind(&short).unwrap());
+    std::fs::rename(&short, t.repo_path().join(keys::pack(&id))).unwrap();
+
+    let res = repo.prune(prune_opts(r + Duration::hours(1))).await;
+    assert!(
+        sidecar.exists(),
+        "pack 的 HEAD 失敗不等於 pack 不在：sidecar 不得刪：{res:?}"
+    );
+    assert!(res.is_err(), "HEAD 的錯誤要讓 prune 回錯：{res:?}");
+}
