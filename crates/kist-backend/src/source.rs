@@ -249,7 +249,9 @@ impl ObjectStoreSource {
                 None => (rest.to_owned(), String::new()),
             };
             let store = s3_store_for_prefix(&bucket, &prefix)?;
-            let root = object_store::path::Path::from(prefix.as_str());
+            // 與 to_store_path 同理：prefix 是遠端上的原始名稱，用 parse 不編碼。
+            let root = object_store::path::Path::parse(prefix.as_str())
+                .map_err(|e| BackendError::Source(format!("{spec}: {e}")))?;
             (
                 store,
                 root,
@@ -273,7 +275,14 @@ impl ObjectStoreSource {
     }
 
     /// 相對路徑 → store 路徑（root 底下）。
-    fn to_store_path(&self, rel: &[u8]) -> object_store::path::Path {
+    ///
+    /// 一律用 `Path::parse`（不編碼）：清單端產生名稱用的就是 parse
+    /// （sftp.rs 的 to_meta 與 list_with_delimiter、object_store 的 S3 client），
+    /// 讀檔與列子目錄必須送出同一個字串。`Path::from` 會把 `~ # % [ ]` 等
+    /// 百分比編碼，同一個名字列出來與讀的時候變成兩個字串：檔讀不到，
+    /// 子目錄被列成空的（ADR 019 A1）。名稱不合命名規則（控制字元、`.`、
+    /// `..`）時回 Source 錯誤，由走訪端記進 skip 帳。
+    fn to_store_path(&self, rel: &[u8]) -> Result<object_store::path::Path> {
         let joined = if self.root.as_ref().is_empty() {
             String::from_utf8_lossy(rel).into_owned()
         } else if rel.is_empty() {
@@ -281,7 +290,8 @@ impl ObjectStoreSource {
         } else {
             format!("{}/{}", self.root, String::from_utf8_lossy(rel))
         };
-        object_store::path::Path::from(joined.as_str())
+        object_store::path::Path::parse(joined.as_str())
+            .map_err(|e| BackendError::Source(format!("{joined}: {e}")))
     }
 
     /// HEAD prefix 本身（僅根列舉用）：存在 → 它是一顆「檔案來源」物件，
@@ -290,7 +300,7 @@ impl ObjectStoreSource {
         // 來源的 store 是**裸 bucket**（無 PrefixStore）：root 就是完整前綴。
         // HEAD 完整前綴路徑——目錄來源 404（→ None，正常走清單）；檔案來源
         // 200（→ 單一 File 條目，走檔案來源分支）。
-        let path = self.to_store_path(b"");
+        let path = self.to_store_path(b"")?;
         let path_for_err = path.to_string();
         let store = Arc::clone(&self.store);
         let head_path = path.clone();
@@ -346,7 +356,7 @@ impl Source for ObjectStoreSource {
     }
 
     fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError> {
-        let prefix = self.to_store_path(dir);
+        let prefix = self.to_store_path(dir)?;
         let store = Arc::clone(&self.store);
         // 根列舉時先 HEAD prefix 本身：若它是「檔案來源」（prefix 即一顆
         // 物件），list_with_delimiter 會把同名物件藏起來、回傳空清單——
@@ -416,7 +426,7 @@ impl Source for ObjectStoreSource {
     }
 
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
-        let path = self.to_store_path(file);
+        let path = self.to_store_path(file)?;
         let store = Arc::clone(&self.store);
         let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
         self.handle.spawn(async move {
@@ -630,6 +640,127 @@ mod s3_root_probe_tests {
         assert!(
             !items.iter().any(|i| i.name == b"data"),
             "folder marker 不得作為檔案來源出現，got {items:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod store_path_tests {
+    use super::*;
+    use object_store::path::Path as StorePath;
+
+    /// 走訪 `dir` 底下的所有檔案（遞迴），回傳 (rel, 讀到的內容或錯誤)。
+    /// 錯誤收成字串而不是 unwrap：斷言失敗時要看得到是哪個名稱讀不到。
+    fn walk_and_read(
+        src: &ObjectStoreSource,
+        dir: &[u8],
+        out: &mut Vec<(String, std::result::Result<Vec<u8>, String>)>,
+    ) {
+        let mut listing = src.list(dir).unwrap();
+        while let Some(item) = listing.next_item() {
+            let item = item.unwrap();
+            let mut rel = dir.to_vec();
+            if !rel.is_empty() {
+                rel.push(b'/');
+            }
+            rel.extend_from_slice(&item.name);
+            match item.kind {
+                SourceItemKind::Dir => walk_and_read(src, &rel, out),
+                _ => {
+                    let mut content = Vec::new();
+                    let got = src.read(&rel).map_err(|e| e.to_string()).and_then(|mut r| {
+                        r.read_to_end(&mut content)
+                            .map(|_| content)
+                            .map_err(|e| e.to_string())
+                    });
+                    out.push((String::from_utf8_lossy(&rel).into_owned(), got));
+                }
+            }
+        }
+    }
+
+    /// 遠端上的名稱含 `~ [ ]`（ADR 019 A1）：清單端（S3 client、SFTP）用不
+    /// 編碼的 `Path::parse` 產生名稱，讀檔與列子目錄必須用同一個字串。
+    /// 用 `Path::from` 的話 `a~1.txt` 會變成 `a%7E1.txt`（讀不到）、`d[1]`
+    /// 變成 `d%5B1%5D`（子目錄被列成空的，整棵靜默備成空目錄）。
+    #[tokio::test]
+    async fn names_with_reserved_chars_round_trip_from_list_to_read() {
+        let store = object_store::memory::InMemory::new();
+        // 以 parse 放入＝遠端上真實的名稱（S3 client 列出時也是 parse）。
+        store
+            .put(
+                &StorePath::parse("a~1.txt").unwrap(),
+                object_store::PutPayload::from_static(b"tilde"),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &StorePath::parse("d[1]/x").unwrap(),
+                object_store::PutPayload::from_static(b"bracket"),
+            )
+            .await
+            .unwrap();
+        let src = ObjectStoreSource {
+            store: Arc::new(store),
+            root: StorePath::default(),
+            locator: b"s3://bucket".to_vec(),
+            meta_kind: kist_format::tree::meta_kind::S3,
+            handle: tokio::runtime::Handle::current(),
+        };
+        // list 與讀取的橋接內部都 block_on：照生產端在 blocking 執行緒上跑。
+        let got = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            walk_and_read(&src, b"", &mut out);
+            out
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a~1.txt".to_owned(), Ok(b"tilde".to_vec())),
+                ("d[1]/x".to_owned(), Ok(b"bracket".to_vec())),
+            ]
+        );
+    }
+
+    /// `s3://bucket/<prefix>` 的 prefix 也是遠端上的原始名稱：root 必須原樣
+    /// 保存，不能被編碼成 `photos%5B2024%5D`。
+    #[tokio::test]
+    async fn s3_root_prefix_keeps_reserved_chars() {
+        let src = ObjectStoreSource::open("s3://bucket/photos[2024]")
+            .await
+            .unwrap();
+        assert_eq!(src.root.as_ref(), "photos[2024]");
+    }
+
+    /// 名稱不合 object_store 的命名規則（控制字元、`.`、`..`）時，回
+    /// `BackendError::Source`，由走訪端記進 skip 帳，不送出另一個字串。
+    #[tokio::test]
+    async fn unrepresentable_name_is_a_source_error() {
+        let src = ObjectStoreSource {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            root: StorePath::default(),
+            locator: b"s3://bucket".to_vec(),
+            meta_kind: kist_format::tree::meta_kind::S3,
+            handle: tokio::runtime::Handle::current(),
+        };
+        let (read, list) = tokio::task::spawn_blocking(move || {
+            let read = src.read(b"bad\x01name").err();
+            let list = src.list(b"d/..").err();
+            (read, list)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(read, Some(BackendError::Source(_))),
+            "read: {read:?}"
+        );
+        assert!(
+            matches!(list, Some(BackendError::Source(_))),
+            "list: {list:?}"
         );
     }
 }
