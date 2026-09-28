@@ -8,7 +8,5 @@ __pycache__/
 dhat-heap.json
 /dist/
 
-# 本機工具（code-index MCP 索引、zcode session）
-.mcp-index/
-.mcp-index.json
+# 本機工具（zcode session）
 .zcode/
