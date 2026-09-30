@@ -10,3 +10,6 @@ dhat-heap.json
 
 # 本機工具（zcode session）
 .zcode/
+
+# codegraph index
+.codegraph/
