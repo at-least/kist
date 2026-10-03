@@ -203,7 +203,11 @@ impl Backend {
             path: path.display().to_string(),
             source,
         })?;
-        let store = object_store::local::LocalFileSystem::new_with_prefix(path)?;
+        // with_fsync(true)：object_store 的 local 預設**不** fsync（remote 的 ack
+        // 隱含 durability），斷電時 rename 進去的 pack／index 內容可能還沒落盤。
+        // snapshot 最後寫的 commit 規則（docs/format.md）依賴 put 回報成功即
+        // durable——S3 ack 即 durable、SFTP 有 fsync（ADR 013），本機不能是例外。
+        let store = object_store::local::LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
         Ok(Self {
             store: Arc::new(store),
             location: RepoLocation::Local(path.to_path_buf()),
@@ -277,7 +281,9 @@ impl Backend {
         }
     }
 
-    /// 寫入（覆蓋既有物件）。只有 `config` 應該用這個。
+    /// 寫入（覆蓋既有物件）。覆寫的合法使用者：`config`，以及 GC 的 `touch/*`
+    /// （固定 8 bytes 內容、刷新 mtime；docs/format.md §13.1/§15）——其餘物件
+    /// 一律 [`put_if_absent`](Self::put_if_absent)。
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         self.store
             .put(&Self::path(key)?, bytes.into())
