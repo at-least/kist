@@ -512,7 +512,9 @@ impl Repository {
                                 summary.symlinks += 1;
                                 if node.xattrs.is_some() {
                                     tracing::warn!(
-                                        "{}: snapshot has extended attributes for this symlink;                                      Linux cannot set user.* on a symlink and following it would                                      write to the target, so they are not restored",
+                                        "{}: snapshot has extended attributes for this symlink; \
+                                         Linux cannot set user.* on a symlink and following it \
+                                         would write to the target, so they are not restored",
                                         path.display()
                                     );
                                 }

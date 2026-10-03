@@ -26,9 +26,10 @@ cargo test --workspace
 docker rm -f kist-sftp              # 用完關掉
 ```
 
-`tests/sftp-setup.sh` 會印出要 export 的環境變數：`KIST_TEST_SFTP_URL`（含隨機 port 的
-`kisttest` 帳號）、密碼、known_hosts 路徑，以及帶 passphrase 的 ed25519 key（測
-`KIST_SFTP_KEY` / `KIST_SFTP_KEY_PASSPHRASE` 認證路徑）。容器的 OpenSSH sftp-server
+`tests/sftp-setup.sh` 會印出要 export 的環境變數：`KIST_TEST_SFTP_URL`（port 固定
+19222，可用 `SFTP_PORT` 蓋過；`kisttest` 帳號）、密碼、known_hosts 路徑，以及帶
+passphrase 的 ed25519 key（測 `KIST_TEST_SFTP_KEY` / `KIST_TEST_SFTP_KEY_PASSPHRASE`
+認證路徑——測試專用的名稱，不是 CLI 的 `KIST_SFTP_*`）。容器的 OpenSSH sftp-server
 支援 kist 需要的 `hardlink@openssh.com` / `posix-rename@openssh.com` 擴充。
 
 ## rclone 橋接

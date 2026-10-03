@@ -122,6 +122,11 @@ kist run --config /etc/kist/backup.toml --once   # 每件工作各跑一次就�
 kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端口：/metrics 與 Web UI
 ```
 
+> 排程錯過不補跑：daemon 沒在跑、機器休眠或停機跨過了排程時間的話，那次就跳過，
+> 下一輪是排程的**下一次**時間（不是醒來後立刻補跑）。常休眠的機器請用外部
+> cron / systemd timer 配 `run --once`。對應的訊號是 `kist_job_last_success_timestamp_seconds`
+> 多久沒更新。
+
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
 
 grace（見「空間回收（GC）」一節）：`[backup] gc_grace` 沒寫時，backup 取**同一份設定**的 `[prune] grace`，

@@ -144,7 +144,8 @@ fn interop_tree_canonical_cbor() {
     );
     let encoded = kist_format::cbor::encode(&tree).unwrap();
     let path = "tests/testdata/tree-canonical.hex";
-    if std::env::var_os("UPDATE_VECTOR").is_some() {
+    // 只認 "1"（UPDATE_VECTOR=0 是「想關掉」，不是「要重錄」）。
+    if std::env::var_os("UPDATE_VECTOR").as_deref() == Some(std::ffi::OsStr::new("1")) {
         std::fs::write(path, format!("{}\n", to_hex(&encoded))).unwrap();
         return;
     }
