@@ -314,7 +314,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // 約定：Ctrl-C 是乾淨收工（不再開下一件工作、
                 // 進行中的做完），不是 unit 失敗。
                 let (tx, rx) = tokio::sync::watch::channel(false);
-                spawn_ctrl_c(tx.clone());
+                spawn_shutdown_watcher(tx.clone());
                 let outcomes = daemon
                     .run_once(Some(rx.clone()), |o| {
                         if !json {
@@ -355,7 +355,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             print_next_runs(&daemon);
             let (tx, rx) = tokio::sync::watch::channel(false);
-            spawn_ctrl_c(tx.clone());
+            spawn_shutdown_watcher(tx.clone());
             daemon.run(rx, emit_outcome_wrap(json)).await?;
             Ok(())
         }
@@ -369,13 +369,14 @@ async fn run(cli: Cli) -> Result<()> {
             let local = listener.local_addr()?;
             if !local.ip().is_loopback() {
                 eprintln!(
-                    "warning: /metrics has no authentication and reveals the repo location and \
-                     job schedule; do not expose it to untrusted networks"
+                    "warning: /metrics and (without [serve] password_file) the read-only web UI \
+                     have no authentication; they reveal the repo location, backup source paths \
+                     and job schedule; do not expose them to untrusted networks"
                 );
             }
             eprintln!("listening on http://{local} (/metrics, /healthz)");
             let (tx, rx) = tokio::sync::watch::channel(false);
-            spawn_ctrl_c(tx.clone());
+            spawn_shutdown_watcher(tx.clone());
             let ui = kist_app::server::ui_config(daemon.config(), local)?;
             let state = kist_app::server::ServeState {
                 metrics: daemon.metrics(),
@@ -731,12 +732,14 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let r = open_repo(&repo).await?;
             let report = r.check(CheckOptions { read_data, repair }).await?;
-            for id in &report.repaired {
-                println!("repaired pack {id} from parity");
-            }
             if json {
                 print_json(&report)?;
             } else {
+                // 人類可讀的輸出（含修復了哪些 pack）只在非 --json 模式印：
+                // --json 的 stdout 必須整份是 JSON（README 的契約）。
+                for id in &report.repaired {
+                    println!("repaired pack {id} from parity");
+                }
                 println!(
                     "checked {} snapshots, {} trees, {} packs, {} chunks{}",
                     report.snapshots,
@@ -842,13 +845,38 @@ fn emit_outcome(o: &kist_app::JobOutcome) {
     );
 }
 
-fn spawn_ctrl_c(tx: tokio::sync::watch::Sender<bool>) {
+fn spawn_shutdown_watcher(tx: tokio::sync::watch::Sender<bool>) {
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        if wait_for_shutdown_signal().await {
             eprintln!("shutting down after the current job");
             let _ = tx.send(true);
         }
     });
+}
+
+/// `run`／`serve` 的結束訊號：Ctrl-C（SIGINT）**或** SIGTERM。systemd／docker
+/// 的 `stop` 送的是 SIGTERM——只等 SIGINT 的話，「跑完手邊工作再停」的約定
+/// 在主要的部署訊號下不會發生（`kist mount` 的 `sigterm()` 同一款理由）。
+async fn wait_for_shutdown_signal() -> bool {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                // ctrl_c 註冊失敗不算結束訊號：退回只等 SIGTERM，不憑空觸發。
+                c = tokio::signal::ctrl_c() => match c {
+                    Ok(()) => true,
+                    Err(_) => term.recv().await.is_some(),
+                },
+                _ = term.recv() => true,
+            },
+            Err(_) => tokio::signal::ctrl_c().await.is_ok(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.is_ok()
+    }
 }
 
 fn print_next_runs(daemon: &kist_app::Daemon) {
@@ -1033,4 +1061,30 @@ fn username() -> String {
 
 fn time_now() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod shutdown_tests {
+    /// systemd `stop`、docker `stop` 都送 SIGTERM：`run`/`serve` 的「跑完手邊
+    /// 工作再停」約定必須對 SIGTERM 也成立（只有 SIGINT 的話，主要的部署
+    /// 訊號會直接殺掉進行中的工作）。
+    #[tokio::test]
+    async fn sigterm_triggers_the_shutdown_channel() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        super::spawn_shutdown_watcher(tx);
+        // 讓 watcher task 註冊好 signal handler
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let ok = std::process::Command::new("kill")
+            .args(["-s", "TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "kill -TERM 指令本身失敗了");
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed())
+            .await
+            .expect("SIGTERM 應觸發 shutdown 通道（graceful shutdown）")
+            .unwrap();
+        assert!(*rx.borrow(), "通道要被設成 true");
+    }
 }
