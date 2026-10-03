@@ -34,3 +34,28 @@ pub mod serde_opt {
             .transpose()
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// 釘住整張解析表：prune 的 grace/inactive_after 從這裡進來，"72h" 與
+    /// "72" 的差別就是 prune 能不能刪東西——默默接受無單位數字或拆錯
+    /// 複合單位都不許。
+    #[test]
+    fn parse_duration_table() {
+        assert_eq!(parse_duration("72h"), Ok(Duration::from_secs(72 * 3600)));
+        assert_eq!(parse_duration("30d"), Ok(Duration::from_secs(30 * 86_400)));
+        assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(parse_duration("2w"), Ok(Duration::from_secs(14 * 86_400)));
+        assert_eq!(parse_duration(" 1h "), Ok(Duration::from_secs(3600)));
+        // 沒有單位、單位在前、小數、複合單位、未知單位、負數：全拒
+        for bad in ["72", "h", "s5", "1.5h", "1h30m", "5H", "-5s", ""] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} 不該被接受");
+        }
+        // u64 溢出要報錯，不能繞回小值
+        assert!(parse_duration("18446744073709551615w").is_err());
+    }
+}
