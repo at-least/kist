@@ -981,6 +981,96 @@ async fn restore_twice_keeps_hard_links() {
     }
 }
 
+/// ADR 019 A4（審查）：snapshot 裡有擁有者只能進入、不能讀的目錄（0311；以
+/// root 備份、以一般使用者還原才會遇到）。目錄 handle 只以 O_RDONLY 開的話：
+/// - 第一次還原：d 套上 0311 之後，第一個名字在 d 裡的硬連結（e/g → d/f1）
+///   重開不了 d，靜靜退成獨立的複製（只有 warn，errors 是空的）；
+/// - 第二次還原：d 整個開不了，子項目全被跳過（files 只剩 1）。
+///
+/// 以前以完整路徑操作只要求能進入 d，兩次都保住硬連結、子項目照寫；第二次
+/// 只有 d 本身的 metadata 回 Permission denied（它讀不了，開不了來套）。一般
+/// 使用者備份不了讀不到的目錄，所以以真備份為底，只把 d 記錄的 mode 改成
+/// 0311。以 root 跑就略過：root 讀得到 0311 的目錄，驗不到這件事。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unreadable_dir_in_the_snapshot_keeps_hard_links_and_children() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipping: running as root");
+        return;
+    }
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("d")).unwrap();
+    std::fs::create_dir_all(src.join("e")).unwrap();
+    std::fs::write(src.join("d").join("f1"), b"linked").unwrap();
+    std::fs::write(src.join("d").join("f2"), b"plain").unwrap();
+    std::fs::hard_link(src.join("d").join("f1"), src.join("e").join("g")).unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
+    let mut entries = repo.read_tree_chain(&snap.roots[0].tree).await.unwrap();
+    let d = entries.iter_mut().find(|e| e.name == b"d").unwrap();
+    d.mode = d.mode.map(|m| (m & !0o7777) | 0o311);
+    let key = hand_snapshot(&repo, &s.snapshot_key, b"/hand", entries).await;
+
+    let target = t.dir.path().join("out");
+    let restored = target.join("hand");
+    let d = restored.join("d");
+    let mut rounds = Vec::new();
+    for _ in 1..=2 {
+        let summary = repo
+            .restore(&key, &target, RestoreOptions::default())
+            .await
+            .unwrap();
+        // d 是 0311：stat 與讀它裡面的檔只要能進入，不必讀 d。
+        let f1 = std::fs::symlink_metadata(d.join("f1")).unwrap();
+        let g = std::fs::symlink_metadata(restored.join("e").join("g")).unwrap();
+        let mode = std::fs::symlink_metadata(&d).unwrap().mode() & 0o7777;
+        rounds.push((
+            summary,
+            (f1.ino() == g.ino(), g.nlink()),
+            format!("{mode:o}"),
+            std::fs::read(restored.join("e").join("g")).unwrap(),
+        ));
+    }
+    // 先把 d 改回可讀，TempDir 才刪得掉它（否則靜靜留在 /tmp）。
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (first, first_link, first_mode, first_g) = &rounds[0];
+    assert!(first.errors.is_empty(), "第一次：{first:?}");
+    assert_eq!((first.files, first.dirs), (3, 2), "第一次：{first:?}");
+    assert_eq!(
+        *first_link,
+        (true, 2),
+        "第一次：e/g 要與 d/f1 是同一個 inode、nlink 2，不能退成複製"
+    );
+    assert_eq!(first_mode, "311");
+    assert_eq!(first_g, b"linked");
+
+    let (second, second_link, second_mode, second_g) = &rounds[1];
+    assert_eq!(
+        (second.files, second.dirs),
+        (3, 2),
+        "第二次：d 的子項目不能被跳過；{second:?}"
+    );
+    assert_eq!(*second_link, (true, 2), "第二次：{second:?}");
+    assert_eq!(second_mode, "311");
+    assert_eq!(second_g, b"linked");
+    // 與以前相同：d 讀不了，它本身的 metadata 套不上，只回報這一筆。
+    assert_eq!(second.errors.len(), 1, "第二次：{second:?}");
+    assert!(
+        second.errors[0].contains("Permission denied"),
+        "第二次：{second:?}"
+    );
+    assert_no_restore_temp(&restored.join("d"));
+    assert_no_restore_temp(&restored.join("e"));
+}
+
 /// ADR 019 A2（審查）：覆寫使用者原有的 0o600 檔，而這個條目的 metadata 套不上
 /// （xattr 名稱超過 XATTR_NAME_MAX，set_xattr 回 ERANGE；記錄的 mode 就不會套）。
 /// 內容照舊 rename 成正式名、記一個錯；但裝著它的檔不能比記錄的 mode 寬鬆——
