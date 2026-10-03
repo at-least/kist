@@ -186,6 +186,7 @@ fn push_real(levels: &mut HashMap<Vec<u8>, Vec<VEntry>>, key: &[u8], e: &Entry) 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_bytes::ByteBuf;
