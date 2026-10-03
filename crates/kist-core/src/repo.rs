@@ -129,6 +129,19 @@ fn decode_index_blob(payload: &[u8]) -> Result<IndexBlob> {
     decode_index_blob_limited(payload, MAX_INDEX_PLAIN)
 }
 
+/// index 讀取失敗的歸類：只有真正的損壞（hash 不符、解不開、解出來不合法）
+/// 才包成 `Corrupt` 並建議 `rebuild-index`；後端與本機快取的 I/O 錯誤
+/// （網路斷、5xx、權限）不是損壞，照原樣回——免得健康的 repo 被誤診。
+fn index_load_error(e: CoreError) -> CoreError {
+    match e {
+        CoreError::Backend(_) | CoreError::Io { .. } | CoreError::Join(_) => e,
+        other => CoreError::Corrupt {
+            key: "index".to_owned(),
+            reason: format!("{other}; run `kist rebuild-index`"),
+        },
+    }
+}
+
 /// 同上，上限由呼叫端給（測試用小上限釘行為；正式路徑恆為
 /// [`MAX_INDEX_PLAIN`]）。串流解到上限+1 為止，超過即 Corrupt。
 fn decode_index_blob_limited(payload: &[u8], limit: u64) -> Result<IndexBlob> {
@@ -465,18 +478,12 @@ impl Repository {
             return cache
                 .load(&live, |id| async move { self.read_index_blob(&id).await })
                 .await
-                .map_err(|e| CoreError::Corrupt {
-                    key: "index".to_owned(),
-                    reason: format!("{e}; run `kist rebuild-index`"),
-                });
+                .map_err(index_load_error);
         }
         let mut errors = Vec::new();
         let index = self.load_index_lenient(&mut errors).await?;
         if let Some(first) = errors.into_iter().next() {
-            return Err(CoreError::Corrupt {
-                key: "index".to_owned(),
-                reason: format!("{first}; run `kist rebuild-index`"),
-            });
+            return Err(index_load_error(first));
         }
         Ok(index)
     }
@@ -540,10 +547,7 @@ impl Repository {
         let mut errors = Vec::new();
         let blobs = self.load_index_blobs(&mut errors).await?;
         if let Some(first) = errors.into_iter().next() {
-            return Err(CoreError::Corrupt {
-                key: "index".to_owned(),
-                reason: format!("{first}; run `kist rebuild-index`"),
-            });
+            return Err(index_load_error(first));
         }
         let mut index = ChunkIndex::new();
         for (_, blob) in &blobs.effective {
