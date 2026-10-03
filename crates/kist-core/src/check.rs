@@ -191,6 +191,12 @@ impl Repository {
         Ok(report)
     }
 
+    /// 整包 pack 的 hash 在 blocking 執行緒算：BLAKE3 掃可達數十 MiB 的內容，
+    /// 屬 PLAN 點名的 CPU 密集工作，不該佔住 async worker。
+    async fn hash_matches(bytes: Arc<Vec<u8>>, expected: ObjectId) -> Result<bool> {
+        blocking(move || Ok(ObjectId::of(&bytes) == expected)).await
+    }
+
     /// 下載整個 pack：名稱 = hash(bytes)、trailer 解得開、trailer 與 index 一致、每個 chunk 解得開且 ID 相符。
     async fn check_pack_data(
         &self,
@@ -208,35 +214,62 @@ impl Repository {
                 return;
             }
         };
-        let bytes = match ObjectId::of(&bytes) == *id {
-            true => bytes,
-            false => {
-                if !repair {
-                    report
-                        .errors
-                        .push(format!("{key}: content hash does not match its name"));
-                    return;
-                }
-                // 修復的證明是重算 hash 等於 pack 的名字，所以結果永遠不會
-                // 「修錯」，只會修不成；修復成功就重抓重驗，失敗的原因與
-                // 「沒有 parity」由 repair_pack 回報。
-                if !self.repair_pack(id, &bytes, report).await {
-                    return;
-                }
-                report.repaired.push(key.clone());
-                // 這個 pack 先前記的錯誤（step 2 的大小不符等）是對損壞內容說的：
-                // 修好了就撤掉，report 才不會同時說「修好了」與「有錯」。
-                let prefix = format!("{key}:");
-                report.errors.retain(|e| !e.starts_with(&prefix));
-                // 修復後重抓重驗：驗不過要說出來，不能讓 report 看起來乾淨。
-                match self.backend().get(&key).await {
-                    Ok(b) if ObjectId::of(&b) == *id => b,
-                    _ => {
-                        report.errors.push(format!(
-                            "{key}: repaired pack does not re-verify; the repair did not stick"
-                        ));
-                        return;
+        // PLAN：hash 屬 CPU 密集——整包 pack 的 BLAKE3（可達數十 MiB）在
+        // blocking 執行緒算，不佔住 async worker（同一原則：下面的 trailer／
+        // chunk 解密驗證也在 blocking 裡）。
+        let bytes = Arc::new(bytes);
+        let hash_ok = match Self::hash_matches(Arc::clone(&bytes), *id).await {
+            Ok(ok) => ok,
+            Err(e) => {
+                report.errors.push(format!("{key}: {e}"));
+                return;
+            }
+        };
+        let bytes = if hash_ok {
+            bytes
+        } else {
+            if !repair {
+                report
+                    .errors
+                    .push(format!("{key}: content hash does not match its name"));
+                return;
+            }
+            // 修復的證明是重算 hash 等於 pack 的名字，所以結果永遠不會
+            // 「修錯」，只會修不成；修復成功就重抓重驗，失敗的原因與
+            // 「沒有 parity」由 repair_pack 回報。
+            if !self.repair_pack(id, &bytes, report).await {
+                return;
+            }
+            report.repaired.push(key.clone());
+            // 這個 pack 先前記的錯誤（step 2 的大小不符等）是對損壞內容說的：
+            // 修好了就撤掉，report 才不會同時說「修好了」與「有錯」。
+            let prefix = format!("{key}:");
+            report.errors.retain(|e| !e.starts_with(&prefix));
+            // 修復後重抓重驗：驗不過要說出來，不能讓 report 看起來乾淨。
+            match self.backend().get(&key).await {
+                Ok(b) => {
+                    let b = Arc::new(b);
+                    match Self::hash_matches(Arc::clone(&b), *id).await {
+                        Ok(true) => b,
+                        // hash 對不起來是「修復沒生效」；hash 工作本身失敗
+                        // （blocking 執行緒壞掉）是另一回事，照實回。
+                        Ok(false) => {
+                            report.errors.push(format!(
+                                "{key}: repaired pack does not re-verify; the repair did not stick"
+                            ));
+                            return;
+                        }
+                        Err(e) => {
+                            report.errors.push(format!("{key}: {e}"));
+                            return;
+                        }
                     }
+                }
+                Err(_) => {
+                    report.errors.push(format!(
+                        "{key}: repaired pack does not re-verify; the repair did not stick"
+                    ));
+                    return;
                 }
             }
         };
