@@ -988,6 +988,27 @@ fn read_capacity_hint(claimed: u64) -> usize {
     claimed.min(READ_CAPACITY_HINT) as usize
 }
 
+/// 單一**repo 物件**讀取量的硬上限：`take(宣稱量)` 只擋「送超過宣稱」，不擋
+/// 「宣稱超大再串流」——敵意伺服器謊報 2^62 一路餵 bytes，Vec 邊讀邊長到
+/// OOM，完整性檢查一行都還沒跑到。合法 repo 物件離這個上限很遠：index blob
+/// 明文上限 1 GiB（kist-core repo.rs）；pack 上限 4 GiB（parity=0 的
+/// MAX_PACK_TARGET_SIZE；開 parity 時 16×64 MiB = 1 GiB）。
+/// **來源模式（`list_all`）不吃這個上限**：來源是使用者自己配置的伺服器，
+/// 讀的是使用者的資料（8 GiB+ 的檔案要能備份），不適用敵意 repo 的威脅模型。
+const MAX_READ_LEN: u64 = 8 * 1024 * 1024 * 1024;
+
+/// 宣稱的讀取量超過 [`MAX_READ_LEN`] 就在**讀之前**拒絕。repo 模式才執行；
+/// 來源模式（`list_all`）永遠放行（見 [`MAX_READ_LEN`] 的說明）。
+fn check_claimed_len(list_all: bool, claimed: u64) -> std::io::Result<()> {
+    if !list_all && claimed > MAX_READ_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("server claims {claimed} bytes for one object (cap {MAX_READ_LEN})"),
+        ));
+    }
+    Ok(())
+}
+
 async fn walk(
     sftp: &Sftp,
     root: &str,
@@ -1201,7 +1222,11 @@ impl ObjectStore for SftpStore {
                 .await
                 .map_err(generic)?;
         }
-        // 預配只取容量提示；take(長度) 邊讀邊長——謊報大小不預配。
+        // 預配只取容量提示，讀取用 take(宣稱 size) 封頂：宣稱 size 不可信任
+        // （預配會被推進 alloc abort），真的多送也只收到宣稱量為止。宣稱量
+        // 本身先過硬上限——「宣稱超大再串流」take 擋不住（OOM 語義見
+        // check_claimed_len）。
+        check_claimed_len(inner.list_all, range.end - range.start).map_err(generic)?;
         let len = (range.end - range.start) as usize;
         let mut buf = Vec::with_capacity(read_capacity_hint(range.end - range.start));
         let mut limited = tf.as_mut().take(len as u64);
@@ -1229,8 +1254,9 @@ impl ObjectStore for SftpStore {
         location: &StorePath,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        // 一次讀全檔再切片：kist 的 range 讀（trailer、多段）都落在同一個物件上，
-        // 物件 ≤ 128 MiB；整讀換程式直白。
+        // 一次讀全檔再切片：kist 的 range 讀（trailer、多段）都落在同一個
+        // repo 物件上（pack 上限見 docs/format.md §7：parity=0 最多 4 GiB；
+        // 整讀換程式直白）。
         let inner = &*self.0;
         let full = inner.full(location);
         let meta = inner.meta_of(&full).await?;
@@ -1242,8 +1268,9 @@ impl ObjectStore for SftpStore {
         let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
         use tokio::io::AsyncReadExt as _;
         // 預配只取容量提示，讀取用 take(宣稱 size) 封頂：宣稱 size 不可信任
-        // （預配會被推進 alloc abort），真的多送也只收到宣稱量為止（敵意
-        // 伺服器不能靠無止盡的串流把 Vec 養到 OOM）。
+        // （預配會被推進 alloc abort），真的多送也只收到宣稱量為止；宣稱量
+        // 本身先過硬上限（「宣稱超大再串流」take 擋不住，見 check_claimed_len）。
+        check_claimed_len(inner.list_all, meta.size).map_err(generic)?;
         let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
         let mut limited = tf.as_mut().take(meta.size);
         limited.read_to_end(&mut buf).await.map_err(generic)?;
@@ -1417,7 +1444,9 @@ impl ObjectStore for SftpStore {
         let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
         use tokio::io::AsyncReadExt as _;
         // 與 get_ranges 同款：預配取提示、讀取用 take(宣稱 size) 封頂，
-        // 不給敵意伺服器「無止盡串流養大 Vec」的機會。
+        // 不給敵意伺服器「無止盡串流養大 Vec」的機會；宣稱量先過硬上限
+        // （見 check_claimed_len）。copy 只有 repo 端會用——無條件執行上限。
+        check_claimed_len(false, meta.size).map_err(generic)?;
         let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
         let mut limited = tf.as_mut().take(meta.size);
         limited.read_to_end(&mut buf).await.map_err(generic)?;
@@ -1526,6 +1555,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod hardening_tests {
     use super::*;
 
@@ -1540,6 +1570,22 @@ mod hardening_tests {
             READ_CAPACITY_HINT as usize
         );
         assert_eq!(read_capacity_hint(1 << 62), READ_CAPACITY_HINT as usize);
+    }
+
+    /// 宣稱大小超過單一物件的合理上限要直接拒讀：take(宣稱量) 只擋「送超過
+    /// 宣稱」，不擋「宣稱超大再串流」——敵意伺服器謊報 2^62 一路餵資料，
+    /// Vec 邊讀邊長到 OOM，任何完整性檢查都還沒跑到。
+    #[test]
+    fn claimed_size_beyond_the_object_cap_is_rejected_before_reading() {
+        // repo 模式：宣稱量過了硬上限就在讀之前拒絕
+        assert!(check_claimed_len(false, 0).is_ok());
+        assert!(check_claimed_len(false, 64 * 1024 * 1024).is_ok());
+        assert!(check_claimed_len(false, MAX_READ_LEN).is_ok());
+        let err = check_claimed_len(false, MAX_READ_LEN + 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(check_claimed_len(false, 1 << 62).is_err());
+        // 來源模式（list_all）：使用者的資料再大都要能備份，不設上限
+        assert!(check_claimed_len(true, 1 << 62).is_ok());
     }
 
     /// 深度上限只屬於 repo 命名空間；來源模式（list_all）列使用者資料，
