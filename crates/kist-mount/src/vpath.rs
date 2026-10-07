@@ -87,9 +87,8 @@ impl VirtualRoot {
                 parent.extend_from_slice(comp);
             }
             let leaf = match contents {
-                RootContents::Dir => root_leaf_entry(last, root.tree),
+                RootContents::Dir | RootContents::Flatten(_) => root_leaf_entry(last, root.tree),
                 RootContents::Leaf(e) => *e,
-                RootContents::Flatten(_) => root_leaf_entry(last, root.tree),
             };
             push_real(&mut levels, &parent, &leaf);
         }
@@ -179,9 +178,10 @@ fn has_name(level: &[VEntry], name: &[u8]) -> bool {
 /// 同一目標寫兩次。
 fn push_real(levels: &mut HashMap<Vec<u8>, Vec<VEntry>>, key: &[u8], e: &Entry) {
     let level = levels.entry(key.to_vec()).or_default();
+    let v = VEntry::Real(Arc::new(e.clone()));
     match level.iter().position(|v| v.name() == e.name) {
-        Some(i) => level[i] = VEntry::Real(Arc::new(e.clone())),
-        None => level.push(VEntry::Real(Arc::new(e.clone()))),
+        Some(i) => level[i] = v,
+        None => level.push(v),
     }
 }
 
@@ -348,5 +348,3 @@ mod tests {
         );
     }
 }
-
-// （附加在 tests mod 外會編譯失敗——放進 mod tests）
