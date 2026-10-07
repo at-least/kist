@@ -82,9 +82,8 @@ pub struct SftpConfig {
 ///   請用 `KIST_SFTP_PASSWORD`。
 /// - 支援 `[ipv6]` 形式的主機；不做 percent-decoding，路徑就是字面內容。
 pub fn parse_sftp_url(s: &str) -> Result<SftpConfig> {
-    let rest = match s.strip_prefix("sftp://") {
-        Some(rest) => rest,
-        None => return Err(BackendError::InvalidUrl(s.to_owned())),
+    let Some(rest) = s.strip_prefix("sftp://") else {
+        return Err(BackendError::InvalidUrl(s.to_owned()));
     };
     // `@` 只在 authority（第一個 `/` 之前）裡才算 userinfo：路徑是字面內容，
     // 裡面的 `@` 與帳號無關。
@@ -118,10 +117,7 @@ pub fn parse_sftp_url(s: &str) -> Result<SftpConfig> {
         };
         (v6, port, path)
     } else {
-        let (hp, path) = match hostport.split_once('/') {
-            Some((hp, path)) => (hp, path),
-            None => (hostport, ""),
-        };
+        let (hp, path) = hostport.split_once('/').unwrap_or((hostport, ""));
         match hp.split_once(':') {
             Some((h, p)) => (h, Some(p), path),
             None => (hp, None, path),
@@ -159,7 +155,8 @@ pub struct SftpAuth {
 
 /// 從環境變數讀認證素材：`KIST_SFTP_KNOWN_HOSTS` / `KIST_SFTP_KEY` /
 /// `KIST_SFTP_KEY_PASSPHRASE` / `KIST_SFTP_PASSWORD`。
-/// 只給 [`crate::Backend::from_url`] 用；其他管道請直接構造 [`SftpAuth`]。
+/// 給 [`crate::Backend::from_url`] 與 sftp 來源（[`crate::source`]）用；其他管道
+/// 請直接構造 [`SftpAuth`]。
 pub fn auth_from_env() -> SftpAuth {
     let known_hosts = std::env::var("KIST_SFTP_KNOWN_HOSTS")
         .ok()
@@ -207,15 +204,11 @@ pub struct RcloneConfig {
 /// **語意比 `sftp://` 寬鬆**（理由與風險分析見模組說明與 ADR 014）：選這個 scheme
 /// 就是同意這份妥協。
 pub fn parse_rclone_url(s: &str) -> Result<RcloneConfig> {
-    let rest = match s.strip_prefix("rclone://") {
-        Some(rest) => rest,
-        None => return Err(BackendError::InvalidUrl(s.to_owned())),
+    let Some(rest) = s.strip_prefix("rclone://") else {
+        return Err(BackendError::InvalidUrl(s.to_owned()));
     };
     // remote 名字切在第一個 '/'；rclone 的 remote 名不含 '/'（設定檔的 section 名）。
-    let (remote, path) = match rest.split_once('/') {
-        Some((r, p)) => (r, p),
-        None => (rest, ""),
-    };
+    let (remote, path) = rest.split_once('/').unwrap_or((rest, ""));
     // remote 用**白名單**驗證。安全理由：remote 與 path 會合成**一個** argv 元素餵
     // 給 rclone，而 rclone 的旗標解析穿插在位置參數之間——`--password-command=…`
     // 這種「remote」會被解析成 rclone 的旗標，加密設定檔下該旗標的值會被 shell 執行
@@ -295,7 +288,7 @@ impl client::Handler for HostKeyCheck {
 }
 
 /// 連線：TCP + 握手（host key 驗證）+ 認證 + SFTP subsystem + 伺服器能力檢查。
-async fn connect(cfg: &SftpConfig, auth: &SftpAuth) -> Result<(Keepalive, Arc<Sftp>, bool)> {
+async fn connect(cfg: &SftpConfig, auth: &SftpAuth) -> Result<(Keepalive, Arc<Sftp>)> {
     let user = match &cfg.user {
         Some(u) => u.clone(),
         None => current_user()?,
@@ -384,8 +377,7 @@ async fn connect(cfg: &SftpConfig, auth: &SftpAuth) -> Result<(Keepalive, Arc<Sf
                 .to_owned(),
         ));
     }
-    let fsync = sftp.support_fsync();
-    Ok((Keepalive::Ssh { _handle: handle }, Arc::new(sftp), fsync))
+    Ok((Keepalive::Ssh { _handle: handle }, Arc::new(sftp)))
 }
 
 /// 讓連線活著的所有權：SSH 模式是 russh 的連線把手（drop 即斷線）；rclone 模式
@@ -427,7 +419,7 @@ impl StderrTail {
                         let mut buf = inner.lock().unwrap_or_else(|e| e.into_inner());
                         buf.extend_from_slice(&chunk[..n]);
                         let excess = buf.len().saturating_sub(4096);
-                        drain_front(&mut buf, excess);
+                        buf.drain(..excess);
                     }
                 }
             }
@@ -444,15 +436,9 @@ impl StderrTail {
     }
 }
 
-/// `Vec::drain(..n)` 的借用分離寫法（在還持有 lock 的當下整理緩衝）。
-fn drain_front(buf: &mut Vec<u8>, n: usize) {
-    let rest = buf.split_off(n);
-    *buf = rest;
-}
-
 /// spawn `rclone serve sftp --stdio <source>` 並完成 SFTP 版本交換。
-/// 回傳（子程序、sftp、是否支援 fsync、stderr 尾巴）。
-async fn connect_stdio(cfg: &RcloneConfig) -> Result<(Child, Arc<Sftp>, bool, StderrTail)> {
+/// 回傳（子程序、sftp、stderr 尾巴）。
+async fn connect_stdio(cfg: &RcloneConfig) -> Result<(Child, Arc<Sftp>, StderrTail)> {
     let bin = std::env::var("KIST_RCLONE_BIN").unwrap_or_else(|_| "rclone".to_owned());
     // remote 留空 = 本機目錄，直接給絕對路徑；否則 rclone 的 `remote:path` 寫法。
     let source = if cfg.remote.is_empty() {
@@ -546,8 +532,7 @@ async fn connect_stdio(cfg: &RcloneConfig) -> Result<(Child, Arc<Sftp>, bool, St
                 .to_owned(),
         ));
     }
-    let fsync = sftp.support_fsync();
-    Ok((child, Arc::new(sftp), fsync, tail))
+    Ok((child, Arc::new(sftp), tail))
 }
 
 async fn authenticate(
@@ -698,11 +683,12 @@ struct SftpInner {
     relaxed: bool,
     /// O_EXCL 建檔被伺服器拒絕時只警告一次。
     warned_no_o_excl: AtomicBool,
-    /// rclone 的 stderr 尾巴（stdio 模式才有；錯誤訊息附帶 rclone 說了什麼）。
-    stderr_tail: Option<StderrTail>,
-    /// **欄位順序即 drop 順序**：先 drop sftp（關 stdin 讓 rclone 收尾），連線
-    /// 把手／子程序最後才 drop（斷線／kill）。
-    keepalive: Keepalive,
+    /// rclone 的 stderr 尾巴（stdio 模式才有；握手失敗時 connect_stdio 自己讀它
+    /// 附進錯誤訊息）。存在這裡只為持有（`_` 開頭：沒有程式讀它，留著是要它跟 SftpInner 一起 drop）。
+    _stderr_tail: Option<StderrTail>,
+    /// **欄位順序即 drop 順序**（Rust 依宣告順序 drop 欄位，不要調換）：先 drop
+    /// sftp（關 stdin 讓 rclone 收尾），連線把手／子程序最後才 drop（斷線／kill）。
+    _keepalive: Keepalive,
     root: String,
     display: String,
     /// 來源模式：列出**使用者的資料**，不做 dot-skip（repo 命名空間的
@@ -711,20 +697,63 @@ struct SftpInner {
     list_all: bool,
 }
 
-impl Drop for SftpInner {
-    fn drop(&mut self) {
-        // 欄位宣告順序已保證 sftp 先 drop（關掉 stdin，rclone 有機會自己收尾），
-        // keepalive（ssh 把手＝斷線、子程序＝kill_on_drop）與 stderr 的背景任務
-        // 最後收。這裡讀取只是把這個所有權契約寫成程式碼。
-        let _ = &self.sftp;
-        let _ = &self.stderr_tail;
-        let _ = &self.keepalive;
-    }
-}
-
 impl SftpInner {
     fn full(&self, location: &StorePath) -> String {
         format!("{}/{}", self.root, location)
+    }
+
+    /// list 的 prefix → 遠端絕對目錄。rclone 模式的 root 是空字串（served root
+    /// 即 SFTP 根）；SFTP 路徑要絕對，空的就是 `/`。
+    fn list_dir(&self, prefix: Option<&StorePath>) -> String {
+        let dir = match prefix {
+            Some(p) => format!("{}/{}", self.root, p),
+            None => self.root.clone(),
+        };
+        if dir.is_empty() {
+            "/".to_owned()
+        } else {
+            dir
+        }
+    }
+
+    /// 讀 `full` 從 `start` 起的 `len` bytes 進記憶體（get_opts／get_ranges／
+    /// copy_opts 共用）。預配只取容量提示，讀取用 take(宣稱量) 封頂：宣稱
+    /// size 不可信任（預配會被推進 alloc abort），真的多送也只收到宣稱量為止。
+    /// 宣稱量本身先過硬上限——「宣稱超大再串流」take 擋不住（OOM 語義見
+    /// check_claimed_len）；`list_all` 決定上限是否執行。少送就回 UnexpectedEof。
+    async fn read_whole(
+        &self,
+        location: &StorePath,
+        full: &str,
+        start: u64,
+        len: u64,
+        list_all: bool,
+    ) -> std::result::Result<Vec<u8>, StoreError> {
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        let fh = self
+            .sftp
+            .open(full)
+            .await
+            .map_err(|e| self.store_error(location, e))?;
+        let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
+        if start > 0 {
+            tf.as_mut()
+                .seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(generic)?;
+        }
+        check_claimed_len(list_all, len).map_err(generic)?;
+        let mut buf = Vec::with_capacity(read_capacity_hint(len));
+        let mut limited = tf.as_mut().take(len);
+        limited.read_to_end(&mut buf).await.map_err(generic)?;
+        drop(limited);
+        if buf.len() as u64 != len {
+            return Err(generic(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{full}: server closed after {} of {len} bytes", buf.len()),
+            )));
+        }
+        Ok(buf)
     }
 
     /// 一層一層建（SFTP 沒有 mkdir -p）；已存在視為成功。
@@ -854,15 +883,27 @@ pub(crate) struct SftpStore(Arc<SftpInner>);
 
 impl SftpStore {
     pub async fn open(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
-        let (keepalive, sftp, fsync) = connect(cfg, auth).await?;
+        Self::open_ssh(cfg, auth, false).await
+    }
+
+    /// 以**來源**身分開 sftp store：listing 不做 dot-skip（見
+    /// [`SftpInner::list_all`]）。連線參數與 [`SftpStore::open`] 相同。
+    pub async fn open_source(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
+        Self::open_ssh(cfg, auth, true).await
+    }
+
+    /// `open` 與 `open_source` 的共同本體：只差 `list_all`。
+    async fn open_ssh(cfg: &SftpConfig, auth: &SftpAuth, list_all: bool) -> Result<Self> {
+        let (keepalive, sftp) = connect(cfg, auth).await?;
+        let fsync = sftp.support_fsync();
         let root = format!("/{}", cfg.path.trim_matches('/'));
         let inner = Arc::new(SftpInner {
             sftp,
             fsync,
             relaxed: false,
             warned_no_o_excl: AtomicBool::new(false),
-            stderr_tail: None,
-            keepalive,
+            _stderr_tail: None,
+            _keepalive: keepalive,
             root: root.clone(),
             display: format!(
                 "sftp://{}@{}:{}/{}",
@@ -871,7 +912,7 @@ impl SftpStore {
                 cfg.port,
                 root
             ),
-            list_all: false,
+            list_all,
         });
         inner.ensure_dir(&root).await?;
         Ok(Self(inner))
@@ -881,7 +922,8 @@ impl SftpStore {
     /// source，所以 SFTP 路徑的 root 是 `/`；repo 的目錄結構由 `ensure_dir` 在
     /// 各自的寫入路徑上按需建立。
     pub async fn open_rclone(cfg: &RcloneConfig) -> Result<Self> {
-        let (child, sftp, fsync, tail) = connect_stdio(cfg).await?;
+        let (child, sftp, tail) = connect_stdio(cfg).await?;
+        let fsync = sftp.support_fsync();
         let display = if cfg.remote.is_empty() {
             format!("rclone:///{}", cfg.path)
         } else {
@@ -892,40 +934,14 @@ impl SftpStore {
             fsync,
             relaxed: true,
             warned_no_o_excl: AtomicBool::new(false),
-            stderr_tail: Some(tail),
-            keepalive: Keepalive::Stdio {
+            _stderr_tail: Some(tail),
+            _keepalive: Keepalive::Stdio {
                 _child: Box::new(child),
             },
             root: String::new(),
             display,
             list_all: false,
         });
-        Ok(Self(inner))
-    }
-
-    /// 以**來源**身分開 sftp store：listing 不做 dot-skip（見
-    /// [`SftpInner::list_all`]）。連線參數與 [`SftpStore::open`] 相同。
-    pub async fn open_source(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
-        let (keepalive, sftp, fsync) = connect(cfg, auth).await?;
-        let root = format!("/{}", cfg.path.trim_matches('/'));
-        let inner = Arc::new(SftpInner {
-            sftp,
-            fsync,
-            relaxed: false,
-            warned_no_o_excl: AtomicBool::new(false),
-            stderr_tail: None,
-            keepalive,
-            list_all: true,
-            root: root.clone(),
-            display: format!(
-                "sftp://{}@{}:{}/{}",
-                cfg.user.clone().unwrap_or_default(),
-                cfg.host,
-                cfg.port,
-                root
-            ),
-        });
-        inner.ensure_dir(&root).await?;
         Ok(Self(inner))
     }
 }
@@ -952,11 +968,6 @@ fn bytes_of(payload: &PutPayload) -> Vec<u8> {
     out
 }
 
-/// `list` 的遞迴走訪（自由函式：要放進 `'static` 的 stream，抓 `Arc<Sftp>` 就好）。
-/// 跳過 `.` 開頭的暫存殘骸。SFTP 一次列一個目錄；kist 的樹是淺的
-/// （packs/、indexes/、snapshots/<client>/…）。
-/// `root` 不帶尾斜線；回傳的 ObjectMeta.location 是**相對於 root** 的 key
-/// （object_store 的語意），不是遠端絕對路徑。
 /// listing 的 dot-skip 只屬於 **repo 命名空間**：kist 自己的 `.tmp-<hex>`
 /// 暫存檔不能進 repo 的物件列表（index 重建／GC 會把它們當真）。來源模式
 /// （`list_all`）列的是**使用者的資料**——`.bashrc` 是內容不是雜訊，本地
@@ -1013,6 +1024,20 @@ fn check_claimed_len(list_all: bool, claimed: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 遠端絕對路徑 → 相對於 `root` 的 key（object_store 的語意）；不在 root 底下
+/// 就原樣回傳。
+fn key_under_root(root: &str, full: &str) -> String {
+    full.strip_prefix(root)
+        .and_then(|r| r.strip_prefix('/'))
+        .map(|r| r.to_owned())
+        .unwrap_or_else(|| full.to_owned())
+}
+
+/// `list` 的走訪（自由函式：要放進 `'static` 的 stream，抓 `Arc<Sftp>` 就好）。
+/// 跳過 `.` 開頭的暫存殘骸。SFTP 一次列一個目錄；kist 的樹是淺的
+/// （packs/、indexes/、snapshots/<client>/…）。
+/// `root` 不帶尾斜線；回傳的 ObjectMeta.location 是**相對於 root** 的 key
+/// （object_store 的語意），不是遠端絕對路徑。
 async fn walk(
     sftp: &Sftp,
     root: &str,
@@ -1020,10 +1045,9 @@ async fn walk(
     list_all: bool,
     out: &mut Vec<ObjectMeta>,
 ) -> std::result::Result<(), StoreError> {
-    // 迭代 DFS（明確堆疊取代 Box::pin 遞迴）：敵意伺服器可以捏造任意深
-    // 的目錄鏈，遞迴會把原生堆疊吃成 abort。每個目錄的檔案先全數列出、
-    // 子目錄排在後面（原遞迴是撞到子目錄就先下去——輸出順序因此不同，
-    // 但本來就未排序）；Backend::list 的合約是不保證順序，呼叫端各自排。
+    // 迭代 DFS（明確堆疊，不遞迴）：敵意伺服器可以捏造任意深的目錄鏈，
+    // 遞迴會把原生堆疊吃成 abort。每個目錄的檔案先全數列出、子目錄排在
+    // 後面；Backend::list 的合約是不保證順序，呼叫端各自排。
     let mut stack: Vec<(String, usize)> = vec![(dir.to_owned(), 0)];
     while let Some((dir, depth)) = stack.pop() {
         let mut fs = sftp.fs();
@@ -1047,7 +1071,7 @@ async fn walk(
                 continue;
             }
             let full = format!("{dir}/{name}");
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if is_dir(&entry.metadata()) {
                 let child_depth = depth + 1;
                 if too_deep(list_all, child_depth) {
                     return Err(StoreError::Generic {
@@ -1061,12 +1085,7 @@ async fn walk(
                 subdirs.push((full, child_depth));
                 continue;
             }
-            let key = full
-                .strip_prefix(root)
-                .and_then(|r| r.strip_prefix('/'))
-                .map(|r| r.to_owned())
-                .unwrap_or_else(|| full.clone());
-            match to_meta(&key, &entry.metadata()) {
+            match to_meta(&key_under_root(root, &full), &entry.metadata()) {
                 Ok(m) => out.push(m),
                 // 伺服器給了 object_store 命名規則外的名稱：略過該條目，不讓整個 list 失敗
                 Err(MetaError::BadName(_)) => {}
@@ -1102,22 +1121,17 @@ impl ObjectStore for SftpStore {
                     });
                 }
                 let scratch = inner.spool(dir_of(&full), &bytes).await?;
+                let mut fs = inner.sftp.fs();
                 let published = if inner.relaxed {
                     // rclone 橋接：hardlink 在 rclone 上不會動（宣稱支援、執行回
                     // OpUnsupported），退化成 posix-rename publish。race 視窗（兩個
                     // 寫入者同時通過上面的 stat）與緩解見模組說明與 ADR 014。
-                    let mut fs = inner.sftp.fs();
-                    let renamed = fs.rename(&scratch, &full).await;
-                    drop(fs);
-                    inner.remove_quiet(&scratch).await;
-                    renamed.map(|_| ())
+                    fs.rename(&scratch, &full).await
                 } else {
-                    let mut fs = inner.sftp.fs();
-                    let linked = fs.hard_link(&scratch, &full).await;
-                    drop(fs);
-                    inner.remove_quiet(&scratch).await;
-                    linked
+                    fs.hard_link(&scratch, &full).await
                 };
+                drop(fs);
+                inner.remove_quiet(&scratch).await;
                 match published {
                     Ok(()) => Ok(PutResult {
                         e_tag: None,
@@ -1213,35 +1227,15 @@ impl ObjectStore for SftpStore {
                 extensions: Default::default(),
             });
         }
-        let fh = inner
-            .sftp
-            .open(&full)
-            .await
-            .map_err(|e| inner.store_error(location, e))?;
-        let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
-        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
-        if range.start > 0 {
-            tf.as_mut()
-                .seek(std::io::SeekFrom::Start(range.start))
-                .await
-                .map_err(generic)?;
-        }
-        // 預配只取容量提示，讀取用 take(宣稱 size) 封頂：宣稱 size 不可信任
-        // （預配會被推進 alloc abort），真的多送也只收到宣稱量為止。宣稱量
-        // 本身先過硬上限——「宣稱超大再串流」take 擋不住（OOM 語義見
-        // check_claimed_len）。
-        check_claimed_len(inner.list_all, range.end - range.start).map_err(generic)?;
-        let len = (range.end - range.start) as usize;
-        let mut buf = Vec::with_capacity(read_capacity_hint(range.end - range.start));
-        let mut limited = tf.as_mut().take(len as u64);
-        limited.read_to_end(&mut buf).await.map_err(generic)?;
-        if buf.len() != len {
-            return Err(generic(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("{full}: server closed after {} of {len} bytes", buf.len()),
-            )));
-        }
-        drop(limited);
+        let buf = inner
+            .read_whole(
+                location,
+                &full,
+                range.start,
+                range.end - range.start,
+                inner.list_all,
+            )
+            .await?;
         Ok(GetResult {
             payload: GetResultPayload::Stream(
                 futures::stream::once(async move { Ok(Bytes::from(buf)) }).boxed(),
@@ -1264,31 +1258,9 @@ impl ObjectStore for SftpStore {
         let inner = &*self.0;
         let full = inner.full(location);
         let meta = inner.meta_of(&full).await?;
-        let fh = inner
-            .sftp
-            .open(&full)
-            .await
-            .map_err(|e| inner.store_error(location, e))?;
-        let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
-        use tokio::io::AsyncReadExt as _;
-        // 預配只取容量提示，讀取用 take(宣稱 size) 封頂：宣稱 size 不可信任
-        // （預配會被推進 alloc abort），真的多送也只收到宣稱量為止；宣稱量
-        // 本身先過硬上限（「宣稱超大再串流」take 擋不住，見 check_claimed_len）。
-        check_claimed_len(inner.list_all, meta.size).map_err(generic)?;
-        let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
-        let mut limited = tf.as_mut().take(meta.size);
-        limited.read_to_end(&mut buf).await.map_err(generic)?;
-        drop(limited);
-        if buf.len() != meta.size as usize {
-            return Err(generic(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "{full}: server closed after {} of {} bytes",
-                    buf.len(),
-                    meta.size
-                ),
-            )));
-        }
+        let buf = inner
+            .read_whole(location, &full, 0, meta.size, inner.list_all)
+            .await?;
         // 切片前用**實際讀到的長度**做邊界檢查：index 壞掉或 pack 被截斷時回乾淨的
         // 錯誤，而不是切片 panic。
         for r in ranges {
@@ -1319,23 +1291,16 @@ impl ObjectStore for SftpStore {
                     let full = inner.full(&loc);
                     let mut fs = inner.sftp.fs();
                     match fs.remove_file(&full).await {
-                        Ok(()) => Ok(Some(loc)),
+                        Ok(()) => Ok(loc),
                         // 刪不存在的物件視為已刪（與 S3 一致）。**要回報該路徑**：
                         // object_store 的單鍵 delete 包裝要求 delete_stream 對一個
                         // location 剛好 yield 一次，靜默跳過會讓它變成錯誤。
-                        Err(e) if is_not_found(&e) => Ok(Some(loc)),
+                        Err(e) if is_not_found(&e) => Ok(loc),
                         Err(e) => Err(generic(e)),
                     }
                 }
             })
             .buffered(10)
-            .filter_map(|r| async move {
-                match r {
-                    Ok(Some(path)) => Some(Ok(path)),
-                    Ok(None) => None,
-                    Err(e) => Some(Err(e)),
-                }
-            })
             .boxed()
     }
 
@@ -1344,12 +1309,7 @@ impl ObjectStore for SftpStore {
         prefix: Option<&StorePath>,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let sftp = self.0.sftp.clone();
-        let dir = match prefix {
-            Some(p) => format!("{}/{}", self.0.root, p),
-            None => self.0.root.clone(),
-        };
-        // rclone 模式的 root 是空字串（served root 即 SFTP 根）；SFTP 路徑要絕對。
-        let dir = if dir.is_empty() { "/".to_owned() } else { dir };
+        let dir = self.0.list_dir(prefix);
         let root = self.0.root.clone();
         let list_all = self.0.list_all;
         let task = async move {
@@ -1371,12 +1331,8 @@ impl ObjectStore for SftpStore {
         prefix: Option<&StorePath>,
     ) -> object_store::Result<ListResult> {
         // key 一樣回相對 root 的形式（跟 list 一致）。
-        let root = self.0.root.clone();
-        let dir = match prefix {
-            Some(p) => format!("{}/{}", root, p),
-            None => root.clone(),
-        };
-        let dir = if dir.is_empty() { "/".to_owned() } else { dir };
+        let root = &self.0.root;
+        let dir = self.0.list_dir(prefix);
         let mut fs = self.0.sftp.fs();
         let d = match fs.open_dir(&dir).await {
             Ok(d) => d,
@@ -1390,12 +1346,6 @@ impl ObjectStore for SftpStore {
             Err(e) => return Err(generic(e)),
         };
         drop(fs);
-        let rel = |full: &str| {
-            full.strip_prefix(&root)
-                .and_then(|r| r.strip_prefix('/'))
-                .map(|r| r.to_owned())
-                .unwrap_or_else(|| full.to_owned())
-        };
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
         let list_all = self.0.list_all;
@@ -1407,14 +1357,14 @@ impl ObjectStore for SftpStore {
                 continue;
             }
             let full = format!("{dir}/{name}");
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                match StorePath::parse(rel(&full)) {
+            if is_dir(&entry.metadata()) {
+                match StorePath::parse(key_under_root(root, &full)) {
                     Ok(p) => common_prefixes.push(p),
                     // 伺服器給了 object_store 命名規則外的名稱：略過，不讓整個 list 失敗
                     Err(_) => continue,
                 }
             } else {
-                match to_meta(&rel(&full), &entry.metadata()) {
+                match to_meta(&key_under_root(root, &full), &entry.metadata()) {
                     Ok(m) => objects.push(m),
                     // 同 walk：命名規則外的名稱略過；缺 mtime 讓 list 失敗
                     Err(MetaError::BadName(_)) => {}
@@ -1440,31 +1390,8 @@ impl ObjectStore for SftpStore {
         let src = inner.full(from);
         let dst = inner.full(to);
         let meta = inner.meta_of(&src).await?;
-        let fh = inner
-            .sftp
-            .open(&src)
-            .await
-            .map_err(|e| inner.store_error(from, e))?;
-        let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
-        use tokio::io::AsyncReadExt as _;
-        // 與 get_ranges 同款：預配取提示、讀取用 take(宣稱 size) 封頂，
-        // 不給敵意伺服器「無止盡串流養大 Vec」的機會；宣稱量先過硬上限
-        // （見 check_claimed_len）。copy 只有 repo 端會用——無條件執行上限。
-        check_claimed_len(false, meta.size).map_err(generic)?;
-        let mut buf = Vec::with_capacity(read_capacity_hint(meta.size));
-        let mut limited = tf.as_mut().take(meta.size);
-        limited.read_to_end(&mut buf).await.map_err(generic)?;
-        drop(limited);
-        if buf.len() != meta.size as usize {
-            return Err(generic(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "{src}: server closed after {} of {} bytes",
-                    buf.len(),
-                    meta.size
-                ),
-            )));
-        }
+        // copy 只有 repo 端會用——無條件執行讀取上限（list_all = false）。
+        let buf = inner.read_whole(from, &src, 0, meta.size, false).await?;
         let scratch = inner.spool(dir_of(&dst), &buf).await?;
         let mut fs = inner.sftp.fs();
         let renamed = fs.rename(&scratch, &dst).await;

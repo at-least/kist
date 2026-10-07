@@ -28,7 +28,7 @@ pub enum SourceItemKind {
     /// 本地來源會另帶完整 POSIX metadata（由走訪端處理條目時 lstat 取得）。
     File {
         size: u64,
-        /// 秒精度（遠端來源只有秒；本地是奈秒）。
+        /// 奈秒單位；精度依來源（SFTP 秒、S3 清單毫秒、本機奈秒）。
         mtime_ns: i64,
         /// 來源計算的內容指紋（S3 ETag 等）。
         etag: Option<Vec<u8>>,
@@ -46,7 +46,7 @@ pub enum SourceItemKind {
 /// 刻意**不**攜帶完整 metadata：list 會把整個目錄（可能 100 萬條目）常駐
 /// 記憶體（排序所需），每條目多幾十 bytes 就是上百 MiB（大 repo 記憶體
 /// 門檻的回歸教訓）。本地來源的 ctime/inode/mode 等由走訪端在處理該
-/// 條目時對路徑再 lstat 一次取得——每檔一次系統呼叫，與 v2 相同。
+/// 條目時對路徑再 lstat 一次取得——每檔一次系統呼叫。
 /// 已知極小視窗：條目的 kind 在 yield 時判定，走訪端第二次 lstat 之間
 /// 檔案被換成別種型別的話，會以「當下的 metadata + 讀到的內容」收尾
 /// （content 已驗 size 與 chunk；racy 變更由下一次備份的 ctime guard
@@ -98,7 +98,7 @@ impl LocalSource {
     pub fn new(root: std::path::PathBuf) -> Result<Self> {
         let abs = std::fs::canonicalize(&root)
             .map_err(|e| BackendError::Source(format!("{}: {e}", root.display())))?;
-        let locator = crate::fsmeta::path_to_bytes(&abs).map_err(|_| {
+        let locator = crate::fsmeta::path_to_bytes(&abs).ok_or_else(|| {
             BackendError::Source(format!("{}: unrepresentable path", abs.display()))
         })?;
         Ok(Self { root: abs, locator })
@@ -172,20 +172,19 @@ impl SortedItems for LocalListing {
             };
             let ft = meta.file_type();
             let kind = if ft.is_symlink() {
-                match std::fs::read_link(&path) {
-                    Ok(target) => match crate::fsmeta::path_to_bytes(&target) {
-                        Ok(t) => SourceItemKind::Symlink { target: t },
-                        Err(_) => {
-                            continue; // 無法表示的連結目標：略過
-                        }
-                    },
+                let target = match std::fs::read_link(&path) {
+                    Ok(t) => t,
                     Err(e) => {
                         return Some(Err(BackendError::Source(format!(
                             "{}: {e}",
                             path.display()
                         ))))
                     }
-                }
+                };
+                let Some(t) = crate::fsmeta::path_to_bytes(&target) else {
+                    continue; // 無法表示的連結目標：略過
+                };
+                SourceItemKind::Symlink { target: t }
             } else if ft.is_dir() {
                 SourceItemKind::Dir
             } else {
@@ -223,14 +222,13 @@ impl ObjectStoreSource {
     pub async fn open(spec: &str) -> Result<Self> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             BackendError::Source(format!(
-                "{}: {}",
-                spec.to_owned(),
-                "object-store source requires a tokio runtime context".to_owned()
+                "{spec}: object-store source requires a tokio runtime context"
             ))
         })?;
-        let (store, root, locator, meta_kind) = if spec.starts_with("sftp://") {
+        let locator = spec.as_bytes().to_vec();
+        let (store, root, meta_kind) = if spec.starts_with("sftp://") {
             let cfg = sftp::parse_sftp_url(spec)
-                .map_err(|e| BackendError::Source(format!("{}: {e}", spec.to_owned())))?;
+                .map_err(|e| BackendError::Source(format!("{spec}: {e}")))?;
             // 來源模式：listing 不做 dot-skip——列的是使用者的資料，
             // 不是 repo 命名空間（`.bashrc` 是內容，本地/s3 來源也列）。
             let store = sftp::SftpStore::open_source(&cfg, &sftp::auth_from_env()).await?;
@@ -240,27 +238,19 @@ impl ObjectStoreSource {
             (
                 Arc::new(store) as Arc<dyn ObjectStore>,
                 root,
-                spec.as_bytes().to_vec(),
                 kist_format::tree::meta_kind::SFTP,
             )
         } else if let Some(rest) = spec.strip_prefix("s3://") {
-            let (bucket, prefix) = match rest.split_once('/') {
-                Some((b, p)) => (b.to_owned(), p.to_owned()),
-                None => (rest.to_owned(), String::new()),
-            };
-            let store = s3_store_for_prefix(&bucket, &prefix)?;
-            let root = s3_source_root(spec, &prefix)?;
-            (
-                store,
-                root,
-                spec.as_bytes().to_vec(),
-                kist_format::tree::meta_kind::S3,
-            )
+            let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+            // 來源端用**裸 bucket**（不掛 PrefixStore；憑證走環境變數）：前綴由
+            // self.root 負責拼接（to_store_path 會 join root+rel）。若再包
+            // PrefixStore 會雙重前綴（實機 E2E 抓到：讀檔變成 prefix/prefix/key）。
+            let store = crate::s3_store(bucket, "", None)?;
+            let root = s3_source_root(spec, prefix)?;
+            (store, root, kist_format::tree::meta_kind::S3)
         } else {
             return Err(BackendError::Source(format!(
-                "{}: {}",
-                spec.to_owned(),
-                "unsupported source scheme (want sftp:// or s3://)".to_owned()
+                "{spec}: unsupported source scheme (want sftp:// or s3://)"
             )));
         };
         Ok(Self {
@@ -299,7 +289,6 @@ impl ObjectStoreSource {
         // HEAD 完整前綴路徑——目錄來源 404（→ None，正常走清單）；檔案來源
         // 200（→ 單一 File 條目，走檔案來源分支）。
         let path = self.to_store_path(b"")?;
-        let path_for_err = path.to_string();
         let store = Arc::clone(&self.store);
         let head_path = path.clone();
         let meta = match self
@@ -308,7 +297,7 @@ impl ObjectStoreSource {
         {
             Ok(m) => m,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(BackendError::Source(format!("{}: {e}", path_for_err))),
+            Err(e) => return Err(BackendError::Source(format!("{path}: {e}"))),
         };
         let name = path
             .to_string()
@@ -332,16 +321,6 @@ impl ObjectStoreSource {
             },
         }))
     }
-}
-
-/// S3 store（bucket + 可選 prefix）；與 `Backend::s3_with` 同一構造。
-/// 來源端的憑證走環境變數（與 repo 端的預設一致）。
-fn s3_store_for_prefix(bucket: &str, prefix: &str) -> Result<Arc<dyn ObjectStore>> {
-    // 來源端用**裸 bucket**（不掛 PrefixStore）：前綴由 self.root 負責拼接
-    // （to_store_path 會 join root+rel）。若再包 PrefixStore 會雙重前綴
-    // （實機 E2E 抓到：讀檔變成 prefix/prefix/key）。
-    let _ = prefix;
-    crate::s3_store(bucket, "", None)
 }
 
 /// `s3://bucket/<prefix>` 的 prefix → 來源的 root。與 to_store_path 同理：
@@ -384,7 +363,7 @@ impl Source for ObjectStoreSource {
             store
                 .list_with_delimiter(Some(&prefix))
                 .await
-                .map_err(|e| BackendError::Source(format!("{}: {e}", prefix)))
+                .map_err(|e| BackendError::Source(format!("{prefix}: {e}")))
         })?;
         let mut out = Vec::new();
         // 子目錄（common prefix）。
@@ -446,14 +425,8 @@ impl Source for ObjectStoreSource {
             use futures::StreamExt;
             let mut stream = std::pin::pin!(get.into_stream());
             while let Some(chunk) = stream.next().await {
-                let ok = match chunk {
-                    Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
-                    Err(e) => tx
-                        .send(Err(std::io::Error::other(e.to_string())))
-                        .await
-                        .is_ok(),
-                };
-                if !ok {
+                let msg = chunk.map_err(|e| std::io::Error::other(e.to_string()));
+                if tx.send(msg).await.is_err() {
                     return; // 讀端已放棄
                 }
             }
