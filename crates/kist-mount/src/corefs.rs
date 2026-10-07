@@ -428,12 +428,11 @@ impl FsCore {
                 // （檔案來源顯示成目錄、`/` 攤平顯示成空的）。
                 let mut degraded = false;
                 for root in &info.roots {
-                    let comps: Vec<&[u8]> = root
-                        .path
-                        .as_slice()
-                        .split(|&b| b == b'/')
-                        .filter(|c| !c.is_empty() && *c != b".")
-                        .collect();
+                    // 與 VirtualRoot::build 同一套切段（去 scheme 等）：兩邊不一致時
+                    // 只有 scheme 的定位（`s3://`）會在這裡判成 Dir、在那裡沒有組件，
+                    // 整個 root 就從頂層消失。敵意 locator（NUL）拒成 InvalidInput。
+                    let comps = crate::vpath::locator_components(root.path.as_slice())
+                        .map_err(|_| FsError::InvalidInput)?;
                     let contents = match self.repo.read_tree_chain(&root.tree).await {
                         Err(_) => {
                             degraded = true;

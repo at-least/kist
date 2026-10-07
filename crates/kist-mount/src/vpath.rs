@@ -51,7 +51,7 @@ pub enum RootContents {
     /// 檔案/symlink 來源：root tree 恰好一個非目錄 entry、名稱 = 定位末段
     /// ——葉子是那個 entry 本身（與 restore 的落點一致）。
     Leaf(Box<Entry>),
-    /// 定位沒有組件（`/`、`s3://bucket/`）：root tree 的內容**攤平到頂層**
+    /// 定位沒有組件（`/`、只有 scheme 的 `s3://`）：root tree 的內容**攤平到頂層**
     /// （與 restore 的「空相對路徑 = 直接落在 target」一致）。
     Flatten(Vec<Entry>),
 }
@@ -117,7 +117,7 @@ impl VirtualRoot {
 
 /// root 定位 → 組件（與 fsmeta::locator_to_relative 同一套規則：
 /// 去 scheme、`/` 切段、空與 `.` 組件正規化掉）。
-fn locator_components(path: &[u8]) -> Result<Vec<&[u8]>, String> {
+pub(crate) fn locator_components(path: &[u8]) -> Result<Vec<&[u8]>, String> {
     let rest = match path.iter().position(|&b| b == b':') {
         Some(i) if path.len() >= i + 3 && &path[i + 1..i + 3] == b"//" => &path[i + 3..],
         _ => path,
@@ -305,8 +305,8 @@ mod tests {
         assert!(VirtualRoot::lookup(root.top(), b"b").is_none());
     }
 
-    /// 兩個 root 的定位切出同一組組件（`/a/b` 與 `a/b`——scheme 去掉後
-    /// host 不入組件、絕對與相對定位同形）時，同名葉只能出現一次——
+    /// 兩個 root 的定位切出同一組組件（`/a/b` 與 `a/b`——絕對與相對定位
+    /// 同形）時，同名葉只能出現一次——
     /// 重複條目會讓 mount 列出兩個 `b`（層級已排序、二分查找只找得到
     /// 其中之一），restore 也會對同一目標寫兩次。後到的 root 贏
     /// （與 restore 目前的覆寫行為一致）。

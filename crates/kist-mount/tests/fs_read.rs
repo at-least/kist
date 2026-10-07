@@ -261,6 +261,20 @@ async fn xattrs_are_exposed() {
 /// 整個跳過（vpath），此測試釘住兩代語意的差異。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slash_root_entry_flattens_to_top() {
+    assert_root_flattens_to_top(b"/").await;
+}
+
+/// 只有 scheme、沒有組件的定位（`s3://`）與 `/` 同一規則：restore 落在
+/// target 本身（fsmeta::locator_to_relative 回空路徑），mount 也要攤平——
+/// 不能因為 corefs 與 vpath 切段規則不同，整個 root 在頂層消失。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheme_only_root_entry_flattens_to_top() {
+    assert_root_flattens_to_top(b"s3://").await;
+}
+
+/// 手工做一個 snapshot：唯一的 root 定位是 `locator`、內容是 bin、etc 兩個
+/// 空目錄；斷言 snapshot 頂層直接就是 bin、etc。
+async fn assert_root_flattens_to_top(locator: &[u8]) {
     use kist_format::snapshot::{format_key_timestamp, Root, Snapshot};
     use kist_format::tree::{meta_kind, node_type, Tree};
     use kist_format::FORMAT_VERSION;
@@ -329,7 +343,7 @@ async fn slash_root_entry_flattens_to_top() {
     let snapshot = Snapshot {
         version: FORMAT_VERSION,
         roots: vec![Root {
-            path: b"/".to_vec().into(),
+            path: locator.to_vec().into(),
             tree: root_id,
         }],
         time_ns: t0.unix_timestamp_nanos() as i64,
@@ -358,7 +372,8 @@ async fn slash_root_entry_flattens_to_top() {
     assert_eq!(
         names,
         vec![b"bin".to_vec(), b"etc".to_vec()],
-        "\"/\": 子樹攤平到頂層"
+        "{}: 子樹攤平到頂層",
+        String::from_utf8_lossy(locator)
     );
 
     // 子目錄真的可以走進去（空的）
