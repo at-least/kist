@@ -390,6 +390,11 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   gate：fmt／clippy 乾淨、windows-gnu clippy（cargo-zigbuild，不含 kist-mount／kist-cli）乾淨、
   nextest 391 過 1 略過、deny ok；另起 tests/sftp-setup.sh 與 rclone 跑 kist-backend 的
   sftp／contract／rclone 測試 12 過（只有 S3 略過）。
+- 同分支，整理時順帶發現的三項（每項先紅後綠，或註明為何無紅）：prune 的 index 壓縮觸發
+  改看有效 blob 數（原本連等 grace 的被取代 blob 一起算，合併後 grace 內每次 prune 都再重寫
+  整份 index）；mount 的 snapshot 根改用 vpath 的切段（只有 scheme 的定位 `s3://` 原本整個
+  root 從頂層消失）；crypto 的 unlock_key_slot 刪掉永不發生的第二個長度錯（行為不變，補測試
+  釘住）。gate：fmt／clippy／windows-gnu clippy 乾淨、nextest 394 過 1 略過、deny ok。
 - 待辦：ADR 019「待負責人決定」第 1 點的第三～五批（A7／A9／A13／A14 起）。
 
 ## 已接受的限制（非待辦）
