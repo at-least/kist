@@ -10,6 +10,9 @@
 //! - unix：rustix 的 `*at` 系列（safe 封裝，kist 維持 `forbid(unsafe_code)`）。
 //!   往下一層一律 `openat(O_DIRECTORY|O_NOFOLLOW)`：擋路的是 symlink 或其他
 //!   非目錄就開不起來，不跟隨。
+//! - Linux：擁有者只能進入、不能讀的目錄（例如 0311）唯讀開不了，改以
+//!   `O_PATH` 開來當錨（見 `imp::open_dir`）：以前以完整路徑操作只要求能進入，
+//!   這裡也一樣。這種目錄自己的 metadata 照舊套不上（[`DirHandle::meta_handle`]）。
 //! - 非 unix：沒有 `*at` 系列，維持以前的兩步檢查（lstat 看過再以完整路徑
 //!   操作），中間段的競態仍在。
 //!
@@ -30,9 +33,12 @@ use crate::{CoreError, Result};
 #[derive(Clone)]
 pub(crate) struct DirHandle {
     /// 已開的目錄（unix：`O_RDONLY|O_DIRECTORY`，目標之下的每一層另加
-    /// `O_NOFOLLOW`）。
+    /// `O_NOFOLLOW`；Linux 上讀不了的目錄以 `O_PATH` 代替 `O_RDONLY`）。
     #[cfg(unix)]
     file: Arc<File>,
+    /// `file` 是唯讀開的（能直接拿來套 metadata）；false＝`O_PATH` 的錨。
+    #[cfg(unix)]
+    readable: bool,
     /// 這層目錄的完整路徑。unix 只拿來寫錯誤訊息；非 unix 拿來做實際操作。
     path: PathBuf,
     /// 相對於還原目標的路徑元件（目標本身是空的）。硬連結表記這個，之後從
@@ -118,9 +124,10 @@ impl DirHandle {
 
     /// 內部：往下一層的 handle。
     #[cfg(unix)]
-    fn child(&self, name: &OsStr, file: File) -> DirHandle {
+    fn child(&self, name: &OsStr, (file, readable): (File, bool)) -> DirHandle {
         DirHandle {
             file: Arc::new(file),
+            readable,
             path: self.child_path(name),
             rel: self.child_rel(name),
         }
@@ -131,6 +138,7 @@ impl DirHandle {
 mod imp {
     use std::ffi::OsStr;
     use std::fs::File;
+    use std::os::fd::AsFd;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -142,30 +150,78 @@ mod imp {
     use super::{DirHandle, Kind};
     use crate::{CoreError, Result};
 
-    /// 往下一層目錄的開法：唯讀（之後在同一個 handle 上套目錄的 metadata，
-    /// ADR 019 A3）、必須是目錄、最末段不跟隨 symlink。
-    fn dir_flags() -> OFlags {
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    /// 往下一層目錄的開法（存取模式由 [`open_dir`] 加）：必須是目錄、最末段
+    /// 不跟隨 symlink。
+    pub(super) fn dir_flags() -> OFlags {
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
+
+    /// 開 `dir` 裡的目錄 `name`，回傳 (handle, 是不是唯讀開的)。先唯讀開：目錄的
+    /// metadata 之後在同一個 handle 上套（ADR 019 A3）。擁有者只能進入、不能讀
+    /// 的目錄（例如 0311；以 root 備份、以一般使用者還原才會遇到）唯讀開不了
+    /// （EACCES），Linux 改走 [`open_dir_path`]；其他 unix 沒有 O_PATH，照舊回
+    /// EACCES。
+    fn open_dir(dir: impl AsFd, name: &OsStr, flags: OFlags) -> rustix::io::Result<(File, bool)> {
+        match rustix::fs::openat(&dir, name, OFlags::RDONLY | flags, Mode::empty()) {
+            Ok(fd) => Ok((File::from(fd), true)),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Err(e) if e == Errno::ACCESS => Ok((open_dir_path(dir, name, flags)?, false)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 以 O_PATH 開目錄 `name`：不檢查這個目錄本身的權限，只要能進入它的上一層。
+    /// 這種 handle 不能讀寫、不能 fchmod／futimens／fsetxattr（EBADF），但當
+    /// `*at` 的錨照樣可用——在裡面建立、查找、改名只要能進入它，與以前以完整
+    /// 路徑操作的要求相同。O_PATH 加 O_NOFOLLOW 遇到 symlink 本來會開 symlink
+    /// 本身；有 O_DIRECTORY 時 symlink 與其他非目錄一樣回 ENOTDIR、不跟隨（實測；
+    /// 測試直接呼叫它釘住這一點）。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn open_dir_path(
+        dir: impl AsFd,
+        name: &OsStr,
+        flags: OFlags,
+    ) -> rustix::io::Result<File> {
+        let fd = rustix::fs::openat(dir, name, OFlags::PATH | flags, Mode::empty())?;
+        Ok(File::from(fd))
     }
 
     impl DirHandle {
         /// 開還原目標本身。`target` 與其之上是使用者自己的路徑，照常跟隨
         /// symlink；目標之下的每一層才不跟隨。
         pub(crate) fn open_target(target: &Path) -> Result<DirHandle> {
-            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-            let fd = rustix::fs::open(target, flags, Mode::empty())
+            let flags = OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let (file, readable) = open_dir(rustix::fs::CWD, target.as_os_str(), flags)
                 .map_err(|e| CoreError::io(target, e.into()))?;
             Ok(DirHandle {
-                file: Arc::new(File::from(fd)),
+                file: Arc::new(file),
+                readable,
                 path: target.to_path_buf(),
                 rel: Vec::new(),
             })
         }
 
-        /// 已開的目錄本身：目錄的 metadata 在這個 handle 上套（ADR 019 A3），
-        /// 目錄之後被搬走、原位換成 symlink 也套不到別處。
+        /// 套目錄 metadata 用的 handle：唯讀開的就是錨本身（ADR 019 A3），目錄
+        /// 之後被搬走、原位換成 symlink 也套不到別處。O_PATH 的錨不能拿來套，
+        /// 從它重開 `"."`（唯讀）：`"."` 就是錨住的那個目錄，不經名字重新解析，
+        /// 搬走了也一樣（實測）。目錄仍讀不了時回 EACCES，記成這個目錄的錯——
+        /// 與以前以路徑重開時相同。
         pub(crate) fn meta_handle(&self) -> Result<Arc<File>> {
-            Ok(Arc::clone(&self.file))
+            if self.readable {
+                return Ok(Arc::clone(&self.file));
+            }
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let fd = rustix::fs::openat(&*self.file, ".", flags, Mode::empty())
+                .map_err(|e| CoreError::io(&self.path, e.into()))?;
+            Ok(Arc::new(File::from(fd)))
+        }
+
+        /// 這層目錄本身的權限（fstat 經錨，O_PATH 的錨也可以）。
+        pub(crate) fn permissions(&self) -> Result<std::fs::Permissions> {
+            self.file
+                .metadata()
+                .map(|m| m.permissions())
+                .map_err(|e| CoreError::io(&self.path, e))
         }
 
         /// 建立（已存在就沿用）子目錄 `name` 並開它。`mkdirat` 遇到既有的
@@ -184,8 +240,8 @@ mod imp {
         /// 回 ENOTDIR（有 O_DIRECTORY 時；實測），其他 unix 可能回 ELOOP：兩個
         /// 都回報成擋路。
         pub(crate) fn open_child_dir(&self, name: &OsStr) -> Result<DirHandle> {
-            match rustix::fs::openat(&*self.file, name, dir_flags(), Mode::empty()) {
-                Ok(fd) => Ok(self.child(name, File::from(fd))),
+            match open_dir(&*self.file, name, dir_flags()) {
+                Ok(opened) => Ok(self.child(name, opened)),
                 Err(e) if e == Errno::NOTDIR || e == Errno::LOOP => {
                     Err(self.in_the_way_of_dir(name))
                 }
@@ -561,5 +617,71 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("symlink is in the way"), "{err}");
+    }
+
+    /// 擁有者只能進入、不能讀的目錄（0311）在 Linux 以 O_PATH 開成錨：A4 的保證
+    /// 不變——錨開好之後原位換成外指 symlink，經它的寫入仍落在被搬開的真目錄。
+    /// 它自己的 metadata 套不上（EACCES，與以前以路徑重開相同）；之後變得可讀，
+    /// 重開的是錨住的那個目錄，不是換上的 symlink 指的地方。root 讀得到 0311，
+    /// 走不到 O_PATH，略過。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_unreadable_dir_is_anchored_without_read_permission() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping: running as root");
+            return;
+        }
+        let (_dir, target, outside) = layout();
+        let root = DirHandle::open_target(&target).unwrap();
+        drop(root.create_child_dir(OsStr::new("real")).unwrap());
+        std::fs::set_permissions(target.join("real"), PermissionsExt::from_mode(0o311)).unwrap();
+        let real = root.open_child_dir(OsStr::new("real")).unwrap();
+        assert_eq!(real.permissions().unwrap().mode() & 0o7777, 0o311);
+
+        let moved = target.join("real.moved");
+        std::fs::rename(target.join("real"), &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, target.join("real")).unwrap();
+
+        let mut f = real.create_new_file(OsStr::new(".tmp"), 0o600).unwrap();
+        f.write_all(b"content").unwrap();
+        drop(f);
+        real.rename(OsStr::new(".tmp"), OsStr::new("f")).unwrap();
+        real.hard_link(OsStr::new("f"), &real, OsStr::new("g"))
+            .unwrap();
+        drop(real.create_child_dir(OsStr::new("sub")).unwrap());
+        assert!(real.same_file(OsStr::new("f"), &real, OsStr::new("g")));
+        let err = real.meta_handle().err().unwrap();
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+
+        std::fs::set_permissions(&moved, PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(names(&outside), Vec::<String>::new(), "寫到目標之外了");
+        assert_eq!(names(&moved), ["f", "g", "sub"]);
+        assert_eq!(std::fs::read(moved.join("g")).unwrap(), b"content");
+        let reopened = real.meta_handle().unwrap();
+        assert_eq!(
+            reopened.metadata().unwrap().ino(),
+            std::fs::metadata(&moved).unwrap().ino(),
+            "重開的應該是錨住的目錄"
+        );
+    }
+
+    /// O_PATH 的退路同樣不跟隨：O_PATH|O_NOFOLLOW 本來會開 symlink 本身，靠
+    /// O_DIRECTORY 讓 symlink 與一般檔都回 ENOTDIR（唯讀開回 EACCES 之後、改以
+    /// O_PATH 開之前，名字被換掉時就是這條路）。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_o_path_fallback_refuses_a_symlink_or_file_in_the_way() {
+        let (_dir, target, outside) = layout();
+        std::os::unix::fs::symlink(&outside, target.join("link")).unwrap();
+        std::fs::write(target.join("plain"), b"x").unwrap();
+        let top = std::fs::File::open(&target).unwrap();
+        for name in ["link", "plain"] {
+            let err = super::imp::open_dir_path(&top, OsStr::new(name), super::imp::dir_flags())
+                .err()
+                .unwrap();
+            assert_eq!(err, rustix::io::Errno::NOTDIR, "{name}");
+        }
     }
 }

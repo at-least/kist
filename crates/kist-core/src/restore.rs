@@ -311,7 +311,8 @@ fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
 /// 寫完後重新套上（[`apply_meta`]），所以先暫時加上擁有者寫入權，回傳原本的
 /// 權限（套 metadata 失敗時放回去）。不會被重新套 mode 的目錄（s3/generic
 /// 來源沒有 mode 或 mtime）不動。fstat 與 chmod 都經往下走時開的那個 handle
-/// （ADR 019 A3、A4）。
+/// （ADR 019 A3、A4）；chmod 要能套 metadata 的 handle（[`DirHandle::meta_handle`]），
+/// 擁有者讀不了的目錄拿不到，照 chmod 失敗處理。
 #[cfg(unix)]
 fn make_owner_writable(dir: &DirHandle, node: &Entry) -> Result<Option<std::fs::Permissions>> {
     use std::os::unix::fs::PermissionsExt;
@@ -319,22 +320,20 @@ fn make_owner_writable(dir: &DirHandle, node: &Entry) -> Result<Option<std::fs::
     if !mode_will_be_applied {
         return Ok(None);
     }
-    let handle = dir.meta_handle()?;
-    let original = handle
-        .metadata()
-        .map_err(|e| CoreError::io(dir.path(), e))?
-        .permissions();
+    let original = dir.permissions()?;
     if original.mode() & 0o200 != 0 {
         return Ok(None);
     }
     let writable = std::fs::Permissions::from_mode((original.mode() & 0o7777) | 0o200);
-    // chmod 失敗（例如目錄不是我們的）不擋整個目錄：群組或其他人的寫入權
-    // 也許就夠；不夠的話，每個子項目各自回報寫不進去。
-    if let Err(e) = handle.set_permissions(writable) {
-        tracing::warn!(
-            "{}: cannot make the existing directory writable for the restore: {e}",
-            dir.path().display()
-        );
+    // chmod 失敗（例如目錄不是我們的、或讀不了）不擋整個目錄：群組或其他人的
+    // 寫入權也許就夠；不夠的話，每個子項目各自回報寫不進去。
+    let chmod = dir.meta_handle().and_then(|handle| {
+        handle
+            .set_permissions(writable)
+            .map_err(|e| CoreError::io(dir.path(), e))
+    });
+    if let Err(e) = chmod {
+        tracing::warn!("cannot make the existing directory writable for the restore: {e}");
         return Ok(None);
     }
     Ok(Some(original))
