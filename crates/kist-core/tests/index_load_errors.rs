@@ -5,8 +5,11 @@
 mod common;
 
 use common::*;
-use kist_core::{CoreError, Repository};
+use kist_core::CoreError;
+#[cfg(unix)]
+use kist_core::Repository;
 
+#[cfg(unix)]
 async fn open_cached(t: &TestRepo) -> Repository {
     Repository::open_with_cache(
         t.backend.clone(),

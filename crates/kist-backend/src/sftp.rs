@@ -398,8 +398,10 @@ enum Keepalive {
     Stdio {
         /// `kill_on_drop(true)`：drop 即 kill。kist 的每個操作都等伺服器 ACK 才算
         /// 完成，CLI 結束時不會有還在飛的請求；kill 只是避免子程序在異常路徑上
-        /// 掛著（正常路徑 sftp drop 已關 stdin，rclone 會自己退出）。
-        _child: Child,
+        /// 掛著（正常路徑 sftp drop 已關 stdin，rclone 會自己退出）。Box：Windows
+        /// 上的 Child 有 272 bytes，不包的話 clippy 的 large_enum_variant 在
+        /// Windows 擋下 `-D warnings`。
+        _child: Box<Child>,
     },
 }
 
@@ -891,7 +893,9 @@ impl SftpStore {
             relaxed: true,
             warned_no_o_excl: AtomicBool::new(false),
             stderr_tail: Some(tail),
-            keepalive: Keepalive::Stdio { _child: child },
+            keepalive: Keepalive::Stdio {
+                _child: Box::new(child),
+            },
             root: String::new(),
             display,
             list_all: false,
