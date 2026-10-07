@@ -1071,6 +1071,57 @@ async fn unreadable_dir_in_the_snapshot_keeps_hard_links_and_children() {
     assert_no_restore_temp(&restored.join("e"));
 }
 
+/// ADR 019 A4（審查）：還原目標本身是擁有者只能進入、不能讀的目錄（0311），或是
+/// 指向這種目錄的 symlink（目標本身照常跟隨）。目標的 handle 只以 O_RDONLY 開的
+/// 話整個 restore 回 Permission denied；以前以完整路徑操作只要求能進入，照常
+/// 還原。以 root 跑就略過：root 讀得到 0311 的目錄，驗不到這件事。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unreadable_target_is_restored_into() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipping: running as root");
+        return;
+    }
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("sub").join("f.txt"), b"data").unwrap();
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+
+    let direct = t.dir.path().join("direct");
+    let behind_link = t.dir.path().join("behind-link");
+    let link = t.dir.path().join("link");
+    std::os::unix::fs::symlink(&behind_link, &link).unwrap();
+    for (real, target) in [(&direct, &direct), (&behind_link, &link)] {
+        std::fs::create_dir(real).unwrap();
+        std::fs::set_permissions(real, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let summary = repo
+            .restore(&s.snapshot_key, target, RestoreOptions::default())
+            .await;
+        // 先把目錄改回可讀，TempDir 才刪得掉它（否則靜靜留在 /tmp）。
+        std::fs::set_permissions(real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let summary = summary.unwrap();
+        assert!(
+            summary.errors.is_empty(),
+            "{}: {summary:?}",
+            target.display()
+        );
+        let restored = real.join(src.strip_prefix("/").unwrap());
+        assert_eq!(
+            std::fs::read(restored.join("sub").join("f.txt")).unwrap(),
+            b"data",
+            "{}",
+            target.display()
+        );
+    }
+}
+
 /// ADR 019 A2（審查）：覆寫使用者原有的 0o600 檔，而這個條目的 metadata 套不上
 /// （xattr 名稱超過 XATTR_NAME_MAX，set_xattr 回 ERANGE；記錄的 mode 就不會套）。
 /// 內容照舊 rename 成正式名、記一個錯；但裝著它的檔不能比記錄的 mode 寬鬆——
