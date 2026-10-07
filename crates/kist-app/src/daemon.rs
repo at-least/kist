@@ -190,7 +190,7 @@ impl Daemon {
             .iter()
             .map(|(k, s)| (*k, s.clone()))
             .collect();
-        schedules.sort_by_key(|(k, _)| k.name());
+        schedules.sort_by_key(|(k, _)| *k);
         DaemonHandle {
             cfg: Arc::clone(&self.cfg),
             state: Arc::clone(&self.state),
@@ -211,12 +211,12 @@ impl Daemon {
             .iter()
             .map(|(k, s)| (*k, s.next_after(after)))
             .collect();
-        v.sort_by_key(|(k, _)| k.name());
+        v.sort_by_key(|(k, _)| *k);
         v
     }
 
     /// 設定裡有的工作各跑一次（backup → forget → prune），不看排程。給 `run --once` 與外部 cron 用。
-    /// 跑每一件已排程的工作各一次。`shutdown` 一旦被傳訊（Ctrl-C），剩餘
+    /// `shutdown` 一旦被傳訊（Ctrl-C），剩餘
     /// 的不再開跑——與 `run` 同款「停在本輪工作後」的約定；工作本身做完，
     /// 不中途取消。
     pub async fn run_once(
@@ -259,7 +259,7 @@ impl Daemon {
                 .iter()
                 .filter_map(|(k, s)| s.next_after(now).map(|t| (t, *k)))
                 .collect();
-            due.sort_by_key(|(t, k)| (*t, order(*k)));
+            due.sort();
             let next = due.first().copied();
             if next.is_none() && !self.schedules.is_empty() {
                 return Err(AppError::Config(
@@ -282,13 +282,12 @@ impl Daemon {
                     }
                 } => {
                     let Some((at, _)) = next else { continue };
-                    // 同一秒到期的其他工作也一起跑（依序）
-                    let mut batch: Vec<JobKind> = due
+                    // 同一秒到期的其他工作也一起跑（due 已依 backup → forget → prune 排好）
+                    let batch: Vec<JobKind> = due
                         .iter()
                         .filter(|(t, _)| *t == at)
                         .map(|(_, k)| *k)
                         .collect();
-                    batch.sort_by_key(|k| order(*k));
                     for kind in batch {
                         let o = self.execute(kind).await;
                         on_outcome(&o);
@@ -397,12 +396,4 @@ pub(crate) fn configured(cfg: &Config, kind: JobKind) -> bool {
 /// 拿狀態鎖。裡面只有普通資料，別的 task panic 時留下的 poison 不會讓資料壞掉，直接用。
 fn lock_state(state: &Mutex<DaemonState>) -> MutexGuard<'_, DaemonState> {
     state.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn order(k: JobKind) -> u8 {
-    match k {
-        JobKind::Backup => 0,
-        JobKind::Forget => 1,
-        JobKind::Prune => 2,
-    }
 }

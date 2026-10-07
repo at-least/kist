@@ -1,4 +1,4 @@
-//! kist 的應用層：設定檔、排程、工作執行、通知、（之後）metrics 與 Web UI。
+//! kist 的應用層：設定檔、排程、工作執行、通知、metrics 與 Web UI。
 //! `kist-core` 只懂 repo；這裡把「每天幾點備份哪些路徑、結果通知到哪」串起來，
 //! CLI 的 `kist run` / `kist serve` 只是薄薄一層。
 
@@ -17,7 +17,7 @@ pub mod schedule;
 pub mod server;
 
 pub use config::Config;
-pub use daemon::{Daemon, DaemonHandle, DaemonState, RunningJob, TriggerError};
+pub use daemon::{Daemon, DaemonHandle, TriggerError};
 pub use jobs::{JobKind, JobOutcome, JobStatus};
 pub use metrics::Metrics;
 
