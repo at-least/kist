@@ -49,7 +49,7 @@ use crate::repo::{IndexBlobs, Repository};
 use crate::{blocking, CoreError, Result};
 
 /// 有效（未被 supersede）index blob 超過這個數，prune 必須合併重寫為一顆
-/// （docs/format.md §10 的壓縮觸發；v2 的 ADR 005 未做項）。
+/// （docs/format.md §10 的壓縮觸發）。
 pub const MAX_EFFECTIVE_BLOBS: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -135,18 +135,17 @@ struct Target {
 }
 
 /// prune 專用的 chunk 索引：有效 index 裡的每個 (chunk, holder) 一筆，
-/// 依 (chunk, pack) 排序。一份結構取代原本三份 100 萬級的東西——walk 用的
-/// `ChunkIndex` overlay HashMap、`canonical` HashMap、`referenced` HashSet
-///（ADR 005 §5 的「三份合一」；100 萬 chunk 從 ~330 MiB 降到 ~90 MiB）。
+/// 依 (chunk, pack) 排序。walk 的查詢、正本選擇、引用旗標都用這一份
+///（ADR 005 §5 的「三份合一」；100 萬 chunk 約 ~90 MiB，分開三份要 ~330 MiB）。
 ///
 /// 排序鍵**不含** phantom/marked：marks 的取得時點是競態語義的一部分，
-/// 正本選擇維持在原本的時點（walk 之後、list 過 gc/ 之後）由
+/// 正本選擇在 walk 之後、list 過 gc/ 之後才由
 /// [`Self::mark_and_canonicalize`] 掃組計算。
 struct PruneIndex {
     records: Vec<TableRecord>,
     /// 與 records 平行：這筆 holder 的 chunk 是否被引用
     ///（`mark_and_canonicalize` 之後才有效）。
-    referenced: Vec<u8>,
+    referenced: Vec<bool>,
 }
 
 impl PruneIndex {
@@ -167,7 +166,7 @@ impl PruneIndex {
         let n = records.len();
         Self {
             records,
-            referenced: vec![0; n],
+            referenced: vec![false; n],
         }
     }
 
@@ -182,14 +181,13 @@ impl PruneIndex {
     /// 把每個被引用 chunk 的所有非 phantom holder 打上旗標，並算出
     /// 正本（非 phantom holder 裡 `(marked, pack)` 最小者）的
     /// needed packs 與 live bytes。被引用 chunk 一個非 phantom holder
-    /// 都沒有 → 引用不完整，回 `Unsafe`（與原本 canonical 表相同語義）。
+    /// 都沒有 → 引用不完整，回 `Unsafe`。
     fn mark_and_canonicalize(
         &mut self,
-        referenced: Vec<ChunkId>,
+        mut ref_ids: Vec<ChunkId>,
         is_marked: &dyn Fn(&ObjectId) -> bool,
         phantoms: &HashSet<ObjectId>,
     ) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, u64>)> {
-        let mut ref_ids = referenced;
         ref_ids.sort_unstable();
         ref_ids.dedup();
         let mut needed: HashSet<ObjectId> = HashSet::new();
@@ -213,28 +211,24 @@ impl PruneIndex {
                     if better {
                         best = Some((pid, self.records[i].location.length));
                     }
-                    self.referenced[i] = 1;
+                    self.referenced[i] = true;
                 }
                 i += 1;
             }
-            match best {
-                Some((pack, len)) => {
-                    needed.insert(pack);
-                    *live.entry(pack).or_insert(0) += len;
-                }
-                None => {
-                    return Err(CoreError::Unsafe(format!(
-                        "chunk {chunk} is referenced but no existing pack holds it (the index lists a pack that is gone); run `kist check` and `kist rebuild-index` first"
-                    )));
-                }
-            }
+            let Some((pack, len)) = best else {
+                return Err(CoreError::Unsafe(format!(
+                    "chunk {chunk} is referenced but no existing pack holds it (the index lists a pack that is gone); run `kist check` and `kist rebuild-index` first"
+                )));
+            };
+            needed.insert(pack);
+            *live.entry(pack).or_insert(0) += len;
         }
         Ok((needed, live))
     }
 
     /// 這個 chunk 是否被引用（`mark_and_canonicalize` 之後）。
     fn is_referenced(&self, id: &ChunkId) -> bool {
-        self.group(id).any(|i| self.referenced[i] == 1)
+        self.group(id).any(|i| self.referenced[i])
     }
 
     /// 這個 chunk 是否有 holder 在 `packs` 裡（repack 的 kept_chunks 語義：
@@ -247,18 +241,12 @@ impl PruneIndex {
 
 impl ChunkLocator for PruneIndex {
     fn contains(&self, id: &ChunkId) -> bool {
-        let g = self.group(id);
-        g.start < g.end
+        !self.group(id).is_empty()
     }
     fn get(&self, id: &ChunkId) -> Option<ChunkLocation> {
         // 組內依 pack 排序，第一筆 = 名稱最小的 holder——與 ChunkIndex
         // 「同名 chunk 取名稱最小 pack」的規則一致（規格 §10）。
-        let g = self.group(id);
-        if g.start < g.end {
-            self.records.get(g.start).map(|r| r.location)
-        } else {
-            None
-        }
+        self.group(id).next().map(|i| self.records[i].location)
     }
 }
 
@@ -322,7 +310,7 @@ impl Repository {
         // 把 entries 從 blob move 出來：blob 解碼結果整份留著會讓 entries 在
         // 記憶體裡多一份（100 萬 chunk ≈ 48 MiB）。同時把 (chunk, holder) 攤平
         // 進 PruneIndex——walk 的 contains/get、正本選擇、repack 的引用查詢
-        // 都查這一份，不再各自建 HashMap/HashSet。
+        // 都查這一份。
         for (_, blob) in blob_list {
             for p in blob.packs {
                 for e in &p.entries {
@@ -744,44 +732,39 @@ impl PrunePlan {
         // 13. parity sidecar 清掃：pack 已不在的 sidecar 一併刪——本 run 刪掉的
         //     已在刪除時帶走，這裡清的是之前死掉的 run 或手動刪 pack 留下的。
         //     m=8 時 sidecar 是 pack 的一半大，孤兒很燒空間。
-        if !self.dry_run {
-            let stored: HashSet<String> = repo
-                .backend()
-                .list(keys::PACKS_PREFIX)
-                .await?
-                .into_iter()
-                .map(|o| o.key)
-                .collect();
-            let sidecars: Vec<String> = repo
-                .backend()
-                .list(kist_format::parity::PREFIX)
-                .await?
-                .into_iter()
-                .map(|o| o.key)
-                .collect();
-            for key in sidecars {
-                let orphan = match keys::object_id_from_key(&key) {
-                    Ok(id) => !stored.contains(&keys::pack(&id)),
-                    Err(_) => true, // 不是 parity 命名：當垃圾清
-                };
-                if orphan {
-                    // 名單是剛才列的：並發 backup 可能「pack 已 Put、parity 尚未
-                    // 列進我們的名單但已存在」。刪之前再看一眼 pack 還在不在，
-                    // pack 在就不動它的 sidecar。只有 NotFound 算「pack 不在」；
-                    // 其他錯誤（暫時性網路）不得當成不在——會刪掉活 pack 的
-                    // parity，回錯（同第 14 步的分法）。
-                    let pack_gone = match keys::object_id_from_key(&key) {
-                        Ok(id) => !repo.backend().exists(&keys::pack(&id)).await?,
-                        Err(_) => true,
-                    };
-                    if !pack_gone {
-                        continue;
-                    }
-                    match repo.backend().delete(&key).await {
-                        Ok(()) | Err(BackendError::NotFound(_)) => {}
-                        Err(e) => return Err(e.into()),
-                    }
+        let stored: HashSet<String> = repo
+            .backend()
+            .list(keys::PACKS_PREFIX)
+            .await?
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        let sidecars: Vec<String> = repo
+            .backend()
+            .list(kist_format::parity::PREFIX)
+            .await?
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        for key in sidecars {
+            // 名單是剛才列的：並發 backup 可能「pack 已 Put、parity 尚未
+            // 列進我們的名單但已存在」。不在名單裡的 pack 刪之前再看一眼
+            // 還在不在，pack 在就不動它的 sidecar。只有 NotFound 算「pack
+            // 不在」；其他錯誤（暫時性網路）不得當成不在——會刪掉活 pack 的
+            // parity，回錯（同第 14 步的分法）。
+            let pack_gone = match keys::object_id_from_key(&key) {
+                Ok(id) => {
+                    let pack = keys::pack(&id);
+                    !stored.contains(&pack) && !repo.backend().exists(&pack).await?
                 }
+                Err(_) => true, // 不是 parity 命名：當垃圾清
+            };
+            if !pack_gone {
+                continue;
+            }
+            match repo.backend().delete(&key).await {
+                Ok(()) | Err(BackendError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -789,38 +772,36 @@ impl PrunePlan {
         //     不在——之前死掉的 run 留下的，刪。**孤兒 `.r1`（主體不在、無標記）
         //     刻意不清理**：那是「主體意外遺失」的災難訊號，副本存在的目的
         //     就是它；交給 `check` 回報。
-        if !self.dry_run {
-            let touches: Vec<String> = repo
-                .backend()
-                .list(keys::TOUCH_PREFIX)
-                .await?
-                .into_iter()
-                .map(|o| o.key)
-                .collect();
-            for key in touches {
-                let Some(hex) = key.strip_prefix(&format!("{}/", keys::TOUCH_PREFIX)) else {
-                    continue;
-                };
-                let Ok(tree_id) = kist_format::TreeId::from_hex(hex) else {
-                    // 不是 touch 命名：當垃圾清；刪不掉不擋 prune，但要留下紀錄
-                    match repo.backend().delete(&key).await {
-                        Ok(()) | Err(BackendError::NotFound(_)) => {}
-                        Err(e) => tracing::warn!("{key}: cannot delete stray touch object: {e}"),
-                    }
-                    continue;
-                };
-                // 樹不在了才清 touch；head 的**其他**錯誤（暫時性網路）不得
-                // 當成「樹不在」——誤刪活著的復活訊號，下一輪 prune 會把
-                // 進行中 backup 重用中的樹當死的刪掉（同函式刪除迴圈對
-                // 錯誤種類的分法）。
-                match repo.backend().head(&keys::tree(&tree_id)).await {
-                    Err(BackendError::NotFound(_)) => match repo.backend().delete(&key).await {
-                        Ok(()) | Err(BackendError::NotFound(_)) => {}
-                        Err(e) => return Err(e.into()),
-                    },
-                    Err(e) => return Err(e.into()),
-                    Ok(_) => {}
+        let touches: Vec<String> = repo
+            .backend()
+            .list(keys::TOUCH_PREFIX)
+            .await?
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        for key in touches {
+            let Some(hex) = key.strip_prefix(&format!("{}/", keys::TOUCH_PREFIX)) else {
+                continue;
+            };
+            let Ok(tree_id) = kist_format::TreeId::from_hex(hex) else {
+                // 不是 touch 命名：當垃圾清；刪不掉不擋 prune，但要留下紀錄
+                match repo.backend().delete(&key).await {
+                    Ok(()) | Err(BackendError::NotFound(_)) => {}
+                    Err(e) => tracing::warn!("{key}: cannot delete stray touch object: {e}"),
                 }
+                continue;
+            };
+            // 樹不在了才清 touch；head 的**其他**錯誤（暫時性網路）不得
+            // 當成「樹不在」——誤刪活著的復活訊號，下一輪 prune 會把
+            // 進行中 backup 重用中的樹當死的刪掉（同函式刪除迴圈對
+            // 錯誤種類的分法）。
+            match repo.backend().head(&keys::tree(&tree_id)).await {
+                Err(BackendError::NotFound(_)) => match repo.backend().delete(&key).await {
+                    Ok(()) | Err(BackendError::NotFound(_)) => {}
+                    Err(e) => return Err(e.into()),
+                },
+                Err(e) => return Err(e.into()),
+                Ok(_) => {}
             }
         }
         Ok(self.report)
@@ -1178,7 +1159,7 @@ mod tests {
             }
             let mut index = ChunkIndex::new();
             let mut records = Vec::new();
-            // 以隨機順序餵 pack（每個 pack 一次 add_pack），打亞 holder 順序
+            // 依 pack 名稱順序餵（每個 pack 一次 add_pack）；records 另以隨機順序塞
             let mut packs: Vec<u8> = (0..n_packs).collect();
             packs.sort();
             for p in &packs {

@@ -5,17 +5,17 @@
 //! 2. 找同一台 client、同一組 roots 的上一個 snapshot 當 parent：
 //!    檔案的 size 與 mtime 沒變就直接沿用它的 chunk 清單，不重讀檔案。
 //! 3. 依名稱排序遞迴走訪。檔案在 blocking thread 裡串流切塊、算 ID、對 index 去重、
-//!    新 chunk 壓縮加密進 pack；pack 滿了就交回 async 端上傳（最多 2 個同時在飛）。
+//!    新 chunk 壓縮加密進 pack；pack 滿了就交回 async 端上傳（最多 `MAX_INFLIGHT_UPLOADS` 個在飛）。
 //! 4. 每個目錄結束時封成 tree 上傳：**新樹** put_if_absent；**沿用的既有樹**
 //!    以覆寫式 Put 寫 `touch/<id>`（8 bytes）刷新 mtime——那是復活訊號本體
-//!    （v2 每次 backup 重 put 整棵樹的 bytes，v3 樹 bytes 永不重寫）。
+//!    （樹 bytes 正常不重寫，只有驗證出壞樹時才覆寫）。
 //! 5. 全部結束：flush 最後一個 pack、等上傳完成、寫 index blob（到這裡是 `backup_prepare`）。
 //! 6. `commit`：確認引用到的每個 pack 都還在、有標記的可達樹 touch 夠新，然後
 //!    寫 snapshot（replicas=1 時 `.r1` 副本先寫，主體出現＝commit）。
 //!
 //! v3 的 roots：每個備份來源是 `Root { path, tree }`——path 是不透明定位
 //! （本機絕對路徑；遠端來源是 `sftp://…`/`s3://…`，見 Source 抽象），
-//! 樹節點名**一律**是單一路徑元件（v2 的合成根已淘汰）。
+//! 樹節點名**一律**是單一路徑元件。
 //!
 //! 走訪消費 `kist_backend::Source`（本機 = `LocalSource`，遠端 = URL 開出的
 //! `ObjectStoreSource`，測試可注入）：「直接遠端備份」就是 client 當轉運——
@@ -67,7 +67,7 @@ const MAX_INFLIGHT_UPLOADS: usize = 1;
 pub const DEFAULT_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
 
 /// 備份來源的指定（[`BackupOptions::source`]）。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub enum SourceSpec {
     /// `paths` 是本機檔案系統路徑（可多個；預設）。
     #[default]
@@ -90,16 +90,6 @@ impl std::fmt::Debug for SourceSpec {
                 .debug_tuple("Injected")
                 .field(&String::from_utf8_lossy(locator))
                 .finish(),
-        }
-    }
-}
-
-impl Clone for SourceSpec {
-    fn clone(&self) -> Self {
-        match self {
-            Self::LocalPaths => Self::LocalPaths,
-            Self::Url(url) => Self::Url(url.clone()),
-            Self::Injected(source, locator) => Self::Injected(Arc::clone(source), locator.clone()),
         }
     }
 }
@@ -207,8 +197,8 @@ struct FileFacts {
     etag: Option<Vec<u8>>,
 }
 
-/// 一個 root 的走訪環境：每個 root 各自的來源，與（本機來源時）把 rel
-/// 對應回本機路徑的根——xattr 讀取與進度顯示用；遠端來源 = `None`。
+/// 一個 root 的走訪來源；本機路徑由 `Source::local_path` 給（遠端回 `None`），
+/// xattr 讀取與進度顯示用。
 struct SourceCtx {
     source: Arc<dyn Source>,
 }
@@ -299,17 +289,11 @@ enum RootPlan {
 /// 同名檔案的節點）；讀不到就沒有快速路徑，重讀。
 async fn parent_file_entry(
     repo: &Repository,
-    parent_roots: &[(Vec<u8>, TreeId)],
-    pb: &[u8],
+    parent_subtree: Option<TreeId>,
     name: &[u8],
 ) -> Option<Entry> {
-    match parent_roots.iter().find(|(pp, _)| pp.as_slice() == pb) {
-        Some((_, t)) => match ParentStream::open(repo, t).await {
-            Ok(mut s) => s.take_name(name).await,
-            Err(_) => None,
-        },
-        None => None,
-    }
+    let mut s = ParentStream::open(repo, &parent_subtree?).await.ok()?;
+    s.take_name(name).await
 }
 
 struct Backup {
@@ -339,15 +323,23 @@ struct Backup {
     progress: Option<ProgressCallback>,
     /// 每個 pack 旁存幾片 Reed-Solomon 同位（0 = 不存）。
     parity: u8,
-    /// 這次 backup 已看過的硬連結：(dev, inode) → 第一個名字的 chunk 清單與大小。
+    /// 這次 backup 已看過的硬連結：(dev, inode) → 第一個名字的內容。
     /// 後續名字直接沿用，不必重讀資料。
-    hardlinks: HashMap<(u64, u64), (u64, Vec<ChunkId>, u8)>,
+    hardlinks: HashMap<(u64, u64), FileContent>,
     /// 已把 bytes 計入 stats 的硬連結群組（(dev,ino)）：`bytes` 對同一份內容
     /// 只算一次（docs/format.md §9.1），跨 roots 也一樣。
     counted_hardlinks: HashSet<(u64, u64)>,
     /// 切塊緩衝池（每個 2×chunker.max）：整個 backup 重用同一批，不在每個
     /// 檔案各配一次。單執行緒走訪時通常只有一個；池化是為了之後並行切塊。
     chunk_bufs: Vec<Vec<u8>>,
+}
+
+/// 一個檔案在 tree 裡的內容：大小、chunk 清單、content 型態（DIRECT／INDIRECT）。
+#[derive(Clone)]
+struct FileContent {
+    size: u64,
+    chunks: Vec<ChunkId>,
+    content: u8,
 }
 
 /// 呼叫進度 callback（有設才做）。stats/report 是幾個 u64 的 copy，成本可忽略。
@@ -371,8 +363,8 @@ fn report_progress(
 
 /// parent tree 鏈的串流游標（merge-join 用）。
 ///
-/// 一次只持有一個 segment（≤ `MAX_NODES_PER_TREE` 個節點，約幾 MiB）。
-/// 原本是把整個目錄的 parent entries 讀成 `Vec` 再建成 HashMap——
+/// 一次只持有一個 segment（≤ `MAX_NODES_PER_TREE` 個節點，約幾 MiB）：
+/// 把整個目錄的 parent entries 讀成 `Vec` 再建 HashMap 的話，
 /// 100 萬檔的平面目錄光這兩個結構就要 ~450 MiB。
 ///
 /// 段以 `prev` 串接、段內與段間都以名稱遞增（寫入端的排序合約，
@@ -382,7 +374,7 @@ struct ParentStream {
     repo: Repository,
     /// 尚未讀取的段 ID（舊→新）。
     parts: std::collections::VecDeque<TreeId>,
-    /// 目前段的節點。比 `next_part` 之後進來的任何名稱都小的節點已在這裡被丟掉。
+    /// 目前段的節點。比上一次查詢名稱小的節點已被丟掉。
     current: std::iter::Peekable<std::vec::IntoIter<Entry>>,
 }
 
@@ -413,19 +405,14 @@ impl ParentStream {
 
     /// 回傳名稱等於 `name` 的 parent 節點（沒有則 `None`）。
     /// 呼叫端必須用遞增的名稱查詢。段讀取失敗時 parent reuse 停擺
-    ///（後續都回 `None`，檔案重讀——與原本「讀不到就重建」同一語意）。
+    ///（後續都回 `None`，檔案重讀）。
     async fn take_name(&mut self, name: &[u8]) -> Option<Entry> {
         loop {
             while matches!(self.current.peek(), Some(e) if e.name.as_slice() < name) {
                 self.current.next();
             }
-            let hits = matches!(self.current.peek(), Some(e) if e.name.as_slice() == name);
-            if hits {
-                for e in self.current.by_ref() {
-                    if e.name.as_slice() == name {
-                        return Some(e);
-                    }
-                }
+            if matches!(self.current.peek(), Some(e) if e.name.as_slice() == name) {
+                return self.current.next();
             }
             if matches!(self.current.peek(), Some(e) if e.name.as_slice() > name) {
                 return None; // 目標不在鏈裡；游標留在原地給下一個（更大的）名稱
@@ -466,14 +453,6 @@ pub struct PreparedBackup {
 const GRACE_SAFETY_MARGIN: time::Duration = time::Duration::hours(1);
 
 impl PreparedBackup {
-    pub fn stats(&self) -> &SnapshotStats {
-        &self.stats
-    }
-
-    pub fn report(&self) -> &BackupReport {
-        &self.report
-    }
-
     /// 驗證引用到的資料都還在，然後寫 snapshot。
     pub async fn commit(self) -> Result<BackupSummary> {
         self.commit_at(time::OffsetDateTime::now_utc()).await
@@ -674,20 +653,19 @@ impl Repository {
     ) -> Result<()> {
         let marked_id = ObjectId::from_bytes(*tree_id.as_bytes());
         // 樹要存在（touch 在而樹不在 = prune 已刪了它——TOCTOU 視窗命中）。
-        if let Err(e) = self.backend().head(&keys::tree(tree_id)).await {
-            return Err(match e {
-                BackendError::NotFound(_) => CoreError::TreeMarked(marked_id),
-                e => e.into(),
-            });
-        }
+        let not_found_is_marked = |e| match e {
+            BackendError::NotFound(_) => CoreError::TreeMarked(marked_id),
+            e => e.into(),
+        };
+        self.backend()
+            .head(&keys::tree(tree_id))
+            .await
+            .map_err(not_found_is_marked)?;
         let touch = self
             .backend()
             .head(&keys::touch(tree_id))
             .await
-            .map_err(|e| match e {
-                BackendError::NotFound(_) => CoreError::TreeMarked(marked_id),
-                e => e.into(),
-            })?;
+            .map_err(not_found_is_marked)?;
         if touch.modified < *marked_at {
             return Err(CoreError::TreeMarked(marked_id));
         }
@@ -864,7 +842,7 @@ impl Repository {
                         source: Arc::new(LocalSource::new(parent.to_path_buf())?),
                     };
                     let item = local_file_item(&path, &name)?;
-                    let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
+                    let parent_entry = parent_file_entry(self, parent_subtree, &name).await;
                     let Some(entry) = b
                         .process_entry(&ctx, &name, item, parent_entry.as_ref(), 1)
                         .await?
@@ -907,7 +885,7 @@ impl Repository {
                         // 是**空字串**（read/讀 xattr 都落在來源根本身）；
                         // entry 名稱維持最後元件。
                         let name = item.name.clone();
-                        let parent_entry = parent_file_entry(self, &parent_roots, &pb, &name).await;
+                        let parent_entry = parent_file_entry(self, parent_subtree, &name).await;
                         let Some(entry) = b
                             .process_entry(&ctx, b"", item, parent_entry.as_ref(), 1)
                             .await?
@@ -1083,7 +1061,7 @@ impl Backup {
         // mtime/etag/vern。缺席欄位一律 `None`（＝來源未知，不是 0）。
         // posix 的 metadata 在處理條目時對路徑 lstat 取得——清單刻意不攜帶
         // （100 萬條目的清單常駐記憶體是 512 MiB 門檻的回歸點），每檔一次
-        // lstat 與 v2 相同。
+        // lstat。
         let posix = if mk == meta_kind::POSIX {
             ctx.join_local(rel)
                 .and_then(|p| std::fs::symlink_metadata(&p).ok())
@@ -1158,8 +1136,11 @@ impl Backup {
                     posix,
                     etag: etag.clone(),
                 };
-                let Some((fsize, chunks, content)) =
-                    self.process_file(ctx, rel, &facts, parent).await?
+                let Some(FileContent {
+                    size: fsize,
+                    chunks,
+                    content,
+                }) = self.process_file(ctx, rel, &facts, parent).await?
                 else {
                     return Ok(None); // 讀不到，已記錄
                 };
@@ -1314,9 +1295,8 @@ impl Backup {
             {
                 Ok(()) => true,
                 Err(BackendError::AlreadyExists(_)) => {
-                    // 已存在：驗證現有 bytes（自我修復）。v2 靠無條件重 put
-                    // 順手療癒壞樹；v3 正常路徑零額外寫入，只在驗證失敗時
-                    // 覆寫——同名必同內容（名稱 = 明文 keyed hash），所以
+                    // 已存在：驗證現有 bytes（自我修復）。正常路徑零額外寫入，
+                    // 只在驗證失敗時覆寫——同名必同內容（名稱 = 明文 keyed hash），所以
                     // 覆寫絕不會蓋掉「不同的合法樹」。
                     if self
                         .repo
@@ -1358,23 +1338,22 @@ impl Backup {
         Ok(id)
     }
 
-    /// 記錄一個讀不到的項目：警告、計數、不寫進 tree。回傳 `None` 方便呼叫端直接 return。
+    /// 記錄一個讀不到的項目：警告、計數、不寫進 tree。
     ///（參數名避開 `display`：tracing 巨集把它保留給欄位包裝函式。）
-    fn skip(&mut self, what: &str, reason: &str) -> Option<Entry> {
+    fn skip(&mut self, what: &str, reason: &str) {
         tracing::warn!("{what}: {reason}; skipped");
         self.report.errors += 1;
-        None
     }
 
     /// 處理一個檔案：parent 的快速路徑 → 硬連結的重用 → 讀檔切塊。
-    /// 回傳 (size, chunks, content 型態)；`None` 表示讀不到、已記錄略過。
+    /// `None` 表示讀不到、已記錄略過。
     async fn process_file(
         &mut self,
         ctx: &SourceCtx,
         rel: &[u8],
         f: &FileFacts,
         parent: Option<&Entry>,
-    ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
+    ) -> Result<Option<FileContent>> {
         // 本機（posix）來源：非正規檔（FIFO/socket/裝置）跳過並記警告——
         // open 在 FIFO 無寫端時無限阻塞、裝置讀不完，還原也無法忠實重建。
         // 遠端來源沒有型別位元（posix = None），不檢查。
@@ -1394,8 +1373,8 @@ impl Backup {
         // 讀過 → 直接沿用 chunk 清單。
         let hl_key = f.posix.filter(|p| p.nlink > 1).map(|p| (p.dev, p.inode));
         if let Some(key) = hl_key {
-            if let Some((size, chunks, content)) = self.hardlinks.get(&key).cloned() {
-                return Ok(Some((size, chunks, content)));
+            if let Some(hit) = self.hardlinks.get(&key) {
+                return Ok(Some(hit.clone()));
             }
         }
 
@@ -1428,7 +1407,11 @@ impl Backup {
         self.report.chunks_new += result.chunks_new;
 
         let out = if result.chunks.len() <= MAX_INLINE_CHUNKS {
-            (size, result.chunks, content_type::DIRECT)
+            FileContent {
+                size,
+                chunks: result.chunks,
+                content: content_type::DIRECT,
+            }
         } else {
             // 大檔：chunk 清單本身當資料存
             let list_bytes = cbor::encode(&ChunkList::new(result.chunks))?;
@@ -1440,7 +1423,11 @@ impl Backup {
             // 清單 chunk 也是這次新存的 bytes（對帳：trailer entry 總和
             // == bytes_stored）。
             self.report.bytes_stored += list_result.bytes_new;
-            (size, list_result.chunks, content_type::INDIRECT)
+            FileContent {
+                size,
+                chunks: list_result.chunks,
+                content: content_type::INDIRECT,
+            }
         };
         if let Some(key) = hl_key {
             self.hardlinks.insert(key, out.clone());
@@ -1459,7 +1446,7 @@ impl Backup {
         &mut self,
         f: &FileFacts,
         parent: Option<&Entry>,
-    ) -> Result<Option<(u64, Vec<ChunkId>, u8)>> {
+    ) -> Result<Option<FileContent>> {
         let Some(pentry) = parent else {
             return Ok(None);
         };
@@ -1519,19 +1506,17 @@ impl Backup {
                 }
             }
         };
+        // 資料 chunk 與（INDIRECT 時）清單 chunk 都要在未標記的 pack 裡。
+        let list_ids: &[ChunkId] = if content == content_type::INDIRECT {
+            &pentry.chunks
+        } else {
+            &[]
+        };
         let mut packs: Vec<(ChunkId, ObjectId)> = Vec::with_capacity(data_ids.len());
-        for id in &data_ids {
+        for id in data_ids.iter().chain(list_ids) {
             match index.get(id) {
                 Some(loc) if !self.marked.contains(&loc.pack) => packs.push((*id, loc.pack)),
                 _ => return Ok(None),
-            }
-        }
-        if content == content_type::INDIRECT {
-            for id in &pentry.chunks {
-                match index.get(id) {
-                    Some(loc) if !self.marked.contains(&loc.pack) => packs.push((*id, loc.pack)),
-                    _ => return Ok(None),
-                }
             }
         }
         self.record_referenced(packs);
@@ -1545,7 +1530,11 @@ impl Backup {
             self.stats.bytes += pentry.size;
         }
         self.report.chunks_read += data_ids.len() as u64;
-        Ok(Some((pentry.size, pentry.chunks.clone(), content)))
+        Ok(Some(FileContent {
+            size: pentry.size,
+            chunks: pentry.chunks.clone(),
+            content,
+        }))
     }
 
     /// 記下沿用的 chunk 在哪個 pack。這次新寫的 pack（佔位或已 flush）另外在最後加。
@@ -1671,7 +1660,7 @@ impl Backup {
             state = state_back;
             self.record_referenced(std::mem::take(&mut state.reused));
             if let Some(p) = finished {
-                self.handle_finished(vec![p]).await?;
+                self.handle_finished(p).await?;
             }
             if let Some(e) = hard_error {
                 self.chunk_bufs.push(state.chunks.take_buf());
@@ -1701,70 +1690,67 @@ impl Backup {
             .packer
             .take()
             .ok_or_else(|| CoreError::Join("packer missing".into()))?;
-        let finished = blocking(move || {
+        let (packer, finished) = blocking(move || {
             let p = packer.finish()?;
             Ok((packer, p))
         })
-        .await;
-        let (packer, finished) = finished?;
+        .await?;
         self.packer = Some(packer);
         if let Some(p) = finished {
             if let Some(index) = self.index.as_mut() {
                 index.resolve_pending(p.id, p.bytes.len() as u64, &p.entries);
             }
-            self.handle_finished(vec![p]).await?;
+            self.handle_finished(p).await?;
         }
         Ok(())
     }
 
     /// 把封好的 pack 丟去上傳，並記進 index blob 的內容。
-    async fn handle_finished(&mut self, packs: Vec<FinishedPack>) -> Result<()> {
-        for p in packs {
-            self.wait_uploads(MAX_INFLIGHT_UPLOADS - 1).await?;
-            self.new_packs.push(IndexPack {
-                pack: p.id,
-                size: p.bytes.len() as u64,
-                entries: p.entries,
-            });
-            self.report.packs_new += 1;
-            let backend: Backend = self.repo.backend().clone();
-            let id = p.id;
-            let key = keys::pack(&id);
-            let parity_m = usize::from(self.parity);
-            let bytes = p.bytes;
-            self.uploads.spawn(async move {
-                // 同位是 sidecar：算不出來或上不去只警告——pack 本身已安全，
-                // 缺的只是冗餘。
-                // RS 對整個 pack（可到 64 MiB+）做線性組合是重 CPU，丟 blocking；
-                // 閉式把 bytes 帶回來上傳，不為了算同位多抄一份。
-                let (bytes, parity_bytes) = if parity_m > 0 {
-                    blocking(move || {
-                        let pb = match parity::encode(&id, &bytes, parity_m) {
-                            Ok(b) => Some(b),
-                            Err(e) => {
-                                tracing::warn!("pack {id} is stored but its parity is not: {e}");
-                                None
-                            }
-                        };
-                        Ok((bytes, pb))
-                    })
-                    .await?
-                } else {
-                    (bytes, None)
-                };
-                backend.put(&key, bytes).await.map_err(CoreError::from)?;
-                if let Some(parity_bytes) = parity_bytes {
-                    let parity_key = keys::parity(&id);
-                    match backend.put_if_absent(&parity_key, parity_bytes).await {
-                        Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+    async fn handle_finished(&mut self, p: FinishedPack) -> Result<()> {
+        self.wait_uploads(MAX_INFLIGHT_UPLOADS - 1).await?;
+        self.new_packs.push(IndexPack {
+            pack: p.id,
+            size: p.bytes.len() as u64,
+            entries: p.entries,
+        });
+        self.report.packs_new += 1;
+        let backend: Backend = self.repo.backend().clone();
+        let id = p.id;
+        let key = keys::pack(&id);
+        let parity_m = usize::from(self.parity);
+        let bytes = p.bytes;
+        self.uploads.spawn(async move {
+            // 同位是 sidecar：算不出來或上不去只警告——pack 本身已安全，
+            // 缺的只是冗餘。
+            // RS 對整個 pack（可到 64 MiB+）做線性組合是重 CPU，丟 blocking；
+            // 閉式把 bytes 帶回來上傳，不為了算同位多抄一份。
+            let (bytes, parity_bytes) = if parity_m > 0 {
+                blocking(move || {
+                    let pb = match parity::encode(&id, &bytes, parity_m) {
+                        Ok(b) => Some(b),
                         Err(e) => {
                             tracing::warn!("pack {id} is stored but its parity is not: {e}");
+                            None
                         }
+                    };
+                    Ok((bytes, pb))
+                })
+                .await?
+            } else {
+                (bytes, None)
+            };
+            backend.put(&key, bytes).await.map_err(CoreError::from)?;
+            if let Some(parity_bytes) = parity_bytes {
+                let parity_key = keys::parity(&id);
+                match backend.put_if_absent(&parity_key, parity_bytes).await {
+                    Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+                    Err(e) => {
+                        tracing::warn!("pack {id} is stored but its parity is not: {e}");
                     }
                 }
-                Ok(())
-            });
-        }
+            }
+            Ok(())
+        });
         Ok(())
     }
 
