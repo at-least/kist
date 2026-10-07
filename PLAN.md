@@ -372,12 +372,14 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   統一。gate：fmt／clippy 乾淨、nextest 357 過（原 333）、fixture_v3 4 過、deny ok。
 - 另：rustls 升 0.23.45（e9e06e6，RUSTSEC-2026-0285）。
 - 第二批：restore 一條線（分支 `adr-019-batch2`，每項先紅後綠）：A3 metadata 經已開的
-  handle 套用、A2 暫存檔＋rename（失敗不再刪使用者原有的檔；審查後暫存檔建成 0600）、
+  handle 套用、A2 暫存檔＋rename（失敗不再刪使用者原有的檔；審查後暫存檔不再以 umask
+  預設建立）、
   A4 以目錄 fd 為錨逐層走（rustix 成為 kist-core 的直接依賴；審查後擁有者只能進入、
   不能讀的目錄在 Linux 以 O_PATH 當錨）、A43 以 root 還原時先 chown 再套 mode、A30 本機
   擋路改報 RestoreBlocked。同一分支另有 A19、A33、A41、C1 資料安全那一半的測試，以及
-  一輪審查修正（本機後端 fsync、index 讀取的 I/O 錯誤不再壓成 Corrupt、run／serve 收
-  SIGTERM、CPU 密集段移出 async worker、SFTP 讀取的宣稱大小上限、Windows 的 clippy）。
+  其他修正（本機後端 fsync、index 讀取的 I/O 錯誤不再壓成 Corrupt、run／serve 收
+  SIGTERM、CPU 密集段移出 async worker、SFTP 讀取的宣稱大小上限、Windows 的 clippy）
+  與測試、文件的補強。
   gate：fmt／clippy 乾淨、nextest 391 過（原 357）、deny ok；交叉 clippy 乾淨：
   x86_64-pc-windows-gnu 不含 kist-mount、x86_64-apple-darwin 另不含 kist-cli（unix 上
   它依賴 kist-mount；fuser 的 build.rs 在 macOS 要 macFUSE）。

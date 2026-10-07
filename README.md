@@ -60,8 +60,10 @@ is corrupt」，改成「<路徑>: a symlink is in the way of a restored file」
 `restore` 在目標之下逐層開著目錄往下寫（unix；Windows 不變）：還原途中某一層被換成 symlink，寫入仍落在
 原本開著的那個目錄，不會跟著 symlink 寫到目標之外（以前會）。只能進入、不能讀的目錄（例如 0311；以 root
 備份、以一般使用者還原時會遇到）在 Linux 照樣還原得進去，子項目與硬連結都保得住；再還原到已經存在的這種
-目錄時，只有它自己的 metadata 套不上、回報 Permission denied（以前也是）。Linux 以外的 unix 則要求目標
-本身與其下既有的目錄都可讀，否則回報 Permission denied。
+目錄時，只有它自己的 metadata 套不上、回報 Permission denied（以前也是）。Linux 以外的 unix 沒有這條
+退路（依程式；沒在 macOS 上跑過）：目標本身要可讀，否則整個 restore 回報 Permission denied；snapshot 裡
+的這種目錄，名字落在其中的硬連結會退成各自獨立的複製（只記 warn），再還原到已經存在的這種目錄時，它
+回報 Permission denied、子項目被跳過。
 
 以 root（euid 0）執行 `restore` 時，記錄了 uid/gid 的條目（posix 來源）會先設回記錄的擁有者、再套
 mode（以前從不 chown：別人的 4755 檔會還原成 root 擁有的 setuid 檔）。擁有者設不回去的條目回報錯誤

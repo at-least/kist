@@ -159,8 +159,8 @@ mod imp {
     /// 開 `dir` 裡的目錄 `name`，回傳 (handle, 是不是唯讀開的)。先唯讀開：目錄的
     /// metadata 之後在同一個 handle 上套（ADR 019 A3）。擁有者只能進入、不能讀
     /// 的目錄（例如 0311；以 root 備份、以一般使用者還原才會遇到）唯讀開不了
-    /// （EACCES），Linux 改走 [`open_dir_path`]；其他 unix 沒有 O_PATH，照舊回
-    /// EACCES。
+    /// （EACCES），Linux（含 Android）改走 [`open_dir_path`]；其他 unix 不走這條
+    /// （macOS 沒有 O_PATH；FreeBSD 有，但沒驗過它的語意），照舊回 EACCES。
     fn open_dir(dir: impl AsFd, name: &OsStr, flags: OFlags) -> rustix::io::Result<(File, bool)> {
         match rustix::fs::openat(&dir, name, OFlags::RDONLY | flags, Mode::empty()) {
             Ok(fd) => Ok((File::from(fd), true)),

@@ -234,8 +234,9 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   唯讀開回 EACCES 時，Linux 改以 `O_PATH|O_DIRECTORY|O_NOFOLLOW` 開成錨（不檢查這個
   目錄本身的權限；`*at` 只要能進入它）；目錄的 metadata 從錨重開 `"."`（唯讀）來套，
   仍讀不了就回 EACCES，與以前相同；暫時加寫入權那一步改經錨 fstat 讀原權限。目標
-  本身同樣適用；可讀的目錄行為不變。Linux 以外的 unix 沒有這條退路，照舊要求可讀
-  （沒在上面跑過）。探針（Linux 6.18、非 root）：0311 目錄唯讀開 EACCES、O_PATH
+  本身同樣適用；可讀的目錄行為不變。Linux 以外的 unix 沒有這條退路，照舊要求可讀，
+  上述回歸（硬連結靜靜退成複製、再還原時子項目被跳過）在那裡仍在（讀碼；沒在上面
+  跑過）。探針（Linux 6.18、非 root）：0311 目錄唯讀開 EACCES、O_PATH
   開得起來；以 O_PATH 錨為 dirfd 的 openat(O_CREAT)、renameat、linkat、mkdirat、
   symlinkat、utimensat、unlinkat 都成功，fchmod 回 EBADF；O_PATH 加 O_NOFOLLOW 遇到
   symlink 與一般檔，有 O_DIRECTORY 時都回 ENOTDIR；錨開好後原位換成外指 symlink，
