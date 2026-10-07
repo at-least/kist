@@ -241,21 +241,16 @@ pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<UnlockedMaster
         open(&kek, kist_format::AAD_MASTER, &slot.wrapped)
             .map_err(|_| CryptoError::WrongPassword)?,
     );
-    if plain.len() < 32 {
+    let Some((key, rest)) = plain.split_first_chunk::<32>() else {
         return Err(CryptoError::BadLength {
             what: "unwrapped master payload",
             expected: 32,
             actual: plain.len(),
         });
-    }
-    let key: [u8; 32] = plain[..32].try_into().map_err(|_| CryptoError::BadLength {
-        what: "master key",
-        expected: 32,
-        actual: plain.len(),
-    })?;
-    let invariants: Invariants = kist_format::cbor::decode(&plain[32..])?;
+    };
+    let invariants: Invariants = kist_format::cbor::decode(rest)?;
     Ok(UnlockedMaster {
-        master: MasterKey(key),
+        master: MasterKey(*key),
         invariants,
     })
 }
@@ -429,5 +424,37 @@ impl RepoKeys {
     /// 解開 index blob。
     pub fn open_index_blob(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         open(&self.index_key, kist_format::AAD_INDEX, bytes)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// 密碼對、AEAD 也過，但解開的 payload 不到 master key 的 32 bytes：
+    /// 要回長度錯，不能 panic、也不能謊報成密碼錯。
+    #[test]
+    fn short_unwrapped_payload_is_a_length_error() {
+        let binding = KeyBinding {
+            repo_id: vec![9; 16],
+            chunker: kist_format::config::ChunkerParams::default(),
+        };
+        let cost = KdfCost {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let (mut slot, _) = create_key_slot(b"pw", "d", 0, cost, &binding).unwrap();
+        let kek = kdf(b"pw", &slot.kdf).unwrap();
+        slot.wrapped = seal(&kek, kist_format::AAD_MASTER, &[7; 31]).unwrap();
+        match unlock_key_slot(b"pw", &slot) {
+            Err(CryptoError::BadLength {
+                what: "unwrapped master payload",
+                expected: 32,
+                actual: 31,
+            }) => {}
+            other => panic!("want BadLength for a 31-byte payload, got {other:?}"),
+        }
     }
 }
