@@ -263,6 +263,8 @@ pub struct PrunePlan {
     marked_packs: HashSet<ObjectId>,
     /// 目前存在的所有 index blob（有效的與被取代的），新 blob 要 supersede 它們。
     all_blob_ids: Vec<ObjectId>,
+    /// 有效（未被取代）的 index blob 數：§10 的壓縮觸發只看它。
+    effective_blob_count: usize,
     /// 全部 (chunk, holder)，含被引用旗標；repack 的引用/kept 查詢用。
     idx: PruneIndex,
     /// 需要的 pack（是某個被引用 chunk 的正本）。
@@ -529,6 +531,7 @@ impl Repository {
             phantoms,
             indexed,
             all_blob_ids,
+            effective_blob_count: effective_blobs.len(),
             idx,
             needed_packs,
             to_delete,
@@ -609,7 +612,9 @@ impl PrunePlan {
             // v3（docs/format.md §10）：有效 blob 超過上限就必須合併——
             // 只增不刪的 repo 每次 backup 多一顆 blob，讀取端的 Get＋合併
             // 成本隨之增長；64 顆以內的增量合併代價可忽略。
-            || self.all_blob_ids.len() > MAX_EFFECTIVE_BLOBS
+            // 等 grace 的被取代 blob 不算：算進去的話合併後 grace 內每次
+            // prune 都會再重寫一次。
+            || self.effective_blob_count > MAX_EFFECTIVE_BLOBS
         {
             // 順序有意義：讀取端同一個 chunk 取第一個位置，所以新 pack 在前、被標記的（含被 repack 的舊 pack）
             // 在最後，之後的 backup 才不會把 chunk 解析到被標記的 pack 而白白重傳。幽靈 pack 丟掉。
