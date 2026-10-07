@@ -383,6 +383,13 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   gate：fmt／clippy 乾淨、nextest 391 過（原 357）、deny ok；交叉 clippy 乾淨：
   x86_64-pc-windows-gnu 不含 kist-mount、x86_64-apple-darwin 另不含 kist-cli（unix 上
   它依賴 kist-mount；fuser 的 build.rs 在 macOS 要 macFUSE）。
+- 易讀性整理（分支 `readability`，自 `adr-019-batch2` 分出；依 crate 五個 commit，行為不變）：
+  刪死碼與一行包裝、手寫 impl 改 derive、多義 tuple 改具名 struct、重複的小段收成一份、
+  巢狀 match 攤平、過時或只敘述歷史的註解改準；不新增 trait／泛型／模組。刻意沒動：
+  kist-format（PLAN 要負責人點頭）、對外 JSON／CLI 文字、ADR 019 已列的 A27–A42、tests/。
+  gate：fmt／clippy 乾淨、windows-gnu clippy（cargo-zigbuild，不含 kist-mount／kist-cli）乾淨、
+  nextest 391 過 1 略過、deny ok；另起 tests/sftp-setup.sh 與 rclone 跑 kist-backend 的
+  sftp／contract／rclone 測試 12 過（只有 S3 略過）。
 - 待辦：ADR 019「待負責人決定」第 1 點的第三～五批（A7／A9／A13／A14 起）。
 
 ## 已接受的限制（非待辦）
