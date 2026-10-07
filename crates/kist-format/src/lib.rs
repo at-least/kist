@@ -7,7 +7,7 @@
 //!
 //! 模組一覽：
 //! - [`ids`]：`ChunkId` / `TreeId`（keyed hash）與 `ObjectId`（pack/index 的密文 hash）。
-//! - [`cbor`]：所有 metadata 共用的規範 CBOR 編解碼（map keys 排序）。
+//! - [`cbor`]：所有 metadata 共用的規範 CBOR 編解碼（依規格欄位表順序，不排序 keys）。
 //! - [`pack`]：pack 檔的位元組排版與 trailer 結構。
 //! - [`config`]、[`tree`]、[`snapshot`]、[`index`]：各種明文結構。
 //! - [`keys`]：repo 內物件的 key（路徑）命名規則。

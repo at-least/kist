@@ -28,6 +28,7 @@ use kist_format::index::IndexBlob;
 use kist_format::{cbor, ObjectId};
 use serde::{Deserialize, Serialize};
 
+use crate::blocking;
 use crate::index::{ChunkIndex, ChunkLocation, DiskTable, TableRecord};
 use crate::{CoreError, Result};
 
@@ -120,22 +121,30 @@ impl IndexCache {
                 // 同一個 chunk 兩邊都有時**新的贏**——別台 client 因為舊 pack
                 // 被 GC 標記而重寫了同一個 chunk，這台才不會一直解析到被標記
                 // 的 pack。整張舊表串流讀取，不物化成 Vec（100 萬 chunk ≈ 96 MiB）。
-                let mut new_records: Vec<TableRecord> = Vec::new();
-                let mut packs = m.packs.clone();
-                let mut blobs = known;
-                for (id, blob) in new_blobs {
-                    if superseded.contains(&id) {
-                        continue;
+                // 新 blob 的攤平、排序與寫表（含整張舊表的串流 merge、fsync）
+                // 是純 CPU＋本機磁碟 I/O——包進 blocking 執行緒，不佔住
+                // async worker（PLAN 的 CPU 密集規則）。
+                let dir = self.dir.clone();
+                let base_packs = m.packs.clone();
+                blocking(move || {
+                    let mut new_records: Vec<TableRecord> = Vec::new();
+                    let mut packs = base_packs;
+                    let mut blobs = known;
+                    for (id, blob) in new_blobs {
+                        if superseded.contains(&id) {
+                            continue;
+                        }
+                        push_blob(&mut new_records, &mut packs, &blob);
+                        blobs.push(id);
                     }
-                    push_blob(&mut new_records, &mut packs, &blob);
-                    blobs.push(id);
-                }
-                new_records.sort_by_key(|r| r.id);
-                new_records.dedup_by(|later, earlier| later.id == earlier.id);
-                packs.sort();
-                packs.dedup();
-                // 舊表串流 merge 在 write() 裡進行（t 的所有權移進去）
-                self.write(new_records, blobs, packs, Some(t))
+                    new_records.sort_by_key(|r| r.id);
+                    new_records.dedup_by(|later, earlier| later.id == earlier.id);
+                    packs.sort();
+                    packs.dedup();
+                    // 舊表串流 merge 在 write() 裡進行（t 的所有權移進去）
+                    Self::write(&dir, new_records, blobs, packs, Some(t))
+                })
+                .await
             }
             _ => return self.rebuild(live, fetch).await,
         }
@@ -163,11 +172,16 @@ impl IndexCache {
                 }
             },
         };
-        records.sort_by_key(|r| r.id);
-        records.dedup_by(|later, earlier| later.id == earlier.id);
-        packs.sort();
-        packs.dedup();
-        self.write(records, kept, packs, None)
+        // 排序與寫表進 blocking（同 load 的增量路徑：純 CPU＋本機磁碟 I/O）。
+        let dir = self.dir.clone();
+        blocking(move || {
+            records.sort_by_key(|r| r.id);
+            records.dedup_by(|later, earlier| later.id == earlier.id);
+            packs.sort();
+            packs.dedup();
+            Self::write(&dir, records, kept, packs, None)
+        })
+        .await
     }
 
     /// 樂遍（`optimistic = true`）：blob 讀完即丟；遇到帶 supersedes 的 blob
@@ -219,15 +233,16 @@ impl IndexCache {
     }
 
     /// 寫表與 manifest。`new_records` 必須已排序去重；`old` 是要合併進來的
-    /// 舊表（增量），同 ID 時新紀錄贏。
+    /// 舊表（增量），同 ID 時新紀錄贏。不拿 `&self`：呼叫端把整段排序＋寫表
+    /// 包進 blocking 執行緒（純 CPU＋本機磁碟 I/O，PLAN 的 CPU 密集規則）。
     fn write(
-        &self,
+        dir: &Path,
         new_records: Vec<TableRecord>,
         blobs: Vec<ObjectId>,
         packs: Vec<(ObjectId, u64)>,
         old: Option<DiskTable>,
     ) -> Result<ChunkIndex> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| CoreError::io(&self.dir, e))?;
+        std::fs::create_dir_all(dir).map_err(|e| CoreError::io(dir, e))?;
         let records: Box<dyn Iterator<Item = Result<TableRecord>> + '_> = match &old {
             Some(t) => Box::new(MergeOldNew {
                 old: t.iter()?.peekable(),
@@ -235,16 +250,16 @@ impl IndexCache {
             }),
             None => Box::new(new_records.into_iter().map(Ok)),
         };
-        let table = DiskTable::build_sorted(&self.table_path(), records)?;
+        let table = DiskTable::build_sorted(&dir.join("index.tbl"), records)?;
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             blobs,
             packs: packs.clone(),
         };
-        let tmp = self.manifest_path().with_extension("cbor.tmp");
+        let tmp = dir.join("manifest.cbor.tmp");
         std::fs::write(&tmp, cbor::encode(&manifest)?).map_err(|e| CoreError::io(&tmp, e))?;
-        std::fs::rename(&tmp, self.manifest_path())
-            .map_err(|e| CoreError::io(self.manifest_path(), e))?;
+        std::fs::rename(&tmp, dir.join("manifest.cbor"))
+            .map_err(|e| CoreError::io(dir.join("manifest.cbor"), e))?;
         Ok(ChunkIndex::with_base(
             Arc::new(table),
             packs.into_iter().collect(),

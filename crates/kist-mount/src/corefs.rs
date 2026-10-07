@@ -27,8 +27,8 @@ pub const VOLATILE_TTL: Duration = Duration::from_secs(1);
 /// snapshot 內容（內容定址、不可變）的快取期限。
 pub const IMMUTABLE_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// mount 設定。`chunk_cache` = 解密後 chunk 的快取顆數（0 = 8；8 MiB chunk 時
-/// 上限 64 MiB）。
+/// mount 設定。`chunk_cache` = 解密後 chunk 的快取顆數（0 視為 1；預設 8；
+/// 8 MiB chunk 時上限 64 MiB）。
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub chunk_cache: usize,
@@ -249,7 +249,11 @@ impl Lru {
         self.map.insert(id, data);
         self.order.push_front(id);
         while self.order.len() > self.cap {
-            let victim = self.order.pop_back().expect("order 與 map 同步");
+            // ADR 019 A19：非測試碼不用 expect——迴圈條件保證 pop_back 必有值，
+            // 真的不同步時這裡停下來就好（map 移除不了不存在的 key 也無害）。
+            let Some(victim) = self.order.pop_back() else {
+                break;
+            };
             self.map.remove(&victim);
         }
     }

@@ -46,6 +46,28 @@ kist forget --keep-last 10 --prune      # 一次做完
 結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
 請看警告。
 
+`restore` 先把每個檔寫進同目錄的隱藏暫存檔 `.kist-restore-*`，完整寫好才 rename 成正式名：還原失敗
+時目標處原有的檔不動（以前會被刪掉），擋路的 symlink、目錄或特殊檔回報錯誤、不動它；再還原到先前
+還原出的唯讀目錄（例如 0555）時，會暫時加上擁有者寫入權，最後套回記錄的 mode。覆寫大檔時新舊兩份
+會同時佔空間；Ctrl-C 中斷的 restore 可能留下 `.kist-restore-*`，可以直接刪掉。暫存檔建成只有擁有者可
+讀寫（0600），記錄的 mode 最後才套上：metadata（例如 xattr）套不上時內容照樣還原、回報錯誤，檔案停在
+0600；沒記錄 mode 的條目（s3／generic 來源）覆寫既有檔時沿用原檔的權限（再經 umask），新檔照舊是
+umask 預設。
+這類本機擋路（含目錄位置上擋著的 symlink 或非目錄）與 xattr 設不上去的錯誤，訊息不再說「object …
+is corrupt」，改成「<路徑>: a symlink is in the way of a restored file」之類（`restore --json` 的
+`errors` 字串同樣改變）；結束碼不變。
+
+`restore` 在目標之下逐層開著目錄往下寫（unix；Windows 不變）：還原途中某一層被換成 symlink，寫入仍落在
+原本開著的那個目錄，不會跟著 symlink 寫到目標之外（以前會）。只能進入、不能讀的目錄（例如 0311；以 root
+備份、以一般使用者還原時會遇到）在 Linux 照樣還原得進去，子項目與硬連結都保得住；再還原到已經存在的這種
+目錄時，只有它自己的 metadata 套不上、回報 Permission denied（以前也是）。Linux 以外的 unix 則要求目標
+本身與其下既有的目錄都可讀，否則回報 Permission denied。
+
+以 root（euid 0）執行 `restore` 時，記錄了 uid/gid 的條目（posix 來源）會先設回記錄的擁有者、再套
+mode（以前從不 chown：別人的 4755 檔會還原成 root 擁有的 setuid 檔）。擁有者設不回去的條目回報錯誤
+（結束碼 3），mode 照套但去掉 setuid／setgid；沒記錄 uid/gid 的條目（遠端來源）同樣去掉這兩個位。
+非 root 還原不變：檔案屬於還原者本人，mode 照記錄的值。
+
 密碼檔（`--password-file` 與設定檔的 `password_file` 同一份規則）：只取第一行、去掉結尾的 `\r`，
 空的算錯誤。
 
@@ -101,6 +123,11 @@ kist run --config /etc/kist/backup.toml          # 常駐，照排程跑（Ctrl-
 kist run --config /etc/kist/backup.toml --once   # 每件工作各跑一次就結束（給外部 cron / systemd timer）
 kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端口：/metrics 與 Web UI
 ```
+
+> 排程錯過不補跑：daemon 沒在跑、機器休眠或停機跨過了排程時間的話，那次就跳過，
+> 下一輪是排程的**下一次**時間（不是醒來後立刻補跑）。常休眠的機器請用外部
+> cron / systemd timer 配 `run --once`。對應的訊號是 `kist_job_last_success_timestamp_seconds`
+> 多久沒更新。
 
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
 

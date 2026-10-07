@@ -15,15 +15,19 @@
 //! 是隨機的（約一半）。所以每個情境最多跑 `MAX_ROUNDS` 回，遇到「不看標記的 loader
 //! 把沿用的 chunk 解析到被標記 pack」的回合（修正前必定誤拒的那種）就停；每一回都
 //! 要求 backup 成功。
+//!
+//! 只驗放行不夠：`deleting_the_old_pack_*` 驗資料安全的一半——放行之後讓 prune 真的
+//! 刪掉被標記的舊 pack，放行的 snapshot 仍要逐 byte 還原、check 讀資料無錯。
 
 mod common;
 
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use common::*;
-use kist_core::{BackupOptions, ForgetOptions, PruneOptions, Repository};
+use kist_core::{BackupOptions, CheckOptions, ForgetOptions, PruneOptions, Repository};
 use kist_format::{keys, ChunkId, ObjectId};
 use time::OffsetDateTime;
 
@@ -99,12 +103,22 @@ struct Round {
     rejected: Option<String>,
 }
 
+/// 真 prune repack 情境做到 b3 之前的狀態（見 [`repack_setup`]）。
+struct RepackSetup {
+    t: TestRepo,
+    src: PathBuf,
+    /// 第一輪 prune 標記的物件：被 repack 的舊 pack A，以及只裝 drop 的 pack。
+    marked: BTreeSet<ObjectId>,
+    marked_sorts_first: bool,
+}
+
 /// 真 prune repack 的情境（無快取），不手放標記：
 /// b1（keep＋drop）→ 刪掉 drop 再 b2 → forget b1 → pack 放老 → prune 把 keep 的 chunk
-/// 從半死的舊 pack A 搬進新 pack N、標記 A → 標記超過 grace，還沒有 prune 來刪 A → b3。
-/// `offline`：b1、b2 在 6 天前與 5 天前（早於標記），b3 之前先跑第二輪 prune，
+/// 從半死的舊 pack A 搬進新 pack N、標記 A → 標記超過 grace，還沒有 prune 來刪 A。
+/// 下一步是 b3，由呼叫端做。
+/// `offline`：b1、b2 在 6 天前與 5 天前（早於標記），最後再跑第二輪 prune，
 /// 確認它被活躍 client 規則擋住、A 還在。
-async fn repack_round(offline: bool, seed: u64) -> Round {
+async fn repack_setup(offline: bool, seed: u64) -> RepackSetup {
     let t = TestRepo::new().await;
     let src = t.dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -183,17 +197,89 @@ async fn repack_round(offline: bool, seed: u64) -> Round {
         .collect();
     assert!(!moved.is_empty());
     let marked_sorts_first = resolves_to_marked(&t.open().await, &moved, &marked).await;
+    RepackSetup {
+        t,
+        src,
+        marked,
+        marked_sorts_first,
+    }
+}
 
-    let rejected = t
+/// 放行的一半：[`repack_setup`] 之後的 b3 必須成功。
+async fn repack_round(offline: bool, seed: u64) -> Round {
+    let s = repack_setup(offline, seed).await;
+    let rejected =
+        s.t.open()
+            .await
+            .backup(std::slice::from_ref(&s.src), client(1, None))
+            .await
+            .err()
+            .map(|e| format!("repack offline={offline} seed={seed}: {e}"));
+    Round {
+        marked_sorts_first: s.marked_sorts_first,
+        rejected,
+    }
+}
+
+/// 資料安全的一半：gate 放行的 b3，在被標記的舊 pack 真的刪掉之後仍然還原得出來。
+/// [`repack_setup`] 之後：b3 必須成功，而且一個新 chunk 都沒寫（backup 不拿被標記的
+/// pack 去重，所以沿用的 chunk 全落在未標記的新持有者 N）→ 跑 prune（標記已超過 grace）：
+/// b3 晚於標記，活躍 client 規則不再擋，第一輪標記的 pack（含 A）必須全數刪掉 →
+/// 還原 b3 逐 byte 比對來源、check 讀資料無錯。
+/// A 排在 N 前面的排列（`marked_sorts_first`）正是不看標記的 loader（restore 用的
+/// `load_index`）會先挑 A 的那種：A 刪掉之後 index 必須已經不指它。
+async fn repack_then_delete_round(offline: bool, seed: u64) -> Round {
+    let s = repack_setup(offline, seed).await;
+    let t = &s.t;
+    let b3 = match t
         .open()
         .await
-        .backup(std::slice::from_ref(&src), client(1, None))
+        .backup(std::slice::from_ref(&s.src), client(1, None))
         .await
-        .err()
-        .map(|e| format!("repack offline={offline} seed={seed}: {e}"));
+    {
+        Ok(b3) => b3,
+        Err(e) => {
+            return Round {
+                marked_sorts_first: s.marked_sorts_first,
+                rejected: Some(format!("repack offline={offline} seed={seed}: {e}")),
+            }
+        }
+    };
+    assert_eq!(b3.report.chunks_new, 0, "b3 沒有完全去重：{:?}", b3.report);
+
+    // 標記在 setup 裡已老到 4 天（超過 72 小時的 grace）；b3 晚於標記，這一輪就該刪。
+    // 不再把標記撥得更老：刪除前 prune 會比 pack 與標記的 mtime，標記不比 pack 新
+    // （同一秒算重寫過）就當作標記後被重寫而復活——pack 在 setup 裡撥成 8 天前，
+    // 標記也撥到 8 天前會落在同一秒。
+    let p3 = t.open().await.prune(PruneOptions::default()).await.unwrap();
+    assert_eq!(p3.blocked, 0, "{p3:?}");
+    assert!(p3.deleted > 0, "{p3:?}");
+    let left: Vec<ObjectId> = ids_under(t, keys::PACKS_PREFIX)
+        .intersection(&s.marked)
+        .copied()
+        .collect();
+    assert!(left.is_empty(), "被標記的舊 pack 還在：{left:?}\n{p3:?}");
+
+    // 還原 b3：來源此時只剩 keep.bin，逐 byte（連 mtime）相同
+    let fresh = t.open().await;
+    let out = t.dir.path().join("out");
+    let r = fresh
+        .restore(&b3.snapshot_key, &out, Default::default())
+        .await
+        .unwrap();
+    assert!(r.errors.is_empty(), "還原失敗：{:?}", r.errors);
+    assert_same_tree(&s.src, &out.join(s.src.strip_prefix("/").unwrap_or(&s.src)));
+    let report = fresh
+        .check(CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(report.errors.is_empty(), "check：{:?}", report.errors);
     Round {
-        marked_sorts_first,
-        rejected,
+        marked_sorts_first: s.marked_sorts_first,
+        rejected: None,
     }
 }
 
@@ -284,6 +370,16 @@ async fn gate_accepts_dedup_to_the_repacked_holder() {
 #[tokio::test]
 async fn gate_accepts_dedup_to_the_repacked_holder_for_an_offline_client() {
     run_until_marked_sorts_first(|seed| repack_round(true, seed)).await;
+}
+
+#[tokio::test]
+async fn deleting_the_old_pack_keeps_the_accepted_snapshot_restorable() {
+    run_until_marked_sorts_first(|seed| repack_then_delete_round(false, seed)).await;
+}
+
+#[tokio::test]
+async fn deleting_the_old_pack_keeps_the_accepted_snapshot_restorable_for_an_offline_client() {
+    run_until_marked_sorts_first(|seed| repack_then_delete_round(true, seed)).await;
 }
 
 #[tokio::test]

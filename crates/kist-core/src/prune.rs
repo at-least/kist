@@ -339,7 +339,9 @@ impl Repository {
                 indexed.entry(p.pack).or_insert(p);
             }
         }
-        let mut idx = PruneIndex::new(records);
+        // 排序＋去重是純 CPU（百萬級記錄）——丟進 blocking 執行緒，不佔住
+        // async worker（PLAN：CPU 密集段不進 async task）。
+        let idx = blocking(move || Ok(PruneIndex::new(records))).await?;
 
         // 2. 可達性（嚴格：連被引用的 chunk 不在 index 裡都算引用不完整）
         let reach = self.walk_references(&idx, &mut |_| {}).await?;
@@ -371,9 +373,20 @@ impl Repository {
             );
         }
         // 掃 PruneIndex 的每個 chunk 組（組均 1–2 筆），同時把被引用 chunk 的 holder 打上旗標。
-        let is_marked = |id: &ObjectId| marks.contains_key(id);
-        let (needed_packs, live_bytes) =
-            idx.mark_and_canonicalize(reach.referenced_chunks, &is_marked, &phantoms)?;
+        // 正本選擇也是純 CPU（引用名單排序＋線性合併），同樣進 blocking；
+        // marks 第 6 步還要用，這裡只複製一份 32-byte 鍵集換得 'static。
+        let marked_ids: HashSet<ObjectId> = marks.keys().copied().collect();
+        let (idx, needed_packs, live_bytes, phantoms) = {
+            let mut idx = idx;
+            let referenced = reach.referenced_chunks;
+            blocking(move || {
+                let is_marked = |id: &ObjectId| marked_ids.contains(id);
+                let (needed, live) =
+                    idx.mark_and_canonicalize(referenced, &is_marked, &phantoms)?;
+                Ok((idx, needed, live, phantoms))
+            })
+            .await?
+        };
         // 每個 pack 的 (正本 bytes, 全部 bytes)：全部 bytes 從 indexed 累計，
         // 正本 bytes 是 mark_and_canonicalize 算出的正本表。
         let mut pack_bytes: HashMap<ObjectId, (u64, u64)> = HashMap::new();

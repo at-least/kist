@@ -6,7 +6,7 @@
 #                  不給 = 不限量（量測跑法）。
 #
 # 產出：
-#   <outdir>/<label>.samples   每行「memory.current file_page_cache」（bytes，~50ms 一次）
+#   <outdir>/<label>.samples   每行「memory.current file_page_cache slab_reclaimable」（bytes，~50ms 一次）
 #   <outdir>/<label>.result    exit_code、sampled_max_ex_file、memory.peak、oom 摘要
 #
 # 取樣值 = memory.current − memory.stat 的 file 欄：把可回收的檔案 page cache

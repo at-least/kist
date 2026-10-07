@@ -3,7 +3,9 @@
 mod common;
 
 use common::*;
-use kist_core::{CheckOptions, RestoreOptions};
+#[cfg(unix)]
+use kist_core::CheckOptions;
+use kist_core::RestoreOptions;
 
 /// 讀不到的檔案：跳過、計數、snapshot 照寫（restic 的做法），其他檔案都在。
 #[cfg(unix)]

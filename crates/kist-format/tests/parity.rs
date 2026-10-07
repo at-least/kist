@@ -39,7 +39,8 @@ fn golden_go_parity_repairs_rust_side() {
     );
 
     // 向量以 UPDATE_VECTOR=1 錄製；凍結 golden，只在格式版本升級時重錄。
-    if std::env::var_os("UPDATE_VECTOR").is_some() {
+    // 只認 "1"（UPDATE_VECTOR=0 是「想關掉」，不是「要重錄」）。
+    if std::env::var_os("UPDATE_VECTOR").as_deref() == Some(std::ffi::OsStr::new("1")) {
         let ours = parity::encode(&id, &pack, 2).unwrap();
         std::fs::write(
             "tests/testdata/parity-golden.txt",

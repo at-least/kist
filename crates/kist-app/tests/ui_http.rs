@@ -529,8 +529,10 @@ async fn ui_responses_carry_content_security_policy() {
     let (status, headers, _) = request(s.addr, "GET", "/", &[("Host", &s.host)], "").await;
     assert!(status.contains("200"), "{status}");
     assert!(
-        headers.contains("content-security-policy:"),
-        "UI 回應要帶 CSP header：{headers}"
+        headers.contains("content-security-policy:")
+            && headers.contains("default-src 'none'")
+            && headers.contains("frame-ancestors 'none'"),
+        "UI 回應要帶 CSP header，而且政策的骨幹不能被放寬：{headers}"
     );
 }
 

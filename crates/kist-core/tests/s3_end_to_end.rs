@@ -196,10 +196,16 @@ async fn forget_and_prune_on_s3() {
         .unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     let target = dir.path().join("out");
+    // `Repository::restore` 吃的是快照 key——`latest` 的解析在 CLI 層，這裡照
+    // CLI 的做法先解析再還原。（以前直接傳 "latest" 只會得到 SnapshotNotFound，
+    // 舊的 `is_err() ||` 斷言把這個測試自己的用法錯誤當成「通過」，restore 的
+    // 主張整個是空的。）
+    let latest = fresh.resolve_snapshot("latest").await.unwrap();
     let r = fresh
-        .restore("latest", &target, RestoreOptions::default())
-        .await;
-    assert!(r.is_err() || r.as_ref().unwrap().errors.is_empty());
+        .restore(&latest, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
     for prefix in ["packs", "trees", "indexes", "snapshots", "gc"] {
         for o in backend.list(prefix).await.unwrap() {
             backend.delete(&o.key).await.unwrap();

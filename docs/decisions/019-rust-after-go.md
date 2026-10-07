@@ -145,6 +145,23 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   隱藏的暫存檔（比正式檔名下的半截檔好）；還原到先前還原出來的唯讀目錄（0555）時
   建暫存檔會 EACCES，現行原地寫入反而成功（實測），實作要選退回原地寫或明確報錯。
   非 Go 所致（「殘檔移除」來自 25600ac）。
+  【實作後：唯讀目錄兩者都沒選——既有目錄擁有者不可寫、而且記錄了 mode（之後會
+  重新套上）時，讀完子 tree 後先經 O_NOFOLLOW 的 handle 暫時加上擁有者寫入權，子
+  項目寫完照常套回記錄的 mode；套 metadata 失敗時放回原本的權限，chmod 本身失敗只
+  記 warn、讓子項目各自回報。硬連結：「複製那條路」之外，EEXIST（第二次還原到同一
+  目標的常態）改成以暫存名 link 再 rename——只改走複製的話，第二次還原後硬連結
+  關係就斷了（實測兩個 inode、nlink 1；HEAD 是同一個 inode、nlink 2）。擋路的
+  symlink 照裁定拒絕；目錄與特殊檔（FIFO、socket、裝置）在寫之前、rename 之前也都
+  拒絕（以前 FIFO 會卡在開檔）。暫存檔名的亂數用 kist_crypto::random_bytes（rand
+  在 kist-core 只是 dev-dependency）。非 unix 走同一條暫存＋rename，只少了
+  O_NOFOLLOW；只做了交叉 clippy，沒在 Windows 上跑過。】
+  【實作後（審查）：暫存檔起初以 umask 預設（0o644）建立，比原地寫差——覆寫使用者
+  0o600 的檔時內容先落在別人讀得到的暫存檔，metadata（xattr）套不上時就停在 0o644；
+  沒記錄 mode 的條目（s3／generic）覆寫後也從 0o600 變 0o644、不報錯（兩者對
+  619e500 之前的版本實測都維持 0o600）。改成：記錄的 mode 之後會套上時以 0o600 建
+  暫存檔（套不上就停在 0o600）；不會套時沿用正式名處原有一般檔的權限，沒有才是
+  0o666（皆再經 umask）。不以記錄的 mode 建檔：唯讀的 mode 會讓之後的 user.* 設不
+  進去。】
 
 **A3　restore 的 mode 與時間以路徑套用，會跟隨被換上的 symlink（repo-2）**
 
@@ -155,7 +172,10 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
 - **提案**：metadata 一律經已開的 handle 套用：`File::set_times`、
   `File::set_permissions`、`xattr::FileExt::set_xattr`，保留 xattr → 時間 → mode 的
   順序；目錄以 `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` 開 handle。只用 std 與既有 crate。
-  與 A2 同一次做。
+  與 A2 同一次做。【實作後：A3 先於 A2 單獨做——檔案用寫內容的同一個 handle；目錄
+  在子項目寫完後才開，ENOTDIR／ELOOP 回報「a non-directory is in the way of a restored
+  directory」（錯誤變體仍是 Corrupt，留給 A30）。Windows 的目錄照舊用 filetime 的
+  開法（會跟隨 reparse point），只做了交叉編譯，沒在 Windows 上跑過。】
 - **代價的證據**：實測（探針，非 kist 本身）：寫完、drop、把路徑換成指向外部檔的
   symlink 後以路徑套用，外部檔被改成 mode 4755、mtime 1000000；改用 fd 則外部檔
   不受影響。目錄變體已實測可行。路徑被換成 FIFO 時 set_file_times 會卡住（實測
@@ -189,6 +209,39 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   ADR 018:34-35 指的是另一件已修的事。
   【需負責人同意：新增直接依賴 rustix（不是換技術選型）；「只接受空目標」的替代案
   會改產品契約】
+  【實作後：照裁定做 fd 錨定、不恢復空目標規則。新模組 dirhandle.rs 的 DirHandle：
+  目標本身照常跟隨地開（O_RDONLY|O_DIRECTORY），之下每層 `mkdirat` 後
+  `openat(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`；暫存檔
+  `openat(O_CREAT|O_EXCL|O_NOFOLLOW)`、`renameat`、`unlinkat`、`linkat`、`symlinkat`，
+  symlink 本身的時間改用 `utimensat(AT_SYMLINK_NOFOLLOW)`。目錄的 metadata 改套在往下
+  走時開的那個 handle 上、不再以路徑重開：A3 的目錄測試因此改成斷言 metadata 落在
+  被搬開的真目錄、沒有錯誤（A3 時是回報擋路錯誤）。硬連結表**不照**上面寫的存
+  （目錄 handle, name）——每筆開著一個 fd，大樹會把 fd 用光——改存相對於目標的
+  路徑元件，連結時從目標的 handle 逐層 O_NOFOLLOW 重開再 `linkat`；同時開著的
+  handle 以深度為上限（測試：RLIMIT_NOFILE 64 下還原 300 對硬連結）。rustix 1.1
+  （fs、process；process 留給 A43）成為 kist-core 的直接依賴，Cargo.lock 仍只有
+  1.1.4 一份；libc 不再是 kist-core 的直接依賴。代價：目錄 handle 以 O_RDONLY 開，
+  目標本身與其下既有的目錄都要可讀——實測擁有者 0311 的目標或中間目錄，HEAD 還原
+  成功，之後回 Permission denied。實測競態（同 uid、2000 個檔、中間目錄反覆換成外指
+  symlink）：HEAD 10 次全紅，每次 780–830 個項目寫到外面；之後 20 次全綠，2000 個檔
+  全數還原、沒有錯誤。非 unix 維持兩步檢查（改成往下走時逐層檢查）；Windows 與
+  macOS 只做了交叉 clippy，沒在上面跑過。】
+  【實作後（審查）：上面那個代價其實是回歸，而且不只「回 Permission denied」：snapshot
+  裡擁有者只能進入、不能讀的目錄（0311，以 root 備份、以一般使用者還原才會遇到）
+  第一次還原時，名字落在它裡面的硬連結重開不了它，靜靜退成複製（只有 warn）；再
+  還原一次，它整個開不了，子項目全被跳過。以前以完整路徑操作只要求能進入，兩次都
+  保住硬連結、子項目照寫，第二次只有它自己的 metadata 回 Permission denied。改成：
+  唯讀開回 EACCES 時，Linux 改以 `O_PATH|O_DIRECTORY|O_NOFOLLOW` 開成錨（不檢查這個
+  目錄本身的權限；`*at` 只要能進入它）；目錄的 metadata 從錨重開 `"."`（唯讀）來套，
+  仍讀不了就回 EACCES，與以前相同；暫時加寫入權那一步改經錨 fstat 讀原權限。目標
+  本身同樣適用；可讀的目錄行為不變。Linux 以外的 unix 沒有這條退路，照舊要求可讀
+  （沒在上面跑過）。探針（Linux 6.18、非 root）：0311 目錄唯讀開 EACCES、O_PATH
+  開得起來；以 O_PATH 錨為 dirfd 的 openat(O_CREAT)、renameat、linkat、mkdirat、
+  symlinkat、utimensat、unlinkat 都成功，fchmod 回 EBADF；O_PATH 加 O_NOFOLLOW 遇到
+  symlink 與一般檔，有 O_DIRECTORY 時都回 ENOTDIR；錨開好後原位換成外指 symlink，
+  寫入仍落在被搬開的目錄，從錨重開 `"."` 拿到同一個 inode。restore_hardening 的
+  0311 測試 RED→GREEN；三個變異（拿掉退路、metadata 直接用 O_PATH 錨、退路少了
+  O_DIRECTORY）各讓對應測試變紅。】
 
 **A5　`kist run` 的 backup 閘門不看 `[prune].grace`（backup-8）**
 
@@ -419,7 +472,7 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
 | A27 | 報告欄位名照 Go、與實際量的不符（backup-1） | chunks_read（backup.rs:133）只數沿用的；packs_revived（:136）逐 chunk 累加 | 改名 chunks_reused、chunks_revived，改 doc、backup_gc_rules.rs:435-466 測試名與 format.md:298-300 | 實測首次備份讀了 32 個 chunk 報 0，快速路徑沒讀卻報 32；標記 1 顆 pack 報 14。名字來自 08198b8 改用 Go 的名稱 | S | CONFIRMED。只影響 `backup --json`、`run --json`、webhook；metrics、jobstate 不讀。【改對外 JSON】 |
 | A28 | forget 的 JSON 形狀依入口而異（app-4） | CLI 包成 `{snapshot, reasons}` 加 dry_run（main.rs:903-941），daemon 直接輸出 tuple（jobs.rs:160） | kept 改 `Vec<Kept { snapshot, reasons }>`，ForgetSummary、PruneReport 帶 dry_run；刪 CLI 包裝；修訂 ADR 006 §1；補 daemon 路徑測試 | 實測兩個入口形狀不同，daemon 那份正是 ADR 006 判定「太脆弱」的 tuple | S | CONFIRMED。webhook 預設只送 failure／incomplete。【改對外 JSON】 |
 | A29 | CheckOptions 兩個 bool（prune-3） | repair 隱含 read_data 只在 core 內改寫（check.rs:55-62），CLI 用原始 bool 印摘要（main.rs:746） | 最小：main.rs:746 改成讀 `read_data` 或 `repair`，補 CLI `--repair` 測試；CheckLevel enum 可選 | 實測（HEAD binary）`--repair` 確實讀了資料，摘要卻少了「(data read)」；CLI 從沒測過 `--repair` | S | CONFIRMED。Go 端本來就是兩者取或，移植漏了 |
-| A30 | Corrupt 被當萬用錯誤（repo-5） | 本機 symlink 擋路（restore.rs:87-90、377-380、389-392、489-492）與 xattr 失敗（fsmeta.rs:236-240）都報「object … is corrupt」 | 加一個本機擋路變體（例如 `RestoreBlocked { path, reason }`）替換四處；xattr 保留 Io 與 source。讀 repo bytes 的點維持 Corrupt（repo.rs:346-347 的 `.r1` 退路靠它） | 實測使用者自己的 symlink：檔案層報 corrupt、結束碼 3；目錄層整個 restore 中止 | S | CONFIRMED。Compress 變體、結構化 errors 剔除；Go 因果被推翻 |
+| A30 | Corrupt 被當萬用錯誤（repo-5） | 本機 symlink 擋路（restore.rs:87-90、377-380、389-392、489-492）與 xattr 失敗（fsmeta.rs:236-240）都報「object … is corrupt」 | 加一個本機擋路變體（例如 `RestoreBlocked { path, reason }`）替換四處；xattr 保留 Io 與 source。讀 repo bytes 的點維持 Corrupt（repo.rs:346-347 的 `.r1` 退路靠它） | 實測使用者自己的 symlink：檔案層報 corrupt、結束碼 3；目錄層整個 restore 中止 | S | CONFIRMED。Compress 變體、結構化 errors 剔除；Go 因果被推翻。【實作後：新變體 `RestoreBlocked { path, reason }`，訊息「{path}: {reason}」，reason 字串不變。A2／A4 之後四處收成三個函式：dirhandle.rs 的 in_the_way_of_dir（目錄）、restore.rs 的 refuse_in_the_way（檔案）與 replace_with_symlink（symlink）。控制流程不變（檔案層結束碼仍 3，root 定位被擋仍整個中止）。xattr 改回 Io，訊息照舊帶 xattr 名稱；寫法同 owner_error，保留錯誤種類、不保留 errno】 |
 | A31 | mount 把錯誤抹成 EIO 且不記 log（app-11） | corefs.rs:319、387、510、659、728 一律轉成 `FsError::Io`；corefs 只有兩處 tracing | 私有 `fn io(e: CoreError) -> FsError`，先 `tracing::warn!` 再回 Io；修 corefs.rs:77、427 過時註解 | 讀碼：後端、解密、缺 chunk 都只剩 EIO；restore.rs:62-72 每 60 秒只印一次「repack may be in progress」，會誤導。掛載實測 UNVERIFIED | S | CONFIRMED。kist-app 的 String 錯誤部分剔除（改帶 source 的變體可能把 webhook token 帶回 log） |
 | A32 | fsmeta 兩份（crosscut-3） | PosixMeta（kist-backend/src/fsmeta.rs:11-22）與 FsMeta（kist-core/src/fsmeta.rs:113-125）八欄相同，backup.rs:1457-1466 逐欄抄 | `pub use kist_backend::fsmeta::PosixMeta as FsMeta`；source.rs:316-321、400-405 兩份 chrono→ns 合一；補 restore 時間轉換的負值測試 | 1970 年前 mtime 被夾成 0 的同類 bug 修過兩次（4d97250、b03ee7d），前者訊息「兩份漂移正是夾 0 沒被發現的原因」 | S | CONFIRMED。時間 helper 模組、0 哨兵改 Option 剔除；Windows lossy 分岔 UNVERIFIED |
 | A33 | kist-format 頂端文件說 CBOR 會排序（crosscut-7） | lib.rs:10「map keys 排序」；實際是欄位表順序、不排序（cbor.rs:4-6、PLAN.md:32） | 改成「struct 依欄位表順序、不排序；唯一例外 xattrs 依 bytes 排序（format.md §4 第 5、7 條）」 | 實測編碼器照宣告順序輸出。08198b8 加入；63d2c9d 撤回排序、5cf1197 清 Go 註解都漏了這行 | S | CONFIRMED。只改註解 |
@@ -633,6 +686,17 @@ A7／A23／A37 都在 backup 走訪；A9／A27／A28 都動對外 JSON；A5／A2
   （fsmeta.rs:4「M1 不做」）：root 還原攻擊者擁有的 4755 檔，會得到 root 擁有的
   setuid 檔。Go 在 restore.go:431-447 先 chown 再 chmod。UNVERIFIED（需要 root，
   只讀碼）。複核者認為優先序高於 A3，建議另立一條。
+  【實作後（A43）：照裁定做。euid 0 時檔案與目錄經已開的 handle fchown、symlink
+  經所在那層的 handle `fchownat(AT_SYMLINK_NOFOLLOW)`；要套的 mode 由純函式
+  `fsmeta::mode_to_apply` 決定。順序 xattr → 擁有者 → 時間 → mode：Go 把時間放
+  最後的理由是 chown 會動 ctime，與 mtime 無關，所以不照搬。uid 與 gid 都記錄了
+  才 chown（只有一個當成沒記錄）；id 為 -1（`u32::MAX`）對 chown 是「不改」，當成
+  失敗。目錄只在擁有者失敗時，mode 已套上（清掉 0o6000），不再放回暫時加的寫入權。
+  與 Go 不同：Go 不分身分都 chown、失敗只警告、不處理 symlink、0:0 略過；這裡只有
+  root 才 chown，失敗記節點錯誤。真 root 的行為 UNVERIFIED；user namespace 探針
+  （euid 0）：`unshare -r` 下 chown 回 EINVAL → 755 加節點錯誤、exit 3（HEAD 是 4755、
+  exit 0）；`unshare --map-auto -r` 下擁有者成為 100999、仍是 4755；把 chmod 移到
+  chown 之前 → 755。】
 - format.md:283-284 與 vpath.rs:53-56 說 `s3://bucket/` 切不出組件、內容直接落在
   target；探針顯示兩份實作都切出 `["bucket"]`。文件與程式不符，改哪一邊交負責人
   （A14 合併時要保留現行程式行為）。

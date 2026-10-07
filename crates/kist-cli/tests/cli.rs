@@ -306,6 +306,39 @@ fn backup_with_unreadable_file_writes_snapshot_but_exits_nonzero() {
     assert_eq!(snaps, 1);
 }
 
+/// ADR 019 A30：還原目標處擋著使用者自己的 symlink：那一項失敗、結束碼 3（與
+/// 以前相同），訊息點名擋路的本機路徑，不說 repo 物件損壞。
+#[cfg(unix)]
+#[test]
+fn restore_with_a_symlink_in_the_way_exits_3_without_blaming_the_repo() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let target = env.dir.path().join("out");
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    std::fs::create_dir_all(&restored).unwrap();
+    let link = restored.join("a.txt");
+    std::os::unix::fs::symlink(env.dir.path().join("elsewhere"), &link).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["restore", "latest", target.to_str().unwrap()])
+        .env("KIST_REPO", env.repo())
+        .env("KIST_PASSWORD", "cli test password")
+        .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&link.display().to_string()),
+        "要點名擋路的路徑：{stderr}"
+    );
+    assert!(!stderr.contains("corrupt"), "本機擋路被報成損壞：{stderr}");
+}
+
 #[cfg(unix)]
 fn nix_is_root() -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -842,4 +875,51 @@ fn mount_round_trip() {
     );
     // 卸載後掛載點回到普通空目錄
     assert!(std::fs::read_dir(&mnt).unwrap().next().is_none());
+}
+
+/// `check --json --repair` 的 stdout 必須整份是 JSON（README：「結果以 JSON 印到
+/// stdout」）：修復成功的人類可讀行（`repaired pack …`）不能混在 JSON 前面，
+/// 否則 `jq`／監控腳本直接解析失敗。
+#[test]
+fn check_json_repair_output_is_pure_json() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", "--parity", "2", src.to_str().unwrap()]);
+
+    // 弄壞一個 pack（中間一個 byte）：hash 一定不符，parity 修得回來
+    let packs = env.repo().join("packs");
+    let mut pack_files: Vec<_> = std::fs::read_dir(&packs)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file())
+        .collect();
+    pack_files.sort();
+    assert!(!pack_files.is_empty(), "backup 後應該有 pack");
+    let victim_id = pack_files[0]
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let mut data = std::fs::read(&pack_files[0]).unwrap();
+    let mid = data.len() / 2;
+    data[mid] ^= 0x01;
+    std::fs::write(&pack_files[0], &data).unwrap();
+
+    let (ok, stdout, stderr) = env.kist(&["check", "--json", "--repair"]);
+    assert!(
+        ok,
+        "check --repair 應該成功\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout 不是純 JSON（{e}）：\n{stdout}"));
+    let repaired = report["repaired"].as_array().expect("repaired 欄位");
+    assert!(
+        repaired
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.ends_with(&victim_id))),
+        "壞掉的 pack {victim_id} 應該被修復：{report}"
+    );
 }

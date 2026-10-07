@@ -24,7 +24,8 @@ fn golden_dir() -> PathBuf {
 /// 比對 bytes；設 UPDATE_GOLDEN=1 時改為寫入。
 fn check(name: &str, actual: &[u8]) {
     let path = golden_dir().join(name);
-    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+    // 只認 "1"：有人環境裡殘留 UPDATE_GOLDEN=0（想關掉重錄）時不能默默重寫凍結向量。
+    if std::env::var_os("UPDATE_GOLDEN").as_deref() == Some(std::ffi::OsStr::new("1")) {
         std::fs::write(&path, actual).unwrap();
         return;
     }

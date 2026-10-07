@@ -17,6 +17,7 @@
 pub mod backup;
 pub mod cache;
 pub mod check;
+mod dirhandle;
 pub mod forget;
 pub mod fsmeta;
 pub mod index;
@@ -74,6 +75,10 @@ pub enum CoreError {
         #[source]
         source: std::io::Error,
     },
+    /// restore 的目標處（本機檔案系統）擋著東西：symlink、非目錄、目錄。
+    /// 不是 repo 損壞，移開它再還原即可（ADR 019 A30；以前報成 Corrupt）。
+    #[error("{path}: {reason}")]
+    RestoreBlocked { path: PathBuf, reason: String },
     #[error("unsupported file name {0:?}: not valid Unicode on this platform")]
     BadFileName(PathBuf),
     #[error("background task failed: {0}")]

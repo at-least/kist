@@ -14,6 +14,9 @@
 //! 平台：Linux / macOS（fuser 支援的）。Windows 沒有這個 crate 的 FUSE 部分
 //! （純邏輯模組仍可編譯、可測）。
 
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod corefs;
 pub mod offsets;
 pub mod vpath;
