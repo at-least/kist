@@ -17,8 +17,8 @@ use kist_format::{cbor, Algorithm, ChunkId, ObjectId};
 
 use crate::{CoreError, Result};
 
-/// chunk 壓縮等級。
-const ZSTD_LEVEL: i32 = 3;
+/// chunk 與 index blob 的壓縮等級。
+pub(crate) const ZSTD_LEVEL: i32 = 3;
 
 /// 壓縮 chunk 明文：回傳 `algorithm byte ‖ 資料`。
 pub fn compress_chunk(raw: &[u8]) -> Result<Vec<u8>> {
@@ -122,14 +122,10 @@ impl PackWriter {
     }
 
     fn empty_buf(target: usize, max_sealed: usize) -> Vec<u8> {
-        // 檔頭 magic 先種好：offset 從 magic 之後開始算（原本由 pack::begin() 提供）。
+        // 檔頭 magic 先種好：offset 從 magic 之後開始算。
         let mut b = Vec::with_capacity(target.saturating_add(max_sealed));
         b.extend_from_slice(pack::magic().as_slice());
         b
-    }
-
-    fn fresh_buf(&self) -> Vec<u8> {
-        Self::empty_buf(self.target_size, self.max_sealed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -161,7 +157,7 @@ impl PackWriter {
             return Ok(None);
         }
         let entries = std::mem::take(&mut self.entries);
-        let fresh = self.fresh_buf();
+        let fresh = Self::empty_buf(self.target_size, self.max_sealed);
         let buf = std::mem::replace(&mut self.buf, fresh);
         let trailer = cbor::encode(&PackTrailer::new(entries.clone()))?;
         let trailer_sealed = self.keys.seal_pack_trailer(&trailer)?;
@@ -252,63 +248,51 @@ pub fn decode_trailer(
 pub fn validate_trailer(key: &str, trailer: &PackTrailer, data_end: usize) -> Result<()> {
     const MAX_CHUNKER_MAX: u64 = 64 * 1024 * 1024;
     const MAX_ENTRY_LEN: u64 = MAX_CHUNKER_MAX + 1 + (pack::CHUNK_NONCE_LEN + pack::TAG_LEN) as u64;
+    let corrupt = |reason: String| CoreError::Corrupt {
+        key: key.to_owned(),
+        reason,
+    };
     if trailer.entries.is_empty() {
-        return Err(CoreError::Corrupt {
-            key: key.to_owned(),
-            reason: "trailer lists no chunks".to_owned(),
-        });
+        return Err(corrupt("trailer lists no chunks".to_owned()));
     }
     let mut next = pack::HEADER_LEN as u64;
     let mut seen = std::collections::HashSet::with_capacity(trailer.entries.len());
     for (i, e) in trailer.entries.iter().enumerate() {
         if e.offset != next {
-            return Err(CoreError::Corrupt {
-                key: key.to_owned(),
-                reason: format!("entry {i} starts at {}, expected {next}", e.offset),
-            });
+            return Err(corrupt(format!(
+                "entry {i} starts at {}, expected {next}",
+                e.offset
+            )));
         }
         if e.length < pack::MIN_ENTRY_LEN as u64 {
-            return Err(CoreError::Corrupt {
-                key: key.to_owned(),
-                reason: format!(
-                    "entry {i} is {} bytes, shorter than an empty sealed chunk",
-                    e.length
-                ),
-            });
+            return Err(corrupt(format!(
+                "entry {i} is {} bytes, shorter than an empty sealed chunk",
+                e.length
+            )));
         }
         if e.length > MAX_ENTRY_LEN {
-            return Err(CoreError::Corrupt {
-                key: key.to_owned(),
-                reason: format!(
-                    "entry {i} is {} bytes, over the {MAX_ENTRY_LEN} a sealed chunk can be",
-                    e.length
-                ),
-            });
+            return Err(corrupt(format!(
+                "entry {i} is {} bytes, over the {MAX_ENTRY_LEN} a sealed chunk can be",
+                e.length
+            )));
         }
         let end = e.offset + e.length;
         if end > data_end as u64 {
-            return Err(CoreError::Corrupt {
-                key: key.to_owned(),
-                reason: format!("entry {i} ends at {end}, past the {data_end} bytes of chunk data"),
-            });
+            return Err(corrupt(format!(
+                "entry {i} ends at {end}, past the {data_end} bytes of chunk data"
+            )));
         }
         if !seen.insert(e.id) {
-            return Err(CoreError::Corrupt {
-                key: key.to_owned(),
-                reason: format!("chunk {} is listed twice", e.id),
-            });
+            return Err(corrupt(format!("chunk {} is listed twice", e.id)));
         }
         next = end;
     }
     if next != data_end as u64 {
         // 規格 §7：entries 連續排列且**完整覆蓋**資料區——夾縫位元組是
         // 有 bug 的 client 或損壞的表，不是可略的填充。
-        return Err(CoreError::Corrupt {
-            key: key.to_owned(),
-            reason: format!(
-                "entries cover {next} bytes but the pack holds {data_end} of chunk data"
-            ),
-        });
+        return Err(corrupt(format!(
+            "entries cover {next} bytes but the pack holds {data_end} of chunk data"
+        )));
     }
     Ok(())
 }

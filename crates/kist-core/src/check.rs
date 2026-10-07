@@ -111,12 +111,12 @@ impl Repository {
                     }
                 }
                 // 不讀資料也能抓到 size 與 chunk 總長不符（例如備份中變動的檔）
-                if complete && sum != f.size {
+                if complete && sum != f.node.size {
                     file_errors.push(format!(
                         "{}: file {:?} says {} bytes but its chunks total {sum}",
                         f.tree_key,
                         String::from_utf8_lossy(&f.node.name),
-                        f.size
+                        f.node.size
                     ));
                 }
             })
@@ -246,36 +246,29 @@ impl Repository {
             let prefix = format!("{key}:");
             report.errors.retain(|e| !e.starts_with(&prefix));
             // 修復後重抓重驗：驗不過要說出來，不能讓 report 看起來乾淨。
-            match self.backend().get(&key).await {
-                Ok(b) => {
-                    let b = Arc::new(b);
-                    match Self::hash_matches(Arc::clone(&b), *id).await {
-                        Ok(true) => b,
-                        // hash 對不起來是「修復沒生效」；hash 工作本身失敗
-                        // （blocking 執行緒壞掉）是另一回事，照實回。
-                        Ok(false) => {
-                            report.errors.push(format!(
-                                "{key}: repaired pack does not re-verify; the repair did not stick"
-                            ));
-                            return;
-                        }
-                        Err(e) => {
-                            report.errors.push(format!("{key}: {e}"));
-                            return;
-                        }
-                    }
+            let not_stuck =
+                format!("{key}: repaired pack does not re-verify; the repair did not stick");
+            let Ok(b) = self.backend().get(&key).await else {
+                report.errors.push(not_stuck);
+                return;
+            };
+            let b = Arc::new(b);
+            match Self::hash_matches(Arc::clone(&b), *id).await {
+                Ok(true) => b,
+                // hash 對不起來是「修復沒生效」；hash 工作本身失敗
+                // （blocking 執行緒壞掉）是另一回事，照實回。
+                Ok(false) => {
+                    report.errors.push(not_stuck);
+                    return;
                 }
-                Err(_) => {
-                    report.errors.push(format!(
-                        "{key}: repaired pack does not re-verify; the repair did not stick"
-                    ));
+                Err(e) => {
+                    report.errors.push(format!("{key}: {e}"));
                     return;
                 }
             }
         };
         let keys = Arc::clone(self.keys());
         let max_chunk = u64::from(self.config().chunker.max);
-        let _id = *id;
         let key_for_task = key.clone();
         let result: Result<Vec<String>> = blocking(move || {
             let mut errs = Vec::new();

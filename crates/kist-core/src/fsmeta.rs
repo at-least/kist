@@ -47,11 +47,6 @@ pub fn path_to_bytes(path: &Path) -> Result<Vec<u8>> {
     name_to_bytes(path.as_os_str())
 }
 
-/// bytes → 路徑，並去掉根（`/` 或 `C:\`），讓它可以接在 restore 目標底下。
-pub fn bytes_to_relative_path(bytes: &[u8]) -> Result<PathBuf> {
-    locator_to_relative(bytes)
-}
-
 /// v3 的 root 定位字串（`Root.path`）→ restore 目標底下的相對路徑。
 /// 本機絕對路徑 `/srv/data` → `srv/data`；帶 scheme 的遠端定位去掉 scheme
 /// 後切段：`s3://bucket/prefix` → `bucket/prefix`、`sftp://host/path` →

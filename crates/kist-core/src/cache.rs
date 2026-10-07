@@ -159,18 +159,13 @@ impl IndexCache {
         // 逐 blob 讀取、合併、**立刻丟棄**。若真的有 blob 帶 supersedes
         //（repack / rebuild-index 之類），退回保守兩遍重讀——那時全部 blob
         // 才會同時在記憶體，因為 supersedes 要收齊才知道哪些紀錄要丟。
-        let (mut records, kept, mut packs) = match self.rebuild_pass(live, &fetch, true).await? {
-            RebuildOutcome::Done(out) => out,
-            RebuildOutcome::NeedsTwoPass => match self.rebuild_pass(live, &fetch, false).await? {
-                RebuildOutcome::Done(out) => out,
-                // 第二遍已收齊全部 supersedes，不會再需要
-                RebuildOutcome::NeedsTwoPass => {
-                    return Err(CoreError::Corrupt {
-                        key: "index".to_owned(),
-                        reason: "index cache rebuild failed twice".to_owned(),
-                    })
-                }
-            },
+        let Merged {
+            mut records,
+            kept,
+            mut packs,
+        } = match self.optimistic_pass(live, &fetch).await? {
+            Some(merged) => merged,
+            None => self.two_pass(live, &fetch).await?,
         };
         // 排序與寫表進 blocking（同 load 的增量路徑：純 CPU＋本機磁碟 I/O）。
         let dir = self.dir.clone();
@@ -184,52 +179,57 @@ impl IndexCache {
         .await
     }
 
-    /// 樂遍（`optimistic = true`）：blob 讀完即丟；遇到帶 supersedes 的 blob
-    /// 回 `NeedsTwoPass`。保守遍：先收齊全部 blob 與 supersedes，再合併未取代者。
-    async fn rebuild_pass<F, Fut>(
-        &self,
-        live: &[ObjectId],
-        fetch: &F,
-        optimistic: bool,
-    ) -> Result<RebuildOutcome>
+    /// 樂觀單遍：blob 讀完即丟；遇到帶 supersedes 的 blob 回 `None`。
+    async fn optimistic_pass<F, Fut>(&self, live: &[ObjectId], fetch: &F) -> Result<Option<Merged>>
+    where
+        F: Fn(ObjectId) -> Fut,
+        Fut: std::future::Future<Output = Result<IndexBlob>>,
+    {
+        let mut m = Merged {
+            records: Vec::new(),
+            kept: Vec::new(),
+            packs: Vec::new(),
+        };
+        for id in live {
+            let blob = fetch(*id).await?;
+            if !blob.supersedes.is_empty() {
+                // 場上可能有取代關係（這個 blob 取代別人，或被別人取代）：
+                // 單遍分不清，保守重來
+                return Ok(None);
+            }
+            push_blob(&mut m.records, &mut m.packs, &blob);
+            m.kept.push(*id);
+        }
+        Ok(Some(m))
+    }
+
+    /// 保守兩遍：先收齊全部 blob 與 supersedes，再合併未取代者。
+    async fn two_pass<F, Fut>(&self, live: &[ObjectId], fetch: &F) -> Result<Merged>
     where
         F: Fn(ObjectId) -> Fut,
         Fut: std::future::Future<Output = Result<IndexBlob>>,
     {
         let mut blobs: Vec<(ObjectId, IndexBlob)> = Vec::new();
-        if !optimistic {
-            for id in live {
-                blobs.push((*id, fetch(*id).await?));
-            }
+        for id in live {
+            blobs.push((*id, fetch(*id).await?));
         }
         let superseded: HashSet<ObjectId> = blobs
             .iter()
             .flat_map(|(_, b)| b.supersedes.iter().copied())
             .collect();
-        let mut records = Vec::new();
-        let mut packs = Vec::new();
-        let mut kept = Vec::new();
-        for id in live {
-            if optimistic {
-                let blob = fetch(*id).await?;
-                if !blob.supersedes.is_empty() {
-                    // 場上可能有取代關係（這個 blob 取代別人，或被別人取代）：
-                    // 單遍分不清，保守重來
-                    return Ok(RebuildOutcome::NeedsTwoPass);
-                }
-                push_blob(&mut records, &mut packs, &blob);
-                kept.push(*id);
-            } else {
-                if superseded.contains(id) {
-                    continue;
-                }
-                if let Some((_, b)) = blobs.iter().find(|(bid, _)| bid == id) {
-                    push_blob(&mut records, &mut packs, b);
-                    kept.push(*id);
-                }
+        let mut m = Merged {
+            records: Vec::new(),
+            kept: Vec::new(),
+            packs: Vec::new(),
+        };
+        for (id, blob) in &blobs {
+            if superseded.contains(id) {
+                continue;
             }
+            push_blob(&mut m.records, &mut m.packs, blob);
+            m.kept.push(*id);
         }
-        Ok(RebuildOutcome::Done((records, kept, packs)))
+        Ok(m)
     }
 
     /// 寫表與 manifest。`new_records` 必須已排序去重；`old` 是要合併進來的
@@ -286,23 +286,17 @@ where
     type Item = Result<TableRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 舊表的讀取錯誤原樣傳播（包括錯誤落在表尾、new 已耗盡的情況）
-        if matches!(self.old.peek(), Some(Err(_))) {
-            return self.old.next();
-        }
-        let o: Option<TableRecord> = match self.old.peek() {
-            Some(Ok(r)) => Some(*r),
-            _ => None,
-        };
-        let n: Option<TableRecord> = self.new.peek().copied();
-        match (o, n) {
+        match (self.old.peek(), self.new.peek()) {
+            // 舊表的讀取錯誤原樣傳播（包括錯誤落在表尾、new 已耗盡的情況）
+            (Some(Err(_)), _) => self.old.next(),
             (None, None) => None,
             (None, Some(_)) => self.new.next().map(Ok),
-            (Some(_), None) => self.old.next(),
-            (Some(o), Some(n)) => {
-                if n.id <= o.id {
+            (Some(Ok(_)), None) => self.old.next(),
+            (Some(Ok(o)), Some(n)) => {
+                let (o, n) = (o.id, n.id);
+                if n <= o {
                     // 同 ID：新的贏，丟掉舊的
-                    if n.id == o.id {
+                    if n == o {
                         self.old.next();
                     }
                     self.new.next().map(Ok)
@@ -314,9 +308,11 @@ where
     }
 }
 
-enum RebuildOutcome {
-    Done((Vec<TableRecord>, Vec<ObjectId>, Vec<(ObjectId, u64)>)),
-    NeedsTwoPass,
+/// 重建一遍的結果：合併好的紀錄、併入的 blob、pack 清單。
+struct Merged {
+    records: Vec<TableRecord>,
+    kept: Vec<ObjectId>,
+    packs: Vec<(ObjectId, u64)>,
 }
 
 fn push_blob(records: &mut Vec<TableRecord>, packs: &mut Vec<(ObjectId, u64)>, blob: &IndexBlob) {

@@ -217,6 +217,11 @@ impl TempFile {
     }
 }
 
+/// 記錄的 mode 會不會被套上：與 [`apply_meta`] 同條件（有 mtime、mode 不是 0）。
+fn mode_will_be_applied(node: &Entry) -> bool {
+    node.mtime_ns.is_some() && node.mode.is_some_and(|m| m != 0)
+}
+
 /// 暫存檔的建檔權限（unix 再經 umask；非 unix 沒有 mode，不看）。內容寫進
 /// 暫存檔之後、記錄的 mode 套上之前，它不能比該有的寬鬆（ADR 019 A2 審查：
 /// 以 umask 預設建的話，覆寫使用者 0o600 的檔時內容會先放在 0o644 的暫存檔，
@@ -227,8 +232,7 @@ impl TempFile {
 /// - 不會套 mode（s3／generic 來源）→ 正式名處原有一般檔的權限（以前原地寫時
 ///   就是保留它），沒有就是 0o666（與 std 新建的檔相同）。
 fn temp_file_mode(dir: &DirHandle, name: &OsStr, node: &Entry) -> Result<u32> {
-    let mode_applies = node.mtime_ns.is_some() && node.mode.unwrap_or(0) != 0;
-    if mode_applies {
+    if mode_will_be_applied(node) {
         return Ok(0o600);
     }
     Ok(dir.file_mode(name)?.unwrap_or(0o666))
@@ -316,8 +320,7 @@ fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
 #[cfg(unix)]
 fn make_owner_writable(dir: &DirHandle, node: &Entry) -> Result<Option<std::fs::Permissions>> {
     use std::os::unix::fs::PermissionsExt;
-    let mode_will_be_applied = node.mtime_ns.is_some() && node.mode.is_some_and(|m| m != 0);
-    if !mode_will_be_applied {
+    if !mode_will_be_applied(node) {
         return Ok(None);
     }
     let original = dir.permissions()?;
@@ -504,26 +507,7 @@ impl Repository {
                         Err(e) => Err(e),
                     }
                 }
-                node_type::SYMLINK => match fsmeta::bytes_to_name(&node.target) {
-                    Ok(link_target) => {
-                        match replace_with_symlink(dir, name, Path::new(&link_target)) {
-                            Ok(()) => {
-                                summary.symlinks += 1;
-                                if node.xattrs.is_some() {
-                                    tracing::warn!(
-                                        "{}: snapshot has extended attributes for this symlink; \
-                                         Linux cannot set user.* on a symlink and following it \
-                                         would write to the target, so they are not restored",
-                                        path.display()
-                                    );
-                                }
-                                apply_symlink_meta(dir, name, node)
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Err(e) => Err(e),
-                },
+                node_type::SYMLINK => restore_symlink(dir, name, node, summary),
                 other => Err(CoreError::Corrupt {
                     key: path.display().to_string(),
                     reason: format!("unknown node type {other}"),
@@ -718,6 +702,27 @@ impl Repository {
         let max_chunk = u64::from(self.config().chunker.max);
         blocking(move || decode_chunk(&keys, &id, &bytes, raw_len, max_chunk)).await
     }
+}
+
+/// 還原 symlink 條目：建連結（[`replace_with_symlink`]），再套它本身的 metadata。
+fn restore_symlink(
+    dir: &DirHandle,
+    name: &OsStr,
+    node: &Entry,
+    summary: &mut RestoreSummary,
+) -> Result<()> {
+    let link_target = fsmeta::bytes_to_name(&node.target)?;
+    replace_with_symlink(dir, name, Path::new(&link_target))?;
+    summary.symlinks += 1;
+    if node.xattrs.is_some() {
+        tracing::warn!(
+            "{}: snapshot has extended attributes for this symlink; \
+             Linux cannot set user.* on a symlink and following it \
+             would write to the target, so they are not restored",
+            dir.child_path(name).display()
+        );
+    }
+    apply_symlink_meta(dir, name, node)
 }
 
 /// 建 symlink 前先移除既有的檔案或 symlink（第二次 restore 到同一目錄）；既有的是

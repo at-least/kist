@@ -85,9 +85,9 @@ impl TableRecord {
 /// 12  4  保留
 /// 16  8  紀錄數
 /// 24  8  保留
-/// 32  …  紀錄 × N，每筆 96 bytes：id 32 ‖ pack 32 ‖ offset 8 ‖ length 8 ‖ raw_len 8 ‖ flags 1 ‖ pad 7
+/// 32  …  紀錄 × N，每筆 96 bytes：id 32 ‖ pack 32 ‖ offset 8 ‖ length 8 ‖ raw_len 8 ‖ pad 8
 /// ```
-/// 這是本機快取的格式，不是 repo 格式（v1 凍結不受影響）。
+/// 這是本機快取的格式，不是 repo 格式（改它不影響 repo 格式）。
 #[derive(Debug)]
 pub struct DiskTable {
     file: File,

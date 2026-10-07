@@ -29,7 +29,7 @@ impl SnapshotInfo {
     }
 }
 
-fn timestamp_of(key: &str) -> &str {
+pub(crate) fn timestamp_of(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
 }
 

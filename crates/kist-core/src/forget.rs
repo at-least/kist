@@ -100,7 +100,6 @@ pub fn apply_policy(
     sorted.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| b.key.cmp(&a.key)));
     let latest = sorted.first().map(|c| c.time);
 
-    // 每種桶：(理由, 剩餘數量, 上一個保留的桶 key)
     struct Bucket {
         reason: &'static str,
         remaining: u32,
