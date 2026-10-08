@@ -112,7 +112,7 @@ impl RepoConfig {
             created_ns,
             chunker: ChunkerParams::default(),
             pack_target_size: 64 * 1024 * 1024,
-            min_reader: FORMAT_VERSION.try_into().unwrap_or(3),
+            min_reader: FORMAT_VERSION as u16,
             replicas: 0,
             key,
         }

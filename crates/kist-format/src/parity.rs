@@ -114,18 +114,6 @@ pub fn parse(data: &[u8]) -> Result<Object> {
 }
 
 impl Object {
-    pub fn version(&self) -> u32 {
-        self.v
-    }
-
-    pub fn pack_size(&self) -> u64 {
-        self.pack_size
-    }
-
-    pub fn shard_len(&self) -> u32 {
-        self.shard_len
-    }
-
     pub fn parity_shards(&self) -> usize {
         self.m as usize
     }
@@ -225,9 +213,8 @@ impl Object {
             .into_iter()
             .map(|s| if s.is_empty() { None } else { Some(s) })
             .collect();
-        // 空的 shard 也可能是「合法但全 0」嗎？可能——但全 0 shard 的 hash 幾乎
-        // 不可能等於 hashes[i]（那些 hash 是密文的 hash），所以全 0 只會出現在
-        // 我們標記為 erasure 的位置。保守起見仍以 hash 判定，不用長度。
+        // 空 Vec 只會是上面依 hash 標成 erasure 的位置：split 出來的 shard
+        // 長度都是 shard_len（validate 保證 > 0），內容全 0 的 shard 也不是空的。
         ReedSolomon::<Field>::new(DATA_SHARDS, m)
             .map_err(|e| FormatError::Unrepairable(format!("coder: {e}")))?
             .reconstruct(&mut options)

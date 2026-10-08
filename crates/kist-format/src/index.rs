@@ -1,7 +1,7 @@
-//! index blob（v2）：chunk ID → (pack, offset, length) 的查表快取。
+//! index blob：chunk ID → (pack, offset, length) 的查表快取。
 //!
 //! - 明文 = `algorithm byte（0 原文 / 1 zstd）‖ CBOR`，以 index key 密封
-//!   （AAD = [`crate::AAD_INDEX`]）。實測 zstd 後比 v1 的陣列形狀更小。
+//!   （AAD = [`crate::AAD_INDEX`]）。
 //! - 讀取端先讀所有 blob、收集全部 `supersedes`，被任何有效 blob 列到的
 //!   整個忽略——重疊的 prune / 途中 rebuild-index 都安全。
 //! - 只是 pack trailer 的快取，可由所有 pack 重建（`rebuild-index`）。
