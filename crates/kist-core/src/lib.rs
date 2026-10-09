@@ -18,6 +18,7 @@ pub mod backup;
 pub mod cache;
 pub mod check;
 mod dirhandle;
+pub mod filter;
 pub mod forget;
 pub mod fsmeta;
 pub mod index;
@@ -34,6 +35,7 @@ pub use backup::{
     DEFAULT_GC_GRACE,
 };
 pub use check::{CheckOptions, CheckReport};
+pub use filter::{PathFilter, PatternError};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
 /// parity 份數的上限。CLI 與 kist-app 的設定檢查都用它，不各寫字面值

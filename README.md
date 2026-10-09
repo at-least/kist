@@ -31,6 +31,7 @@ export KIST_PASSWORD=...                # 或 --password-file，或互動輸入
 
 kist init                               # 建立 repo
 kist backup ~/Documents ~/Photos        # 備份，產生一個 snapshot
+kist backup ~ --exclude node_modules --exclude '*.tmp'   # 排除規則，見「排除規則」一節
 kist backup sftp://nas.local/srv/data   # 遠端來源也能備：讀遠端、本機切塊加密後上傳
 kist snapshots                          # 列出 snapshot
 kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路徑>
@@ -80,6 +81,29 @@ mode（以前從不 chown：別人的 4755 檔會還原成 root 擁有的 setuid
 > `--password-file` 優先於 `KIST_PASSWORD`，而它也吃環境變數 `KIST_PASSWORD_FILE`：有匯出的話先
 > `unset KIST_PASSWORD_FILE`。`kist run` 一直是這個讀法，不受影響。
 
+### 排除規則（`backup --exclude`）
+
+```sh
+kist backup ~ --exclude node_modules --exclude '*.tmp' --exclude "$HOME/.cache"
+kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行與 # 開頭的行略過
+```
+
+被排除的檔案與目錄不進 snapshot（目錄整棵不走），數量印在 backup 的摘要（`excluded: N`）與
+`--json` 的 `report.excluded`。設定檔寫成 `[backup] exclude = ["node_modules", "*.tmp"]`。
+
+樣式比對的是節點在 snapshot 裡的路徑，也就是整份還原時它在目標底下的位置：
+
+- 本機來源是 **canonical 絕對路徑**（symlink 已解開，與 `kist snapshots` 的 PATHS 欄位相同）。
+  遠端來源去掉 `scheme://`：`sftp://nas/srv/data` 底下的 `x` 是 `/nas/srv/data/x`。
+- `/` 開頭的樣式從路徑頂端比起；其他樣式在每一層都比對（`*.tmp`、`node_modules`、`build/out`）。
+- 以 `/` 分段，每段比對恰好一個路徑元件：`*` 任意多個字元、`?` 一個字元（CJK 字也是一個）、
+  `[abc]`／`[a-z]`／`[!a]` 一個字元、`\` 讓下一個字元照字面。整段只有 `**` 時比對零或多個元件
+  （`/home/me/**/build`）。區分大小寫；結尾的 `/` 會被去掉。
+- 指名的來源本身不會被排除（`kist backup ~/proj --exclude proj` 照樣備份 `~/proj`）。
+- 不支援 `!` 開頭的反向樣式（直接報錯；字面的 `!` 寫成 `\!`）與 `{a,b}`（大括號是字面字元）。
+- 樣式寫錯（例如沒關上的 `[`、夾在字裡的 `**`、`.`／`..` 段）時，backup 在碰 repo 之前就以結束碼 1
+  結束；樣式檔裡的錯誤點名 `檔案:行號`。設定檔裡寫錯，`kist run`／`kist serve` 起不來。
+
 ### `--json`
 
 `backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild-index` / `run` 都支援
@@ -101,6 +125,7 @@ timezone = "local"                        # 排程用的時區，或 "utc"
 [backup]
 paths = ["/home", "/etc"]
 schedule = "0 2 * * *"                    # cron（5 欄；前面可多加一欄秒）
+exclude = ["node_modules", "*.tmp"]       # 選填；規則見「排除規則」
 
 [notify]
 webhook_url = "https://example.com/hook"  # 每件工作結束 POST 一個 JSON

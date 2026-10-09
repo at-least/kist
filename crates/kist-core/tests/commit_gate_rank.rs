@@ -46,6 +46,7 @@ fn client(id: u8, now: Option<OffsetDateTime>) -> BackupOptions {
         parity: 0,
         progress: None,
         source: kist_core::SourceSpec::default(),
+        exclude: kist_core::PathFilter::default(),
     }
 }
 

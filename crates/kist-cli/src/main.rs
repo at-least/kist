@@ -23,8 +23,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use kist_backend::{Backend, RepoLocation};
 use kist_core::{
-    BackupOptions, CheckOptions, ForgetOptions, ForgetSummary, InitOptions, PruneOptions,
-    PruneReport, Repository, RestoreOptions, RetentionPolicy, SourceSpec,
+    BackupOptions, CheckOptions, ForgetOptions, ForgetSummary, InitOptions, PathFilter,
+    PruneOptions, PruneReport, Repository, RestoreOptions, RetentionPolicy, SourceSpec,
 };
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
@@ -151,6 +151,17 @@ enum Command {
         /// (0 = none; 2 = 12.5% overhead, repairs up to 2 damaged sixteenths).
         #[arg(long, value_name = "0..=8", default_value = "0")]
         parity: u8,
+        /// Leave out files and directories matching PATTERN (repeatable). A leading `/`
+        /// anchors it at the top of the snapshot path (for local sources the canonical
+        /// absolute path); otherwise it matches at any depth. `*`, `?` and `[...]` stay
+        /// within one path component, a `**` component spans any number. The named
+        /// source paths themselves are never excluded.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Read exclude patterns from FILE, one per line (repeatable). Surrounding
+        /// whitespace is trimmed; empty lines and lines starting with `#` are skipped.
+        #[arg(long, value_name = "FILE")]
+        exclude_file: Vec<PathBuf>,
     },
     /// List snapshots.
     Snapshots {
@@ -261,6 +272,27 @@ enum Command {
     },
     /// Print version information.
     Version,
+}
+
+/// `backup --exclude` 與 `--exclude-file` 合成一組樣式（ADR 020）。樣式檔一行一條：
+/// 去掉前後空白（`\r\n` 結尾也一併去掉），空行與 `#` 開頭的行略過；寫錯的那一行以
+/// `檔案:行號` 點名。
+fn exclude_filter(patterns: &[String], files: &[PathBuf]) -> Result<PathFilter> {
+    let mut all = patterns.to_vec();
+    PathFilter::new(&all).context("--exclude")?;
+    for file in files {
+        let text = std::fs::read_to_string(file)
+            .with_context(|| format!("reading exclude file {}", file.display()))?;
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            PathFilter::new(&[line]).with_context(|| format!("{}:{}", file.display(), n + 1))?;
+            all.push(line.to_owned());
+        }
+    }
+    Ok(PathFilter::new(&all)?)
 }
 
 fn main() {
@@ -451,10 +483,13 @@ async fn run(cli: Cli) -> Result<()> {
             client_id_file,
             gc_grace,
             parity,
+            exclude,
+            exclude_file,
         } => {
             if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
                 anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
             }
+            let exclude = exclude_filter(&exclude, &exclude_file)?;
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
             let remote_url = paths
@@ -484,6 +519,7 @@ async fn run(cli: Cli) -> Result<()> {
                 parity,
                 progress: None,
                 source,
+                exclude,
             };
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;
@@ -505,6 +541,12 @@ async fn run(cli: Cli) -> Result<()> {
                     rep.chunks_new,
                     rep.packs_new
                 );
+                if rep.excluded > 0 {
+                    println!(
+                        "  excluded: {} item(s) matching the exclude patterns",
+                        rep.excluded
+                    );
+                }
             }
             if rep.errors > 0 {
                 // snapshot 已經寫出（不含那些項目）；結束碼 3 讓排程器知道要看警告

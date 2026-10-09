@@ -51,6 +51,7 @@ use kist_format::tree::{
 use kist_format::{cbor, keys, ChunkId, ObjectId, TreeId};
 use tokio::task::JoinSet;
 
+use crate::filter::{FilterState, PathFilter};
 use crate::fsmeta;
 use crate::index::ChunkIndex;
 use crate::pack::{FinishedPack, PackWriter};
@@ -111,6 +112,9 @@ pub struct BackupOptions {
     pub progress: Option<ProgressCallback>,
     /// 備份來源（預設 [`SourceSpec::LocalPaths`]：`paths` 是本機路徑）。
     pub source: SourceSpec,
+    /// 排除樣式（ADR 020）：比對到的檔案與目錄不進 snapshot（目錄整棵不走），計進
+    /// [`BackupReport::excluded`]。指名的來源本身不比對。空的（預設）＝不排除。
+    pub exclude: PathFilter,
 }
 
 /// **過程計數**（v3 起不在格式裡——它們依 GC 狀態與去重順序而變，不同實作
@@ -130,6 +134,8 @@ pub struct BackupReport {
     pub errors: u64,
     /// 走快速路徑沿用 chunk 清單的檔案數。
     pub files_reused: u64,
+    /// 被排除樣式比對到、沒有備份的項目數（被排除的目錄算一個，底下不再走）。
+    pub excluded: u64,
 }
 
 /// backup 進行中的即時狀態（給 UI 顯示進度）。每處理完一個目錄項目呼叫一次 callback；結尾的
@@ -332,6 +338,8 @@ struct Backup {
     /// 切塊緩衝池（每個 2×chunker.max）：整個 backup 重用同一批，不在每個
     /// 檔案各配一次。單執行緒走訪時通常只有一個；池化是為了之後並行切塊。
     chunk_bufs: Vec<Vec<u8>>,
+    /// 排除樣式（見 [`BackupOptions::exclude`]）。
+    exclude: PathFilter,
 }
 
 /// 一個檔案在 tree 裡的內容：大小、chunk 清單、content 型態（DIRECT／INDIRECT）。
@@ -801,6 +809,7 @@ impl Repository {
             progress: opts.progress.clone(),
             parity: opts.parity,
             chunk_bufs: Vec::new(),
+            exclude: opts.exclude.clone(),
         };
 
         // v3 roots：每個來源路徑的**內容**走訪成自己的 tree（沒有合成根，
@@ -818,7 +827,8 @@ impl Repository {
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(path.clone())?),
                     };
-                    b.walk_dir(&ctx, b"", parent_subtree, 1).await?
+                    let state = b.root_state(&pb)?;
+                    b.walk_dir(&ctx, b"", parent_subtree, 1, state).await?
                 }
                 RootPlan::LocalFile(path) => {
                     let name = pb
@@ -843,8 +853,16 @@ impl Repository {
                     };
                     let item = local_file_item(&path, &name)?;
                     let parent_entry = parent_file_entry(self, parent_subtree, &name).await;
+                    // 指名的檔案來源不比對排除樣式（它底下也沒有東西）。
                     let Some(entry) = b
-                        .process_entry(&ctx, &name, item, parent_entry.as_ref(), 1)
+                        .process_entry(
+                            &ctx,
+                            &name,
+                            item,
+                            parent_entry.as_ref(),
+                            1,
+                            FilterState::default(),
+                        )
                         .await?
                     else {
                         return Err(CoreError::Usage(format!(
@@ -887,7 +905,14 @@ impl Repository {
                         let name = item.name.clone();
                         let parent_entry = parent_file_entry(self, parent_subtree, &name).await;
                         let Some(entry) = b
-                            .process_entry(&ctx, b"", item, parent_entry.as_ref(), 1)
+                            .process_entry(
+                                &ctx,
+                                b"",
+                                item,
+                                parent_entry.as_ref(),
+                                1,
+                                FilterState::default(),
+                            )
                             .await?
                         else {
                             return Err(CoreError::Usage(format!(
@@ -897,7 +922,8 @@ impl Repository {
                         };
                         b.write_tree(Tree::new(vec![entry], None)).await?
                     } else {
-                        b.walk_dir(&ctx, b"", parent_subtree, 1).await?
+                        let state = b.root_state(&pb)?;
+                        b.walk_dir(&ctx, b"", parent_subtree, 1, state).await?
                     }
                 }
             };
@@ -1018,6 +1044,17 @@ impl Repository {
 }
 
 impl Backup {
+    /// 目錄來源 `locator`（`Root.path`）在排除樣式裡的狀態：從頂端沿它的切段
+    /// （[`fsmeta::locator_components`]，與 restore 的落點同一套）走下去。來源本身
+    /// 符合樣式也照備——它是指名的，樣式只管它底下的東西。
+    fn root_state(&self, locator: &[u8]) -> Result<FilterState> {
+        let mut state = self.exclude.start();
+        for name in fsmeta::locator_components(locator)? {
+            state = self.exclude.descend(&state, name);
+        }
+        Ok(state)
+    }
+
     /// 回報目前進度（有 callback 才做）。
     fn report_phase(&self, phase: &'static str, current: Option<String>) {
         report_progress(
@@ -1031,6 +1068,7 @@ impl Backup {
 
     /// 處理一個目錄項目，回傳它的 tree 節點；讀不到的回 `None`（略過並警告）。
     /// 不論結果如何（寫進 tree、略過、記成錯誤），做完都回報一次進度。
+    /// `filter`：這個項目在排除樣式裡的狀態，是目錄時往下走用。
     async fn process_entry(
         &mut self,
         ctx: &SourceCtx,
@@ -1038,9 +1076,10 @@ impl Backup {
         item: SourceItem,
         parent: Option<&Entry>,
         depth: usize,
+        filter: FilterState,
     ) -> Result<Option<Entry>> {
         let node = self
-            .process_entry_inner(ctx, rel, item, parent, depth)
+            .process_entry_inner(ctx, rel, item, parent, depth, filter)
             .await?;
         let display = ctx.display_path(rel);
         self.report_phase("files", Some(display));
@@ -1054,6 +1093,7 @@ impl Backup {
         item: SourceItem,
         parent: Option<&Entry>,
         depth: usize,
+        filter: FilterState,
     ) -> Result<Option<Entry>> {
         let mk = ctx.source.meta_kind();
         // 來源能證明什麼就記什麼（docs/format.md §8 的 metadata 聯集）：
@@ -1105,7 +1145,9 @@ impl Backup {
                     Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
                     _ => None,
                 };
-                let subtree = self.walk_dir(ctx, rel, parent_subtree, depth + 1).await?;
+                let subtree = self
+                    .walk_dir(ctx, rel, parent_subtree, depth + 1, filter)
+                    .await?;
                 self.stats.dirs += 1;
                 entry.kind = node_type::DIR;
                 entry.subtree = subtree;
@@ -1189,6 +1231,7 @@ impl Backup {
 
     /// 遞迴走訪一個目錄的**內容**，回傳它（最後一段）tree 的名稱。
     /// v3 的根目錄也走這裡（roots[].tree = 根目錄內容的 tree）。
+    /// `filter`：這個目錄在排除樣式裡的狀態；每個子項目從它往下走一步。
     /// `Send`：讓整個 backup 的 future 能被 `tokio::spawn`（daemon 在別的 task 上跑工作）。
     fn walk_dir<'a>(
         &'a mut self,
@@ -1196,6 +1239,7 @@ impl Backup {
         dir_rel: &'a [u8],
         parent_subtree: Option<TreeId>,
         depth: usize,
+        filter: FilterState,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TreeId>> + Send + 'a>> {
         Box::pin(async move {
             let mut parent_stream = match parent_subtree {
@@ -1243,6 +1287,14 @@ impl Backup {
                     }
                 };
                 let child_rel = join_rel(dir_rel, &item.name);
+                // 排除先於其他檢查：被排除的過深目錄不算略過的錯誤。跳過一個名字不影響
+                // parent 串流（take_name 只要求查詢名稱遞增）。
+                let child_filter = self.exclude.descend(&filter, &item.name);
+                if child_filter.is_match() {
+                    tracing::debug!("{}: excluded", ctx.display_path(&child_rel));
+                    self.report.excluded += 1;
+                    continue;
+                }
                 // 深度上限與讀取端同一把尺（MAX_TREE_DEPTH，§8.4）：讀取端
                 // 把超過上限的樹當敵意 repo 拒收，寫入端就不能把「合法但
                 // 過深」的來源目錄寫進去——寫得出、還原不回＝自造損壞。
@@ -1265,7 +1317,14 @@ impl Backup {
                     None => None,
                 };
                 let entry = self
-                    .process_entry(ctx, &child_rel, item, parent_entry.as_ref(), depth)
+                    .process_entry(
+                        ctx,
+                        &child_rel,
+                        item,
+                        parent_entry.as_ref(),
+                        depth,
+                        child_filter,
+                    )
                     .await?;
                 if let Some(entry) = entry {
                     children.push(entry);

@@ -99,6 +99,7 @@ on = ["failure", "success"]
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[notify]\nwebhook_url = \"https://x\"\non = [\"sometimes\"]\n", "unknown event"),
         ("repo = \"/x\"\npassword_file = \"/p\"\npassword = \"inline\"\n[backup]\npaths = [\"/e\"]\n", "unknown field"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"3 days\"\n", "unknown unit"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude = [\"*.tmp\", \"[bad\"]\n", "[backup] exclude: invalid pattern \"[bad\""),
     ];
     for (text, needle) in bad {
         let err = Config::parse(text)
@@ -260,6 +261,35 @@ async fn run_once_executes_backup_forget_prune_in_order() {
         outcomes[1].detail["removed"].as_array().map(|a| a.len()),
         Some(1)
     );
+}
+
+/// `[backup] exclude` 與 CLI 的 `--exclude` 同一套樣式（ADR 020）：比對到的不進 snapshot，
+/// 計數出現在工作結果的 report 裡。
+#[tokio::test]
+async fn run_once_backup_honours_exclude() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path()).await;
+    let password = write_password(dir.path());
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("cache")).unwrap();
+    std::fs::write(src.join("a.txt"), b"keep").unwrap();
+    std::fs::write(src.join("b.tmp"), b"drop").unwrap();
+    std::fs::write(src.join("cache/c.txt"), b"drop").unwrap();
+    let text = config_text(
+        &repo,
+        &password,
+        dir.path(),
+        &format!(
+            "[backup]\npaths = [{:?}]\nexclude = [\"*.tmp\", \"cache\"]\n",
+            src.display().to_string()
+        ),
+    );
+    let cfg = Config::parse(&text).unwrap();
+    cfg.validate().unwrap();
+    let outcomes = Daemon::new(cfg).unwrap().run_once(None, |_| {}).await;
+    assert_eq!(outcomes[0].status, JobStatus::Success, "{:?}", outcomes[0]);
+    assert_eq!(outcomes[0].detail["stats"]["files"].as_u64(), Some(1));
+    assert_eq!(outcomes[0].detail["report"]["excluded"].as_u64(), Some(2));
 }
 
 /// 同一份設定只寫 `[prune] grace`：backup 的閘門要用它（ADR 019 A5），不是 72h 預設。

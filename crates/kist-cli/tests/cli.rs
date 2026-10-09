@@ -22,6 +22,12 @@ impl Env {
 
     /// 執行 kist，回傳 (exit ok, stdout, stderr)。密碼與 client id 檔都走環境變數，不碰使用者家目錄。
     fn kist(&self, args: &[&str]) -> (bool, String, String) {
+        let (code, stdout, stderr) = self.kist_code(args);
+        (code == Some(0), stdout, stderr)
+    }
+
+    /// 同 [`Env::kist`]，但回傳結束碼本身（區分 1 的失敗與 3 的不完整）。
+    fn kist_code(&self, args: &[&str]) -> (Option<i32>, String, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_kist"))
             .args(args)
             .env("KIST_REPO", self.repo())
@@ -32,7 +38,7 @@ impl Env {
             .output()
             .unwrap();
         (
-            out.status.success(),
+            out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
@@ -921,5 +927,76 @@ fn check_json_repair_output_is_pure_json() {
             .iter()
             .any(|v| v.as_str().is_some_and(|s| s.ends_with(&victim_id))),
         "壞掉的 pack {victim_id} 應該被修復：{report}"
+    );
+}
+
+/// `backup --exclude`／`--exclude-file`（ADR 020）：樣式檔一行一條，空行與 `#` 開頭的行略過、
+/// 前後空白去掉；寫錯的樣式在碰 repo 之前就以 exit 1 結束，並點名出處。
+#[test]
+fn backup_excludes_from_flags_and_files() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    std::fs::write(src.join("junk.tmp"), b"junk").unwrap();
+    std::fs::create_dir_all(src.join("sub/cache")).unwrap();
+    std::fs::write(src.join("sub/cache/c"), b"cache").unwrap();
+    let list = env.dir.path().join("exclude.txt");
+    std::fs::write(&list, "# comment\n\n  cache  \r\n").unwrap();
+
+    env.ok(&["init"]);
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--exclude",
+        "*.tmp",
+        "--exclude-file",
+        list.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(v["report"]["excluded"], 2, "{v}");
+    assert_eq!(v["stats"]["files"], 3, "{v}");
+
+    let out = env.ok(&[
+        "backup",
+        "--exclude",
+        "*.tmp",
+        "--exclude-file",
+        list.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    assert!(out.contains("excluded: 2"), "{out}");
+
+    let target = env.dir.path().join("out");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert!(restored.join("a.txt").is_file());
+    assert!(restored.join("sub/b.txt").is_file());
+    assert!(!restored.join("junk.tmp").exists());
+    assert!(!restored.join("sub/cache").exists());
+
+    let (code, _, err) = env.kist_code(&["backup", "--exclude", "[oops", src.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "寫錯的樣式是硬失敗：{err}");
+    assert!(err.contains("invalid pattern \"[oops\""), "{err}");
+    std::fs::write(&list, "ok\n!negated\n").unwrap();
+    let (code, _, err) = env.kist_code(&[
+        "backup",
+        "--exclude-file",
+        list.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains(&format!("{}:2", list.display())),
+        "要點名檔案與行號：{err}"
+    );
+    assert!(err.contains("not supported"), "{err}");
+    let snapshots: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+    assert_eq!(
+        snapshots.as_array().unwrap().len(),
+        2,
+        "寫錯樣式的 backup 不留 snapshot"
     );
 }

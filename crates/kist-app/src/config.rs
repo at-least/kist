@@ -11,6 +11,7 @@
 //! paths = ["/home", "/etc"]
 //! schedule = "0 2 * * *"      # 5 或 6 欄（秒選填）cron；省略 = 只在 `run --once` 時跑
 //! gc_grace = "72h"            # 選填；沒寫取同檔的 [prune] grace，不得比它長
+//! exclude = ["*.tmp", "node_modules", "/home/me/.cache"]   # 選填；同 CLI 的 --exclude（ADR 020）
 //!
 //! [forget]                     # 選填；需要 Delete 權限，建議放在維護主機的設定裡
 //! keep_daily = 7
@@ -76,6 +77,18 @@ pub struct BackupSection {
     /// 每個 pack 旁存幾片 Reed-Solomon 同位（0..=8；0 = 不存，預設）。
     #[serde(default)]
     pub parity: u8,
+    /// 排除樣式，規則同 CLI 的 `--exclude`（ADR 020，`kist_core::filter`）。
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl BackupSection {
+    /// 編譯 `exclude`。載入設定時（[`Config::validate`]）就跑一次：寫錯的樣式讓
+    /// `kist run`／`kist serve` 起不來，不會等到排程時間才失敗。
+    pub fn exclude_filter(&self) -> Result<kist_core::PathFilter> {
+        kist_core::PathFilter::new(&self.exclude)
+            .map_err(|e| AppError::Config(format!("[backup] exclude: {e}")))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -172,6 +185,7 @@ impl Config {
                     kist_core::MAX_PARITY_SHARDS
                 )));
             }
+            b.exclude_filter()?;
         }
         if let Some(f) = &self.forget {
             let policy = f.policy();
