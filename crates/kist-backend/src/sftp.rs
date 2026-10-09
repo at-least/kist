@@ -716,23 +716,22 @@ impl SftpInner {
         }
     }
 
-    /// 讀 `full` 從 `start` 起的 `len` bytes 進記憶體（get_opts／get_ranges／
+    /// 讀 `location` 從 `start` 起的 `len` bytes 進記憶體（get_opts／get_ranges／
     /// copy_opts 共用）。預配只取容量提示，讀取用 take(宣稱量) 封頂：宣稱
     /// size 不可信任（預配會被推進 alloc abort），真的多送也只收到宣稱量為止。
     /// 宣稱量本身先過硬上限——「宣稱超大再串流」take 擋不住（OOM 語義見
-    /// check_claimed_len）；`list_all` 決定上限是否執行。少送就回 UnexpectedEof。
+    /// check_claimed_len）；來源模式（`list_all`）不設上限。少送就回 UnexpectedEof。
     async fn read_whole(
         &self,
         location: &StorePath,
-        full: &str,
         start: u64,
         len: u64,
-        list_all: bool,
     ) -> std::result::Result<Vec<u8>, StoreError> {
         use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        let full = self.full(location);
         let fh = self
             .sftp
-            .open(full)
+            .open(&full)
             .await
             .map_err(|e| self.store_error(location, e))?;
         let mut tf = std::pin::pin!(TokioCompatFile::from(fh));
@@ -742,7 +741,7 @@ impl SftpInner {
                 .await
                 .map_err(generic)?;
         }
-        check_claimed_len(list_all, len).map_err(generic)?;
+        check_claimed_len(self.list_all, len).map_err(generic)?;
         let mut buf = Vec::with_capacity(read_capacity_hint(len));
         let mut limited = tf.as_mut().take(len);
         limited.read_to_end(&mut buf).await.map_err(generic)?;
@@ -1228,13 +1227,7 @@ impl ObjectStore for SftpStore {
             });
         }
         let buf = inner
-            .read_whole(
-                location,
-                &full,
-                range.start,
-                range.end - range.start,
-                inner.list_all,
-            )
+            .read_whole(location, range.start, range.end - range.start)
             .await?;
         Ok(GetResult {
             payload: GetResultPayload::Stream(
@@ -1258,9 +1251,7 @@ impl ObjectStore for SftpStore {
         let inner = &*self.0;
         let full = inner.full(location);
         let meta = inner.meta_of(&full).await?;
-        let buf = inner
-            .read_whole(location, &full, 0, meta.size, inner.list_all)
-            .await?;
+        let buf = inner.read_whole(location, 0, meta.size).await?;
         // 切片前用**實際讀到的長度**做邊界檢查：index 壞掉或 pack 被截斷時回乾淨的
         // 錯誤，而不是切片 panic。
         for r in ranges {
@@ -1390,8 +1381,9 @@ impl ObjectStore for SftpStore {
         let src = inner.full(from);
         let dst = inner.full(to);
         let meta = inner.meta_of(&src).await?;
-        // copy 只有 repo 端會用——無條件執行讀取上限（list_all = false）。
-        let buf = inner.read_whole(from, &src, 0, meta.size, false).await?;
+        // copy 只有 repo 端會用（來源模式的 store 只 list／get／head），讀取
+        // 上限在這裡因此實際上無條件執行。
+        let buf = inner.read_whole(from, 0, meta.size).await?;
         let scratch = inner.spool(dir_of(&dst), &buf).await?;
         let mut fs = inner.sftp.fs();
         let renamed = fs.rename(&scratch, &dst).await;

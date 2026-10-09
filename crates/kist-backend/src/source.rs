@@ -299,27 +299,25 @@ impl ObjectStoreSource {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(e) => return Err(BackendError::Source(format!("{path}: {e}"))),
         };
-        let name = path
-            .to_string()
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("root")
-            .as_bytes()
-            .to_vec();
+        let name = path.filename().unwrap_or("root").as_bytes().to_vec();
         Ok(Some(SourceItem {
             name,
-            kind: SourceItemKind::File {
-                size: meta.size,
-                mtime_ns: meta
-                    .last_modified
-                    .timestamp()
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(i64::from(meta.last_modified.timestamp_subsec_nanos())),
-                etag: meta.e_tag.as_ref().map(|e| e.as_bytes().to_vec()),
-                vern: meta.version.as_ref().map(|v| v.as_bytes().to_vec()),
-            },
+            kind: file_kind(&meta),
         }))
+    }
+}
+
+/// 遠端物件的 metadata → 檔案條目（大小、mtime 奈秒、etag／版本）。
+fn file_kind(meta: &object_store::ObjectMeta) -> SourceItemKind {
+    SourceItemKind::File {
+        size: meta.size,
+        mtime_ns: meta
+            .last_modified
+            .timestamp()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i64::from(meta.last_modified.timestamp_subsec_nanos())),
+        etag: meta.e_tag.as_ref().map(|e| e.as_bytes().to_vec()),
+        vern: meta.version.as_ref().map(|v| v.as_bytes().to_vec()),
     }
 }
 
@@ -368,39 +366,15 @@ impl Source for ObjectStoreSource {
         let mut out = Vec::new();
         // 子目錄（common prefix）。
         for p in &result.common_prefixes {
-            let name = p
-                .as_ref()
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .as_bytes()
-                .to_vec();
             out.push(SourceItem {
-                name,
+                name: p.filename().unwrap_or("").as_bytes().to_vec(),
                 kind: SourceItemKind::Dir,
             });
         }
         for meta in &result.objects {
-            let name = meta
-                .location
-                .as_ref()
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .as_bytes()
-                .to_vec();
             out.push(SourceItem {
-                name,
-                kind: SourceItemKind::File {
-                    size: meta.size,
-                    mtime_ns: meta
-                        .last_modified
-                        .timestamp()
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(i64::from(meta.last_modified.timestamp_subsec_nanos())),
-                    etag: meta.e_tag.as_ref().map(|e| e.as_bytes().to_vec()),
-                    vern: meta.version.as_ref().map(|v| v.as_bytes().to_vec()),
-                },
+                name: meta.location.filename().unwrap_or("").as_bytes().to_vec(),
+                kind: file_kind(meta),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -482,9 +456,15 @@ impl Read for StreamBridge {
     }
 }
 
+/// `spec` 是不是遠端來源 URL（`sftp://`／`s3://`）；其他都是本機路徑。CLI 用
+/// 同一條規則判斷 backup 的第一個路徑是不是遠端來源。
+pub fn is_remote_spec(spec: &str) -> bool {
+    spec.starts_with("sftp://") || spec.starts_with("s3://")
+}
+
 /// 從來源 URL 構造 Source：本機路徑或 `sftp://`/`s3://`。
 pub async fn open_source(spec: &str) -> Result<Box<dyn Source>> {
-    if spec.starts_with("sftp://") || spec.starts_with("s3://") {
+    if is_remote_spec(spec) {
         return Ok(Box::new(ObjectStoreSource::open(spec).await?));
     }
     Ok(Box::new(LocalSource::new(std::path::PathBuf::from(spec))?))

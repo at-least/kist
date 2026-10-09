@@ -460,7 +460,7 @@ async fn run(cli: Cli) -> Result<()> {
             let remote_url = paths
                 .first()
                 .and_then(|p| p.to_str())
-                .filter(|u| u.starts_with("sftp://") || u.starts_with("s3://"))
+                .filter(|u| kist_backend::source::is_remote_spec(u))
                 .map(str::to_owned);
             if remote_url.is_some() && paths.len() > 1 {
                 anyhow::bail!(
@@ -561,13 +561,8 @@ async fn run(cli: Cli) -> Result<()> {
                 "mounted at {}; interrupt (Ctrl-C) to unmount",
                 mountpoint.display()
             );
-            tokio::select! {
-                res = tokio::signal::ctrl_c() => {
-                    res.context("installing the Ctrl-C handler")?;
-                }
-                res = sigterm() => {
-                    res.context("installing the SIGTERM handler")?;
-                }
+            if !wait_for_shutdown_signal().await {
+                anyhow::bail!("installing the Ctrl-C and SIGTERM handlers failed");
             }
             // 有檔案還開著時 FUSE 會回 EBUSY——把原錯誤帶上人話。
             mounted.unmount().context(format!(
@@ -850,9 +845,9 @@ fn spawn_shutdown_watcher(tx: tokio::sync::watch::Sender<bool>) {
     });
 }
 
-/// `run`／`serve` 的結束訊號：Ctrl-C（SIGINT）**或** SIGTERM。systemd／docker
-/// 的 `stop` 送的是 SIGTERM——只等 SIGINT 的話，「跑完手邊工作再停」的約定
-/// 在主要的部署訊號下不會發生（`kist mount` 的 `sigterm()` 同一款理由）。
+/// `run`／`serve`／`mount` 的結束訊號：Ctrl-C（SIGINT）**或** SIGTERM。systemd／
+/// docker 的 `stop` 送的是 SIGTERM——只等 SIGINT 的話，「跑完手邊工作再停」
+/// 的約定在主要的部署訊號下不會發生。回 false 表示兩個 handler 都裝不起來。
 async fn wait_for_shutdown_signal() -> bool {
     #[cfg(unix)]
     {
@@ -972,15 +967,6 @@ fn repo_url(args: &RepoArgs) -> Result<&str> {
 
 async fn open_backend(args: &RepoArgs) -> Result<Backend> {
     Ok(Backend::from_url(repo_url(args)?).await?)
-}
-
-/// `kist mount` 的第二個結束訊號（systemd/終端機都會送 SIGTERM）。
-#[cfg(unix)]
-async fn sigterm() -> std::io::Result<()> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate())?;
-    term.recv().await;
-    Ok(())
 }
 
 async fn open_repo(args: &RepoArgs) -> Result<Repository> {
