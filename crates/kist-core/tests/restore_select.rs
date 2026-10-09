@@ -33,6 +33,7 @@ fn select(include: &[&str], exclude: &[&str]) -> RestoreOptions {
     RestoreOptions {
         include: PathFilter::new(include).unwrap(),
         exclude: PathFilter::new(exclude).unwrap(),
+        ..RestoreOptions::default()
     }
 }
 
@@ -324,4 +325,186 @@ async fn roots_are_selected_by_their_path() {
     let (summary, got) = run(select(&["readme.txt"], &[])).await;
     assert_eq!(got, set(&["readme.txt"]), "檔案 root 也能被 include 選到");
     assert_eq!(summary.files, 1);
+}
+
+// --- 只還原一個子目錄、直接放進目標（`RestoreOptions::subtree`，ADR 022）---
+
+fn subtree(path: &Path) -> Vec<Vec<u8>> {
+    kist_core::restore::subtree_components(path.to_str().unwrap()).unwrap()
+}
+
+/// 目標底下的全部路徑（不再加 root 的定位）。
+fn under(target: &Path) -> BTreeSet<PathBuf> {
+    snapshot_dir(target).into_keys().collect()
+}
+
+#[tokio::test]
+async fn a_subtree_lands_directly_in_the_target() {
+    let f = fixture().await;
+    let run = |opts: RestoreOptions| {
+        let target = tempfile::tempdir_in(f.t.dir.path()).unwrap().keep();
+        let repo = &f.repo;
+        let key = &f.key;
+        async move {
+            let summary = repo.restore(key, &target, opts).await.unwrap();
+            assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+            under(&target)
+        }
+    };
+    let docs = RestoreOptions {
+        subtree: subtree(&f.abs.join("docs")),
+        ..RestoreOptions::default()
+    };
+    assert_eq!(
+        run(docs).await,
+        set(&["notes.txt", "old", "old/a.pdf", "report.pdf"])
+    );
+    // root 本身：內容直接放進目標。
+    let root = RestoreOptions {
+        subtree: subtree(&f.abs),
+        ..RestoreOptions::default()
+    };
+    let got = run(root).await;
+    assert!(got.contains(Path::new("readme.txt")));
+    assert!(got.contains(Path::new("photos/sub/p2.jpg")));
+    // root 的上一層：從那裡往下的相對路徑。
+    let above = RestoreOptions {
+        subtree: subtree(f.abs.parent().unwrap()),
+        ..RestoreOptions::default()
+    };
+    assert!(run(above).await.contains(Path::new("src/docs/report.pdf")));
+    // 樣式照樣比對 snapshot 裡的完整路徑。
+    let filtered = RestoreOptions {
+        subtree: subtree(&f.abs.join("docs")),
+        exclude: PathFilter::new(&[f.pattern("docs/old")]).unwrap(),
+        ..RestoreOptions::default()
+    };
+    assert_eq!(run(filtered).await, set(&["notes.txt", "report.pdf"]));
+}
+
+#[tokio::test]
+async fn a_subtree_must_be_a_directory_in_the_snapshot() {
+    let f = fixture().await;
+    let target = f.t.dir.path().join("t");
+    for (path, needle) in [
+        (f.abs.join("nope"), "not in this snapshot"),
+        (f.abs.join("readme.txt"), "not a directory"),
+        (PathBuf::from("/elsewhere/entirely"), "not in this snapshot"),
+    ] {
+        let opts = RestoreOptions {
+            subtree: subtree(&path),
+            ..RestoreOptions::default()
+        };
+        let err = f.repo.restore(&f.key, &target, opts).await.unwrap_err();
+        assert!(
+            err.to_string().contains(needle),
+            "{}: {err}",
+            path.display()
+        );
+    }
+    for bad in ["relative/path", "/a/../b", "/a/./b", ""] {
+        assert!(
+            kist_core::restore::subtree_components(bad).is_err(),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        kist_core::restore::subtree_components("/").unwrap(),
+        Vec::<Vec<u8>>::new(),
+        "`/` 是頂端：整份還原的版面"
+    );
+}
+
+#[tokio::test]
+async fn a_subtree_spanning_several_roots() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    let abs = make_tree(&src);
+    let repo = t.open().await;
+    let roots = [src.join("docs"), src.join("photos"), src.join("readme.txt")];
+    let key = repo
+        .backup(&roots, backup_options())
+        .await
+        .unwrap()
+        .snapshot_key;
+    let target = t.dir.path().join("all");
+    let opts = RestoreOptions {
+        subtree: subtree(&abs),
+        ..RestoreOptions::default()
+    };
+    let summary = repo.restore(&key, &target, opts).await.unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    let got = under(&target);
+    for p in ["docs/old/a.pdf", "photos/sub/p2.jpg", "readme.txt"] {
+        assert!(got.contains(Path::new(p)), "{p} missing from {got:?}");
+    }
+    let target = t.dir.path().join("sub");
+    let opts = RestoreOptions {
+        subtree: subtree(&abs.join("photos/sub")),
+        ..RestoreOptions::default()
+    };
+    repo.restore(&key, &target, opts).await.unwrap();
+    assert_eq!(under(&target), set(&["p2.jpg"]));
+}
+
+// --- dry run（`Repository::plan_restore`，ADR 022）：與真的還原寫出來的完全一致 ---
+
+#[tokio::test]
+async fn a_dry_run_predicts_exactly_what_a_restore_writes() {
+    let f = fixture().await;
+    let cases: Vec<RestoreOptions> = vec![
+        RestoreOptions::default(),
+        select(&[&f.pattern("docs/report.pdf")], &[]),
+        select(&[&f.pattern("docs")], &[]),
+        select(&["*.pdf"], &[]),
+        select(&[], &["scratch", "*.jpg"]),
+        select(&[&f.pattern("docs")], &["*.pdf"]),
+        select(&["*.jpg", "*.nope"], &["photos/sub"]),
+        RestoreOptions {
+            subtree: subtree(&f.abs.join("photos")),
+            ..RestoreOptions::default()
+        },
+    ];
+    for opts in cases {
+        let target = tempfile::tempdir_in(f.t.dir.path()).unwrap().keep();
+        let probe = target.join("never-created");
+        let mut planned = BTreeSet::new();
+        let plan = f
+            .repo
+            .plan_restore(&f.key, &probe, opts.clone(), &mut |path, _| {
+                planned.insert(path.strip_prefix(&probe).unwrap().to_path_buf());
+            })
+            .await
+            .unwrap();
+        assert!(!probe.exists(), "dry run 不碰目標");
+
+        let real = f.repo.restore(&f.key, &probe, opts.clone()).await.unwrap();
+        assert!(real.errors.is_empty(), "{:?}", real.errors);
+        assert_eq!(
+            (
+                plan.files,
+                plan.dirs,
+                plan.symlinks,
+                &plan.unmatched_includes
+            ),
+            (
+                real.files,
+                real.dirs,
+                real.symlinks,
+                &real.unmatched_includes
+            ),
+            "{opts:?}"
+        );
+        // 真的還原還會建出 root 的落點與它的上層（不是 snapshot 裡的節點，dry run 不列）。
+        let base = if opts.subtree.is_empty() {
+            f.abs.strip_prefix("/").unwrap().to_path_buf()
+        } else {
+            PathBuf::new()
+        };
+        let written: BTreeSet<PathBuf> = under(&probe)
+            .into_iter()
+            .filter(|p| !base.starts_with(p))
+            .collect();
+        assert_eq!(planned, written, "{opts:?}");
+    }
 }

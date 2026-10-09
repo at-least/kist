@@ -25,7 +25,8 @@ use clap::{Args, Parser, Subcommand};
 use kist_backend::{Backend, RepoLocation};
 use kist_core::{
     BackupOptions, CheckOptions, Exclusions, ForgetOptions, ForgetSummary, InitOptions, Marker,
-    PathFilter, PruneOptions, PruneReport, Repository, RestoreOptions, RetentionPolicy, SourceSpec,
+    PathFilter, Planned, PruneOptions, PruneReport, Repository, RestoreOptions, RestoreSummary,
+    RetentionPolicy, SourceSpec,
 };
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
@@ -198,23 +199,37 @@ enum Command {
     Restore {
         #[command(flatten)]
         repo: RepoArgs,
-        /// Snapshot to restore: `latest`, a full id, or a unique timestamp prefix.
+        /// Snapshot to restore: `latest`, a full id, or a unique timestamp prefix. Append
+        /// `:PATH` (a directory in the snapshot, e.g. `latest:/home/me/docs`) to restore only
+        /// that directory's contents straight into TARGET.
         snapshot: String,
         /// Directory to restore into (the original absolute paths are recreated beneath it).
         /// Should be empty: existing files are overwritten; symlinks in the way (pre-existing or snapshot-planted) are refused, not followed.
         target: PathBuf,
         /// Restore only nodes matching PATTERN and everything below them (repeatable); the
         /// directories on the way are created with their recorded metadata. Patterns match
-        /// the path a node gets under TARGET in a full restore (for local sources the
-        /// original absolute path), with the same rules as `backup --exclude`. A pattern
+        /// the node's path in the snapshot (for local sources the original absolute path),
+        /// with the same rules as `backup --exclude`, also with SNAPSHOT:PATH. A pattern
         /// that selects nothing (no match, or every match excluded) is reported and the
         /// exit code is 3.
         #[arg(long, value_name = "PATTERN")]
         include: Vec<String>,
+        /// Read --include patterns from FILE, one per line (repeatable; same format as
+        /// `backup --exclude-file`).
+        #[arg(long, value_name = "FILE")]
+        include_file: Vec<PathBuf>,
         /// Do not restore nodes matching PATTERN (a directory with everything below it;
         /// repeatable). Wins over --include.
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
+        /// Read --exclude patterns from FILE, one per line (repeatable).
+        #[arg(long, value_name = "FILE")]
+        exclude_file: Vec<PathBuf>,
+        /// List what would be restored (`dir`, `file`, `link` and the path under TARGET)
+        /// without writing anything; TARGET is not even created. Only trees are read, so
+        /// errors that need file data (a damaged chunk) do not show up.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Verify the repository's integrity.
     Check {
@@ -304,12 +319,12 @@ enum Command {
     Version,
 }
 
-/// `backup --exclude` 與 `--exclude-file` 合成一組樣式（ADR 020）。樣式檔一行一條：
-/// 去掉前後空白（`\r\n` 結尾也一併去掉），空行與 `#` 開頭的行略過；寫錯的那一行以
-/// `檔案:行號` 點名。
-fn exclude_filter(patterns: &[String], files: &[PathBuf]) -> Result<PathFilter> {
+/// 命令列的樣式加上樣式檔，合成一組樣式（ADR 020；backup 的 `--exclude`、restore 的
+/// `--include`／`--exclude`）。樣式檔一行一條：去掉前後空白（`\r\n` 結尾也一併去掉），
+/// 空行與 `#` 開頭的行略過；寫錯的那一行以 `檔案:行號` 點名。
+fn pattern_filter(flag: &str, patterns: &[String], files: &[PathBuf]) -> Result<PathFilter> {
     let mut all = patterns.to_vec();
-    PathFilter::new(&all).context("--exclude")?;
+    PathFilter::new(&all).context(flag.to_owned())?;
     for file in files {
         let text = std::fs::read_to_string(file)
             .with_context(|| format!("reading exclude file {}", file.display()))?;
@@ -532,7 +547,7 @@ async fn run(cli: Cli) -> Result<()> {
                 if_present.push(Marker::cachedir_tag());
             }
             let exclude = Exclusions {
-                patterns: exclude_filter(&exclude, &exclude_file)?,
+                patterns: pattern_filter("--exclude", &exclude, &exclude_file)?,
                 if_present,
                 larger_than: exclude_larger_than,
                 one_file_system,
@@ -664,20 +679,50 @@ async fn run(cli: Cli) -> Result<()> {
             snapshot,
             target,
             include,
+            include_file,
             exclude,
+            exclude_file,
+            dry_run,
         } => {
+            // `SNAPSHOT:PATH`（同 restic）：snapshot 的寫法裡沒有 `:`。
+            let (snapshot, subtree) = match snapshot.split_once(':') {
+                Some((snapshot, path)) => (
+                    snapshot.to_owned(),
+                    kist_core::restore::subtree_components(path)?,
+                ),
+                None => (snapshot, Vec::new()),
+            };
             let opts = RestoreOptions {
-                include: PathFilter::new(&include).context("--include")?,
-                exclude: PathFilter::new(&exclude).context("--exclude")?,
+                include: pattern_filter("--include", &include, &include_file)?,
+                exclude: pattern_filter("--exclude", &exclude, &exclude_file)?,
+                subtree,
             };
             let r = open_repo(&repo).await?;
             let key = r.resolve_snapshot(&snapshot).await?;
-            let summary = r.restore(&key, &target, opts).await?;
+            let summary = if dry_run {
+                let mut list = |path: &std::path::Path, kind: Planned| {
+                    if !json {
+                        let kind = match kind {
+                            Planned::Dir => "dir ",
+                            Planned::File => "file",
+                            Planned::Symlink => "link",
+                        };
+                        println!("{kind} {}", path.display());
+                    }
+                };
+                r.plan_restore(&key, &target, opts, &mut list).await?
+            } else {
+                r.restore(&key, &target, opts).await?
+            };
             if json {
-                print_json(&summary)?;
+                print_json(&RestoreJson {
+                    dry_run,
+                    summary: &summary,
+                })?;
             } else {
                 println!(
-                    "restored {} to {}: {} files, {} dirs, {} symlinks",
+                    "{} {} to {}: {} files, {} dirs, {} symlinks",
+                    if dry_run { "would restore" } else { "restored" },
                     short_snapshot_id(&key),
                     target.display(),
                     summary.files,
@@ -1059,6 +1104,14 @@ impl ForgetJson {
                 .collect(),
         }
     }
+}
+
+/// `restore --json`：加上 dry_run（`--dry-run` 時計數是「會還原」的，什麼都沒寫）。
+#[derive(serde::Serialize)]
+struct RestoreJson<'a> {
+    dry_run: bool,
+    #[serde(flatten)]
+    summary: &'a RestoreSummary,
 }
 
 /// `prune --json`：加上 dry_run（report 本身不帶，但消費者需要知道刪了沒）。

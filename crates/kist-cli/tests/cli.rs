@@ -1194,3 +1194,84 @@ fn one_file_system_keeps_mount_points_empty() {
     let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
     assert_eq!(std::fs::read(restored.join("mnt/f")).unwrap(), b"inner\n");
 }
+
+/// `restore SNAPSHOT:PATH`、`--dry-run`、`--include-file`（ADR 022）。
+#[test]
+fn restore_subtree_dry_run_and_pattern_files() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let abs = std::fs::canonicalize(&src).unwrap();
+
+    // SNAPSHOT:PATH：那個目錄的內容直接放進目標。
+    let target = env.dir.path().join("sub-only");
+    let spec = format!("latest:{}/sub", abs.display());
+    env.ok(&["restore", &spec, target.to_str().unwrap()]);
+    assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"world\n");
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+
+    // --dry-run：列出會寫的東西，目標連建都不建。
+    let target = env.dir.path().join("dry");
+    let list = env.dir.path().join("include.txt");
+    std::fs::write(&list, "# text files only\n*.txt\n").unwrap();
+    let out = env.ok(&[
+        "restore",
+        "--dry-run",
+        "latest",
+        target.to_str().unwrap(),
+        "--include-file",
+        list.to_str().unwrap(),
+    ]);
+    let rel = abs.strip_prefix("/").unwrap();
+    let file = |p: &str| format!("file {}", target.join(rel).join(p).display());
+    assert!(out.contains(&file("a.txt")), "{out}");
+    assert!(out.contains(&file("sub/b.txt")), "{out}");
+    assert!(
+        out.contains(&format!("dir  {}", target.join(rel).join("sub").display())),
+        "{out}"
+    );
+    assert!(!out.contains("big.bin"), "{out}");
+    assert!(out.contains("would restore"), "{out}");
+    assert!(!target.exists(), "dry run 不建目標");
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "restore",
+        "--json",
+        "--dry-run",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        "*.txt",
+    ]))
+    .unwrap();
+    assert_eq!(
+        (v["dry_run"].clone(), v["files"].clone(), v["dirs"].clone()),
+        (Value::Bool(true), 2.into(), 1.into()),
+        "{v}"
+    );
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "restore",
+        "--json",
+        "latest",
+        env.dir.path().join("real").to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(v["dry_run"], false);
+
+    for (spec, needle) in [
+        (
+            format!("latest:{}/nope", abs.display()),
+            "not in this snapshot",
+        ),
+        ("latest:relative/path".to_owned(), "starts with `/`"),
+        (format!("latest:{}/a.txt", abs.display()), "not a directory"),
+    ] {
+        let (code, _, err) =
+            env.kist_code(&["restore", &spec, env.dir.path().join("x").to_str().unwrap()]);
+        assert_eq!(code, Some(1), "{spec}: {err}");
+        assert!(err.contains(needle), "{spec}: {err}");
+    }
+}

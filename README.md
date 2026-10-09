@@ -131,6 +131,8 @@ kist backup / --one-file-system                # 不進入別的檔案系統（o
 kist restore latest /tmp/out --include /home/me/docs/report.pdf   # 只還原這個檔
 kist restore latest /tmp/out --include /home/me/docs              # 整個目錄
 kist restore latest /tmp/out --include '*.pdf' --exclude /home/me/old
+kist restore latest:/home/me/docs /tmp/docs                       # 目錄的內容直接放進 /tmp/docs
+kist restore --dry-run latest /tmp/out --include '*.pdf'          # 只列出會寫什麼
 ```
 
 - 樣式規則與 `backup --exclude` 相同，比對的是節點整份還原時在目標底下的路徑（也是 `kist mount`
@@ -144,6 +146,13 @@ kist restore latest /tmp/out --include '*.pdf' --exclude /home/me/old
 - 沒有選到任何東西的 `--include`（比對不到，或比對到的全被排除）印警告、結束碼 3，`--json` 的
   `unmatched_includes` 列出它們；其他選到的照樣還原。
 - 硬連結的第一個名字沒被選到時，後面的名字還原成內容相同的獨立檔案。
+- `SNAPSHOT:PATH`（同 restic）：PATH 是 snapshot 裡的一個目錄（某個 root、root 裡的目錄，或幾個 root
+  共同的上層），它的內容直接放進目標，不重建上面的路徑；目標本身不套那個目錄的 metadata。樣式照樣比對
+  snapshot 裡的完整路徑。PATH 不在 snapshot 裡或不是目錄時，以結束碼 1 結束。
+- `--dry-run`：列出會寫的目錄、檔案、symlink（`dir`／`file`／`link` 加上目標底下的路徑），目標連建都
+  不建；計數與「沒選到東西」的警告和真的還原相同。只讀 tree、不讀檔案內容，所以壞掉的 chunk、目標處
+  擋著的東西這類錯誤只有真的還原才看得到。
+- `--include-file`／`--exclude-file`：樣式一行一條，格式同 `backup --exclude-file`。
 
 ### `--json`
 
@@ -154,7 +163,7 @@ kist restore latest /tmp/out --include '*.pdf' --exclude /home/me/old
 - snapshot 的 `paths` 原本是 OS bytes，JSON 裡以 UTF-8 呈現，非 UTF-8 的位元組會換成 U+FFFD。
 - `forget` / `prune` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個。
 - `backup` 的 `report.excluded`：被排除樣式比對到的項目數；`restore` 的 `unmatched_includes`：沒選到
-  東西的 `--include` 樣式。
+  東西的 `--include` 樣式，`dry_run`：是不是 `--dry-run`（是的話計數是「會還原」的）。
 - `run --once --json` 印出 JobOutcome 陣列；常駐模式下每件工作結束印一行 JSON（NDJSON）。
 
 ### 設定檔與排程

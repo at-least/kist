@@ -44,7 +44,7 @@ pub use kist_format::parity::MAX_PARITY_SHARDS;
 pub use prune::{PruneOptions, PrunePlan, PruneReport, MAX_EFFECTIVE_BLOBS};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
-pub use restore::{ReloadableIndex, RestoreOptions, RestoreSummary};
+pub use restore::{Planned, ReloadableIndex, RestoreOptions, RestoreSummary};
 pub use snapshots::SnapshotInfo;
 
 use std::path::PathBuf;

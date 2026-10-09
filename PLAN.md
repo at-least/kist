@@ -415,9 +415,11 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - 第二批（ADR 021）：`--exclude-if-present NAME[:HEADER]`、`--exclude-caches`、`--exclude-larger-than`、
   `--one-file-system` 與對應的設定鍵。`BackupOptions.exclude` 改成 `Exclusions`；`Source` 新增 `probe`
   判斷記號檔。`--one-file-system` 以 user＋mount namespace 裡的 tmpfs 端到端測過，另對 btrfs 子卷手動跑過。
-- 還沒做：`--iexclude`、`--files-from`、restore 的 `--dry-run` 與 `snap:子目錄`、restore 的樣式檔、反向樣式
-  與大括號。
-- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 431 過 1 略過（原 395）。
+- 第三批（ADR 022）：`restore SNAPSHOT:PATH`（`RestoreOptions.subtree`，目錄內容直接放進目標）、
+  `restore --dry-run`（`Repository::plan_restore`，與真的還原共用落點與選取，測試逐一比對兩者的結果）、
+  restore 的 `--include-file`／`--exclude-file`。
+- 還沒做：`--iexclude`、`--files-from`、反向樣式與大括號。
+- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 436 過 1 略過（原 395）。
   依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
 ## 已接受的限制（非待辦）
