@@ -223,6 +223,83 @@ async fn includes_that_match_nothing_are_reported() {
     assert_eq!(got, set(&["docs", "docs/old", "docs/old/a.pdf"]));
 }
 
+/// 審查修正：include 樣式要涵蓋某個被還原的節點（比對到它或它的上層）才算選到東西。比對
+/// 到、但被後面的反向樣式取消，或只比對到 root 的上層、而 root 被排除，都算沒選到。
+#[tokio::test]
+async fn an_include_counts_only_when_something_it_covers_is_restored() {
+    let f = fixture().await;
+    let docs = f.pattern("docs");
+    let negated = format!("!{docs}");
+    let (summary, got) = f.restore(select(&[&docs, &negated], &[])).await;
+    assert_eq!(summary.unmatched_includes, vec![docs.clone()]);
+    assert!(got.is_empty(), "{got:?}");
+
+    let parent = f.abs.parent().unwrap().display().to_string();
+    let root = f.abs.display().to_string();
+    let (summary, got) = f.restore(select(&[&parent], &[&root])).await;
+    assert_eq!(summary.unmatched_includes, vec![parent.clone()]);
+    assert!(got.is_empty(), "{got:?}");
+
+    // 對照：同一個節點被幾條樣式比對到時每一條都算，不只決定選取的最後一條（root 的上層
+    // 與 root 本身、一個檔案與 `*.pdf`）。
+    let report = f.pattern("docs/report.pdf");
+    for include in [[parent.as_str(), root.as_str()], [report.as_str(), "*.pdf"]] {
+        let (summary, got) = f.restore(select(&include, &[])).await;
+        assert!(
+            summary.unmatched_includes.is_empty(),
+            "{include:?}: {:?}",
+            summary.unmatched_includes
+        );
+        assert!(got.contains(Path::new("docs/report.pdf")), "{include:?}");
+    }
+}
+
+/// 只比對到一個空的目錄 root 的 include 也算選到東西：落點本身被還原。
+#[tokio::test]
+async fn an_include_selecting_an_empty_root_counts() {
+    let t = TestRepo::new().await;
+    let empty = t.dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let abs = std::fs::canonicalize(&empty).unwrap();
+    let repo = t.open().await;
+    let key = repo
+        .backup(std::slice::from_ref(&abs), backup_options())
+        .await
+        .unwrap()
+        .snapshot_key;
+    let target = t.dir.path().join("t");
+    let opts = select(&[&abs.display().to_string()], &[]);
+    let summary = repo.restore(&key, &target, opts).await.unwrap();
+    assert!(
+        summary.unmatched_includes.is_empty(),
+        "{:?}",
+        summary.unmatched_includes
+    );
+    assert!(target.join(abs.strip_prefix("/").unwrap()).is_dir());
+}
+
+/// 審查修正：只有反向樣式的 include 什麼都選不到（反向樣式只取消前面的 include 選到的），
+/// 直接報錯、不建目標，不以「還原 0 個檔案」成功結束。dry run 一樣。
+#[tokio::test]
+async fn only_negated_includes_are_an_error() {
+    let f = fixture().await;
+    let target = f.t.dir.path().join("never");
+    let opts = select(&["!*.tmp", "!scratch"], &[]);
+    let err = f
+        .repo
+        .restore(&f.key, &target, opts.clone())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("negated"), "{err}");
+    let err = f
+        .repo
+        .plan_restore(&f.key, &target, opts, &mut |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("negated"), "{err}");
+    assert!(!target.exists());
+}
+
 /// 剪枝的證據：把 photos 子目錄的 tree 物件刪掉。整份還原會撞到它（證明這個測試抓得到
 /// 「有去讀」）；只 include docs 的還原完全不碰它。
 #[tokio::test]
@@ -481,6 +558,15 @@ async fn a_dry_run_predicts_exactly_what_a_restore_writes() {
         select(&[], &["scratch", "*.jpg"]),
         select(&[&f.pattern("docs")], &["*.pdf"]),
         select(&["*.jpg", "*.nope"], &["photos/sub"]),
+        select(
+            &[&f.pattern("docs"), &format!("!{}", f.pattern("docs"))],
+            &[],
+        ),
+        select(
+            &[&f.abs.parent().unwrap().display().to_string()],
+            &[&f.abs.display().to_string()],
+        ),
+        select(&[&f.pattern("docs/report.pdf"), "*.pdf"], &[]),
         RestoreOptions {
             subtree: subtree(&f.abs.join("photos")),
             ..RestoreOptions::default()

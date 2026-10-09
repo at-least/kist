@@ -870,14 +870,18 @@ async fn run(cli: Cli) -> Result<()> {
                 ));
             }
             if !summary.unmatched_includes.is_empty() {
+                // 樣式可能來自 --include、--iinclude 或樣式檔，訊息不點名旗標。有錯誤時，失敗的
+                // 目錄底下沒有走到，比對也許在那裡（審查修正）。
+                let why = if summary.errors.is_empty() {
+                    "no match in this snapshot, or every match is excluded or negated"
+                } else {
+                    "no match among the items reached; the errors above may hide matches"
+                };
                 for p in &summary.unmatched_includes {
-                    eprintln!(
-                        "warning: --include {p:?} selected nothing: no match in this snapshot, \
-                         or every match is excluded"
-                    );
+                    eprintln!("warning: include pattern {p:?} selected nothing: {why}");
                 }
                 problems.push(format!(
-                    "{} --include pattern(s) selected nothing",
+                    "{} include pattern(s) selected nothing",
                     summary.unmatched_includes.len()
                 ));
             }

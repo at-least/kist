@@ -1071,6 +1071,43 @@ fn restore_include_and_exclude() {
     );
 }
 
+/// 審查修正：還原有錯誤時，失敗的目錄底下沒有走到，沒選到東西的 include 不能說成「snapshot
+/// 裡沒有」。訊息也不點名 `--include`（樣式可能來自樣式檔或 `--iinclude`）。
+#[test]
+fn unmatched_includes_after_errors_are_not_claimed_absent() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::write(src.join("docs/a.pdf"), b"a").unwrap();
+    std::fs::write(src.join("docs/b.txt"), b"b").unwrap();
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let abs = std::fs::canonicalize(&src).unwrap();
+    let rel = abs.strip_prefix("/").unwrap();
+    // docs 要建的地方擋著一個一般檔：a.pdf 之後 docs 整個放棄，b.txt 沒走到。
+    let target = env.dir.path().join("out");
+    std::fs::create_dir_all(target.join(rel)).unwrap();
+    std::fs::write(target.join(rel).join("docs"), b"in the way").unwrap();
+    let (code, _, stderr) = env.kist_code(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        "*.pdf",
+        "--include",
+        "*.txt",
+    ]);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains(
+            "include pattern \"*.txt\" selected nothing: no match among the items reached"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no match in this snapshot"), "{stderr}");
+    assert!(!stderr.contains("--include"), "{stderr}");
+}
+
 /// `--exclude-caches`、`--exclude-if-present`、`--exclude-larger-than`（ADR 021）端到端。
 #[test]
 fn backup_excludes_by_marker_and_size() {

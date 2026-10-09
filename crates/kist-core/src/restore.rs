@@ -551,8 +551,8 @@ struct Walk<'w> {
 struct Select<'o> {
     include: &'o PathFilter,
     exclude: &'o PathFilter,
-    /// 每條 include 樣式有沒有比對到過沒被排除的節點
-    /// （[`RestoreSummary::unmatched_includes`]）。
+    /// 每條 include 樣式有沒有選到東西：涵蓋（比對到它或它的上層）某個被還原的節點
+    /// （[`Select::credit`]、[`RestoreSummary::unmatched_includes`]）。
     hit: Vec<bool>,
 }
 
@@ -563,15 +563,28 @@ struct Pos {
     exclude: FilterState,
     /// 自己或某個上層被 include 比對到（沒有 include 時一律是）：要還原。
     selected: bool,
+    /// 比對到自己或某個上層、還沒算成選到東西的正向 include 樣式。這個節點被還原時它們都
+    /// 選到了東西（[`Select::credit`]）。
+    pending: Vec<usize>,
 }
 
 impl<'o> Select<'o> {
-    fn new(opts: &'o RestoreOptions) -> Self {
-        Self {
-            include: &opts.include,
-            exclude: &opts.exclude,
-            hit: vec![false; opts.include.len()],
+    /// 只有反向樣式的 include 什麼都選不到：反向樣式只取消前面的 include 選到的（ADR
+    /// 023）。直接報錯，不以「還原 0 個檔案」成功結束（審查修正）。
+    fn new(opts: &'o RestoreOptions) -> Result<Self> {
+        let include = &opts.include;
+        if !include.is_empty() && (0..include.len()).all(|p| include.is_negated(p)) {
+            return Err(CoreError::Usage(
+                "every include pattern is negated: a `!` pattern only takes back what an \
+                 earlier include selected, so nothing would be restored"
+                    .to_owned(),
+            ));
         }
+        Ok(Self {
+            include,
+            exclude: &opts.exclude,
+            hit: vec![false; include.len()],
+        })
     }
 
     /// 路徑頂端（還沒走過任何元件）。
@@ -580,18 +593,28 @@ impl<'o> Select<'o> {
             include: self.include.start(),
             exclude: self.exclude.start(),
             selected: self.include.is_empty(),
+            pending: Vec::new(),
         }
     }
 
     /// `parent` 底下的 `name`；被 exclude 比對到 → `None`。
-    fn child(&mut self, parent: &Pos, name: &[u8]) -> Option<Pos> {
+    fn child(&self, parent: &Pos, name: &[u8]) -> Option<Pos> {
         let exclude = self.exclude.descend(&parent.exclude, name);
         if exclude.is_match() {
             return None;
         }
         let include = self.include.descend(&parent.include, name);
+        // 已經算過的不再帶著：被還原的節點底下，這串自己就空了。
+        let mut pending: Vec<usize> = parent
+            .pending
+            .iter()
+            .copied()
+            .filter(|&p| !self.hit[p])
+            .collect();
         for &p in include.matched() {
-            self.hit[p] = true;
+            if !self.include.is_negated(p) && !self.hit[p] && !pending.contains(&p) {
+                pending.push(p);
+            }
         }
         // 最後一個比對到這個節點的 include 樣式決定（反向的取消，ADR 023）；沒有樣式比對到
         // 它就沿用上一層：選到的目錄底下全部選到。
@@ -599,11 +622,23 @@ impl<'o> Select<'o> {
             selected: include.decision().unwrap_or(parent.selected),
             include,
             exclude,
+            pending,
         })
     }
 
+    /// `pos` 被還原：比對到它或它上層的 include 樣式都選到了東西。只在這裡記，不在比對到
+    /// 的時候記——比對到、但被後面的反向樣式取消，或比對到的上層底下全被排除，都不算
+    /// （審查修正）。
+    fn credit(&mut self, pos: &Pos) {
+        if pos.selected {
+            for &p in &pos.pending {
+                self.hit[p] = true;
+            }
+        }
+    }
+
     /// 從頂端沿 `names` 走到底；途中被 exclude 比對到 → `None`（那底下全部不還原）。
-    fn walk<'n>(&mut self, names: impl IntoIterator<Item = &'n [u8]>) -> Option<Pos> {
+    fn walk<'n>(&self, names: impl IntoIterator<Item = &'n [u8]>) -> Option<Pos> {
         let mut pos = self.start();
         for name in names {
             pos = self.child(&pos, name)?;
@@ -615,6 +650,7 @@ impl<'o> Select<'o> {
     /// 選到 → `None`。
     fn visit(&mut self, parent: &Pos, entry: &Entry) -> Option<Pos> {
         let pos = self.child(parent, &entry.name)?;
+        self.credit(&pos);
         (pos.selected || (entry.kind == node_type::DIR && pos.include.may_match_below()))
             .then_some(pos)
     }
@@ -713,11 +749,11 @@ impl Repository {
         target: &Path,
         opts: RestoreOptions,
     ) -> Result<RestoreSummary> {
+        let select = Select::new(&opts)?;
         let snapshot = self.read_snapshot(snapshot_key).await?;
-        let mut select = Select::new(&opts);
         // 第一輪：每個 root 的落點。SNAPSHOT:PATH 不對時在建立任何目錄之前就回錯（審查修正）。
         let placements = self
-            .place_roots(&snapshot.roots, &opts.subtree, &mut select)
+            .place_roots(&snapshot.roots, &opts.subtree, &select)
             .await?;
         let index = ReloadableIndex::new(self.load_index().await?);
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
@@ -732,7 +768,7 @@ impl Repository {
             select,
         };
         for placement in placements {
-            let (rel, pos, entries) = self.open_placement(placement).await?;
+            let (rel, pos, entries) = self.open_placement(placement, &mut w.select).await?;
             // 落點建不起來（例如擋著 symlink）：整個 restore 回錯，不是某一項的錯。沒被
             // 選到的落點等到底下真的有東西要寫才建（[`PendingDir`]）。
             let mut base = PendingDir::base(&mut top, &rel);
@@ -769,7 +805,7 @@ impl Repository {
         &self,
         roots: &[Root],
         subtree: &[Vec<u8>],
-        select: &mut Select<'_>,
+        select: &Select<'_>,
     ) -> Result<Vec<Placement>> {
         let mut placements = Vec::new();
         let mut found = subtree.is_empty();
@@ -800,7 +836,7 @@ impl Repository {
         &self,
         root: &Root,
         subtree: &[Vec<u8>],
-        select: &mut Select<'_>,
+        select: &Select<'_>,
     ) -> Result<Placed> {
         let names = fsmeta::locator_components(root.path.as_slice())?;
         // root 的定位與 subtree 必須有一個是另一個的開頭，否則這個 root 跟這次還原無關。
@@ -844,7 +880,7 @@ impl Repository {
         root: &Root,
         names: &[&[u8]],
         subtree: &[Vec<u8>],
-        select: &mut Select<'_>,
+        select: &Select<'_>,
     ) -> Result<Placed> {
         let mut entries = self.read_tree_chain(&root.tree).await?;
         if names
@@ -883,8 +919,13 @@ impl Repository {
     }
 
     /// 第二輪：讀落點的條目；檔案來源的條目改放在落點的上一層。回傳落點、它的選取位置、
-    /// 條目。
-    async fn open_placement(&self, placement: Placement) -> Result<(PathBuf, Pos, Vec<Entry>)> {
+    /// 條目。落點被選到就算還原了（空的目錄 root 也是），在這裡記 include 選到東西，真的
+    /// 還原與 dry run 一致。
+    async fn open_placement(
+        &self,
+        placement: Placement,
+        select: &mut Select<'_>,
+    ) -> Result<(PathBuf, Pos, Vec<Entry>)> {
         let entries = match placement.content {
             Content::Tree(id) => self.read_tree_chain(&id).await?,
             Content::Read(entries) => entries,
@@ -898,6 +939,7 @@ impl Repository {
                 pos = parent;
             }
         }
+        select.credit(&pos);
         Ok((rel, pos, entries))
     }
 
@@ -913,10 +955,10 @@ impl Repository {
         opts: RestoreOptions,
         on_node: &mut dyn FnMut(&Path, Planned),
     ) -> Result<RestoreSummary> {
+        let select = Select::new(&opts)?;
         let snapshot = self.read_snapshot(snapshot_key).await?;
-        let mut select = Select::new(&opts);
         let placements = self
-            .place_roots(&snapshot.roots, &opts.subtree, &mut select)
+            .place_roots(&snapshot.roots, &opts.subtree, &select)
             .await?;
         let mut p = Plan {
             select,
@@ -925,7 +967,7 @@ impl Repository {
             levels: Vec::new(),
         };
         for placement in placements {
-            let (rel, pos, entries) = self.open_placement(placement).await?;
+            let (rel, pos, entries) = self.open_placement(placement, &mut p.select).await?;
             let base = target.join(&rel);
             p.levels.push(PlanLevel {
                 path: base.clone(),
