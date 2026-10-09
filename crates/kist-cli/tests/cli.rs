@@ -58,6 +58,31 @@ impl Env {
         assert!(!ok, "kist {args:?} should have failed\nstdout: {stdout}");
         stderr
     }
+
+    /// 同 [`Env::kist_code`]，標準輸入是 `input`（用到它的測試只在 unix 跑）。
+    #[cfg(unix)]
+    fn kist_stdin(&self, args: &[&str], input: &[u8]) -> (Option<i32>, String, String) {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kist"))
+            .args(args)
+            .env("KIST_REPO", self.repo())
+            .env("KIST_PASSWORD", "cli test password")
+            .env("KIST_CLIENT_ID_FILE", self.dir.path().join("client-id"))
+            .env("KIST_CACHE_DIR", self.dir.path().join("cache"))
+            .env_remove("RUST_LOG")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
 }
 
 fn make_source(root: &Path) {
@@ -928,6 +953,107 @@ fn check_json_repair_output_is_pure_json() {
             .any(|v| v.as_str().is_some_and(|s| s.ends_with(&victim_id))),
         "壞掉的 pack {victim_id} 應該被修復：{report}"
     );
+}
+
+/// 審查修正：清單與樣式檔的讀法。文字清單與樣式檔開頭的 UTF-8 BOM 去掉、CRLF 的 `\r`
+/// 去掉（verbatim 也是）；raw 的空名字與少了結尾 NUL 是錯；`-`（標準輸入）只能給一次，樣式檔
+/// 也可以是 `-`；一條樣式都沒有的 include 樣式檔是錯（不然 include 是空的、整份還原）。
+#[cfg(unix)]
+#[test]
+fn list_and_pattern_files_are_read_strictly() {
+    use serde_json::Value;
+    use std::os::unix::ffi::OsStrExt;
+
+    let env = Env::new();
+    let one = env.dir.path().join("data/one");
+    let two = env.dir.path().join("data/two");
+    for dir in [&one, &two] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("f"), b"f").unwrap();
+    }
+    std::fs::write(one.join("x.tmp"), b"tmp").unwrap();
+    let (one_b, two_b) = (one.as_os_str().as_bytes(), two.as_os_str().as_bytes());
+    let file = |name: &str, bytes: &[u8]| {
+        let path = env.dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let snapshots = || {
+        let v: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+        v.as_array().unwrap().len()
+    };
+    env.ok(&["init"]);
+
+    // BOM＋CRLF：--files-from 與 --files-from-verbatim 都讀到這兩個路徑。
+    let list = file(
+        "bom-crlf.txt",
+        &[b"\xef\xbb\xbf", one_b, b"\r\n", two_b, b"\r\n"].concat(),
+    );
+    for flag in ["--files-from", "--files-from-verbatim"] {
+        let v: Value = serde_json::from_str(&env.ok(&["backup", "--json", flag, &list])).unwrap();
+        assert_eq!(v["roots"].as_array().unwrap().len(), 2, "{flag}: {v}");
+    }
+
+    // 樣式檔：BOM 之後的第一行就是樣式；也可以從標準輸入讀。
+    let patterns = file("exclude.txt", b"\xef\xbb\xbf*.tmp\r\n");
+    let one_s = one.to_str().unwrap();
+    let v: Value =
+        serde_json::from_str(&env.ok(&["backup", "--json", "--exclude-file", &patterns, one_s]))
+            .unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "{v}");
+    let (code, out, err) = env.kist_stdin(
+        &["backup", "--json", "--exclude-file", "-", one_s],
+        b"*.tmp\n",
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "{v}");
+
+    // raw：空名字、少了結尾的 NUL 都是錯；`-` 給兩次也是。都不留 snapshot。
+    let before = snapshots();
+    let raw_empty = file("raw-empty", &[one_b, b"\0\0", two_b, b"\0"].concat());
+    let raw_open = file("raw-open", &[one_b, b"\0", two_b].concat());
+    for (args, needle) in [
+        (vec!["backup", "--files-from-raw", &raw_empty], "empty name"),
+        (vec!["backup", "--files-from-raw", &raw_open], "NUL"),
+        (
+            vec!["backup", "--files-from", "-", "--files-from-verbatim", "-"],
+            "standard input",
+        ),
+        (
+            vec!["backup", "--files-from", "-", "--exclude-file", "-"],
+            "standard input",
+        ),
+    ] {
+        let (code, _, err) = env.kist_stdin(&args, &[one_b, b"\n"].concat());
+        assert_eq!(code, Some(1), "{args:?}: {err}");
+        assert!(err.contains(needle), "{args:?}: {err}");
+    }
+    assert_eq!(snapshots(), before);
+
+    // 一條樣式都沒有的 include 樣式檔：結束碼 1，目標不建。exclude 的空樣式檔照常。
+    let empty = file("empty.txt", b"");
+    let comments = file("comments.txt", b"# none\n\n   \n");
+    for (flag, list) in [
+        ("--include-file", &empty),
+        ("--include-file", &comments),
+        ("--iinclude-file", &empty),
+    ] {
+        let target = env.dir.path().join("never");
+        let (code, _, err) =
+            env.kist_code(&["restore", "latest", target.to_str().unwrap(), flag, list]);
+        assert_eq!(code, Some(1), "{flag} {list}: {err}");
+        assert!(err.contains("no patterns"), "{err}");
+        assert!(!target.exists());
+    }
+    let target = env.dir.path().join("out");
+    env.ok(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--exclude-file",
+        &empty,
+    ]);
 }
 
 /// `backup --exclude`／`--exclude-file`（ADR 020）：樣式檔一行一條，空行與 `#` 開頭的行略過、

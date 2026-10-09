@@ -90,8 +90,14 @@ kist backup --files-from-verbatim list.txt               # 一行就是一個路
 find ~/proj -name '*.db' -print0 | kist backup --files-from-raw -   # NUL 分隔，從標準輸入讀
 ```
 
-名稱與切法同 restic，但**不展開萬用字元**：列的路徑照字面找，不存在就以結束碼 1 結束、不留 snapshot。
-可以和命令列的路徑一起給；讀完一個路徑都沒有也是結束碼 1。
+旗標名稱同 restic，但**不展開萬用字元**：列的路徑照字面找，不存在就以結束碼 1 結束、不留 snapshot。
+可以和命令列的路徑一起給；讀完一個路徑都沒有也是結束碼 1。切法：
+
+- 兩種文字清單：開頭的 UTF-8 BOM 去掉，行尾的 `\r`（CRLF）去掉，verbatim 也是（同 restic）。restic 只對
+  具名檔案去 BOM、標準輸入不去；kist 兩邊都去。UTF-16 的清單（restic 會轉碼）不支援，請存成 UTF-8。
+- raw：每個名字都要以 NUL 結尾、不能是空的，否則結束碼 1（同 restic）。
+- `-`（標準輸入）整個命令只能給一次（清單與樣式檔合計）；給兩次以結束碼 1 結束，不會讓後面那個默默讀到
+  空的。
 
 ### 排除規則（`backup --exclude`）
 
@@ -101,7 +107,8 @@ kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行�
 ```
 
 被排除的檔案與目錄不進 snapshot（目錄整棵不走），數量印在 backup 的摘要（`excluded: N`）與
-`--json` 的 `report.excluded`。設定檔寫成 `[backup] exclude = ["node_modules", "*.tmp"]`。
+`--json` 的 `report.excluded`。設定檔寫成 `[backup] exclude = ["node_modules", "*.tmp"]`。樣式檔
+的行與 `--files-from` 的文字清單同樣切（BOM、CRLF），去掉前後空白；`-` 是標準輸入。
 
 樣式比對的是節點在 snapshot 裡的路徑，也就是整份還原時它在目標底下的位置：
 
@@ -171,8 +178,9 @@ kist restore --dry-run latest /tmp/out --include '*.pdf'          # 只列出會
 - `--dry-run`：列出會寫的目錄、檔案、symlink（`dir`／`file`／`link` 加上目標底下的路徑），目標連建都
   不建；計數與「沒選到東西」的警告和真的還原相同。只讀 tree、不讀檔案內容，所以壞掉的 chunk、目標處
   擋著的東西這類錯誤只有真的還原才看得到。
-- `--include-file`／`--exclude-file`：樣式一行一條，格式同 `backup --exclude-file`。不分大小寫的版本是
-  `--iinclude`、`--iexclude` 與 `--iinclude-file`、`--iexclude-file`。
+- `--include-file`／`--exclude-file`：樣式一行一條，格式同 `backup --exclude-file`（`-` 是標準輸入）。不分
+  大小寫的版本是 `--iinclude`、`--iexclude` 與 `--iinclude-file`、`--iexclude-file`。一條樣式都沒有的
+  include 樣式檔（空的、只有註解）以結束碼 1 結束：照讀的話 include 是空的，等於整份還原。
 - include 也可以用 `!` 從選到的目錄裡取消一部分（`--include /home/me/docs --include '!/home/me/docs/old'`）；
   「沒選到東西」的檢查不看反向樣式。
 

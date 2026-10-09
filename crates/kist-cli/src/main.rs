@@ -142,17 +142,20 @@ enum Command {
         /// Files or directories to back up, or one remote source URL.
         #[arg(required_unless_present_any = ["files_from", "files_from_verbatim", "files_from_raw"])]
         paths: Vec<PathBuf>,
-        /// Read more source paths from FILE (`-` = standard input), one per line (repeatable).
-        /// Surrounding whitespace is trimmed; empty lines and lines starting with `#` are
-        /// skipped. Paths are taken literally: wildcards are not expanded.
+        /// Read more source paths from FILE (`-` = standard input, at most once per command),
+        /// one per line (repeatable). Surrounding whitespace is trimmed; empty lines and lines
+        /// starting with `#` are skipped; a leading UTF-8 byte order mark and CRLF line ends
+        /// are accepted. Paths are taken literally: wildcards are not expanded.
         #[arg(long, value_name = "FILE")]
         files_from: Vec<PathBuf>,
         /// Like --files-from, but every line is a path exactly as written (no trimming, `#`
-        /// is not a comment); only empty lines are skipped.
+        /// is not a comment; a CR before the line end is dropped); only empty lines are
+        /// skipped.
         #[arg(long, value_name = "FILE")]
         files_from_verbatim: Vec<PathBuf>,
-        /// Like --files-from, but the paths are separated by NUL bytes, so any file name
-        /// works (as written by `find -print0`).
+        /// Like --files-from, but every path ends with a NUL byte (as written by
+        /// `find -print0`), so any file name works. An empty name, or a last name without its
+        /// NUL, is an error.
         #[arg(long, value_name = "FILE")]
         files_from_raw: Vec<PathBuf>,
         /// File holding this machine's client id (created on first use).
@@ -173,8 +176,9 @@ enum Command {
         /// source paths themselves are never excluded.
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
-        /// Read exclude patterns from FILE, one per line (repeatable). Surrounding
-        /// whitespace is trimmed; empty lines and lines starting with `#` are skipped.
+        /// Read exclude patterns from FILE (`-` = standard input), one per line (repeatable).
+        /// Surrounding whitespace is trimmed; empty lines and lines starting with `#` are
+        /// skipped; a leading UTF-8 byte order mark and CRLF line ends are accepted.
         #[arg(long, value_name = "FILE")]
         exclude_file: Vec<PathBuf>,
         /// Like --exclude, ignoring case (repeatable). For `!` patterns the order is:
@@ -235,8 +239,9 @@ enum Command {
         /// exit code is 3.
         #[arg(long, value_name = "PATTERN")]
         include: Vec<String>,
-        /// Read --include patterns from FILE, one per line (repeatable; same format as
-        /// `backup --exclude-file`).
+        /// Read --include patterns from FILE (`-` = standard input), one per line (repeatable;
+        /// same format as `backup --exclude-file`). A file without any pattern is an error:
+        /// it would restore everything.
         #[arg(long, value_name = "FILE")]
         include_file: Vec<PathBuf>,
         /// Like --include, ignoring case (repeatable).
@@ -249,7 +254,7 @@ enum Command {
         /// repeatable). Wins over --include.
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
-        /// Read --exclude patterns from FILE, one per line (repeatable).
+        /// Read --exclude patterns from FILE (`-` = standard input), one per line (repeatable).
         #[arg(long, value_name = "FILE")]
         exclude_file: Vec<PathBuf>,
         /// Like --exclude, ignoring case (repeatable).
@@ -352,52 +357,98 @@ enum Command {
     Version,
 }
 
-/// `--files-from*` 的三種切法（ADR 024，名稱同 restic；都不展開萬用字元）。
+/// `--files-from*` 的三種切法（ADR 024，名稱同 restic；都不展開萬用字元）。文字的兩種：開頭的
+/// UTF-8 BOM 去掉，行尾的 `\r` 去掉（[`text_lines`]）。
 #[derive(Clone, Copy)]
 enum Listing {
     /// 一行一個；去掉前後空白，空行與 `#` 開頭的行略過。
     Plain,
     /// 一行一個，照原樣；只略過空行。
     Verbatim,
-    /// NUL 分隔，照原樣（名字裡可以有換行）。
+    /// NUL 結尾，照原樣（名字裡可以有換行；[`raw_names`]）。
     Raw,
 }
 
 /// `--files-from*` 的每個檔案（`-` 是標準輸入）裡列的來源路徑。
 fn listed_paths(files: &[PathBuf], how: Listing) -> Result<Vec<PathBuf>> {
-    use std::io::Read;
     let mut out = Vec::new();
     for file in files {
-        let bytes = if file.as_os_str() == "-" {
-            let mut bytes = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut bytes)
-                .context("reading source paths from standard input")?;
-            bytes
-        } else {
-            std::fs::read(file)
-                .with_context(|| format!("reading source paths from {}", file.display()))?
-        };
-        let separator = if matches!(how, Listing::Raw) {
-            0
-        } else {
-            b'\n'
-        };
-        for piece in bytes.split(|&b| b == separator) {
-            let piece = match how {
-                Listing::Plain => piece.trim_ascii(),
-                Listing::Verbatim | Listing::Raw => piece,
-            };
-            if piece.is_empty() || (matches!(how, Listing::Plain) && piece.starts_with(b"#")) {
-                continue;
+        let bytes = read_input(file, "source paths")?;
+        let names: Vec<&[u8]> = match how {
+            Listing::Plain => text_lines(&bytes)
+                .map(trim_line)
+                .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
+                .collect(),
+            Listing::Verbatim => text_lines(&bytes).filter(|line| !line.is_empty()).collect(),
+            Listing::Raw => {
+                raw_names(&bytes).with_context(|| format!("--files-from-raw {}", file.display()))?
             }
+        };
+        for name in names {
             out.push(
-                path_from_bytes(piece)
+                path_from_bytes(name)
                     .with_context(|| format!("a source path listed in {}", file.display()))?,
             );
         }
     }
     Ok(out)
+}
+
+/// 清單或樣式檔的內容；`-` 是標準輸入（[`stdin_at_most_once`] 先確定只有一個 `-`）。
+fn read_input(file: &std::path::Path, what: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if file.as_os_str() == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {what} from standard input"))?;
+        return Ok(bytes);
+    }
+    std::fs::read(file).with_context(|| format!("reading {what} from {}", file.display()))
+}
+
+/// 標準輸入只能讀一次：`-` 給了不只一次時直接報錯，不然後面的默默讀到空的（審查修正）。
+fn stdin_at_most_once<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    if files.into_iter().filter(|f| f.as_os_str() == "-").count() > 1 {
+        bail!("`-` (standard input) is given more than once; standard input can be read only once");
+    }
+    Ok(())
+}
+
+/// 文字清單與樣式檔的行（同 restic）：開頭的 UTF-8 BOM 去掉，以 `\n` 切，行尾的一個 `\r`
+/// 去掉（CRLF）。
+fn text_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    bytes
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+}
+
+/// 一行的前後空白去掉：Unicode 的空白（同 restic 的 TrimSpace）；不成 UTF-8 的行只去 ASCII
+/// 空白。
+fn trim_line(line: &[u8]) -> &[u8] {
+    match std::str::from_utf8(line) {
+        Ok(text) => text.trim().as_bytes(),
+        Err(_) => line.trim_ascii(),
+    }
+}
+
+/// `--files-from-raw` 的名字（同 restic）：每個都以 NUL 結尾，不能是空的。
+fn raw_names(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(body) = bytes.strip_suffix(b"\0") else {
+        bail!("the last name does not end with a NUL byte");
+    };
+    body.split(|&b| b == 0)
+        .map(|name| {
+            if name.is_empty() {
+                bail!("empty name (two NUL bytes in a row, or a NUL first)");
+            }
+            Ok(name)
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -417,29 +468,51 @@ fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
 /// 一種樣式的來源：(旗標名, 旗標的值, 樣式檔)。
 type PatternSource<'a> = (&'a str, &'a [String], &'a [PathBuf]);
 
+/// 樣式是選取（restore 的 include）還是排除。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Include,
+    Exclude,
+}
+
 /// 命令列的樣式加上樣式檔，合成一組樣式（ADR 020、023；backup 的 `--exclude`、restore 的
 /// `--include`／`--exclude`）：先是區分大小寫的（旗標的值、再來樣式檔的行），然後是不分的
 /// （`--i…`）——`!` 反向樣式看的就是這個順序。
-fn pattern_filter(exact: PatternSource<'_>, ignore_case: PatternSource<'_>) -> Result<PathFilter> {
-    let filter = PathFilter::new(&pattern_lines(exact)?)?;
-    Ok(filter.and_ignoring_case(&pattern_lines(ignore_case)?)?)
+fn pattern_filter(
+    exact: PatternSource<'_>,
+    ignore_case: PatternSource<'_>,
+    role: Role,
+) -> Result<PathFilter> {
+    let filter = PathFilter::new(&pattern_lines(exact, role)?)?;
+    Ok(filter.and_ignoring_case(&pattern_lines(ignore_case, role)?)?)
 }
 
-/// 旗標的值加上樣式檔的每一行。樣式檔一行一條：去掉前後空白（`\r\n` 結尾也一併去掉），
-/// 空行與 `#` 開頭的行略過；寫錯的在這裡就點名出處（旗標名，或 `檔案:行號`）。
-fn pattern_lines((flag, patterns, files): PatternSource<'_>) -> Result<Vec<String>> {
+/// 旗標的值加上樣式檔（`-` 是標準輸入）的每一行。樣式檔一行一條（[`text_lines`]）：去掉前後
+/// 空白，空行與 `#` 開頭的行略過；寫錯的在這裡就點名出處（旗標名，或 `檔案:行號`）。include 的
+/// 樣式檔一條樣式都沒有時是錯（審查修正）：少了它們 include 就是空的，等於整份還原，而不是
+/// 「只還原那些」。exclude 的空樣式檔只是什麼都不排除。
+fn pattern_lines((flag, patterns, files): PatternSource<'_>, role: Role) -> Result<Vec<String>> {
     let mut all = patterns.to_vec();
     PathFilter::new(&all).context(flag.to_owned())?;
     for file in files {
-        let text = std::fs::read_to_string(file)
-            .with_context(|| format!("reading pattern file {}", file.display()))?;
-        for (n, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+        let bytes = read_input(file, "patterns")?;
+        let before = all.len();
+        for (n, line) in text_lines(&bytes).enumerate() {
+            let line = trim_line(line);
+            if line.is_empty() || line.starts_with(b"#") {
                 continue;
             }
-            PathFilter::new(&[line]).with_context(|| format!("{}:{}", file.display(), n + 1))?;
+            let at = || format!("{}:{}", file.display(), n + 1);
+            let line = std::str::from_utf8(line).with_context(|| format!("{}: not UTF-8", at()))?;
+            PathFilter::new(&[line]).with_context(at)?;
             all.push(line.to_owned());
+        }
+        if role == Role::Include && all.len() == before {
+            bail!(
+                "{flag}-file {}: no patterns (an include list without patterns would restore \
+                 everything)",
+                file.display()
+            );
         }
     }
     Ok(all)
@@ -648,6 +721,14 @@ async fn run(cli: Cli) -> Result<()> {
             if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
                 anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
             }
+            stdin_at_most_once(
+                files_from
+                    .iter()
+                    .chain(&files_from_verbatim)
+                    .chain(&files_from_raw)
+                    .chain(&exclude_file)
+                    .chain(&iexclude_file),
+            )?;
             paths.extend(listed_paths(&files_from, Listing::Plain)?);
             paths.extend(listed_paths(&files_from_verbatim, Listing::Verbatim)?);
             paths.extend(listed_paths(&files_from_raw, Listing::Raw)?);
@@ -666,6 +747,7 @@ async fn run(cli: Cli) -> Result<()> {
                 patterns: pattern_filter(
                     ("--exclude", &exclude, &exclude_file),
                     ("--iexclude", &iexclude, &iexclude_file),
+                    Role::Exclude,
                 )?,
                 if_present,
                 larger_than: exclude_larger_than,
@@ -815,14 +897,23 @@ async fn run(cli: Cli) -> Result<()> {
                 ),
                 None => (snapshot, Vec::new()),
             };
+            stdin_at_most_once(
+                include_file
+                    .iter()
+                    .chain(&iinclude_file)
+                    .chain(&exclude_file)
+                    .chain(&iexclude_file),
+            )?;
             let opts = RestoreOptions {
                 include: pattern_filter(
                     ("--include", &include, &include_file),
                     ("--iinclude", &iinclude, &iinclude_file),
+                    Role::Include,
                 )?,
                 exclude: pattern_filter(
                     ("--exclude", &exclude, &exclude_file),
                     ("--iexclude", &iexclude, &iexclude_file),
+                    Role::Exclude,
                 )?,
                 subtree,
             };
