@@ -140,8 +140,21 @@ enum Command {
         #[command(flatten)]
         repo: RepoArgs,
         /// Files or directories to back up, or one remote source URL.
-        #[arg(required = true)]
+        #[arg(required_unless_present_any = ["files_from", "files_from_verbatim", "files_from_raw"])]
         paths: Vec<PathBuf>,
+        /// Read more source paths from FILE (`-` = standard input), one per line (repeatable).
+        /// Surrounding whitespace is trimmed; empty lines and lines starting with `#` are
+        /// skipped. Paths are taken literally: wildcards are not expanded.
+        #[arg(long, value_name = "FILE")]
+        files_from: Vec<PathBuf>,
+        /// Like --files-from, but every line is a path exactly as written (no trimming, `#`
+        /// is not a comment); only empty lines are skipped.
+        #[arg(long, value_name = "FILE")]
+        files_from_verbatim: Vec<PathBuf>,
+        /// Like --files-from, but the paths are separated by NUL bytes, so any file name
+        /// works (as written by `find -print0`).
+        #[arg(long, value_name = "FILE")]
+        files_from_raw: Vec<PathBuf>,
         /// File holding this machine's client id (created on first use).
         #[arg(long, env = "KIST_CLIENT_ID_FILE")]
         client_id_file: Option<PathBuf>,
@@ -337,6 +350,68 @@ enum Command {
     },
     /// Print version information.
     Version,
+}
+
+/// `--files-from*` 的三種切法（ADR 024，名稱同 restic；都不展開萬用字元）。
+#[derive(Clone, Copy)]
+enum Listing {
+    /// 一行一個；去掉前後空白，空行與 `#` 開頭的行略過。
+    Plain,
+    /// 一行一個，照原樣；只略過空行。
+    Verbatim,
+    /// NUL 分隔，照原樣（名字裡可以有換行）。
+    Raw,
+}
+
+/// `--files-from*` 的每個檔案（`-` 是標準輸入）裡列的來源路徑。
+fn listed_paths(files: &[PathBuf], how: Listing) -> Result<Vec<PathBuf>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    for file in files {
+        let bytes = if file.as_os_str() == "-" {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut bytes)
+                .context("reading source paths from standard input")?;
+            bytes
+        } else {
+            std::fs::read(file)
+                .with_context(|| format!("reading source paths from {}", file.display()))?
+        };
+        let separator = if matches!(how, Listing::Raw) {
+            0
+        } else {
+            b'\n'
+        };
+        for piece in bytes.split(|&b| b == separator) {
+            let piece = match how {
+                Listing::Plain => piece.trim_ascii(),
+                Listing::Verbatim | Listing::Raw => piece,
+            };
+            if piece.is_empty() || (matches!(how, Listing::Plain) && piece.starts_with(b"#")) {
+                continue;
+            }
+            out.push(
+                path_from_bytes(piece)
+                    .with_context(|| format!("a source path listed in {}", file.display()))?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+/// 非 unix：檔名必須是 UTF-8。
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        String::from_utf8(bytes.to_vec()).context("not UTF-8")?,
+    ))
 }
 
 /// 一種樣式的來源：(旗標名, 旗標的值, 樣式檔)。
@@ -554,7 +629,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Backup {
             repo,
-            paths,
+            mut paths,
+            files_from,
+            files_from_verbatim,
+            files_from_raw,
             client_id_file,
             gc_grace,
             parity,
@@ -569,6 +647,12 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
                 anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
+            }
+            paths.extend(listed_paths(&files_from, Listing::Plain)?);
+            paths.extend(listed_paths(&files_from_verbatim, Listing::Verbatim)?);
+            paths.extend(listed_paths(&files_from_raw, Listing::Raw)?);
+            if paths.is_empty() {
+                bail!("no source paths to back up (the --files-from lists are empty)");
             }
             let mut if_present = exclude_if_present
                 .iter()

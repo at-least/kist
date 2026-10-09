@@ -82,6 +82,17 @@ mode（以前從不 chown：別人的 4755 檔會還原成 root 擁有的 setuid
 > `--password-file` 優先於 `KIST_PASSWORD`，而它也吃環境變數 `KIST_PASSWORD_FILE`：有匯出的話先
 > `unset KIST_PASSWORD_FILE`。`kist run` 一直是這個讀法，不受影響。
 
+### 從清單讀來源路徑（`backup --files-from`）
+
+```sh
+kist backup --files-from ~/backup-list.txt               # 一行一個；去前後空白，空行與 # 開頭的行略過
+kist backup --files-from-verbatim list.txt               # 一行就是一個路徑，照原樣
+find ~/proj -name '*.db' -print0 | kist backup --files-from-raw -   # NUL 分隔，從標準輸入讀
+```
+
+名稱與切法同 restic，但**不展開萬用字元**：列的路徑照字面找，不存在就以結束碼 1 結束、不留 snapshot。
+可以和命令列的路徑一起給；讀完一個路徑都沒有也是結束碼 1。
+
 ### 排除規則（`backup --exclude`）
 
 ```sh

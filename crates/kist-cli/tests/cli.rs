@@ -1318,3 +1318,117 @@ fn negated_and_case_insensitive_patterns() {
     let err = env.fails(&["backup", "--iexclude", "[x", src.to_str().unwrap()]);
     assert!(err.contains("--iexclude"), "{err}");
 }
+
+/// `--files-from`、`--files-from-verbatim`、`--files-from-raw`（ADR 024）：來源路徑從檔案讀，
+/// 可以和命令列的路徑一起給；`-` 是標準輸入。三種的差別只在怎麼切行。
+#[cfg(unix)]
+#[test]
+fn backup_reads_source_paths_from_files() {
+    use serde_json::Value;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let env = Env::new();
+    let base = env.dir.path().join("data");
+    for name in [
+        "one",
+        "two",
+        "trailing space ",
+        "new\nline",
+        "three",
+        "four",
+    ] {
+        std::fs::create_dir_all(base.join(name)).unwrap();
+        std::fs::write(base.join(name).join("f"), name).unwrap();
+    }
+    env.ok(&["init"]);
+    let roots = |v: &Value| -> Vec<String> {
+        v["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r["path"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // 一般：去掉前後空白，空行與 `#` 略過。
+    let plain = env.dir.path().join("plain.txt");
+    std::fs::write(
+        &plain,
+        format!(
+            "# my list\n\n  {}  \r\n{}\n",
+            base.join("one").display(),
+            base.join("two").display()
+        ),
+    )
+    .unwrap();
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--files-from",
+        plain.to_str().unwrap(),
+        base.join("three").to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(roots(&v), ["one", "three", "two"]);
+
+    // verbatim：一行就是一個路徑，空白照留（只略過空行）。
+    let verbatim = env.dir.path().join("verbatim.txt");
+    std::fs::write(
+        &verbatim,
+        format!("{}\n\n", base.join("trailing space ").display()),
+    )
+    .unwrap();
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--files-from-verbatim",
+        verbatim.to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(roots(&v), ["trailing space "]);
+
+    // raw：NUL 結尾，名字裡可以有換行；從標準輸入讀。
+    let mut raw = Vec::new();
+    raw.extend_from_slice(base.join("new\nline").as_os_str().as_bytes());
+    raw.push(0);
+    raw.extend_from_slice(base.join("four").as_os_str().as_bytes());
+    raw.push(0);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["backup", "--json", "--files-from-raw", "-"])
+        .env("KIST_REPO", env.repo())
+        .env("KIST_PASSWORD", "cli test password")
+        .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
+        .env_remove("RUST_LOG")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&raw).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(roots(&v), ["four", "new\nline"]);
+
+    // 讀完是空的、或列了不存在的路徑：結束碼 1，不留 snapshot。
+    let empty = env.dir.path().join("empty.txt");
+    std::fs::write(&empty, "# nothing\n").unwrap();
+    let (code, _, err) = env.kist_code(&["backup", "--files-from", empty.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("no source paths"), "{err}");
+    let globbed = env.dir.path().join("globbed.txt");
+    std::fs::write(&globbed, format!("{}/*\n", base.display())).unwrap();
+    let (code, _, err) = env.kist_code(&["backup", "--files-from", globbed.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "沒有萬用字元展開：{err}");
+    let snapshots: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+    assert_eq!(snapshots.as_array().unwrap().len(), 3);
+}
