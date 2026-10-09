@@ -11,9 +11,14 @@
 //!   `[abc]`／`[a-z]`／`[!a]`（或 `[^a]`）一個字元、`\` 讓下一個字元照字面比。名稱裡
 //!   不是合法 UTF-8 的地方，每個 byte 算一個字元。
 //! - 整段只有 `**`：零或多個路徑元件。`**` 不能和其他字元寫在同一段。
-//! - 區分大小寫。結尾的一個 `/` 會被去掉（目錄與同名的檔案一起比對）。
-//! - 不支援 `!` 開頭的反向樣式（直接報錯；字面的 `!` 寫成 `\!`），也不支援 `{a,b}`
-//!   （大括號是字面字元）。
+//! - 區分大小寫（[`PathFilter::and_ignoring_case`] 加進來的不分，ADR 023）。結尾的一個 `/`
+//!   會被去掉（目錄與同名的檔案一起比對）。
+//! - `!` 開頭是反向樣式（ADR 023，同 gitignore）：樣式依加入的順序編號，一個節點上**最後**
+//!   一個比對到它的樣式決定它算不算比對到（[`FilterState::decision`]）。反向樣式只能取消，
+//!   不會讓節點變成比對到。沒有樣式比對到的節點怎麼算由呼叫端決定：backup 與 restore 的
+//!   排除是「不排除」（被排除的目錄本來就整棵不走），restore 的 include 沿用上一層。
+//!   字面的 `!` 寫成 `\!`。
+//! - 不支援 `{a,b}`（大括號是字面字元）。
 //!
 //! 比對逐段進行（NFA）：走訪到一個目錄時，記下每條樣式「比到第幾段」（[`FilterState`]），
 //! 子項目從它往下走一步（[`PathFilter::descend`]）。這讓 restore 的 `--include` 在走訪時
@@ -39,8 +44,13 @@ pub struct PatternError {
 pub struct FilterState {
     /// (樣式, 下一個要比的段)：往下還可能比對到東西的位置。
     active: Vec<(usize, usize)>,
-    /// 在這個節點比對成功的樣式（依 [`PathFilter::new`] 收到的順序編號）。
+    /// 在這個節點比對成功的樣式（依加入的順序編號）。
     matched: Vec<usize>,
+    /// 這個節點的決定：沒有樣式比對到它 → `None`；最後一個比對到它的樣式不是反向的 →
+    /// `Some(true)`，是反向的 → `Some(false)`。
+    decision: Option<bool>,
+    /// `active` 裡有不是反向的樣式：往下還可能出現「比對到」。
+    positive_alive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +58,10 @@ struct Pattern {
     /// 使用者寫的原文（「沒有比對到任何東西」的回報用）。
     text: String,
     comps: Vec<Comp>,
+    /// `!` 開頭：比對到時取消。
+    negated: bool,
+    /// 不分大小寫。
+    fold: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,13 +96,31 @@ enum Unit {
 }
 
 impl PathFilter {
-    /// 編譯 `patterns`；任何一條寫錯就回 [`PatternError`]。
+    /// 編譯 `patterns`（區分大小寫）；任何一條寫錯就回 [`PatternError`]。
     pub fn new<S: AsRef<str>>(patterns: &[S]) -> Result<Self, PatternError> {
-        let patterns = patterns
-            .iter()
-            .map(|p| Pattern::parse(p.as_ref()))
-            .collect::<Result<_, _>>()?;
-        Ok(Self { patterns })
+        Self::default().and(patterns)
+    }
+
+    /// 再加幾條區分大小寫的樣式，編號接在後面。
+    pub fn and<S: AsRef<str>>(self, patterns: &[S]) -> Result<Self, PatternError> {
+        self.extend(patterns, false)
+    }
+
+    /// 再加幾條不分大小寫的樣式（`--iexclude` 等），編號接在後面。
+    pub fn and_ignoring_case<S: AsRef<str>>(self, patterns: &[S]) -> Result<Self, PatternError> {
+        self.extend(patterns, true)
+    }
+
+    fn extend<S: AsRef<str>>(mut self, patterns: &[S], fold: bool) -> Result<Self, PatternError> {
+        for p in patterns {
+            self.patterns.push(Pattern::parse(p.as_ref(), fold)?);
+        }
+        Ok(self)
+    }
+
+    /// 第 `i` 條是反向樣式（`!` 開頭）。
+    pub fn is_negated(&self, i: usize) -> bool {
+        self.patterns[i].negated
     }
 
     pub fn is_empty(&self) -> bool {
@@ -109,7 +141,7 @@ impl PathFilter {
     pub fn start(&self) -> FilterState {
         let mut state = FilterState::default();
         for (p, pattern) in self.patterns.iter().enumerate() {
-            state.add(p, 0, &pattern.comps);
+            state.add(p, 0, pattern);
         }
         state
     }
@@ -118,42 +150,55 @@ impl PathFilter {
     pub fn descend(&self, state: &FilterState, name: &[u8]) -> FilterState {
         let mut next = FilterState::default();
         for &(p, i) in &state.active {
-            let comps = &self.patterns[p].comps;
-            let advanced = match &comps[i] {
+            let pattern = &self.patterns[p];
+            let advanced = match &pattern.comps[i] {
                 // `**` 吃掉這個元件、停在原位（它也可能吃更多）。
                 Comp::AnyDepth => {
-                    next.add(p, i, comps);
+                    next.add(p, i, pattern);
                     continue;
                 }
                 Comp::Literal(literal) => literal.as_slice() == name,
-                Comp::Glob(tokens) => glob_match(tokens, name),
+                Comp::Glob(tokens) => glob_match(tokens, name, pattern.fold),
             };
             if advanced {
-                next.add(p, i + 1, comps);
+                next.add(p, i + 1, pattern);
             }
         }
+        next.decision = next
+            .matched
+            .iter()
+            .max()
+            .map(|&last| !self.patterns[last].negated);
         next
     }
 }
 
 impl FilterState {
-    /// 這個節點被某條樣式比對到。
+    /// 這個節點算比對到：最後一個比對到它的樣式不是反向的。
     pub fn is_match(&self) -> bool {
-        !self.matched.is_empty()
+        self.decision == Some(true)
     }
 
-    /// 在這個節點比對成功的樣式編號。
+    /// 這個節點的決定：沒有樣式比對到它是 `None`；否則看最後一個比對到它的樣式，不是反向
+    /// 的是 `Some(true)`，反向的是 `Some(false)`。
+    pub fn decision(&self) -> Option<bool> {
+        self.decision
+    }
+
+    /// 在這個節點比對成功的樣式編號（含反向樣式）。
     pub fn matched(&self) -> &[usize] {
         &self.matched
     }
 
-    /// 這個節點之下還可能有東西被比對到。false 時整棵子樹都不必再比。
+    /// 這個節點之下還可能有節點**因為樣式**變成比對到（反向樣式不算）。false 時，底下的
+    /// 決定只剩沿用。
     pub fn may_match_below(&self) -> bool {
-        !self.active.is_empty()
+        self.positive_alive
     }
 
     /// 樣式 `p` 走到第 `i` 段，連同 `**` 可以什麼都不吃的那些位置。
-    fn add(&mut self, p: usize, mut i: usize, comps: &[Comp]) {
+    fn add(&mut self, p: usize, mut i: usize, pattern: &Pattern) {
+        let comps = &pattern.comps;
         loop {
             if i == comps.len() {
                 if !self.matched.contains(&p) {
@@ -163,6 +208,7 @@ impl FilterState {
             }
             if !self.active.contains(&(p, i)) {
                 self.active.push((p, i));
+                self.positive_alive |= !pattern.negated;
             }
             if comps[i] != Comp::AnyDepth {
                 return;
@@ -173,7 +219,7 @@ impl FilterState {
 }
 
 impl Pattern {
-    fn parse(text: &str) -> Result<Self, PatternError> {
+    fn parse(text: &str, fold: bool) -> Result<Self, PatternError> {
         let fail = |reason: &str| PatternError {
             pattern: text.to_owned(),
             reason: reason.to_owned(),
@@ -181,14 +227,17 @@ impl Pattern {
         if text.is_empty() {
             return Err(fail("empty pattern"));
         }
-        if text.starts_with('!') {
-            return Err(fail(
-                "negated patterns (a leading `!`) are not supported; write `\\!` to match a literal `!`",
-            ));
-        }
-        let (anchored, rest) = match text.strip_prefix('/') {
+        let (negated, body) =
+            match text.strip_prefix('!') {
+                Some("") => return Err(fail(
+                    "a negated pattern needs a pattern after `!` (write `\\!` for a literal `!`)",
+                )),
+                Some(body) => (true, body),
+                None => (false, text),
+            };
+        let (anchored, rest) = match body.strip_prefix('/') {
             Some(rest) => (true, rest),
-            None => (false, text),
+            None => (false, body),
         };
         let rest = rest.strip_suffix('/').unwrap_or(rest);
         if rest.is_empty() {
@@ -199,17 +248,20 @@ impl Pattern {
             comps.push(Comp::AnyDepth);
         }
         for segment in rest.split('/') {
-            comps.push(parse_segment(segment).map_err(|reason| fail(&reason))?);
+            comps.push(parse_segment(segment, fold).map_err(|reason| fail(&reason))?);
         }
         Ok(Self {
             text: text.to_owned(),
             comps,
+            negated,
+            fold,
         })
     }
 }
 
-/// 一段（兩個 `/` 之間）→ [`Comp`]。錯誤回原因。
-fn parse_segment(segment: &str) -> Result<Comp, String> {
+/// 一段（兩個 `/` 之間）→ [`Comp`]。錯誤回原因。不分大小寫的樣式沒有字面段（逐 byte 比
+/// 不折大小寫），一律編成萬用段。
+fn parse_segment(segment: &str, fold: bool) -> Result<Comp, String> {
     match segment {
         "" => return Err("empty path component (`//`)".to_owned()),
         "." | ".." => {
@@ -249,8 +301,8 @@ fn parse_segment(segment: &str) -> Result<Comp, String> {
         })
         .collect();
     Ok(match literal {
-        Some(s) => Comp::Literal(s.into_bytes()),
-        None => Comp::Glob(tokens),
+        Some(s) if !fold => Comp::Literal(s.into_bytes()),
+        _ => Comp::Glob(tokens),
     })
 }
 
@@ -291,13 +343,19 @@ fn parse_class(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<T
 }
 
 impl Token {
-    /// 單一字元的 token 對 `unit`（`Star` 由 [`glob_match`] 自己處理，這裡回 false）。
-    fn matches(&self, unit: Unit) -> bool {
+    /// 單一字元的 token 對 `unit`（`Star` 由 [`glob_match`] 自己處理，這裡回 false）。`fold`：
+    /// 不分大小寫（兩邊的小寫相同就算；清單看字元本身或它的大小寫形式）。
+    fn matches(&self, unit: Unit, fold: bool) -> bool {
         match (self, unit) {
             (Token::AnyChar, _) => true,
-            (Token::Char(c), Unit::Char(u)) => *c == u,
+            (Token::Char(c), Unit::Char(u)) => {
+                *c == u || (fold && c.to_lowercase().eq(u.to_lowercase()))
+            }
             (Token::Class { negated, ranges }, Unit::Char(u)) => {
-                ranges.iter().any(|&(lo, hi)| lo <= u && u <= hi) != *negated
+                let hit = |c: char| ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+                let found =
+                    hit(u) || (fold && (u.to_lowercase().any(&hit) || u.to_uppercase().any(hit)));
+                found != *negated
             }
             // 不成 UTF-8 的 byte 不等於任何字面字元，只會被反向清單選到。
             (Token::Class { negated, .. }, Unit::Byte(_)) => *negated,
@@ -329,7 +387,7 @@ fn unit_at(name: &[u8], at: usize) -> (Unit, usize) {
 /// 一段的 token 是否比對整個 `name`。`*` 以「記住最後一個 `*`、失敗時讓它多吃一個字元」
 /// 回溯：其他 token 都恰好吃一個字元，所以只需要回到最後一個 `*`，時間是
 /// O(token 數 × 名稱長度)。
-fn glob_match(tokens: &[Token], name: &[u8]) -> bool {
+fn glob_match(tokens: &[Token], name: &[u8], fold: bool) -> bool {
     let (mut t, mut at) = (0, 0);
     // (`*` 之後的 token 位置, `*` 目前吃到的 byte 位置)
     let mut star: Option<(usize, usize)> = None;
@@ -341,7 +399,7 @@ fn glob_match(tokens: &[Token], name: &[u8]) -> bool {
                 t += 1;
                 continue;
             }
-            Some(token) if token.matches(unit) => {
+            Some(token) if token.matches(unit, fold) => {
                 t += 1;
                 at += len;
                 continue;
@@ -488,7 +546,8 @@ mod tests {
         assert!(reason("a//b").contains("empty path component"));
         assert!(reason("/a/../b").contains("never matches"));
         assert!(reason("./build").contains("never matches"));
-        assert!(reason("!keep").contains("not supported"));
+        assert!(reason("!").contains("after `!`"));
+        assert!(reason("!/").contains("names no path component"));
         assert!(reason("a**").contains("whole path component"));
         assert!(reason("/a/b**c").contains("whole path component"));
         assert!(reason("[abc").contains("unclosed"));
@@ -497,6 +556,59 @@ mod tests {
         assert!(reason("abc\\").contains("escapes nothing"));
         let err = PathFilter::new(&["ok", "[bad"]).unwrap_err();
         assert_eq!(err.pattern, "[bad", "錯誤要點名寫錯的那一條");
+    }
+
+    /// 反向樣式（ADR 023）：同一個節點上，最後一個比對到的樣式決定。反向樣式只能取消，
+    /// 不算「底下還可能比對到」。
+    #[test]
+    fn negated_patterns_decide_by_the_last_match() {
+        let f = PathFilter::new(&["/home/me/*", "!/home/me/Documents"]).unwrap();
+        assert!(!walk(&f, b"/home/me").is_match());
+        assert!(walk(&f, b"/home/me/Music").is_match());
+        assert!(!walk(&f, b"/home/me/Documents").is_match());
+        assert!(!walk(&f, b"/home/me/Documents/x").is_match());
+        let f = PathFilter::new(&["!/home/me/Documents", "/home/me/*"]).unwrap();
+        assert!(
+            walk(&f, b"/home/me/Documents").is_match(),
+            "順序反過來就是比對到"
+        );
+        let f = PathFilter::new(&["*.tmp", "!keep.tmp"]).unwrap();
+        assert!(walk(&f, b"/a/x.tmp").is_match());
+        assert!(!walk(&f, b"/a/keep.tmp").is_match());
+        let f = PathFilter::new(&["/a", "!/a/b"]).unwrap();
+        assert_eq!(walk(&f, b"/a").decision(), Some(true));
+        assert_eq!(walk(&f, b"/a/b").decision(), Some(false));
+        assert_eq!(
+            walk(&f, b"/a/c").decision(),
+            None,
+            "沒有樣式比對到；怎麼算由呼叫端決定"
+        );
+        let only_negated = PathFilter::new(&["!/a/b"]).unwrap();
+        assert!(!walk(&only_negated, b"/a/b").is_match());
+        assert!(!only_negated.start().may_match_below());
+        assert!(matches("\\!keep", b"/!keep"), "字面的 `!` 寫成 `\\!`");
+    }
+
+    /// 不分大小寫的樣式（ADR 023，`--iexclude` 等）：字面、`[...]`、非 ASCII 都折；不成
+    /// UTF-8 的 byte 不折。兩種可以混在一組裡，編號依加入的順序。
+    #[test]
+    fn ignore_case_patterns() {
+        let f = PathFilter::default()
+            .and_ignoring_case(&["*.JPG", "/Home/ME", "[a-c]x", "ÄRGER"])
+            .unwrap();
+        assert!(walk(&f, b"/a/x.jpg").is_match());
+        assert!(walk(&f, b"/a/X.Jpg").is_match());
+        assert!(walk(&f, b"/home/me").is_match());
+        assert!(walk(&f, b"/Bx").is_match());
+        assert!(walk(&f, "/ärger".as_bytes()).is_match());
+        assert!(!walk(&f, b"/a/\xff.jpgx").is_match());
+        let f = PathFilter::new(&["Exact"])
+            .unwrap()
+            .and_ignoring_case(&["loose"])
+            .unwrap();
+        assert!(!walk(&f, b"/exact").is_match());
+        assert_eq!(walk(&f, b"/LOOSE").matched(), &[1]);
+        assert_eq!(f.len(), 2);
     }
 
     #[test]
@@ -536,34 +648,41 @@ mod tests {
         out
     }
 
-    fn ref_glob(tokens: &[Token], units: &[Unit]) -> bool {
+    fn ref_glob(tokens: &[Token], units: &[Unit], fold: bool) -> bool {
         match tokens.split_first() {
             None => units.is_empty(),
-            Some((Token::Star, rest)) => (0..=units.len()).any(|k| ref_glob(rest, &units[k..])),
+            Some((Token::Star, rest)) => {
+                (0..=units.len()).any(|k| ref_glob(rest, &units[k..], fold))
+            }
             Some((token, rest)) => {
-                !units.is_empty() && token.matches(units[0]) && ref_glob(rest, &units[1..])
+                !units.is_empty()
+                    && token.matches(units[0], fold)
+                    && ref_glob(rest, &units[1..], fold)
             }
         }
     }
 
-    fn ref_path(comps: &[Comp], path: &[Vec<u8>]) -> bool {
+    fn ref_path(pat: &Pattern, comps: &[Comp], path: &[Vec<u8>]) -> bool {
         match comps.split_first() {
             None => path.is_empty(),
-            Some((Comp::AnyDepth, rest)) => (0..=path.len()).any(|k| ref_path(rest, &path[k..])),
+            Some((Comp::AnyDepth, rest)) => {
+                (0..=path.len()).any(|k| ref_path(pat, rest, &path[k..]))
+            }
             Some((comp, rest)) => {
                 let one = match (comp, path.first()) {
                     (Comp::Literal(literal), Some(name)) => literal == name,
-                    (Comp::Glob(tokens), Some(name)) => ref_glob(tokens, &units(name)),
+                    (Comp::Glob(tokens), Some(name)) => ref_glob(tokens, &units(name), pat.fold),
                     _ => false,
                 };
-                one && ref_path(rest, &path[1..])
+                one && ref_path(pat, rest, &path[1..])
             }
         }
     }
 
     fn segment() -> impl Strategy<Value = String> {
         let atom = prop::sample::select(vec![
-            "a", "b", "ä", "中", "*", "?", "[ab]", "[!a]", "[a-c]", "\\*", "[中]", "[!中]", "[!ä]",
+            "a", "b", "ä", "Ä", "A", "中", "*", "?", "[ab]", "[!a]", "[a-c]", "\\*", "[中]",
+            "[!中]", "[!ä]", "[B-C]",
         ]);
         prop_oneof![
             4 => prop::collection::vec(atom, 1..4).prop_map(|atoms| {
@@ -580,18 +699,33 @@ mod tests {
         ]
     }
 
-    fn pattern() -> impl Strategy<Value = String> {
-        (any::<bool>(), prop::collection::vec(segment(), 1..4)).prop_map(|(anchored, segs)| {
-            format!("{}{}", if anchored { "/" } else { "" }, segs.join("/"))
-        })
+    /// (樣式原文, 不分大小寫)；原文可能以 `!` 開頭（反向）。
+    fn pattern() -> impl Strategy<Value = (String, bool)> {
+        (
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            prop::collection::vec(segment(), 1..4),
+        )
+            .prop_map(|(negated, anchored, fold, segs)| {
+                let text = format!(
+                    "{}{}{}",
+                    if negated { "!" } else { "" },
+                    if anchored { "/" } else { "" },
+                    segs.join("/")
+                );
+                (text, fold)
+            })
     }
 
     fn path() -> impl Strategy<Value = Vec<Vec<u8>>> {
         let name = prop::sample::select(vec![
             b"a".to_vec(),
             b"b".to_vec(),
+            b"B".to_vec(),
             b"ab".to_vec(),
             "ä".as_bytes().to_vec(),
+            "Ä".as_bytes().to_vec(),
             "中".as_bytes().to_vec(),
             "a中".as_bytes().to_vec(),
             b"*".to_vec(),
@@ -604,14 +738,22 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
 
-        /// 逐段的狀態與參考實作對每一個前綴都同意；而且整條路徑比對到時，每個真前綴都還
-        /// `may_match_below`——restore 依它剪枝，不能剪掉會被選到的東西。
+        /// 逐段的狀態與參考實作對每一個前綴都同意：每條樣式比對到哪些前綴、每個前綴的決定
+        /// （同一個節點上最後一個比對到的樣式決定）。而且每個比對到的節點，它的每個真前綴
+        /// 都還 `may_match_below`——restore 依它剪枝，不能剪掉會被選到的東西。
         #[test]
         fn stepwise_matching_agrees_with_the_reference(
-            texts in prop::collection::vec(pattern(), 1..4),
+            specs in prop::collection::vec(pattern(), 1..4),
             path in path(),
         ) {
-            let filter = PathFilter::new(&texts).unwrap();
+            let mut filter = PathFilter::default();
+            for (text, fold) in &specs {
+                filter = if *fold {
+                    filter.and_ignoring_case(&[text]).unwrap()
+                } else {
+                    filter.and(&[text]).unwrap()
+                };
+            }
             let mut states = vec![filter.start()];
             for name in &path {
                 let next = filter.descend(states.last().unwrap(), name);
@@ -619,14 +761,20 @@ mod tests {
             }
             for (depth, state) in states.iter().enumerate().skip(1) {
                 let prefix = &path[..depth];
+                let mut hits = Vec::new();
                 for (p, pat) in filter.patterns.iter().enumerate() {
-                    let want = ref_path(&pat.comps, prefix);
+                    let want = ref_path(pat, &pat.comps, prefix);
                     prop_assert_eq!(state.matched().contains(&p), want, "{} vs {:?}", pat.text, prefix);
                     if want {
-                        for (k, earlier) in states[..depth].iter().enumerate() {
-                            prop_assert!(earlier.active.iter().any(|&(q, _)| q == p),
-                                "{} matches {:?} but was pruned at depth {}", pat.text, prefix, k);
-                        }
+                        hits.push(p);
+                    }
+                }
+                let decision = hits.iter().max().map(|&p| !filter.patterns[p].negated);
+                prop_assert_eq!(state.decision(), decision, "{:?} at {:?}", specs, prefix);
+                if state.is_match() {
+                    for (k, earlier) in states[..depth].iter().enumerate() {
+                        prop_assert!(earlier.may_match_below(),
+                            "{:?} matches {:?} but was pruned at depth {}", specs, prefix, k);
                     }
                 }
             }

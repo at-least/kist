@@ -311,3 +311,39 @@ async fn files_larger_than_the_limit_are_left_out() {
         .unwrap();
     assert_eq!((s.stats.files, s.report.excluded), (1, 0));
 }
+
+/// 反向樣式（ADR 023）：「家目錄底下只備 Documents」——同 restic 文件的例子。不分大小寫的
+/// 樣式也走同一套。
+#[tokio::test]
+async fn negated_and_ignore_case_excludes() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    files(
+        &src,
+        &[
+            ("Documents/a", b"a"),
+            ("Music/b", b"b"),
+            ("top.txt", b"t"),
+            ("Documents/junk.TMP", b"j"),
+        ],
+    );
+    let abs = std::fs::canonicalize(&src).unwrap();
+    let patterns = PathFilter::new(&[
+        format!("{}/*", abs.display()),
+        format!("!{}/Documents", abs.display()),
+    ])
+    .unwrap()
+    .and_ignoring_case(&["*.tmp"])
+    .unwrap();
+    let (got, excluded) = round_trip(
+        &t,
+        &src,
+        with(Exclusions {
+            patterns,
+            ..Exclusions::default()
+        }),
+    )
+    .await;
+    assert_eq!(got, set(&["Documents", "Documents/a"]));
+    assert_eq!(excluded, 3, "Music、top.txt、junk.TMP");
+}

@@ -980,7 +980,7 @@ fn backup_excludes_from_flags_and_files() {
     let (code, _, err) = env.kist_code(&["backup", "--exclude", "[oops", src.to_str().unwrap()]);
     assert_eq!(code, Some(1), "寫錯的樣式是硬失敗：{err}");
     assert!(err.contains("invalid pattern \"[oops\""), "{err}");
-    std::fs::write(&list, "ok\n!negated\n").unwrap();
+    std::fs::write(&list, "ok\n[unclosed\n").unwrap();
     let (code, _, err) = env.kist_code(&[
         "backup",
         "--exclude-file",
@@ -992,7 +992,7 @@ fn backup_excludes_from_flags_and_files() {
         err.contains(&format!("{}:2", list.display())),
         "要點名檔案與行號：{err}"
     );
-    assert!(err.contains("not supported"), "{err}");
+    assert!(err.contains("unclosed"), "{err}");
     let snapshots: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
     assert_eq!(
         snapshots.as_array().unwrap().len(),
@@ -1274,4 +1274,47 @@ fn restore_subtree_dry_run_and_pattern_files() {
         assert_eq!(code, Some(1), "{spec}: {err}");
         assert!(err.contains(needle), "{spec}: {err}");
     }
+}
+
+/// 反向樣式與不分大小寫的旗標（ADR 023）：backup 只備 sub（`!` 加回來），restore 用不分
+/// 大小寫的 include 選檔。
+#[test]
+fn negated_and_case_insensitive_patterns() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    std::fs::write(src.join("sub/C.TXT"), b"upper").unwrap();
+    let abs = std::fs::canonicalize(&src).unwrap();
+    env.ok(&["init"]);
+    let all = format!("{}/*", abs.display());
+    let keep = format!("!{}/sub", abs.display());
+    let out = env.ok(&[
+        "backup",
+        "--exclude",
+        &all,
+        "--exclude",
+        &keep,
+        "--iexclude",
+        "c.txt",
+        src.to_str().unwrap(),
+    ]);
+    assert!(
+        out.contains("excluded: 3"),
+        "a.txt、big.bin、sub/C.TXT：{out}"
+    );
+
+    let target = env.dir.path().join("out");
+    env.ok(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--iinclude",
+        "*.TXT",
+    ]);
+    let restored = target.join(abs.strip_prefix("/").unwrap());
+    assert!(restored.join("sub/b.txt").is_file());
+    assert!(!restored.join("a.txt").exists());
+    assert!(!restored.join("sub/C.TXT").exists());
+    let err = env.fails(&["backup", "--iexclude", "[x", src.to_str().unwrap()]);
+    assert!(err.contains("--iexclude"), "{err}");
 }

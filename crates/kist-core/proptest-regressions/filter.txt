@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 93d1800bc31c072592c8b67ead4ba657a6f56bdc982b0f23e745b9cfbe75f589 # shrinks to texts = ["**"], path = [[97]]
 cc d40eb0773228246b48b4623feeb5be1d24bd2673eab781116700fa3728048865 # shrinks to texts = ["*[!中]"], path = [[228, 184, 173]]
+cc c7aff5e26d22a224340e437efe79661179829b8670bf122ae70abff823eb2722 # shrinks to specs = [("!**", false)], path = []

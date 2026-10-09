@@ -579,8 +579,10 @@ impl<'o> Select<'o> {
         for &p in include.matched() {
             self.hit[p] = true;
         }
+        // 最後一個比對到這個節點的 include 樣式決定（反向的取消，ADR 023）；沒有樣式比對到
+        // 它就沿用上一層：選到的目錄底下全部選到。
         Some(Pos {
-            selected: parent.selected || include.is_match(),
+            selected: include.decision().unwrap_or(parent.selected),
             include,
             exclude,
         })
@@ -608,9 +610,10 @@ impl<'o> Select<'o> {
         pos.selected || pos.include.may_match_below()
     }
 
+    /// 沒選到東西的 include 樣式。反向樣式不算：它們本來就只會取消。
     fn unmatched(&self) -> Vec<String> {
         (0..self.include.len())
-            .filter(|&p| !self.hit[p])
+            .filter(|&p| !self.hit[p] && !self.include.is_negated(p))
             .map(|p| self.include.pattern(p).to_owned())
             .collect()
     }

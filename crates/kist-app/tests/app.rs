@@ -58,6 +58,8 @@ password_file = "/tmp/p"
 paths = ["/etc"]
 schedule = "0 2 * * *"
 gc_grace = "48h"
+exclude = ["/home/*", "!/home/me"]
+iexclude = ["*.BAK"]
 exclude_if_present = [".nobackup"]
 exclude_caches = true
 exclude_larger_than = "100M"
@@ -89,6 +91,7 @@ on = ["failure", "success"]
         ]
     );
     assert!(exclusions.one_file_system);
+    assert_eq!(exclusions.patterns.len(), 3, "exclude 兩條、iexclude 一條");
     assert_eq!(
         cfg.forget.as_ref().unwrap().policy().keep_within,
         Some(std::time::Duration::from_secs(14 * 86_400))
@@ -116,6 +119,7 @@ on = ["failure", "success"]
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude = [\"*.tmp\", \"[bad\"]\n", "[backup] exclude: invalid pattern \"[bad\""),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_if_present = [\"a/b\"]\n", "[backup] exclude_if_present"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = \"1MB\"\n", "unknown unit"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\niexclude = [\"a**\"]\n", "[backup] iexclude"),
     ];
     for (text, needle) in bad {
         let err = Config::parse(text)

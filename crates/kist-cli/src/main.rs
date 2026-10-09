@@ -164,6 +164,14 @@ enum Command {
         /// whitespace is trimmed; empty lines and lines starting with `#` are skipped.
         #[arg(long, value_name = "FILE")]
         exclude_file: Vec<PathBuf>,
+        /// Like --exclude, ignoring case (repeatable). For `!` patterns the order is:
+        /// --exclude, --exclude-file lines, --iexclude, --iexclude-file lines; the last
+        /// pattern matching a path decides.
+        #[arg(long, value_name = "PATTERN")]
+        iexclude: Vec<String>,
+        /// Like --exclude-file, the patterns ignoring case (repeatable).
+        #[arg(long, value_name = "FILE")]
+        iexclude_file: Vec<PathBuf>,
         /// Leave out the contents of every directory that contains NAME (repeatable). With
         /// `NAME:HEADER`, only when NAME is a file that starts with HEADER. The directory
         /// and the marker itself are kept.
@@ -218,6 +226,12 @@ enum Command {
         /// `backup --exclude-file`).
         #[arg(long, value_name = "FILE")]
         include_file: Vec<PathBuf>,
+        /// Like --include, ignoring case (repeatable).
+        #[arg(long, value_name = "PATTERN")]
+        iinclude: Vec<String>,
+        /// Like --include-file, the patterns ignoring case (repeatable).
+        #[arg(long, value_name = "FILE")]
+        iinclude_file: Vec<PathBuf>,
         /// Do not restore nodes matching PATTERN (a directory with everything below it;
         /// repeatable). Wins over --include.
         #[arg(long, value_name = "PATTERN")]
@@ -225,6 +239,12 @@ enum Command {
         /// Read --exclude patterns from FILE, one per line (repeatable).
         #[arg(long, value_name = "FILE")]
         exclude_file: Vec<PathBuf>,
+        /// Like --exclude, ignoring case (repeatable).
+        #[arg(long, value_name = "PATTERN")]
+        iexclude: Vec<String>,
+        /// Like --exclude-file, the patterns ignoring case (repeatable).
+        #[arg(long, value_name = "FILE")]
+        iexclude_file: Vec<PathBuf>,
         /// List what would be restored (`dir`, `file`, `link` and the path under TARGET)
         /// without writing anything; TARGET is not even created. Only trees are read, so
         /// errors that need file data (a damaged chunk) do not show up.
@@ -319,15 +339,25 @@ enum Command {
     Version,
 }
 
-/// 命令列的樣式加上樣式檔，合成一組樣式（ADR 020；backup 的 `--exclude`、restore 的
-/// `--include`／`--exclude`）。樣式檔一行一條：去掉前後空白（`\r\n` 結尾也一併去掉），
-/// 空行與 `#` 開頭的行略過；寫錯的那一行以 `檔案:行號` 點名。
-fn pattern_filter(flag: &str, patterns: &[String], files: &[PathBuf]) -> Result<PathFilter> {
+/// 一種樣式的來源：(旗標名, 旗標的值, 樣式檔)。
+type PatternSource<'a> = (&'a str, &'a [String], &'a [PathBuf]);
+
+/// 命令列的樣式加上樣式檔，合成一組樣式（ADR 020、023；backup 的 `--exclude`、restore 的
+/// `--include`／`--exclude`）：先是區分大小寫的（旗標的值、再來樣式檔的行），然後是不分的
+/// （`--i…`）——`!` 反向樣式看的就是這個順序。
+fn pattern_filter(exact: PatternSource<'_>, ignore_case: PatternSource<'_>) -> Result<PathFilter> {
+    let filter = PathFilter::new(&pattern_lines(exact)?)?;
+    Ok(filter.and_ignoring_case(&pattern_lines(ignore_case)?)?)
+}
+
+/// 旗標的值加上樣式檔的每一行。樣式檔一行一條：去掉前後空白（`\r\n` 結尾也一併去掉），
+/// 空行與 `#` 開頭的行略過；寫錯的在這裡就點名出處（旗標名，或 `檔案:行號`）。
+fn pattern_lines((flag, patterns, files): PatternSource<'_>) -> Result<Vec<String>> {
     let mut all = patterns.to_vec();
     PathFilter::new(&all).context(flag.to_owned())?;
     for file in files {
         let text = std::fs::read_to_string(file)
-            .with_context(|| format!("reading exclude file {}", file.display()))?;
+            .with_context(|| format!("reading pattern file {}", file.display()))?;
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -337,7 +367,7 @@ fn pattern_filter(flag: &str, patterns: &[String], files: &[PathBuf]) -> Result<
             all.push(line.to_owned());
         }
     }
-    Ok(PathFilter::new(&all)?)
+    Ok(all)
 }
 
 fn main() {
@@ -530,6 +560,8 @@ async fn run(cli: Cli) -> Result<()> {
             parity,
             exclude,
             exclude_file,
+            iexclude,
+            iexclude_file,
             exclude_if_present,
             exclude_caches,
             exclude_larger_than,
@@ -547,7 +579,10 @@ async fn run(cli: Cli) -> Result<()> {
                 if_present.push(Marker::cachedir_tag());
             }
             let exclude = Exclusions {
-                patterns: pattern_filter("--exclude", &exclude, &exclude_file)?,
+                patterns: pattern_filter(
+                    ("--exclude", &exclude, &exclude_file),
+                    ("--iexclude", &iexclude, &iexclude_file),
+                )?,
                 if_present,
                 larger_than: exclude_larger_than,
                 one_file_system,
@@ -680,8 +715,12 @@ async fn run(cli: Cli) -> Result<()> {
             target,
             include,
             include_file,
+            iinclude,
+            iinclude_file,
             exclude,
             exclude_file,
+            iexclude,
+            iexclude_file,
             dry_run,
         } => {
             // `SNAPSHOT:PATH`（同 restic）：snapshot 的寫法裡沒有 `:`。
@@ -693,8 +732,14 @@ async fn run(cli: Cli) -> Result<()> {
                 None => (snapshot, Vec::new()),
             };
             let opts = RestoreOptions {
-                include: pattern_filter("--include", &include, &include_file)?,
-                exclude: pattern_filter("--exclude", &exclude, &exclude_file)?,
+                include: pattern_filter(
+                    ("--include", &include, &include_file),
+                    ("--iinclude", &iinclude, &iinclude_file),
+                )?,
+                exclude: pattern_filter(
+                    ("--exclude", &exclude, &exclude_file),
+                    ("--iexclude", &iexclude, &iexclude_file),
+                )?,
                 subtree,
             };
             let r = open_repo(&repo).await?;

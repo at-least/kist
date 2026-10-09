@@ -12,6 +12,7 @@
 //! schedule = "0 2 * * *"      # 5 或 6 欄（秒選填）cron；省略 = 只在 `run --once` 時跑
 //! gc_grace = "72h"            # 選填；沒寫取同檔的 [prune] grace，不得比它長
 //! exclude = ["*.tmp", "node_modules", "/home/me/.cache"]   # 選填；同 CLI 的 --exclude（ADR 020）
+//! iexclude = ["*.bak"]                  # 選填；同 --iexclude（不分大小寫，排在 exclude 之後）
 //! exclude_if_present = [".nobackup"]    # 選填；同 --exclude-if-present（NAME 或 NAME:HEADER）
 //! exclude_caches = true                 # 選填；同 --exclude-caches（CACHEDIR.TAG）
 //! exclude_larger_than = "1G"            # 選填；同 --exclude-larger-than（1024 為底）
@@ -84,6 +85,9 @@ pub struct BackupSection {
     /// 排除樣式，規則同 CLI 的 `--exclude`（ADR 020，`kist_core::filter`）。
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// 不分大小寫的排除樣式，同 `--iexclude`（ADR 023；`!` 的順序上排在 `exclude` 之後）。
+    #[serde(default)]
+    pub iexclude: Vec<String>,
     /// 記號檔，同 `--exclude-if-present`（`NAME` 或 `NAME:HEADER`，ADR 021）。
     #[serde(default)]
     pub exclude_if_present: Vec<String>,
@@ -103,7 +107,9 @@ impl BackupSection {
     /// 寫錯的樣式或記號讓 `kist run`／`kist serve` 起不來，不會等到排程時間才失敗。
     pub fn exclusions(&self) -> Result<kist_core::Exclusions> {
         let patterns = kist_core::PathFilter::new(&self.exclude)
-            .map_err(|e| AppError::Config(format!("[backup] exclude: {e}")))?;
+            .map_err(|e| AppError::Config(format!("[backup] exclude: {e}")))?
+            .and_ignoring_case(&self.iexclude)
+            .map_err(|e| AppError::Config(format!("[backup] iexclude: {e}")))?;
         let mut if_present = self
             .exclude_if_present
             .iter()

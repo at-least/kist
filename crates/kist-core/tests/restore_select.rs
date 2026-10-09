@@ -508,3 +508,52 @@ async fn a_dry_run_predicts_exactly_what_a_restore_writes() {
         assert_eq!(planned, written, "{opts:?}");
     }
 }
+
+/// 反向樣式（ADR 023）：include 的 `!` 從選到的目錄裡取消一部分；exclude 的 `!` 把比對到的
+/// 加回來。都是同一個節點上最後一個比對到的樣式決定。反向的 include 沒比對到東西不回報。
+#[tokio::test]
+async fn negated_patterns_carve_out_selections() {
+    let f = fixture().await;
+    let (summary, got) = f
+        .restore(select(
+            &[
+                &f.pattern("docs"),
+                &format!("!{}", f.pattern("docs/old")),
+                "!*.nope",
+            ],
+            &[],
+        ))
+        .await;
+    assert!(
+        summary.unmatched_includes.is_empty(),
+        "{:?}",
+        summary.unmatched_includes
+    );
+    assert_eq!(got, set(&["docs", "docs/notes.txt", "docs/report.pdf"]));
+
+    let (_, got) = f
+        .restore(select(
+            &[],
+            &[&f.pattern("docs/*"), &format!("!{}", f.pattern("docs/old"))],
+        ))
+        .await;
+    assert!(got.contains(Path::new("docs/old/a.pdf")));
+    assert!(!got.contains(Path::new("docs/report.pdf")));
+    assert!(!got.contains(Path::new("docs/notes.txt")));
+    assert!(got.contains(Path::new("readme.txt")));
+}
+
+/// 不分大小寫的樣式（ADR 023）。
+#[tokio::test]
+async fn ignore_case_patterns_select_and_exclude() {
+    let f = fixture().await;
+    let opts = RestoreOptions {
+        include: PathFilter::default().and_ignoring_case(&["*.PDF"]).unwrap(),
+        exclude: PathFilter::default()
+            .and_ignoring_case(&["REPORT.pdf"])
+            .unwrap(),
+        ..RestoreOptions::default()
+    };
+    let (_, got) = f.restore(opts).await;
+    assert_eq!(got, set(&["docs", "docs/old", "docs/old/a.pdf"]));
+}

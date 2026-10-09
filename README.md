@@ -102,7 +102,13 @@ kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行�
   `[abc]`／`[a-z]`／`[!a]` 一個字元、`\` 讓下一個字元照字面。整段只有 `**` 時比對零或多個元件
   （`/home/me/**/build`）。區分大小寫；結尾的 `/` 會被去掉。
 - 指名的來源本身不會被排除（`kist backup ~/proj --exclude proj` 照樣備份 `~/proj`）。
-- 不支援 `!` 開頭的反向樣式（直接報錯；字面的 `!` 寫成 `\!`）與 `{a,b}`（大括號是字面字元）。
+- `!` 開頭是反向樣式（同 restic 文件描述的 gitignore 行為）：樣式依序編號，一個路徑上**最後**一個比對到
+  它的樣式決定它排不排除。`kist backup ~ --exclude "$HOME/*" --exclude "!$HOME/Documents"` 只備
+  Documents。被排除的目錄整棵不走，裡面的東西加不回來。字面的 `!` 寫成 `\!`。編號的順序：`--exclude` 的
+  值、`--exclude-file` 的行，然後是 `--iexclude` 的值、`--iexclude-file` 的行。
+- `--iexclude`／`--iexclude-file`（設定檔 `iexclude`）：同上，但不分大小寫（CJK 以外有大小寫的字也折，
+  不成 UTF-8 的 byte 不折）。
+- 大括號是字面字元（`{a,b}` 不展開）。
 - 樣式寫錯（例如沒關上的 `[`、夾在字裡的 `**`、`.`／`..` 段）時，backup 在碰 repo 之前就以結束碼 1
   結束；樣式檔裡的錯誤點名 `檔案:行號`。設定檔裡寫錯，`kist run`／`kist serve` 起不來。
 
@@ -152,7 +158,10 @@ kist restore --dry-run latest /tmp/out --include '*.pdf'          # 只列出會
 - `--dry-run`：列出會寫的目錄、檔案、symlink（`dir`／`file`／`link` 加上目標底下的路徑），目標連建都
   不建；計數與「沒選到東西」的警告和真的還原相同。只讀 tree、不讀檔案內容，所以壞掉的 chunk、目標處
   擋著的東西這類錯誤只有真的還原才看得到。
-- `--include-file`／`--exclude-file`：樣式一行一條，格式同 `backup --exclude-file`。
+- `--include-file`／`--exclude-file`：樣式一行一條，格式同 `backup --exclude-file`。不分大小寫的版本是
+  `--iinclude`、`--iexclude` 與 `--iinclude-file`、`--iexclude-file`。
+- include 也可以用 `!` 從選到的目錄裡取消一部分（`--include /home/me/docs --include '!/home/me/docs/old'`）；
+  「沒選到東西」的檢查不看反向樣式。
 
 ### `--json`
 

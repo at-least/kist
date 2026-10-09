@@ -418,8 +418,11 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - 第三批（ADR 022）：`restore SNAPSHOT:PATH`（`RestoreOptions.subtree`，目錄內容直接放進目標）、
   `restore --dry-run`（`Repository::plan_restore`，與真的還原共用落點與選取，測試逐一比對兩者的結果）、
   restore 的 `--include-file`／`--exclude-file`。
-- 還沒做：`--iexclude`、`--files-from`、反向樣式與大括號。
-- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 436 過 1 略過（原 395）。
+- 第四批（ADR 023）：反向樣式（`!`，一個路徑上最後一個比對到的樣式決定，同 restic 文件描述的
+  gitignore 行為）與不分大小寫的樣式（backup `--iexclude`／`--iexclude-file`、restore `--iinclude`／
+  `--iexclude` 與樣式檔、設定檔 `iexclude`）。
+- 還沒做：`--files-from`。大括號維持字面字元（restic 與 gitignore 都沒有，不算缺口）。
+- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 442 過 1 略過（原 395）。
   依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
 ## 已接受的限制（非待辦）
