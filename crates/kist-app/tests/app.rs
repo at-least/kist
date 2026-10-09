@@ -51,7 +51,9 @@ timezone = "utc"
 
 #[test]
 fn config_parses_and_validates() {
-    let good = r#"
+    // one_file_system 只有 unix 支援；其他平台載入時就報錯（下面的 bad）。
+    let good = format!(
+        r#"
 repo = "/tmp/x"
 password_file = "/tmp/p"
 [backup]
@@ -63,7 +65,7 @@ iexclude = ["*.BAK"]
 exclude_if_present = [".nobackup"]
 exclude_caches = true
 exclude_larger_than = "100M"
-one_file_system = true
+one_file_system = {}
 [forget]
 keep_daily = 7
 keep_within = "2w"
@@ -74,8 +76,10 @@ repack_below = 40
 [notify]
 webhook_url = "https://example.com/hook"
 on = ["failure", "success"]
-"#;
-    let cfg = Config::parse(good).unwrap();
+"#,
+        cfg!(unix)
+    );
+    let cfg = Config::parse(&good).unwrap();
     cfg.validate().unwrap();
     assert_eq!(
         cfg.backup.as_ref().unwrap().gc_grace,
@@ -90,7 +94,23 @@ on = ["failure", "success"]
             kist_core::Marker::cachedir_tag()
         ]
     );
-    assert!(exclusions.one_file_system);
+    assert_eq!(exclusions.one_file_system, cfg!(unix));
+    // 大小也可以直接寫 bytes 的整數（審查修正：原本只收字串，整數是載入錯誤）。
+    let sized = Config::parse(
+        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = 1048576\n",
+    )
+    .unwrap();
+    sized.validate().unwrap();
+    assert_eq!(
+        sized
+            .backup
+            .as_ref()
+            .unwrap()
+            .exclusions()
+            .unwrap()
+            .larger_than,
+        Some(1 << 20)
+    );
     assert_eq!(exclusions.patterns.len(), 3, "exclude 兩條、iexclude 一條");
     assert_eq!(
         cfg.forget.as_ref().unwrap().policy().keep_within,
@@ -117,10 +137,20 @@ on = ["failure", "success"]
         ("repo = \"/x\"\npassword_file = \"/p\"\npassword = \"inline\"\n[backup]\npaths = [\"/e\"]\n", "unknown field"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"3 days\"\n", "unknown unit"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude = [\"*.tmp\", \"[bad\"]\n", "[backup] exclude: invalid pattern \"[bad\""),
-        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_if_present = [\"a/b\"]\n", "[backup] exclude_if_present"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_if_present = [\"a/b\"]\n", "[backup] exclude marker \"a/b\""),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = \"1MB\"\n", "unknown unit"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = -1\n", "a size"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = 1.5\n", "a size"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\niexclude = [\"a**\"]\n", "[backup] iexclude"),
     ];
+    let mut bad = bad.to_vec();
+    if cfg!(not(unix)) {
+        // 審查修正：原本載入時照收，每次排程的 backup 才失敗。
+        bad.push((
+            "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\none_file_system = true\n",
+            "not supported on this platform",
+        ));
+    }
     for (text, needle) in bad {
         let err = Config::parse(text)
             .and_then(|c| c.validate())

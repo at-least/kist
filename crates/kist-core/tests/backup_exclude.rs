@@ -470,3 +470,56 @@ async fn an_unreadable_marker_without_a_header_still_counts() {
         set(&["d", "y.txt"])
     );
 }
+
+/// 審查修正：Windows 上 `\` 也是路徑分隔符，記號名稱裡有它就不是單一檔名（同
+/// fsmeta::validate_child_name）。原本照收，`sub\.nobackup` 會被當成上層目錄的記號。
+/// 只在 Windows 編得到；Linux 上由 windows-gnu 的 cross clippy 型別檢查。
+#[cfg(windows)]
+#[test]
+fn a_marker_name_with_a_backslash_is_rejected() {
+    let err = kist_core::Marker::parse("sub\\.nobackup").unwrap_err();
+    assert!(err.to_string().contains("single file name"), "{err}");
+}
+
+/// 審查修正：不支援的平台上 one_file_system 在組排除規則時就報錯（CLI 在碰 repo 之前、設定檔
+/// 在載入時），不是每次 backup 才失敗。
+#[cfg(not(unix))]
+#[test]
+fn one_file_system_is_rejected_when_the_exclusions_are_built() {
+    let err = kist_core::Exclusions::new(kist_core::PathFilter::default(), &[], false, None, true)
+        .unwrap_err();
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+/// [`kist_core::Exclusions::new`]：CLI 與設定檔共用的組法。
+#[test]
+fn exclusions_are_built_from_the_option_values() {
+    let built = kist_core::Exclusions::new(
+        kist_core::PathFilter::new(&["*.tmp"]).unwrap(),
+        &[".nobackup".to_owned(), "TAG:sig".to_owned()],
+        true,
+        Some(1 << 20),
+        cfg!(unix),
+    )
+    .unwrap();
+    assert_eq!(
+        built.if_present,
+        [
+            kist_core::Marker::parse(".nobackup").unwrap(),
+            kist_core::Marker::parse("TAG:sig").unwrap(),
+            kist_core::Marker::cachedir_tag(),
+        ]
+    );
+    assert_eq!(built.larger_than, Some(1 << 20));
+    assert_eq!(built.one_file_system, cfg!(unix));
+    assert_eq!(built.patterns.len(), 1);
+    let err = kist_core::Exclusions::new(
+        kist_core::PathFilter::default(),
+        &["a/b".to_owned()],
+        false,
+        None,
+        false,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("exclude marker \"a/b\""), "{err}");
+}

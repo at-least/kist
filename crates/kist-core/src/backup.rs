@@ -132,6 +132,42 @@ pub struct Exclusions {
     pub one_file_system: bool,
 }
 
+impl Exclusions {
+    /// CLI 旗標與設定檔共用的組法（審查修正：原本兩邊各組一次）：`if_present` 逐一以
+    /// [`Marker::parse`] 解析，`exclude_caches` 再加上 [`Marker::cachedir_tag`]。不支援的平台上
+    /// `one_file_system` 在這裡就報錯：CLI 在碰 repo 之前、設定檔在載入時，不是每次 backup 才失敗。
+    pub fn new(
+        patterns: PathFilter,
+        if_present: &[String],
+        exclude_caches: bool,
+        larger_than: Option<u64>,
+        one_file_system: bool,
+    ) -> Result<Self> {
+        if one_file_system && cfg!(not(unix)) {
+            return Err(one_file_system_unsupported());
+        }
+        let mut markers = if_present
+            .iter()
+            .map(|spec| Marker::parse(spec))
+            .collect::<Result<Vec<_>>>()?;
+        if exclude_caches {
+            markers.push(Marker::cachedir_tag());
+        }
+        Ok(Self {
+            patterns,
+            if_present: markers,
+            larger_than,
+            one_file_system,
+        })
+    }
+}
+
+fn one_file_system_unsupported() -> CoreError {
+    CoreError::Usage(
+        "one-file-system is not supported on this platform (no device numbers)".to_owned(),
+    )
+}
+
 /// [`Exclusions::if_present`] 的記號檔：名稱，加上檔案開頭必須是的 bytes（空的＝任何
 /// 種類、任何內容都算）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +181,9 @@ impl Marker {
     /// 有 HEADER 時，記號必須是開頭為 HEADER 的一般檔案。
     pub fn parse(spec: &str) -> Result<Self> {
         let (name, header) = spec.split_once(':').unwrap_or((spec, ""));
-        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        // Windows 上 `\` 也是路徑分隔符（同 fsmeta::validate_child_name；審查修正）。
+        let separator = |c: char| c == '/' || c == '\0' || (cfg!(windows) && c == '\\');
+        if name.is_empty() || name == "." || name == ".." || name.contains(separator) {
             return Err(CoreError::Usage(format!(
                 "exclude marker {spec:?}: NAME must be a single file name (NAME or NAME:HEADER)"
             )));
@@ -824,9 +862,7 @@ impl Repository {
             ));
         }
         if opts.exclude.one_file_system && cfg!(not(unix)) {
-            return Err(CoreError::Usage(
-                "one-file-system is not supported on this platform (no device numbers)".to_owned(),
-            ));
+            return Err(one_file_system_unsupported());
         }
 
         // snapshot 的時間 = 開始時間：任何在這之後改動的檔案，下一次都必須重讀

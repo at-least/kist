@@ -24,8 +24,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use kist_backend::{Backend, RepoLocation};
 use kist_core::{
-    BackupOptions, CheckOptions, Exclusions, ForgetOptions, ForgetSummary, InitOptions, Marker,
-    PathFilter, Planned, PruneOptions, PruneReport, Repository, RestoreOptions, RestoreSummary,
+    BackupOptions, CheckOptions, Exclusions, ForgetOptions, ForgetSummary, InitOptions, PathFilter,
+    Planned, PruneOptions, PruneReport, Repository, RestoreOptions, RestoreSummary,
     RetentionPolicy, SourceSpec,
 };
 
@@ -735,24 +735,17 @@ async fn run(cli: Cli) -> Result<()> {
             if paths.is_empty() {
                 bail!("no source paths to back up (the --files-from lists are empty)");
             }
-            let mut if_present = exclude_if_present
-                .iter()
-                .map(|spec| Marker::parse(spec))
-                .collect::<Result<Vec<_>, _>>()
-                .context("--exclude-if-present")?;
-            if exclude_caches {
-                if_present.push(Marker::cachedir_tag());
-            }
-            let exclude = Exclusions {
-                patterns: pattern_filter(
+            let exclude = Exclusions::new(
+                pattern_filter(
                     ("--exclude", &exclude, &exclude_file),
                     ("--iexclude", &iexclude, &iexclude_file),
                     Role::Exclude,
                 )?,
-                if_present,
-                larger_than: exclude_larger_than,
+                &exclude_if_present,
+                exclude_caches,
+                exclude_larger_than,
                 one_file_system,
-            };
+            )?;
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
             let remote_url = paths

@@ -428,6 +428,7 @@ fn glob_match(tokens: &[Token], name: &[u8], fold: bool) -> bool {
 }
 
 #[cfg(test)]
+// 測試裡 unwrap／expect 失敗就是測試失敗，正是要的結果。
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;

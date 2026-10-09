@@ -110,21 +110,14 @@ impl BackupSection {
             .map_err(|e| AppError::Config(format!("[backup] exclude: {e}")))?
             .and_ignoring_case(&self.iexclude)
             .map_err(|e| AppError::Config(format!("[backup] iexclude: {e}")))?;
-        let mut if_present = self
-            .exclude_if_present
-            .iter()
-            .map(|spec| kist_core::Marker::parse(spec))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| AppError::Config(format!("[backup] exclude_if_present: {e}")))?;
-        if self.exclude_caches {
-            if_present.push(kist_core::Marker::cachedir_tag());
-        }
-        Ok(kist_core::Exclusions {
+        kist_core::Exclusions::new(
             patterns,
-            if_present,
-            larger_than: self.exclude_larger_than,
-            one_file_system: self.one_file_system,
-        })
+            &self.exclude_if_present,
+            self.exclude_caches,
+            self.exclude_larger_than,
+            self.one_file_system,
+        )
+        .map_err(|e| AppError::Config(format!("[backup] {e}")))
     }
 }
 

@@ -20,18 +20,41 @@ pub fn parse_size(s: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| format!("{s:?}: too large"))
 }
 
-/// serde 用：設定檔裡的 `"100M"` → bytes。
+/// serde 用：設定檔裡的 `"100M"`，或直接寫 bytes 的整數（審查修正：原本整數是載入錯誤）。
 pub mod serde_opt {
-    use serde::{Deserialize, Deserializer};
+    use serde::de::{Error, Unexpected, Visitor};
+    use serde::Deserializer;
 
+    struct Size;
+
+    impl Visitor<'_> for Size {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a size: a number of bytes, or a string such as \"100M\"")
+        }
+
+        fn visit_u64<E: Error>(self, n: u64) -> Result<u64, E> {
+            Ok(n)
+        }
+
+        fn visit_i64<E: Error>(self, n: i64) -> Result<u64, E> {
+            u64::try_from(n).map_err(|_| E::invalid_value(Unexpected::Signed(n), &self))
+        }
+
+        fn visit_str<E: Error>(self, s: &str) -> Result<u64, E> {
+            super::parse_size(s).map_err(E::custom)
+        }
+    }
+
+    /// 欄位有 `#[serde(default)]`：沒寫是 `None`，寫了才會走到這裡。
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-        let s: Option<String> = Option::deserialize(d)?;
-        s.map(|s| super::parse_size(&s).map_err(serde::de::Error::custom))
-            .transpose()
+        d.deserialize_any(Size).map(Some)
     }
 }
 
 #[cfg(test)]
+// 測試裡 unwrap／expect 失敗就是測試失敗，正是要的結果。
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
