@@ -1,9 +1,9 @@
 //! 路徑樣式：backup 的 `--exclude`，restore 的 `--include`／`--exclude`（ADR 020）。
 //!
 //! 比對的對象是節點在 snapshot 裡的路徑：root 的定位切段
-//! （[`crate::fsmeta::locator_components`]；本機來源就是 canonical 絕對路徑）接上 tree
-//! 裡一層層的節點名——也就是整份還原時它在目標底下的位置，`kist snapshots` 的 PATHS
-//! 欄位再往下。規則：
+//! （[`crate::fsmeta::locator_components`]；本機來源就是 canonical 絕對路徑，遠端來源只剝掉
+//! `scheme://`，第一段是 URL 裡的 `[user@]host[:port]` 原樣）接上 tree 裡一層層的節點名——
+//! 也就是整份還原時它在目標底下的位置，`kist snapshots` 的 PATHS 欄位再往下。規則：
 //!
 //! - `/` 開頭的樣式從路徑頂端比起（錨定）；其他樣式可以從任何深度開始：`*.tmp`、
 //!   `node_modules`、`build/out` 在每一層都會比對。

@@ -144,3 +144,17 @@ async fn a_second_backup_with_the_same_excludes_reuses_everything() {
     assert_eq!(second.report.excluded, first.report.excluded);
     assert_eq!(second.roots, first.roots, "內容沒變：同一組 root tree");
 }
+
+/// README／ADR 020 的例子：遠端 root 只剝掉 `scheme://`，URL 裡的 `[user@]host[:port]` 原樣是
+/// 路徑的第一段，錨定樣式要照它寫。
+#[test]
+fn a_remote_root_keeps_user_host_and_port_as_its_first_component() {
+    let comps = kist_core::fsmeta::locator_components(b"sftp://me@nas:2222/srv/data").unwrap();
+    assert_eq!(comps, [&b"me@nas:2222"[..], b"srv", b"data"]);
+    let filter = PathFilter::new(&["/me@nas:2222/srv/data/x"]).unwrap();
+    let mut state = filter.start();
+    for name in comps.into_iter().chain([&b"x"[..]]) {
+        state = filter.descend(&state, name);
+    }
+    assert!(state.is_match());
+}

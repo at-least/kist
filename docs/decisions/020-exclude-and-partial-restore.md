@@ -25,8 +25,10 @@ backup 的排除，用的都是這同一套切段（mount 的 `corefs.rs` 與 re
 
 - 本機來源：backup 會 canonicalize，所以是 **canonical 絕對路徑**（symlink 已解開），與
   `kist snapshots` 的 PATHS 欄位相同。
-- 遠端來源：去掉 `scheme://`。`sftp://nas/srv/data` 底下的 `x` 是 `/nas/srv/data/x`；錨定樣式要從
-  落點寫起，不是遠端主機上的路徑（`source_backup.rs` 的 `mem://bucket/data` 案例釘住）。
+- 遠端來源：只去掉 `scheme://`，第一段是 URL 裡的 `[user@]host[:port]` 原樣（`locator_components`
+  只剝 scheme）。`sftp://nas/srv/data` 底下的 `x` 是 `/nas/srv/data/x`，`sftp://me@nas:2222/srv/data`
+  底下是 `/me@nas:2222/srv/data/x`；錨定樣式要從落點寫起，不是遠端主機上的路徑
+  （`source_backup.rs` 的 `mem://bucket/data` 案例釘住）。
 - Windows：本機 root 的定位是 `C:\…` 一整段，錨定樣式比對不到。不錨定的樣式照常比對。沒在 Windows
   上跑過（UNVERIFIED，同 PLAN「已接受的限制」）。
 
@@ -111,5 +113,7 @@ gitignore／restic 風格的子集，規則全在 `crates/kist-core/src/filter.r
 - 結束碼：restore 多一種 3（沒選到東西的 include）。
 - `BackupOptions` 多一個必填欄位 `exclude`（程式內嵌的呼叫端要補 `PathFilter::default()`）；
   `RestoreOptions` 多 `include`／`exclude`，`Default` 仍是整份還原。
-- 沒量測：大樹上逐段比對的 CPU 成本、剪枝在 S3 repo 上省下的時間。每個節點每條樣式做一次比對；
-  v3 的每個 tree 是一個物件，所以每少讀一個 tree 就少一個請求。
+- 沒量測：大樹上逐段比對的 CPU 成本、剪枝在 S3 repo 上省下的時間。每個走到的節點對 include 與
+  exclude 各推進一步，迭代的是還活著的位置（不是全部樣式）；被選到的目錄底下仍然推進 include，只為了
+  記錄哪些樣式比對到過，巢狀的 include（`/a` 與 `/a/b`）才不會被誤報成沒選到。v3 的每個 tree 是一個
+  物件，所以每少讀一個 tree 就少一個請求。

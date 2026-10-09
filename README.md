@@ -95,7 +95,8 @@ kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行�
 樣式比對的是節點在 snapshot 裡的路徑，也就是整份還原時它在目標底下的位置：
 
 - 本機來源是 **canonical 絕對路徑**（symlink 已解開，與 `kist snapshots` 的 PATHS 欄位相同）。
-  遠端來源去掉 `scheme://`：`sftp://nas/srv/data` 底下的 `x` 是 `/nas/srv/data/x`。
+  遠端來源只去掉 `scheme://`，第一段是 URL 裡的 `[user@]host[:port]` 原樣：`sftp://nas/srv/data`
+  底下的 `x` 是 `/nas/srv/data/x`，`sftp://me@nas:2222/srv/data` 底下的是 `/me@nas:2222/srv/data/x`。
 - `/` 開頭的樣式從路徑頂端比起；其他樣式在每一層都比對（`*.tmp`、`node_modules`、`build/out`）。
 - 以 `/` 分段，每段比對恰好一個路徑元件：`*` 任意多個字元、`?` 一個字元（CJK 字也是一個）、
   `[abc]`／`[a-z]`／`[!a]` 一個字元、`\` 讓下一個字元照字面。整段只有 `**` 時比對零或多個元件

@@ -414,9 +414,9 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   README 寫明）。
 - 沒做（ADR 020「沒做」）：`--exclude-caches`、`--exclude-if-present`、`--one-file-system`、
   `--exclude-larger-than`、`--iexclude`、`--files-from`、restore 的 `--dry-run` 與 `snap:子目錄`。
-- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 420 過 1 略過（原
-  395；filter 9、backup_exclude 3、source_backup 1、restore_select 9、kist-app 1、CLI 2）。依賴沒變，
-  cargo deny 不受影響。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
+- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 421 過 1 略過（原
+  395；filter 9、backup_exclude 4、source_backup 1、restore_select 9、kist-app 1、CLI 2）。依賴沒變，
+  cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
 ## 已接受的限制（非待辦）
 
