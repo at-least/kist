@@ -372,15 +372,29 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   統一。gate：fmt／clippy 乾淨、nextest 357 過（原 333）、fixture_v3 4 過、deny ok。
 - 另：rustls 升 0.23.45（e9e06e6，RUSTSEC-2026-0285）。
 - 第二批：restore 一條線（分支 `adr-019-batch2`，每項先紅後綠）：A3 metadata 經已開的
-  handle 套用、A2 暫存檔＋rename（失敗不再刪使用者原有的檔；審查後暫存檔建成 0600）、
+  handle 套用、A2 暫存檔＋rename（失敗不再刪使用者原有的檔；審查後暫存檔不再以 umask
+  預設建立）、
   A4 以目錄 fd 為錨逐層走（rustix 成為 kist-core 的直接依賴；審查後擁有者只能進入、
   不能讀的目錄在 Linux 以 O_PATH 當錨）、A43 以 root 還原時先 chown 再套 mode、A30 本機
   擋路改報 RestoreBlocked。同一分支另有 A19、A33、A41、C1 資料安全那一半的測試，以及
-  一輪審查修正（本機後端 fsync、index 讀取的 I/O 錯誤不再壓成 Corrupt、run／serve 收
-  SIGTERM、CPU 密集段移出 async worker、SFTP 讀取的宣稱大小上限、Windows 的 clippy）。
+  其他修正（本機後端 fsync、index 讀取的 I/O 錯誤不再壓成 Corrupt、run／serve 收
+  SIGTERM、CPU 密集段移出 async worker、SFTP 讀取的宣稱大小上限、Windows 的 clippy）
+  與測試、文件的補強。
   gate：fmt／clippy 乾淨、nextest 391 過（原 357）、deny ok；交叉 clippy 乾淨：
   x86_64-pc-windows-gnu 不含 kist-mount、x86_64-apple-darwin 另不含 kist-cli（unix 上
   它依賴 kist-mount；fuser 的 build.rs 在 macOS 要 macFUSE）。
+- 易讀性整理（分支 `readability`，自 `adr-019-batch2` 分出；依 crate 五個 commit，行為不變）：
+  刪死碼與一行包裝、手寫 impl 改 derive、多義 tuple 改具名 struct、重複的小段收成一份、
+  巢狀 match 攤平、過時或只敘述歷史的註解改準；不新增 trait／泛型／模組。刻意沒動：
+  kist-format（PLAN 要負責人點頭）、對外 JSON／CLI 文字、ADR 019 已列的 A27–A42、tests/。
+  gate：fmt／clippy 乾淨、windows-gnu clippy（cargo-zigbuild，不含 kist-mount／kist-cli）乾淨、
+  nextest 391 過 1 略過、deny ok；另起 tests/sftp-setup.sh 與 rclone 跑 kist-backend 的
+  sftp／contract／rclone 測試 12 過（只有 S3 略過）。
+- 同分支，整理時順帶發現的三項（每項先紅後綠，或註明為何無紅）：prune 的 index 壓縮觸發
+  改看有效 blob 數（原本連等 grace 的被取代 blob 一起算，合併後 grace 內每次 prune 都再重寫
+  整份 index）；mount 的 snapshot 根改用 vpath 的切段（只有 scheme 的定位 `s3://` 原本整個
+  root 從頂層消失）；crypto 的 unlock_key_slot 刪掉永不發生的第二個長度錯（行為不變，補測試
+  釘住）。gate：fmt／clippy／windows-gnu clippy 乾淨、nextest 394 過 1 略過、deny ok。
 - 待辦：ADR 019「待負責人決定」第 1 點的第三～五批（A7／A9／A13／A14 起）。
 
 ## 已接受的限制（非待辦）

@@ -27,7 +27,7 @@ impl Notifier {
         })
     }
 
-    pub fn wants(&self, outcome: &JobOutcome) -> bool {
+    fn wants(&self, outcome: &JobOutcome) -> bool {
         self.on.contains(outcome.status.name())
     }
 

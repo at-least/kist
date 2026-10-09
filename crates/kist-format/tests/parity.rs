@@ -51,9 +51,9 @@ fn golden_go_parity_repairs_rust_side() {
     }
 
     let obj = parity::parse(&raw).unwrap();
-    assert_eq!(obj.version(), kist_format::FORMAT_VERSION);
+    assert_eq!(obj.v, kist_format::FORMAT_VERSION);
     assert_eq!(obj.parity_shards(), 2);
-    assert_eq!(obj.pack_size(), 4321);
+    assert_eq!(obj.pack_size, 4321);
 
     // 同一個 pack、同一個 m，必須編出與 golden 相同的 bytes（RS 矩陣未漂移 +
     // CBOR 欄位順序未變的共同證明）。
@@ -75,8 +75,8 @@ fn encode_is_deterministic_and_validates_inputs() {
 
     let obj = parity::parse(&raw).unwrap();
     assert_eq!(obj.parity_shards(), 2);
-    assert_eq!(obj.pack_size(), 1000);
-    assert_eq!(obj.shard_len(), 63);
+    assert_eq!(obj.pack_size, 1000);
+    assert_eq!(obj.shard_len, 63);
 
     let wrong = ObjectId::from_hex(&"1".repeat(64)).unwrap();
     assert!(matches!(
@@ -110,7 +110,7 @@ fn repairs_up_to_m_shards() {
     let pack = fake_pack("repair", 100_000);
     let (id, raw) = encode(&pack, 2);
     let obj = parity::parse(&raw).unwrap();
-    let shard_len = obj.shard_len() as usize;
+    let shard_len = obj.shard_len as usize;
 
     let damage = |offsets: &[usize]| {
         let mut out = pack.clone();
@@ -151,7 +151,7 @@ fn refuses_more_than_m_erasures() {
     let pack = fake_pack("toomuch", 50_000);
     let (id, raw) = encode(&pack, 2);
     let obj = parity::parse(&raw).unwrap();
-    let shard_len = obj.shard_len() as usize;
+    let shard_len = obj.shard_len as usize;
     let mut bad = pack.clone();
     for o in [0, shard_len, 2 * shard_len] {
         bad[o] ^= 0x5a;
@@ -181,7 +181,7 @@ fn forged_parity_cannot_repair_wrongly() {
     // hash 恰好都符合受損 shard 的偽造 parity：每片都「驗過」，只剩名字檢查。
     let (_, real_raw) = encode(&pack, 2);
     let mut lying: Object = parity::parse(&real_raw).unwrap();
-    let shard_len = lying.shard_len() as usize;
+    let shard_len = lying.shard_len as usize;
     let first = bad[..shard_len].to_vec();
     lying.hashes[0] = ObjectId::of(&first);
     assert!(matches!(
@@ -208,10 +208,10 @@ fn parse_rejects_inconsistent_headers() {
     let pack = fake_pack("hdr", 3000);
     let (id, raw) = encode(&pack, 1);
     let obj = parity::parse(&raw).unwrap();
-    assert_eq!(obj.pack_size(), 3000);
+    assert_eq!(obj.pack_size, 3000);
 
     let mutate = |f: &dyn Fn(&mut Wire)| {
-        let shard_len = obj.shard_len();
+        let shard_len = obj.shard_len;
         let mut w = Wire {
             v: 2,
             k: DATA_SHARDS as u8,
@@ -263,7 +263,7 @@ proptest! {
         let pack = fake_pack("prop", n);
         let (id, raw) = encode(&pack, m);
         let obj = parity::parse(&raw).unwrap();
-        let shard_len = obj.shard_len() as usize;
+        let shard_len = obj.shard_len as usize;
 
         let mut bad = pack.clone();
         // 每個受損 shard 翻一個 byte（同一 shard 翻兩次仍是 1 片 erasure）。

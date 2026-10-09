@@ -51,7 +51,7 @@ pub enum RootContents {
     /// 檔案/symlink 來源：root tree 恰好一個非目錄 entry、名稱 = 定位末段
     /// ——葉子是那個 entry 本身（與 restore 的落點一致）。
     Leaf(Box<Entry>),
-    /// 定位沒有組件（`/`、`s3://bucket/`）：root tree 的內容**攤平到頂層**
+    /// 定位沒有組件（`/`、只有 scheme 的 `s3://`）：root tree 的內容**攤平到頂層**
     /// （與 restore 的「空相對路徑 = 直接落在 target」一致）。
     Flatten(Vec<Entry>),
 }
@@ -63,7 +63,8 @@ impl VirtualRoot {
     pub fn build(roots: impl IntoIterator<Item = (Root, RootContents)>) -> Result<Self, String> {
         let mut levels: HashMap<Vec<u8>, Vec<VEntry>> = HashMap::new();
         for (root, contents) in roots {
-            let comps = locator_components(root.path.as_slice())?;
+            let comps = kist_core::fsmeta::locator_components(root.path.as_slice())
+                .map_err(|e| e.to_string())?;
             let Some((last, parents)) = comps.split_last() else {
                 match contents {
                     RootContents::Flatten(entries) => {
@@ -87,9 +88,8 @@ impl VirtualRoot {
                 parent.extend_from_slice(comp);
             }
             let leaf = match contents {
-                RootContents::Dir => root_leaf_entry(last, root.tree),
+                RootContents::Dir | RootContents::Flatten(_) => root_leaf_entry(last, root.tree),
                 RootContents::Leaf(e) => *e,
-                RootContents::Flatten(_) => root_leaf_entry(last, root.tree),
             };
             push_real(&mut levels, &parent, &leaf);
         }
@@ -114,33 +114,6 @@ impl VirtualRoot {
         let i = level.partition_point(|v| v.name() < name);
         level.get(i).filter(|v| v.name() == name)
     }
-}
-
-/// root 定位 → 組件（與 fsmeta::locator_to_relative 同一套規則：
-/// 去 scheme、`/` 切段、空與 `.` 組件正規化掉）。
-fn locator_components(path: &[u8]) -> Result<Vec<&[u8]>, String> {
-    let rest = match path.iter().position(|&b| b == b':') {
-        Some(i) if path.len() >= i + 3 && &path[i + 1..i + 3] == b"//" => &path[i + 3..],
-        _ => path,
-    };
-    rest.split(|&b| b == b'/')
-        .filter(|c| !c.is_empty() && *c != b".")
-        // `..` 映射成 `__parent__`：與 fsmeta::locator_to_relative 同一套
-        // 規則——字面 `..` 是 FUSE 核心自己的東西，虛擬層重複吐一個只會是
-        // 不可達的同名 entry。
-        .map(|c| {
-            if c == b".." {
-                Ok(b"__parent__" as &[u8])
-            } else if c.contains(&0u8) {
-                // NUL 不是合法的 FUSE 目錄項位元組：restore 的
-                // fsmeta::locator_to_relative 也拒，mount 不得是讀取
-                // 通路中唯一收下的。
-                Err(format!("locator contains a NUL byte: {c:?}"))
-            } else {
-                Ok(c)
-            }
-        })
-        .collect()
 }
 
 /// root 的葉組件 → 攜帶 subtree 的合成 DIR entry（posix 形狀：mount 的
@@ -179,9 +152,10 @@ fn has_name(level: &[VEntry], name: &[u8]) -> bool {
 /// 同一目標寫兩次。
 fn push_real(levels: &mut HashMap<Vec<u8>, Vec<VEntry>>, key: &[u8], e: &Entry) {
     let level = levels.entry(key.to_vec()).or_default();
+    let v = VEntry::Real(Arc::new(e.clone()));
     match level.iter().position(|v| v.name() == e.name) {
-        Some(i) => level[i] = VEntry::Real(Arc::new(e.clone())),
-        None => level.push(VEntry::Real(Arc::new(e.clone()))),
+        Some(i) => level[i] = v,
+        None => level.push(v),
     }
 }
 
@@ -305,8 +279,8 @@ mod tests {
         assert!(VirtualRoot::lookup(root.top(), b"b").is_none());
     }
 
-    /// 兩個 root 的定位切出同一組組件（`/a/b` 與 `a/b`——scheme 去掉後
-    /// host 不入組件、絕對與相對定位同形）時，同名葉只能出現一次——
+    /// 兩個 root 的定位切出同一組組件（`/a/b` 與 `a/b`——絕對與相對定位
+    /// 同形）時，同名葉只能出現一次——
     /// 重複條目會讓 mount 列出兩個 `b`（層級已排序、二分查找只找得到
     /// 其中之一），restore 也會對同一目標寫兩次。後到的 root 贏
     /// （與 restore 目前的覆寫行為一致）。
@@ -348,5 +322,3 @@ mod tests {
         );
     }
 }
-
-// （附加在 tests mod 外會編譯失敗——放進 mod tests）

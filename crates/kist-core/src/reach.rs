@@ -34,7 +34,6 @@ pub struct FileVisit<'a> {
     /// 這個節點所在的 tree 的 key。
     pub tree_key: &'a str,
     pub node: &'a Entry,
-    pub size: u64,
     /// 解開 Indirect 之後的資料 chunk。
     pub data_chunks: &'a [ChunkId],
 }
@@ -159,7 +158,6 @@ impl Repository {
                             on_file(FileVisit {
                                 tree_key: &key,
                                 node,
-                                size: node.size,
                                 data_chunks: &data,
                             });
                         }

@@ -610,7 +610,7 @@ fn opt_bytes_is_absent(v: &Option<ByteBuf>) -> bool {
 
 impl TreeId {
     pub fn is_zero(&self) -> bool {
-        self.as_bytes() == &[0u8; 32]
+        *self == Self::ZERO
     }
 }
 

@@ -410,7 +410,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(mut slot) => slot.take(),
                 Err(_) => None,
             };
-            result.map_err(anyhow::Error::from)?;
+            result?;
             if let Some(e) = server_err {
                 return Err(e);
             }
@@ -436,7 +436,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ..InitOptions::default()
             };
             Repository::init(backend, password.as_bytes(), opts).await?;
-            println!("repository initialized at {}", repo_display(&repo)?);
+            println!("repository initialized at {}", repo_url(&repo)?);
             if show_versioning_note {
                 eprintln!(
                     "note: enable bucket versioning or Object Lock so that `config` cannot be \
@@ -457,22 +457,19 @@ async fn run(cli: Cli) -> Result<()> {
             }
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
-            if paths.len() > 1
-                && paths
-                    .first()
-                    .and_then(|p| p.to_str())
-                    .is_some_and(|u| u.starts_with("sftp://") || u.starts_with("s3://"))
-            {
+            let remote_url = paths
+                .first()
+                .and_then(|p| p.to_str())
+                .filter(|u| kist_backend::source::is_remote_spec(u))
+                .map(str::to_owned);
+            if remote_url.is_some() && paths.len() > 1 {
                 anyhow::bail!(
                     "a remote source URL (sftp:// or s3://) is the only path a remote backup takes"
                 );
             }
-            let (source, paths) = match paths.first().and_then(|p| p.to_str()) {
-                Some(url) if url.starts_with("sftp://") || url.starts_with("s3://") => {
-                    let url = url.to_owned();
-                    (SourceSpec::Url(url.clone()), vec![PathBuf::from(url)])
-                }
-                _ => (SourceSpec::LocalPaths, paths),
+            let (source, paths) = match remote_url {
+                Some(url) => (SourceSpec::Url(url.clone()), vec![PathBuf::from(url)]),
+                None => (SourceSpec::LocalPaths, paths),
             };
             let r = open_repo(&repo).await?;
             // 先鎖再載入：同 jobs.rs——首建並發各自 mint 不同 id 的視窗。
@@ -480,8 +477,8 @@ async fn run(cli: Cli) -> Result<()> {
             let client_id = client_id::load_or_create(client_id_file.as_deref())?;
             let opts = BackupOptions {
                 client_id,
-                hostname: hostname(),
-                username: username(),
+                hostname: client_id::hostname(),
+                username: client_id::username(),
                 now: None,
                 gc_grace,
                 parity,
@@ -564,13 +561,8 @@ async fn run(cli: Cli) -> Result<()> {
                 "mounted at {}; interrupt (Ctrl-C) to unmount",
                 mountpoint.display()
             );
-            tokio::select! {
-                res = tokio::signal::ctrl_c() => {
-                    res.context("installing the Ctrl-C handler")?;
-                }
-                res = sigterm() => {
-                    res.context("installing the SIGTERM handler")?;
-                }
+            if !wait_for_shutdown_signal().await {
+                anyhow::bail!("installing the Ctrl-C and SIGTERM handlers failed");
             }
             // 有檔案還開著時 FUSE 會回 EBUSY——把原錯誤帶上人話。
             mounted.unmount().context(format!(
@@ -685,7 +677,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 let report = prune_result?;
                 if !json {
-                    output_prune(&report, dry_run)?;
+                    output_prune(&report, dry_run);
                 }
                 prune_warnings_and_exit(&report)
             } else {
@@ -708,7 +700,7 @@ async fn run(cli: Cli) -> Result<()> {
                     report: &report,
                 })?;
             } else {
-                output_prune(&report, dry_run)?;
+                output_prune(&report, dry_run);
             }
             prune_warnings_and_exit(&report)
         }
@@ -767,7 +759,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn output_prune(p: &PruneReport, dry_run: bool) -> Result<()> {
+fn output_prune(p: &PruneReport, dry_run: bool) {
     let would = if dry_run { "would " } else { "" };
     println!(
         "{} snapshots, {} live trees, {} live packs",
@@ -793,7 +785,6 @@ fn output_prune(p: &PruneReport, dry_run: bool) -> Result<()> {
         human_bytes(p.repacked_bytes),
         p.new_packs
     );
-    prune_warnings_and_exit(p)
 }
 
 /// 刪不掉的物件走 stderr + 結束碼 3，兩種輸出模式都一樣。
@@ -854,9 +845,9 @@ fn spawn_shutdown_watcher(tx: tokio::sync::watch::Sender<bool>) {
     });
 }
 
-/// `run`／`serve` 的結束訊號：Ctrl-C（SIGINT）**或** SIGTERM。systemd／docker
-/// 的 `stop` 送的是 SIGTERM——只等 SIGINT 的話，「跑完手邊工作再停」的約定
-/// 在主要的部署訊號下不會發生（`kist mount` 的 `sigterm()` 同一款理由）。
+/// `run`／`serve`／`mount` 的結束訊號：Ctrl-C（SIGINT）**或** SIGTERM。systemd／
+/// docker 的 `stop` 送的是 SIGTERM——只等 SIGINT 的話，「跑完手邊工作再停」
+/// 的約定在主要的部署訊號下不會發生。回 false 表示兩個 handler 都裝不起來。
 async fn wait_for_shutdown_signal() -> bool {
     #[cfg(unix)]
     {
@@ -880,7 +871,7 @@ async fn wait_for_shutdown_signal() -> bool {
 }
 
 fn print_next_runs(daemon: &kist_app::Daemon) {
-    for (job, next) in daemon.next_runs(time_now()) {
+    for (job, next) in daemon.next_runs(time::OffsetDateTime::now_utc()) {
         eprintln!(
             "{}: next run {}",
             job.name(),
@@ -974,21 +965,8 @@ fn repo_url(args: &RepoArgs) -> Result<&str> {
         .context("no repository given: use --repo <path|s3://bucket/prefix|sftp://host/path|rclone://remote/path> or set KIST_REPO")
 }
 
-fn repo_display(args: &RepoArgs) -> Result<String> {
-    Ok(repo_url(args)?.to_owned())
-}
-
 async fn open_backend(args: &RepoArgs) -> Result<Backend> {
     Ok(Backend::from_url(repo_url(args)?).await?)
-}
-
-/// `kist mount` 的第二個結束訊號（systemd/終端機都會送 SIGTERM）。
-#[cfg(unix)]
-async fn sigterm() -> std::io::Result<()> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate())?;
-    term.recv().await;
-    Ok(())
 }
 
 async fn open_repo(args: &RepoArgs) -> Result<Repository> {
@@ -997,14 +975,17 @@ async fn open_repo(args: &RepoArgs) -> Result<Repository> {
     let cache_root = if args.no_cache {
         None
     } else {
-        match &args.cache_dir {
-            Some(d) => Some(d.clone()),
-            None => dirs::cache_dir().map(|d| d.join("kist")),
+        let root = args
+            .cache_dir
+            .clone()
+            .or_else(|| dirs::cache_dir().map(|d| d.join("kist")));
+        if root.is_none() {
+            tracing::warn!(
+                "cannot determine a cache directory; running without the local index cache"
+            );
         }
+        root
     };
-    if cache_root.is_none() && !args.no_cache {
-        tracing::warn!("cannot determine a cache directory; running without the local index cache");
-    }
     Ok(Repository::open_with_cache(backend, password.as_bytes(), cache_root).await?)
 }
 
@@ -1020,8 +1001,7 @@ fn short_snapshot_id(key: &str) -> String {
 fn display_time_ns(ns: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns))
         .map(|t| {
-            t.to_offset(time::UtcOffset::UTC)
-                .format(&time::format_description::well_known::Rfc3339)
+            t.format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default()
         })
         .map(|rfc| display_time(&rfc))
@@ -1049,18 +1029,6 @@ fn human_bytes(n: u64) -> String {
     } else {
         format!("{v:.1} {}", UNITS[i])
     }
-}
-
-fn hostname() -> String {
-    client_id::hostname()
-}
-
-fn username() -> String {
-    client_id::username()
-}
-
-fn time_now() -> time::OffsetDateTime {
-    time::OffsetDateTime::now_utc()
 }
 
 #[cfg(all(test, unix))]

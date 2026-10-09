@@ -255,7 +255,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 /// htmx 2 預設不把 4xx 換進頁面；409（已排隊 / 未設定）帶的是含 notice 的 status partial，要換進去。
 const HTMX_CONFIG: &str = r#"{"responseHandling":[{"code":"204","swap":false},{"code":"409","swap":true},{"code":"[23]..","swap":true},{"code":"[45]..","swap":false,"error":true}]}"#;
 
-/// 首頁整頁；status partial 直接嵌在裡面（原 askama 模板的 `{% include %}`）。
+/// 首頁整頁；status partial 直接嵌在裡面。
 fn index_page(repo: &str, hostname: &str, status: &StatusView) -> Markup {
     html! {
         (DOCTYPE)
@@ -513,10 +513,7 @@ async fn list_snapshots(state: &ServeState) -> std::result::Result<Vec<SnapshotR
 /// snapshot 的 i64 奈秒 → 人類可讀的 UTC 時間。
 fn format_ns_time(ns: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns))
-        .map(|t| {
-            t.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default()
-        })
+        .map(format_time)
         .unwrap_or_default()
 }
 

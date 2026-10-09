@@ -112,10 +112,7 @@ impl RepoLocation {
     /// 其他任何字串都當本機路徑。
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(rest) = s.strip_prefix("s3://") {
-            let (bucket, prefix) = match rest.split_once('/') {
-                Some((b, p)) => (b, p),
-                None => (rest, ""),
-            };
+            let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
             if bucket.is_empty() {
                 return Err(BackendError::InvalidUrl(s.to_owned()));
             }

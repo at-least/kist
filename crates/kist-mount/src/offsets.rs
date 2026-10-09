@@ -24,21 +24,12 @@ impl ChunkOffsets {
         self.ends.last().copied().unwrap_or(0)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ends.is_empty()
-    }
-
     /// chunk i 的明文起點。
     pub fn chunk_start(&self, i: usize) -> u64 {
         match i {
             0 => 0,
             n => self.ends[n - 1],
         }
-    }
-
-    /// chunk i 的明文結尾。
-    pub fn chunk_end(&self, i: usize) -> u64 {
-        self.ends[i]
     }
 
     /// `offset` 落在哪個 chunk：回傳 (chunk 序號, chunk 內偏移)。
@@ -65,7 +56,6 @@ mod tests {
     fn empty_file_has_no_chunks() {
         let o = offsets(&[]);
         assert_eq!(o.total(), 0);
-        assert!(o.is_empty());
         assert_eq!(o.locate(0), None);
     }
 
@@ -113,7 +103,7 @@ mod tests {
         let mut out = Vec::new();
         while pos < end {
             let (i, in_chunk) = o.locate(pos).expect("pos < end ≤ total");
-            let take = std::cmp::min(o.chunk_end(i) - pos, end - pos);
+            let take = std::cmp::min(o.chunk_start(i + 1) - pos, end - pos);
             out.push((i, o.chunk_start(i) + in_chunk, take));
             pos += take;
         }

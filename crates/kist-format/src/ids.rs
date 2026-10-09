@@ -3,8 +3,8 @@
 //! - [`ChunkId`]：chunk 的身分 = keyed BLAKE3(hash key, chunk 明文)。
 //!   只出現在加密內容裡，**絕不**當作 repo 裡的物件名稱。
 //! - [`TreeId`]：tree 的名稱 = keyed BLAKE3(hash key, tree 明文 CBOR)。
-//!   與 ChunkId 同函式同金鑰；v2 的 tree 以**明文** hash 命名（v1 以密文，
-//!   已淘汰：壓縮器版本會改變密文、連帶改變名稱，破壞去重）。
+//!   與 ChunkId 同函式同金鑰。以**明文**而不是密文 hash 命名：壓縮器版本
+//!   會改變密文、連帶改變名稱，破壞去重。
 //! - [`ObjectId`]：pack 與 index blob 的名稱 = 一般 BLAKE3(密文 bytes)。
 //!   不持金鑰也能驗證物件完整性。
 //!
@@ -24,8 +24,6 @@ macro_rules! id_type {
         pub struct $name([u8; 32]);
 
         impl $name {
-            pub const LEN: usize = 32;
-
             pub const fn from_bytes(bytes: [u8; 32]) -> Self {
                 Self(bytes)
             }

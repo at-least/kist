@@ -302,25 +302,10 @@ impl Chunker {
         }
     }
 
-    pub fn params(&self) -> ChunkerParams {
-        self.params
-    }
-
     /// 以串流方式切塊。每個項目是一個 chunk 的明文；讀取錯誤以 `Err`
     /// 交出並終止。空輸入不產生任何 chunk。
     pub fn chunks<R: Read>(&self, reader: R) -> Chunks<R> {
-        Chunks {
-            state: State {
-                params: self.params,
-                mask_small: self.mask_small,
-                mask_large: self.mask_large,
-                reader: Some(reader),
-                buf: vec![0u8; 2 * self.params.max as usize],
-                len: 0,
-                cursor: 0,
-                eof: false,
-            },
-        }
+        self.chunks_with_buf(reader, Vec::new())
     }
 
     /// 同 [`chunks`]，但重用呼叫端的緩衝：省掉每個輸入一次 2×max 的
@@ -427,12 +412,9 @@ impl<R: Read> State<R> {
         if self.eof {
             return Ok(());
         }
-        let reader = match self.reader.as_mut() {
-            Some(r) => r,
-            None => {
-                self.eof = true;
-                return Ok(());
-            }
+        let Some(reader) = self.reader.as_mut() else {
+            self.eof = true;
+            return Ok(());
         };
         // 讀到滿或 EOF：短讀就繼續讀，read 回 0 才算 EOF（已讀的照收）。
         while self.len < self.buf.len() {
@@ -486,11 +468,7 @@ impl<R: Read> Iterator for Chunks<R> {
     type Item = Result<Vec<u8>, ChunkerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.state.next_chunk() {
-            Ok(Some(c)) => Some(Ok(c)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        }
+        self.state.next_chunk().transpose()
     }
 }
 

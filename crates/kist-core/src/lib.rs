@@ -114,6 +114,14 @@ impl CoreError {
             source,
         }
     }
+
+    /// repo 內容損壞：`key` 是出事的物件（或 `<chunk list>` 這類標記）。
+    pub(crate) fn corrupt(key: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Corrupt {
+            key: key.into(),
+            reason: reason.into(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

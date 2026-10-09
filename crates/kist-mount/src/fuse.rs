@@ -272,12 +272,11 @@ impl Filesystem for KistFs {
     fn readdir(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: fuser::FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let _ = ino;
         let page = match self.core.readdir(fh.0, offset, 1024) {
             Ok(p) => p,
             Err(e) => {

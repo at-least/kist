@@ -206,7 +206,7 @@ pub fn wrap_master_key(
     let mut payload = Zeroizing::new(Vec::with_capacity(32 + 64));
     payload.extend_from_slice(master.as_bytes());
     payload.extend_from_slice(&kist_format::cbor::encode(&binding.invariants())?);
-    let sealed = seal_meta(&kek, kist_format::AAD_MASTER, &payload)?;
+    let sealed = seal(&kek, kist_format::AAD_MASTER, &payload)?;
     Ok(KeySlot {
         version: kist_format::FORMAT_VERSION,
         name: name.to_owned(),
@@ -238,24 +238,19 @@ pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<UnlockedMaster
     // plain 就是 master key 明文：用 Zeroizing 包住，drop 時清零（kek、
     // MasterKey 都已如此；模組文件的清零紀律不含例外）。
     let plain = Zeroizing::new(
-        open_meta(&kek, kist_format::AAD_MASTER, &slot.wrapped)
+        open(&kek, kist_format::AAD_MASTER, &slot.wrapped)
             .map_err(|_| CryptoError::WrongPassword)?,
     );
-    if plain.len() < 32 {
+    let Some((key, rest)) = plain.split_first_chunk::<32>() else {
         return Err(CryptoError::BadLength {
             what: "unwrapped master payload",
             expected: 32,
             actual: plain.len(),
         });
-    }
-    let key: [u8; 32] = plain[..32].try_into().map_err(|_| CryptoError::BadLength {
-        what: "master key",
-        expected: 32,
-        actual: plain.len(),
-    })?;
-    let invariants: Invariants = kist_format::cbor::decode(&plain[32..])?;
+    };
+    let invariants: Invariants = kist_format::cbor::decode(rest)?;
     Ok(UnlockedMaster {
-        master: MasterKey(key),
+        master: MasterKey(*key),
         invariants,
     })
 }
@@ -307,15 +302,6 @@ fn open(key: &[u8; 32], aad: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| CryptoError::AuthFailed)
 }
 
-/// KEK 層的密封（master key 封裝專用；不需要 RepoKeys）。
-fn seal_meta(kek: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    seal(kek, aad, plaintext)
-}
-
-fn open_meta(kek: &[u8; 32], aad: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
-    open(kek, aad, bytes)
-}
-
 /// 由 master key 派生的四把子金鑰（hash / chunk / meta / index）。
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RepoKeys {
@@ -364,20 +350,7 @@ impl RepoKeys {
 
     /// 加密一個 chunk 的 payload（明文或已壓縮），回傳 pack entry bytes：nonce ‖ 密文 ‖ tag。
     pub fn seal_chunk(&self, id: &ChunkId, payload: &[u8]) -> Result<Vec<u8>> {
-        let nonce = random_bytes::<CHUNK_NONCE_LEN>()?;
-        let ct = cipher(&self.chunk_key)
-            .encrypt(
-                &XNonce::from(nonce),
-                Payload {
-                    msg: payload,
-                    aad: id.as_bytes(),
-                },
-            )
-            .map_err(|_| CryptoError::AuthFailed)?;
-        let mut out = Vec::with_capacity(CHUNK_NONCE_LEN + ct.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
-        Ok(out)
+        seal(&self.chunk_key, id.as_bytes(), payload)
     }
 
     /// 解開 pack entry，回傳 payload（algorithm byte 在裡面，呼叫端處理）。
@@ -431,8 +404,7 @@ impl RepoKeys {
         open(&self.index_key, kist_format::AAD_PACK_TRAILER, bytes)
     }
 
-    /// 密封 index blob：index key，AAD = 角色常數。
-    /// 密封 index blob：**吃掉**明文 buffer、就地加密（tag 附加在後），
+    /// 密封 index blob：index key，AAD = 角色常數；**吃掉**明文 buffer、就地加密（tag 附加在後），
     /// 回傳 `nonce ‖ ct ‖ tag`（與 [`Self::open_index_blob`] 對應）。
     /// index blob 是 repo 裡最大的 meta（100 萬 chunk 的明文 ≈ 56 MiB），
     /// 就地加密省掉 `encrypt` 的整份密文拷貝。呼叫端先 `reserve(TAG_LEN)`
@@ -452,5 +424,37 @@ impl RepoKeys {
     /// 解開 index blob。
     pub fn open_index_blob(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         open(&self.index_key, kist_format::AAD_INDEX, bytes)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// 密碼對、AEAD 也過，但解開的 payload 不到 master key 的 32 bytes：
+    /// 要回長度錯，不能 panic、也不能謊報成密碼錯。
+    #[test]
+    fn short_unwrapped_payload_is_a_length_error() {
+        let binding = KeyBinding {
+            repo_id: vec![9; 16],
+            chunker: kist_format::config::ChunkerParams::default(),
+        };
+        let cost = KdfCost {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let (mut slot, _) = create_key_slot(b"pw", "d", 0, cost, &binding).unwrap();
+        let kek = kdf(b"pw", &slot.kdf).unwrap();
+        slot.wrapped = seal(&kek, kist_format::AAD_MASTER, &[7; 31]).unwrap();
+        match unlock_key_slot(b"pw", &slot) {
+            Err(CryptoError::BadLength {
+                what: "unwrapped master payload",
+                expected: 32,
+                actual: 31,
+            }) => {}
+            other => panic!("want BadLength for a 31-byte payload, got {other:?}"),
+        }
     }
 }

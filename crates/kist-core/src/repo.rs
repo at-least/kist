@@ -1,4 +1,4 @@
-//! 打開 / 建立 repo，以及各種物件的讀寫幫手（v2）。
+//! 打開 / 建立 repo，以及各種物件的讀寫幫手。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -15,9 +15,6 @@ use zeroize::Zeroizing;
 
 use crate::index::ChunkIndex;
 use crate::{blocking, CoreError, Result};
-
-/// index blob / pack trailer 的壓縮等級（與 chunk 相同）。
-const ZSTD_LEVEL: i32 = 3;
 
 /// repo 裡目前所有 index blob 的原貌：prune 需要看每個 pack 完整的 entries（而不是
 /// `ChunkIndex` 每個 chunk 只記一個位置），才能判斷重複 chunk 所在的每個 pack 都活著。
@@ -92,7 +89,7 @@ fn encode_index_blob(blob: &IndexBlob) -> Result<Vec<u8>> {
             inner: Vec::new(),
             written: 0,
         },
-        ZSTD_LEVEL,
+        crate::pack::ZSTD_LEVEL,
     )
     .map_err(|e| CoreError::Corrupt {
         key: "index".to_owned(),
@@ -638,10 +635,7 @@ impl Repository {
         })
         .await?;
         // snapshot 不是以內容命名：用內容裡的 client 與時間反算 key，必須一致。
-        let ts = key.rsplit('/').next().ok_or_else(|| CoreError::Corrupt {
-            key: key.to_owned(),
-            reason: "not a snapshot key".to_owned(),
-        })?;
+        let ts = crate::snapshots::timestamp_of(key);
         let t = parse_key_timestamp(ts)?;
         let expected_ns: i64 =
             t.unix_timestamp_nanos()

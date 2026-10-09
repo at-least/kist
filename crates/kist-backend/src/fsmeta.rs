@@ -21,21 +21,37 @@ pub struct PosixMeta {
     pub nlink: u64,
 }
 
+#[cfg(unix)]
 pub fn capture(meta: &std::fs::Metadata) -> PosixMeta {
+    use std::os::unix::fs::MetadataExt;
     PosixMeta {
-        mode: mode_of(meta),
-        uid: uid_of(meta),
-        gid: gid_of(meta),
+        mode: meta.mode(),
+        uid: meta.uid(),
+        gid: meta.gid(),
         mtime_ns: mtime_ns_of(meta),
-        ctime_ns: ctime_ns_of(meta),
-        inode: inode_of(meta),
-        dev: dev_of(meta),
-        nlink: nlink_of(meta),
+        ctime_ns: meta.ctime().saturating_mul(1_000_000_000) + meta.ctime_nsec(),
+        inode: meta.ino(),
+        dev: meta.dev(),
+        nlink: meta.nlink(),
     }
 }
 
-pub fn path_to_bytes(path: &std::path::Path) -> Result<Vec<u8>, OsString> {
-    name_to_bytes(path.as_os_str()).ok_or_else(|| path.as_os_str().to_owned())
+#[cfg(not(unix))]
+pub fn capture(meta: &std::fs::Metadata) -> PosixMeta {
+    PosixMeta {
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        mtime_ns: mtime_ns_of(meta),
+        ctime_ns: 0,
+        inode: 0,
+        dev: 0,
+        nlink: 0,
+    }
+}
+
+pub fn path_to_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    name_to_bytes(path.as_os_str())
 }
 
 pub fn name_to_bytes(name: &OsStr) -> Option<Vec<u8>> {
@@ -50,26 +66,18 @@ pub fn name_to_bytes(name: &OsStr) -> Option<Vec<u8>> {
     }
 }
 
-pub fn bytes_to_name(bytes: &[u8]) -> Result<OsString, String> {
+/// bytes → OS 名稱；無法轉換（Windows 非 UTF-8）時 panic-free 地 lossy。
+/// 只用於來源路徑拼接——名稱來自來源列目，這裡不會失敗（失敗也無處回報）。
+pub fn bytes_to_os(bytes: &[u8]) -> OsString {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
-        Ok(OsString::from_vec(bytes.to_vec()))
+        OsString::from_vec(bytes.to_vec())
     }
     #[cfg(not(unix))]
     {
-        String::from_utf8(bytes.to_vec())
-            .map(OsString::from)
-            .map_err(|_| String::from_utf8_lossy(bytes).into_owned())
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
     }
-}
-
-/// bytes → OS 名稱；無法轉換（Windows 非 UTF-8）時 panic-free 地 lossy。
-/// 只用於來源路徑拼接——名稱來自來源列目，與 bytes_to_name 的差別在這裡
-/// 不會失敗（失敗也無處回報）。
-pub fn bytes_to_os(bytes: &[u8]) -> OsString {
-    bytes_to_name(bytes)
-        .unwrap_or_else(|_| OsString::from(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 pub fn os_to_bytes(name: OsString) -> Vec<u8> {
@@ -90,81 +98,4 @@ pub(crate) fn mtime_ns_of(meta: &std::fs::Metadata) -> i64 {
             Err(_) => i64::MIN,
         },
     }
-}
-
-#[cfg(unix)]
-fn ctime_ns_of(meta: &std::fs::Metadata) -> i64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.ctime().saturating_mul(1_000_000_000) + meta.ctime_nsec()
-}
-
-#[cfg(not(unix))]
-fn ctime_ns_of(_: &std::fs::Metadata) -> i64 {
-    0
-}
-
-#[cfg(unix)]
-fn dev_of(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.dev()
-}
-
-#[cfg(not(unix))]
-fn dev_of(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
-fn nlink_of(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.nlink()
-}
-
-#[cfg(not(unix))]
-fn nlink_of(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
-fn inode_of(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.ino()
-}
-
-#[cfg(not(unix))]
-fn inode_of(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
-fn mode_of(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.mode()
-}
-
-#[cfg(not(unix))]
-fn mode_of(_: &std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(unix)]
-fn uid_of(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.uid()
-}
-
-#[cfg(not(unix))]
-fn uid_of(_: &std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(unix)]
-fn gid_of(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.gid()
-}
-
-#[cfg(not(unix))]
-fn gid_of(_: &std::fs::Metadata) -> u32 {
-    0
 }

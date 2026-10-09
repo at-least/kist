@@ -111,12 +111,12 @@ impl Repository {
                     }
                 }
                 // 不讀資料也能抓到 size 與 chunk 總長不符（例如備份中變動的檔）
-                if complete && sum != f.size {
+                if complete && sum != f.node.size {
                     file_errors.push(format!(
                         "{}: file {:?} says {} bytes but its chunks total {sum}",
                         f.tree_key,
                         String::from_utf8_lossy(&f.node.name),
-                        f.size
+                        f.node.size
                     ));
                 }
             })
@@ -192,9 +192,14 @@ impl Repository {
     }
 
     /// 整包 pack 的 hash 在 blocking 執行緒算：BLAKE3 掃可達數十 MiB 的內容，
-    /// 屬 PLAN 點名的 CPU 密集工作，不該佔住 async worker。
-    async fn hash_matches(bytes: Arc<Vec<u8>>, expected: ObjectId) -> Result<bool> {
-        blocking(move || Ok(ObjectId::of(&bytes) == expected)).await
+    /// 屬 PLAN 點名的 CPU 密集工作，不該佔住 async worker。`bytes` 搬進去
+    /// 再帶回來（同 backup.rs 的 handle_finished），呼叫端之後還要用。
+    async fn hash_matches(bytes: Vec<u8>, expected: ObjectId) -> Result<(Vec<u8>, bool)> {
+        blocking(move || {
+            let ok = ObjectId::of(&bytes) == expected;
+            Ok((bytes, ok))
+        })
+        .await
     }
 
     /// 下載整個 pack：名稱 = hash(bytes)、trailer 解得開、trailer 與 index 一致、每個 chunk 解得開且 ID 相符。
@@ -217,9 +222,8 @@ impl Repository {
         // PLAN：hash 屬 CPU 密集——整包 pack 的 BLAKE3（可達數十 MiB）在
         // blocking 執行緒算，不佔住 async worker（同一原則：下面的 trailer／
         // chunk 解密驗證也在 blocking 裡）。
-        let bytes = Arc::new(bytes);
-        let hash_ok = match Self::hash_matches(Arc::clone(&bytes), *id).await {
-            Ok(ok) => ok,
+        let (bytes, hash_ok) = match Self::hash_matches(bytes, *id).await {
+            Ok(r) => r,
             Err(e) => {
                 report.errors.push(format!("{key}: {e}"));
                 return;
@@ -246,36 +250,28 @@ impl Repository {
             let prefix = format!("{key}:");
             report.errors.retain(|e| !e.starts_with(&prefix));
             // 修復後重抓重驗：驗不過要說出來，不能讓 report 看起來乾淨。
-            match self.backend().get(&key).await {
-                Ok(b) => {
-                    let b = Arc::new(b);
-                    match Self::hash_matches(Arc::clone(&b), *id).await {
-                        Ok(true) => b,
-                        // hash 對不起來是「修復沒生效」；hash 工作本身失敗
-                        // （blocking 執行緒壞掉）是另一回事，照實回。
-                        Ok(false) => {
-                            report.errors.push(format!(
-                                "{key}: repaired pack does not re-verify; the repair did not stick"
-                            ));
-                            return;
-                        }
-                        Err(e) => {
-                            report.errors.push(format!("{key}: {e}"));
-                            return;
-                        }
-                    }
+            let not_stuck =
+                format!("{key}: repaired pack does not re-verify; the repair did not stick");
+            let Ok(b) = self.backend().get(&key).await else {
+                report.errors.push(not_stuck);
+                return;
+            };
+            match Self::hash_matches(b, *id).await {
+                Ok((b, true)) => b,
+                // hash 對不起來是「修復沒生效」；hash 工作本身失敗
+                // （blocking 執行緒壞掉）是另一回事，照實回。
+                Ok((_, false)) => {
+                    report.errors.push(not_stuck);
+                    return;
                 }
-                Err(_) => {
-                    report.errors.push(format!(
-                        "{key}: repaired pack does not re-verify; the repair did not stick"
-                    ));
+                Err(e) => {
+                    report.errors.push(format!("{key}: {e}"));
                     return;
                 }
             }
         };
         let keys = Arc::clone(self.keys());
         let max_chunk = u64::from(self.config().chunker.max);
-        let _id = *id;
         let key_for_task = key.clone();
         let result: Result<Vec<String>> = blocking(move || {
             let mut errs = Vec::new();

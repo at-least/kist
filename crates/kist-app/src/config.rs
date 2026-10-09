@@ -39,7 +39,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::duration::parse_duration;
 use crate::schedule::{Schedule, Timezone};
 use crate::{AppError, Result};
 
@@ -315,11 +314,6 @@ impl PruneSection {
             now: None,
         }
     }
-}
-
-/// 給 CLI 用：字串形式的時間長度也走同一個解析。
-pub fn duration(s: &str) -> Result<std::time::Duration> {
-    parse_duration(s).map_err(AppError::Config)
 }
 
 #[cfg(test)]

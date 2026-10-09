@@ -60,3 +60,48 @@ fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
     rng.fill(&mut v[..]);
     v
 }
+
+/// 觸發看的是**有效** blob（§10）。合併後被取代的舊 blob 要等 grace 才刪；
+/// 這段期間再跑 prune（沒有任何變動）不得把 index 再重寫一次——否則
+/// grace 內每次 prune 都多寫一顆整份 index。
+#[tokio::test]
+async fn superseded_blobs_waiting_for_grace_do_not_retrigger_compaction() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..(kist_core::MAX_EFFECTIVE_BLOBS + 1) as u64 {
+        std::fs::write(src.join(format!("f{i:03}.bin")), random_bytes(i, 1024)).unwrap();
+        repo.backup(std::slice::from_ref(&src), backup_options())
+            .await
+            .unwrap();
+    }
+    // 預設 grace：被取代的 blob 只被標記，不刪。
+    repo.prune(PruneOptions::default()).await.unwrap();
+    let mut errors = Vec::new();
+    let after_first = repo.load_index_blobs(&mut errors).await.unwrap();
+    assert_eq!(
+        after_first.effective.len(),
+        1,
+        "前置條件：第一次 prune 已合併"
+    );
+    assert!(
+        after_first.superseded.len() > kist_core::MAX_EFFECTIVE_BLOBS,
+        "前置條件：被取代的 blob 還在等 grace（{} 顆）",
+        after_first.superseded.len()
+    );
+    let effective_id = after_first.effective[0].0;
+
+    repo.prune(PruneOptions::default()).await.unwrap();
+    let after_second = repo.load_index_blobs(&mut errors).await.unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        after_second
+            .effective
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        vec![effective_id],
+        "只有 1 顆有效 blob、沒有任何變動：第二次 prune 不該重寫 index"
+    );
+}

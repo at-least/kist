@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use kist_core::restore::ReloadableIndex;
 use kist_core::{CoreError, Repository};
 use kist_format::keys;
-use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
+use kist_format::tree::{node_type, Entry};
 use kist_format::ChunkId;
 
 use crate::offsets::ChunkOffsets;
@@ -26,6 +26,15 @@ use crate::vpath::{RootContents, VEntry, VirtualRoot};
 pub const VOLATILE_TTL: Duration = Duration::from_secs(1);
 /// snapshot 內容（內容定址、不可變）的快取期限。
 pub const IMMUTABLE_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// inode 的 TTL 由它是否 volatile 決定（lookup 的回覆與 getattr 同一條規則）。
+fn ttl_of(volatile: bool) -> Duration {
+    if volatile {
+        VOLATILE_TTL
+    } else {
+        IMMUTABLE_TTL
+    }
+}
 
 /// mount 設定。`chunk_cache` = 解密後 chunk 的快取顆數（0 視為 1；預設 8；
 /// 8 MiB chunk 時上限 64 MiB）。
@@ -61,10 +70,10 @@ pub struct Attr {
 }
 
 impl Attr {
-    fn dir(perm: u32, mtime_ns: i64) -> Self {
+    fn dir(mtime_ns: i64) -> Self {
         Self {
             kind: Kind::Dir,
-            perm,
+            perm: 0o555,
             size: 0,
             uid: 0,
             gid: 0,
@@ -116,10 +125,7 @@ enum Node {
     Client {
         client: String,
     },
-    SnapshotRoot {
-        vroot: Arc<VirtualRoot>,
-    },
-    /// 絕對路徑根名的中介目錄（repo 裡沒有它）。
+    /// snapshot 根目錄（`level_key` 空）或絕對路徑根名的中介目錄（repo 裡沒有它）。
     SyntheticDir {
         vroot: Arc<VirtualRoot>,
         level_key: Vec<u8>,
@@ -155,12 +161,8 @@ struct InodeTable {
 impl InodeTable {
     fn with_root() -> Self {
         // insert 先加號再配號：next 從 0 起跳，根目錄才會拿到 FUSE 慣例的 ino 1。
-        let mut t = Self {
-            next: 0,
-            map: HashMap::new(),
-            names: HashMap::new(),
-        };
-        t.insert(Node::Root, Attr::dir(0o555, 0), true, None);
+        let mut t = Self::default();
+        t.insert(Node::Root, Attr::dir(0), true, None);
         t
     }
 
@@ -191,6 +193,11 @@ impl InodeTable {
         let ino = self.insert(node, attr, volatile, xattrs);
         self.names.insert(key, ino);
         ino
+    }
+
+    /// 同一個（父 ino, 名稱）之前由 [`Self::insert_named`] 配過的號。
+    fn known(&self, parent: u64, name: &[u8]) -> Option<u64> {
+        self.names.get(&(parent, name.to_vec())).copied()
     }
 
     /// 配一個全新的 inode 號：**永不重用**，所以 generation 恆為 0、
@@ -322,7 +329,6 @@ impl FsCore {
             for k in &fresh {
                 seen.keys.insert(k.clone());
             }
-            drop(seen);
             fresh
         };
         if fresh.is_empty() {
@@ -393,7 +399,7 @@ impl FsCore {
                 if !clients.iter().any(|c| c == client) {
                     return Err(FsError::NotFound);
                 }
-                let attr = Attr::dir(0o555, 0);
+                let attr = Attr::dir(0);
                 let ino = {
                     self.inodes
                         .lock()
@@ -436,45 +442,36 @@ impl FsCore {
                 // （檔案來源顯示成目錄、`/` 攤平顯示成空的）。
                 let mut degraded = false;
                 for root in &info.roots {
-                    let comps: Vec<&[u8]> = root
-                        .path
-                        .as_slice()
-                        .split(|&b| b == b'/')
-                        .filter(|c| !c.is_empty() && *c != b".")
-                        .collect();
-                    let contents = match comps.split_last() {
-                        // 定位沒有組件：攤平（`kist backup /` 的 v3 形態）。
-                        None => match self.repo.read_tree_chain(&root.tree).await {
-                            Ok(entries) => RootContents::Flatten(entries),
-                            Err(_) => {
-                                degraded = true;
-                                RootContents::Dir
-                            }
-                        },
-                        Some((last, _)) => {
-                            let leaf = match self.repo.read_tree_chain(&root.tree).await {
-                                Ok(entries) => matches!(
-                                    entries.as_slice(),
-                                    [e] if e.kind != node_type::DIR && e.name == *last
-                                )
-                                .then(|| Box::new(entries[0].clone())),
-                                Err(_) => {
-                                    degraded = true;
-                                    None
-                                }
-                            };
-                            match leaf {
-                                Some(e) => RootContents::Leaf(e),
-                                None => RootContents::Dir,
-                            }
+                    // 與 VirtualRoot::build、restore 同一份切段：兩邊不一致時，只有
+                    // scheme 的定位（`s3://`）會在這裡判成 Dir、在那裡沒有組件，
+                    // 整個 root 就從頂層消失。敵意 locator（NUL）拒成 InvalidInput。
+                    let comps = kist_core::fsmeta::locator_components(root.path.as_slice())
+                        .map_err(|_| FsError::InvalidInput)?;
+                    let contents = match self.repo.read_tree_chain(&root.tree).await {
+                        Err(_) => {
+                            degraded = true;
+                            RootContents::Dir
                         }
+                        Ok(entries) => match (comps.split_last(), entries.as_slice()) {
+                            // 定位沒有組件：攤平（`kist backup /` 的 v3 形態）。
+                            (None, _) => RootContents::Flatten(entries),
+                            (Some((last, _)), [e])
+                                if e.kind != node_type::DIR && e.name == *last =>
+                            {
+                                RootContents::Leaf(Box::new(e.clone()))
+                            }
+                            (Some(_), _) => RootContents::Dir,
+                        },
                     };
                     pairs.push((root.clone(), contents));
                 }
-                // 敵意 locator（NUL 等非法組件）在這裡拒成 I/O 錯。
+                // 敵意 locator（NUL 等非法組件）在這裡拒成 InvalidInput（EINVAL）。
                 let vroot = Arc::new(VirtualRoot::build(pairs).map_err(|_| FsError::InvalidInput)?);
-                let attr = Attr::dir(0o555, info.time_ns);
-                let node = Node::SnapshotRoot { vroot };
+                let attr = Attr::dir(info.time_ns);
+                let node = Node::SyntheticDir {
+                    vroot,
+                    level_key: Vec::new(),
+                };
                 let ino = {
                     let mut table = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
                     if degraded {
@@ -489,21 +486,8 @@ impl FsCore {
                 Ok(Lookup {
                     ino,
                     attr,
-                    ttl: if degraded {
-                        VOLATILE_TTL
-                    } else {
-                        IMMUTABLE_TTL
-                    },
+                    ttl: ttl_of(degraded),
                 })
-            }
-            Node::SnapshotRoot { vroot } => {
-                let v = VirtualRoot::lookup(vroot.top(), name).ok_or(FsError::NotFound)?;
-                // 頂層合成目錄的虛擬路徑 = "/<name>"（層級表 key 的慣例）
-                let mut child_key = Vec::with_capacity(name.len() + 1);
-                child_key.push(b'/');
-                child_key.extend_from_slice(name);
-                self.vchild_inode(parent_ino, name, v, Arc::clone(vroot), child_key)
-                    .await
             }
             Node::SyntheticDir { vroot, level_key } => {
                 let level = vroot.level(level_key);
@@ -533,7 +517,7 @@ impl FsCore {
     ) -> Result<Lookup, FsError> {
         match v {
             VEntry::Synthetic { .. } => {
-                let attr = Attr::dir(0o555, 0);
+                let attr = Attr::dir(0);
                 let ino = {
                     self.inodes
                         .lock()
@@ -559,6 +543,20 @@ impl FsCore {
 
     /// 真實 tree entry → inode。目錄在這裡就載好整段 chain（immutable）。
     async fn real_inode(&self, parent_ino: u64, name: &[u8], e: &Entry) -> Result<Lookup, FsError> {
+        // 同名已配過號（ADR 019 A6）：內容定址、形態不變，不必為了把新建的
+        // node 丟掉再讀一次 subtree。
+        let known = self
+            .inodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .known(parent_ino, name);
+        if let Some(ino) = known {
+            return Ok(Lookup {
+                ino,
+                attr: entry_attr(e),
+                ttl: IMMUTABLE_TTL,
+            });
+        }
         let xattrs = e.xattrs.as_ref().map(|m| {
             Arc::new(
                 m.iter()
@@ -566,7 +564,7 @@ impl FsCore {
                     .collect::<BTreeMap<_, _>>(),
             )
         });
-        let (node, attr) = match e.kind {
+        let node = match e.kind {
             node_type::DIR => {
                 let entries: Arc<Vec<Entry>> = if e.subtree.is_zero() {
                     Arc::new(Vec::new())
@@ -578,27 +576,22 @@ impl FsCore {
                             .map_err(|_| FsError::Io)?,
                     )
                 };
-                (Node::Dir { entries }, entry_attr(e))
+                Node::Dir { entries }
             }
-            node_type::FILE => (
-                Node::File {
-                    chunks: e.chunks.clone().into(),
-                    content: e.content,
-                    resolved: tokio::sync::OnceCell::new(),
-                },
-                entry_attr(e),
-            ),
-            node_type::SYMLINK => (
-                Node::Symlink {
-                    target: e.target.clone().into(),
-                },
-                entry_attr(e),
-            ),
+            node_type::FILE => Node::File {
+                chunks: e.chunks.clone().into(),
+                content: e.content,
+                resolved: tokio::sync::OnceCell::new(),
+            },
+            node_type::SYMLINK => Node::Symlink {
+                target: e.target.clone().into(),
+            },
             other => {
                 tracing::warn!("unknown tree entry kind {other}; refusing to serve it");
                 return Err(FsError::Io);
             }
         };
+        let attr = entry_attr(e);
         let ino = {
             self.inodes
                 .lock()
@@ -616,14 +609,7 @@ impl FsCore {
 
     pub fn getattr(&self, ino: u64) -> Result<(Attr, Duration), FsError> {
         let ino_entry = self.node(ino).ok_or(FsError::NotFound)?;
-        Ok((
-            ino_entry.attr,
-            if ino_entry.volatile {
-                VOLATILE_TTL
-            } else {
-                IMMUTABLE_TTL
-            },
-        ))
+        Ok((ino_entry.attr, ttl_of(ino_entry.volatile)))
     }
 
     pub fn readlink(&self, ino: u64) -> Result<Vec<u8>, FsError> {
@@ -639,8 +625,8 @@ impl FsCore {
     /// opendir：拍下目錄快照，回 fh。readdir 分頁都從這份讀。
     pub async fn opendir(&self, ino: u64) -> Result<u64, FsError> {
         let ino_entry = self.node(ino).ok_or(FsError::NotFound)?;
-        let listing = match &*ino_entry {
-            i if matches!(i.node, Node::Root) => {
+        let listing = match &ino_entry.node {
+            Node::Root => {
                 let clients = self.list_clients().await?;
                 Listing {
                     entries: clients
@@ -652,29 +638,23 @@ impl FsCore {
                         .collect(),
                 }
             }
-            i => match &i.node {
-                Node::Client { client } => {
-                    let keys = self.snapshot_keys_for(Some(client)).await?;
-                    Listing {
-                        entries: keys
-                            .iter()
-                            .filter_map(|k| k.rsplit('/').next())
-                            .map(|ts| DirEntryData {
-                                name: ts.as_bytes().to_vec(),
-                                kind: Kind::Dir,
-                            })
-                            .collect(),
-                    }
+            Node::Client { client } => {
+                let keys = self.snapshot_keys_for(Some(client)).await?;
+                Listing {
+                    entries: keys
+                        .iter()
+                        .map(|k| DirEntryData {
+                            name: kist_core::snapshots::timestamp_of(k).as_bytes().to_vec(),
+                            kind: Kind::Dir,
+                        })
+                        .collect(),
                 }
-                Node::SnapshotRoot { vroot } => listing_of_vlevel(vroot.top()),
-                Node::SyntheticDir { vroot, level_key } => {
-                    listing_of_vlevel(vroot.level(level_key))
-                }
-                Node::Dir { entries } => Listing {
-                    entries: entries.iter().map(dir_entry_data).collect(),
-                },
-                _ => return Err(FsError::InvalidInput),
+            }
+            Node::SyntheticDir { vroot, level_key } => listing_of_vlevel(vroot.level(level_key)),
+            Node::Dir { entries } => Listing {
+                entries: entries.iter().map(dir_entry_data).collect(),
             },
+            Node::File { .. } | Node::Symlink { .. } => return Err(FsError::InvalidInput),
         };
         let fh = {
             let mut t = self.listings.lock().unwrap_or_else(|e| e.into_inner());
@@ -757,19 +737,10 @@ impl FsCore {
         chunks: &[ChunkId],
         content: u8,
     ) -> Result<ResolvedFile, CoreError> {
-        let ids: Vec<ChunkId> = if content == content_type::DIRECT {
-            chunks.to_vec()
-        } else {
-            let mut bytes = Vec::new();
-            for id in chunks {
-                bytes.extend_from_slice(&self.repo.read_chunk_reloading(id, &self.index).await?);
-            }
-            let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
-                key: "<chunk list>".to_owned(),
-                reason: e.to_string(),
-            })?;
-            list.chunks
-        };
+        let ids = self
+            .repo
+            .resolve_chunks_reloading(chunks, content, &self.index)
+            .await?;
         let mut raw_lens = Vec::with_capacity(ids.len());
         for id in &ids {
             let len = self
@@ -785,19 +756,20 @@ impl FsCore {
         })
     }
 
-    async fn chunk_of(&self, id: &ChunkId) -> Result<Vec<u8>, FsError> {
+    async fn chunk_of(&self, id: &ChunkId) -> Result<bytes::Bytes, FsError> {
         if let Some(data) = self.lru.lock().unwrap_or_else(|e| e.into_inner()).get(id) {
-            return Ok(data.to_vec());
+            return Ok(data);
         }
-        let data = self
-            .repo
-            .read_chunk_reloading(id, &self.index)
-            .await
-            .map_err(|_| FsError::Io)?;
+        let data = bytes::Bytes::from(
+            self.repo
+                .read_chunk_reloading(id, &self.index)
+                .await
+                .map_err(|_| FsError::Io)?,
+        );
         self.lru
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .put(*id, bytes::Bytes::from(data.clone()));
+            .put(*id, data.clone());
         Ok(data)
     }
 
@@ -829,11 +801,7 @@ impl FsCore {
 
 fn entry_attr(e: &Entry) -> Attr {
     Attr {
-        kind: match e.kind {
-            node_type::DIR => Kind::Dir,
-            node_type::SYMLINK => Kind::Symlink,
-            _ => Kind::File,
-        },
+        kind: kind_of(e.kind),
         perm: e.mode.unwrap_or(0o555) & 0o7777,
         size: if e.kind == node_type::FILE {
             e.size

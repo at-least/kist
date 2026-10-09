@@ -47,41 +47,41 @@ pub fn path_to_bytes(path: &Path) -> Result<Vec<u8>> {
     name_to_bytes(path.as_os_str())
 }
 
-/// bytes → 路徑，並去掉根（`/` 或 `C:\`），讓它可以接在 restore 目標底下。
-pub fn bytes_to_relative_path(bytes: &[u8]) -> Result<PathBuf> {
-    locator_to_relative(bytes)
-}
-
-/// v3 的 root 定位字串（`Root.path`）→ restore 目標底下的相對路徑。
-/// 本機絕對路徑 `/srv/data` → `srv/data`；帶 scheme 的遠端定位去掉 scheme
-/// 後切段：`s3://bucket/prefix` → `bucket/prefix`、`sftp://host/path` →
-/// `host/path`（docs/format.md §9 的 restore 映射）。
-pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
+/// v3 的 root 定位字串（`Root.path`）→ 路徑組件：restore 與 mount 共用的
+/// 切段規則（docs/format.md §9）——去掉 `scheme://`、以 `/` 切段、空與 `.`
+/// 組件丟掉、`..` 映射成 `__parent__`（restore 不往目標之外走；字面 `..` 在
+/// FUSE 目錄裡是核心自己的東西）；組件含 NUL 就拒：NUL 不是路徑元件
+/// （Unix 的 bytes_to_name 什麼都收），也不是合法的 FUSE 目錄項位元組。
+pub fn locator_components(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     // 去掉 `scheme://`（有 scheme 且後接 // 才剝；Windows 的 `C:` 不會中）。
     let rest = match bytes.iter().position(|&b| b == b':') {
         Some(i) if bytes.len() >= i + 3 && &bytes[i + 1..i + 3] == b"//" => &bytes[i + 3..],
         _ => bytes,
     };
-    let mut rel = PathBuf::new();
-    for comp in rest.split(|&b| b == b'/') {
-        match comp {
-            b"" | b"." => {}
-            b".." => rel.push("__parent__"),
-            // NUL 不是路徑元件：Unix 的 bytes_to_name 什麼
-            // 都收，得在這裡擋。
-            name if name.contains(&0) => {
-                return Err(crate::CoreError::Corrupt {
-                    key: "<locator>".to_owned(),
-                    reason: format!(
-                        "locator component {:?} is not a path component",
-                        String::from_utf8_lossy(name)
-                    ),
-                })
-            }
-            name => rel.push(bytes_to_name(name)?),
-        }
-    }
-    Ok(rel)
+    rest.split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+        .map(|c| match c {
+            b".." => Ok(b"__parent__" as &[u8]),
+            name if name.contains(&0) => Err(CoreError::corrupt(
+                "<locator>",
+                format!(
+                    "locator component {:?} is not a path component",
+                    String::from_utf8_lossy(name)
+                ),
+            )),
+            name => Ok(name),
+        })
+        .collect()
+}
+
+/// [`locator_components`] → restore 目標底下的相對路徑。本機絕對路徑
+/// `/srv/data` → `srv/data`；遠端定位 `s3://bucket/prefix` → `bucket/prefix`、
+/// `sftp://host/path` → `host/path`。
+pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
+    locator_components(bytes)?
+        .into_iter()
+        .map(bytes_to_name)
+        .collect()
 }
 
 /// restore 用：tree 裡的子節點名稱來自 repo 內容，必須是「單一路徑元件」。
@@ -148,10 +148,7 @@ pub fn meta_of_entry(entry: &Entry) -> FsMeta {
 /// 只有一個（sftp 的選填欄位）當成沒記錄：只改 uid 會留下 root 的 gid，
 /// setgid 指向 gid 0 一樣是提權。
 pub fn owner_of_entry(entry: &Entry) -> Option<(u32, u32)> {
-    match (entry.uid, entry.gid) {
-        (Some(uid), Some(gid)) => Some((uid, gid)),
-        _ => None,
-    }
+    entry.uid.zip(entry.gid)
 }
 
 /// backup 快速路徑的完整判斷：size 相同，且 [`unchanged`] 成立。
@@ -250,16 +247,9 @@ pub fn apply_xattrs(
         }
         let name = std::ffi::OsStr::from_bytes(name);
         // 本機的 I/O 錯誤，不是 repo 損壞（ADR 019 A30）：維持 Io、保留錯誤
-        // 種類，訊息帶 xattr 名稱（寫法同 owner_error）。
+        // 種類，訊息帶 xattr 名稱。
         file.set_xattr(name, value.as_ref()).map_err(|e| {
-            let kind = e.kind();
-            CoreError::io(
-                path,
-                std::io::Error::new(
-                    kind,
-                    format!("setting xattr {}: {e}", name.to_string_lossy()),
-                ),
-            )
+            io_with_context(path, format!("setting xattr {}", name.to_string_lossy()), e)
         })?;
     }
     Ok(())
@@ -391,11 +381,14 @@ pub(crate) fn check_owner_ids(uid: u32, gid: u32) -> std::io::Result<()> {
 
 /// 擁有者設不回去的錯誤（記進該節點）：訊息帶記錄的 uid／gid。
 pub(crate) fn owner_error(path: &Path, uid: u32, gid: u32, e: std::io::Error) -> CoreError {
+    io_with_context(path, format!("restoring owner uid {uid} gid {gid}"), e)
+}
+
+/// 本機 I/O 錯誤加上下文：維持 `Io`、保留錯誤種類（ADR 019 A30），訊息是
+/// `{context}: {e}`。
+fn io_with_context(path: &Path, context: String, e: std::io::Error) -> CoreError {
     let kind = e.kind();
-    CoreError::io(
-        path,
-        std::io::Error::new(kind, format!("restoring owner uid {uid} gid {gid}: {e}")),
-    )
+    CoreError::io(path, std::io::Error::new(kind, format!("{context}: {e}")))
 }
 
 #[cfg(all(test, unix))]

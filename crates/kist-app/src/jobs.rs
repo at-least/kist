@@ -1,7 +1,5 @@
 //! 一件工作 = 對設定檔描述的 repo 做一次 backup / forget / prune，回傳結果（給通知、metrics、UI 用）。
 
-use std::path::PathBuf;
-
 use kist_backend::Backend;
 use kist_core::{BackupOptions, ForgetOptions, ProgressCallback, Repository};
 use serde::Serialize;
@@ -10,7 +8,8 @@ use time::OffsetDateTime;
 use crate::config::Config;
 use crate::{client_id, AppError, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// 宣告順序就是同時到期時的執行順序（backup → forget → prune）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobKind {
     Backup,
@@ -55,7 +54,7 @@ pub struct JobOutcome {
     /// RFC 3339。
     pub started: String,
     pub duration_secs: f64,
-    /// 成功時的摘要（backup 的 stats、prune 的 report…），失敗時的錯誤訊息。
+    /// 成功時的摘要（backup 的 stats、prune 的 report…）；失敗時為 null，訊息在 `error`。
     pub detail: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -136,8 +135,7 @@ async fn run_job_inner(
                 progress,
                 source: kist_core::SourceSpec::default(),
             };
-            let paths: Vec<PathBuf> = b.paths.clone();
-            let summary = repo.backup(&paths, opts).await?;
+            let summary = repo.backup(&b.paths, opts).await?;
             let incomplete = summary.report.errors > 0;
             Ok((
                 incomplete,

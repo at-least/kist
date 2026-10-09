@@ -172,7 +172,7 @@ impl Metrics {
             v.as_u64().map(|n| n as i64)
         };
         match o.job {
-            crate::jobs::JobKind::Backup => {
+            JobKind::Backup => {
                 // BackupSummary 的形狀（jobs.rs 以 serde_json::to_value 放進
                 // detail）：stats 只有資料事實，過程計數在 report 之下。
                 if let Some(n) = get(&["stats", "files"]) {
@@ -191,7 +191,7 @@ impl Metrics {
                     self.backup_errors.set(n);
                 }
             }
-            crate::jobs::JobKind::Prune => {
+            JobKind::Prune => {
                 if let Some(n) = get(&["deleted_bytes"]) {
                     self.prune_deleted_bytes_total.inc_by(n as u64);
                 }
@@ -202,7 +202,7 @@ impl Metrics {
                     self.prune_live_packs.set(n);
                 }
             }
-            crate::jobs::JobKind::Forget => {}
+            JobKind::Forget => {}
         }
     }
 

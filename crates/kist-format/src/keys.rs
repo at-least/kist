@@ -65,17 +65,8 @@ pub fn parity(pack_id: &ObjectId) -> String {
     format!("{PARITY_PREFIX}/{pack_id}")
 }
 
-pub fn key_slot(slot_id: &str) -> String {
-    format!("{KEYS_PREFIX}/{slot_id}")
-}
-
 /// 待刪標記；`id` 是 pack / index 的名稱。
 pub fn gc(id: &ObjectId) -> String {
-    format!("{GC_PREFIX}/{id}")
-}
-
-/// 樹的待刪標記（`gc/` 命名空間以 hex 共用）。
-pub fn gc_tree(id: &TreeId) -> String {
     format!("{GC_PREFIX}/{id}")
 }
 
@@ -83,14 +74,6 @@ pub fn gc_tree(id: &TreeId) -> String {
 pub fn snapshot(client_id: &[u8], key_timestamp: &str) -> String {
     format!(
         "{SNAPSHOTS_PREFIX}/{}/{key_timestamp}",
-        hex::encode(client_id)
-    )
-}
-
-/// snapshot 的 `.r1` 副本（寫在主體**之前**：主體出現＝commit）。
-pub fn snapshot_replica(client_id: &[u8], key_timestamp: &str) -> String {
-    format!(
-        "{SNAPSHOTS_PREFIX}/{}/{key_timestamp}{REPLICA_SUFFIX}",
         hex::encode(client_id)
     )
 }
