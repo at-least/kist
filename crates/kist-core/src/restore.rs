@@ -320,16 +320,13 @@ fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
 /// ADR 019 A2：還原到既有、擁有者不可寫的目錄（例如同一個 snapshot 先前還原
 /// 出的 0o555）時，子項目的暫存檔建不進去。這個目錄記錄的 mode 會在子項目
 /// 寫完後重新套上（[`apply_meta`]），所以先暫時加上擁有者寫入權，回傳原本的
-/// 權限（套 metadata 失敗時放回去）。不會被重新套 mode 的目錄（s3/generic
-/// 來源沒有 mode 或 mtime）不動。fstat 與 chmod 都經往下走時開的那個 handle
-/// （ADR 019 A3、A4）；chmod 要能套 metadata 的 handle（[`DirHandle::meta_handle`]），
-/// 擁有者讀不了的目錄拿不到，照 chmod 失敗處理。
+/// 權限（套 metadata 失敗時放回去）。只對會被重新套 mode 的目錄呼叫（s3/generic
+/// 來源沒有 mode 或 mtime 的不動，見 [`PendingDir::child`]）。fstat 與 chmod 都經
+/// 往下走時開的那個 handle（ADR 019 A3、A4）；chmod 要能套 metadata 的 handle
+/// （[`DirHandle::meta_handle`]），擁有者讀不了的目錄拿不到，照 chmod 失敗處理。
 #[cfg(unix)]
-fn make_owner_writable(dir: &DirHandle, node: &Entry) -> Result<Option<std::fs::Permissions>> {
+fn make_owner_writable(dir: &DirHandle) -> Result<Option<std::fs::Permissions>> {
     use std::os::unix::fs::PermissionsExt;
-    if !mode_will_be_applied(node) {
-        return Ok(None);
-    }
     let original = dir.permissions()?;
     if original.mode() & 0o200 != 0 {
         return Ok(None);
@@ -351,8 +348,134 @@ fn make_owner_writable(dir: &DirHandle, node: &Entry) -> Result<Option<std::fs::
 
 /// 非 unix 沒有 mode 可還原（fsmeta 的 apply_mode 是空的），不需要。
 #[cfg(not(unix))]
-fn make_owner_writable(_: &DirHandle, _: &Entry) -> Result<Option<std::fs::Permissions>> {
+fn make_owner_writable(_: &DirHandle) -> Result<Option<std::fs::Permissions>> {
     Ok(None)
+}
+
+/// 還原路徑上的一層目錄，第一次要往裡面寫東西時才建立。還原目標本身一開始就開著
+/// （[`DirHandle`] 直接實作）；其他層是 [`PendingDir`]，沿 `parent` 一路接到目標。
+/// 每層只開著自己的一個 handle，同時開著的數目仍是遞迴深度（ADR 019 A4）。
+trait OpenDir {
+    /// 這一層的 handle，準備好往裡面寫：還沒建就先建（缺的上層一起建）；第一次寫入
+    /// 之前，既有的唯讀目錄暫時加上擁有者寫入權（[`make_owner_writable`]）。
+    fn open(&mut self) -> Result<&DirHandle>;
+    /// 這一層的完整路徑（錯誤訊息用；還沒建也算得出來）。
+    fn location(&self) -> &Path;
+}
+
+impl OpenDir for DirHandle {
+    fn open(&mut self) -> Result<&DirHandle> {
+        Ok(self)
+    }
+
+    fn location(&self) -> &Path {
+        self.path()
+    }
+}
+
+/// 目標底下還沒建（或還沒開）的一層：root 的落點，或 snapshot 裡的一個目錄。
+struct PendingDir<'p> {
+    parent: &'p mut dyn OpenDir,
+    make: Make,
+    path: PathBuf,
+    /// 這一層最後會套回記錄的 mode（[`mode_will_be_applied`]），所以既有的唯讀目錄
+    /// 可以先暫時加寫入權。root 的落點沒有 metadata，不加。
+    loosen: bool,
+    handle: Option<DirHandle>,
+    /// [`make_owner_writable`] 做過了（第一次往這層寫東西之前做一次）。
+    prepared: bool,
+    /// 暫時加上寫入權之前的權限：套 metadata 失敗時放回去。
+    loosened: Option<std::fs::Permissions>,
+}
+
+enum Make {
+    /// root 的落點：上一層（還原目標）底下的相對路徑，逐段建立
+    /// （[`DirHandle::create_dirs`]）。
+    Base(PathBuf),
+    /// snapshot 裡的目錄：上一層裡的這個名字。
+    Child(OsString),
+}
+
+impl<'p> PendingDir<'p> {
+    /// root 的落點 `rel`（目標底下）。
+    fn base(parent: &'p mut dyn OpenDir, rel: &Path) -> Self {
+        let path = parent.location().join(rel);
+        Self::new(parent, Make::Base(rel.to_path_buf()), path, false)
+    }
+
+    /// snapshot 裡的目錄節點 `node`，名字 `name`。
+    fn child(parent: &'p mut dyn OpenDir, name: &OsStr, node: &Entry) -> Self {
+        let path = parent.location().join(name);
+        let loosen = mode_will_be_applied(node);
+        Self::new(parent, Make::Child(name.to_os_string()), path, loosen)
+    }
+
+    fn new(parent: &'p mut dyn OpenDir, make: Make, path: PathBuf, loosen: bool) -> Self {
+        Self {
+            parent,
+            make,
+            path,
+            loosen,
+            handle: None,
+            prepared: false,
+            loosened: None,
+        }
+    }
+
+    /// 建立這一層（建過就沿用），不做寫入前的準備。
+    fn create(&mut self) -> Result<()> {
+        self.ensure(false).map(|_| ())
+    }
+
+    fn ensure(&mut self, for_writing: bool) -> Result<&DirHandle> {
+        let Self {
+            parent,
+            make,
+            loosen,
+            handle,
+            prepared,
+            loosened,
+            ..
+        } = self;
+        let handle = match handle {
+            Some(handle) => &*handle,
+            slot @ None => {
+                let above = parent.open()?;
+                let created = match make {
+                    Make::Base(rel) => above.create_dirs(rel)?,
+                    Make::Child(name) => above.create_child_dir(name)?,
+                };
+                &*slot.insert(created)
+            }
+        };
+        if for_writing && !*prepared {
+            *prepared = true;
+            if *loosen {
+                *loosened = make_owner_writable(handle)?;
+            }
+        }
+        Ok(handle)
+    }
+}
+
+impl OpenDir for PendingDir<'_> {
+    fn open(&mut self) -> Result<&DirHandle> {
+        self.ensure(true)
+    }
+
+    fn location(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// restore 走訪時一路帶著的東西。
+struct Walk<'w> {
+    /// 還原目標本身：硬連結的後續名字從這裡沿路徑重新找第一個名字（[`link_to_first`]）。
+    target_dir: DirHandle,
+    index: &'w ReloadableIndex,
+    summary: RestoreSummary,
+    /// 範圍是**整個 snapshot、跨 roots**（docs/format.md §8.3）。
+    hardlinks: HardLinks,
 }
 
 impl Repository {
@@ -377,11 +500,14 @@ impl Repository {
         let index = ReloadableIndex::new(self.load_index().await?);
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
         // 目標本身的 handle，整個 restore 都開著：每個 root 從它往下走；硬連結
-        // 跨 roots，後續名字也從它重新找第一個名字。
-        let target_dir = DirHandle::open_target(target)?;
-        let mut summary = RestoreSummary::default();
-        // 範圍是**整個 snapshot、跨 roots**（docs/format.md §8.3）。
-        let mut hardlinks = HardLinks::new();
+        // 跨 roots，後續名字也從它重新找第一個名字。兩份是同一個 fd（clone 不多開）。
+        let mut top = DirHandle::open_target(target)?;
+        let mut w = Walk {
+            target_dir: top.clone(),
+            index: &index,
+            summary: RestoreSummary::default(),
+            hardlinks: HardLinks::new(),
+        };
         for root in &snapshot.roots {
             let rel = fsmeta::locator_to_relative(root.path.as_slice())?;
             let entries = self.read_tree_chain(&root.tree).await?;
@@ -399,25 +525,18 @@ impl Repository {
             } else {
                 rel.as_path()
             };
-            let base = target_dir.create_dirs(base_rel)?;
+            // 落點建不起來（例如擋著 symlink）：整個 restore 回錯，不是某一項的錯。
+            let mut base = PendingDir::base(&mut top, base_rel);
+            base.create()?;
             for entry in entries {
                 // v3：節點名一律是單一路徑元件（合成根已淘汰）。
                 fsmeta::validate_child_name(&entry.name)?;
                 let name = fsmeta::bytes_to_name(&entry.name)?;
-                self.restore_node(
-                    &entry,
-                    &base,
-                    &name,
-                    1,
-                    &target_dir,
-                    &index,
-                    &mut summary,
-                    &mut hardlinks,
-                )
-                .await;
+                base.open()?;
+                self.restore_node(&mut w, &mut base, &entry, &name, 1).await;
             }
         }
-        Ok(summary)
+        Ok(w.summary)
     }
 
     /// 還原一個節點：`dir` 這一層裡的 `name`。錯誤記進 summary，不往上拋：一個
@@ -426,21 +545,17 @@ impl Repository {
     /// chain 只能出自腐壞或敵意 repo——記錄錯誤、不深入，否則遞迴會把
     /// process 墊進 stack overflow。這個上限同時是同時開著的目錄 handle 數的
     /// 上限（每層一個，ADR 019 A4）。
-    #[allow(clippy::too_many_arguments)] // depth 與目標的 handle 都得帶進遞迴
-    fn restore_node<'a>(
+    fn restore_node<'a, 'w: 'a>(
         &'a self,
+        w: &'a mut Walk<'w>,
+        dir: &'a mut dyn OpenDir,
         node: &'a Entry,
-        dir: &'a DirHandle,
         name: &'a OsStr,
         depth: usize,
-        target_dir: &'a DirHandle,
-        index: &'a ReloadableIndex,
-        summary: &'a mut RestoreSummary,
-        hardlinks: &'a mut HardLinks,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
             // 完整路徑只用在錯誤訊息；實際操作都經 `dir`（ADR 019 A4）。
-            let path = dir.child_path(name);
+            let path = dir.location().join(name);
             let result = match node.kind {
                 node_type::DIR if !node.subtree.is_zero() => {
                     if depth >= MAX_TREE_DEPTH {
@@ -452,17 +567,16 @@ impl Repository {
                             ),
                         })
                     } else {
-                        self.restore_dir(
-                            node, dir, name, depth, target_dir, index, summary, hardlinks,
-                        )
-                        .await
+                        self.restore_dir(w, dir, node, name, depth).await
                     }
                 }
-                node_type::FILE => {
-                    self.restore_file_entry(node, dir, name, target_dir, index, summary, hardlinks)
-                        .await
-                }
-                node_type::SYMLINK => restore_symlink(dir, name, node, summary),
+                node_type::FILE => match dir.open() {
+                    Ok(dir) => self.restore_file_entry(w, node, dir, name).await,
+                    Err(e) => Err(e),
+                },
+                node_type::SYMLINK => dir
+                    .open()
+                    .and_then(|dir| restore_symlink(dir, name, node, &mut w.summary)),
                 other => Err(CoreError::Corrupt {
                     key: path.display().to_string(),
                     reason: format!("unknown node type {other}"),
@@ -470,7 +584,7 @@ impl Repository {
             };
             if let Err(e) = result {
                 tracing::warn!("{}: {e}", path.display());
-                summary.errors.push(format!("{}: {e}", path.display()));
+                w.summary.errors.push(format!("{}: {e}", path.display()));
             }
         })
     }
@@ -478,29 +592,25 @@ impl Repository {
     /// 還原一個 FILE 節點：硬連結的第二個以後的名字先試 link 到第一個，不成
     /// 就退回複製；複製走暫存檔＋rename（ADR 019 A2）。commit 成功才計數、
     /// 才記進硬連結表——metadata 套不上時也是（內容已經對了，錯另外回）。
-    #[allow(clippy::too_many_arguments)] // 同 restore_node
     async fn restore_file_entry(
         &self,
+        w: &mut Walk<'_>,
         node: &Entry,
         dir: &DirHandle,
         name: &OsStr,
-        target_dir: &DirHandle,
-        index: &ReloadableIndex,
-        summary: &mut RestoreSummary,
-        hardlinks: &mut HardLinks,
     ) -> Result<()> {
         let path = dir.child_path(name);
         let hardlink_key = (node.nlink.unwrap_or(0) > 1)
             .then_some((node.dev.unwrap_or(0), node.inode.unwrap_or(0)))
             .filter(|k| k.1 != 0);
-        if let Some(first) = hardlink_key.and_then(|k| hardlinks.get(&k)) {
-            match link_to_first(target_dir, first, dir, name) {
+        if let Some(first) = hardlink_key.and_then(|k| w.hardlinks.get(&k)) {
+            match link_to_first(&w.target_dir, first, dir, name) {
                 Ok(()) => {
-                    summary.files += 1;
+                    w.summary.files += 1;
                     return Ok(());
                 }
                 Err(e) => {
-                    let first_path = target_dir.path().join(first.iter().collect::<PathBuf>());
+                    let first_path = w.target_dir.path().join(first.iter().collect::<PathBuf>());
                     tracing::warn!(
                         "{}: cannot hard-link to {}: {e}; restoring a copy",
                         path.display(),
@@ -511,7 +621,7 @@ impl Repository {
         }
         // 硬連結失敗後的複製也走這裡。失敗時暫存檔隨錯誤被 drop 刪掉；正式名
         // 底下原有的檔沒被碰過，不能再像以前那樣 remove_file(path)（ADR 019 A2）。
-        let temp = self.restore_file(dir, name, node, index).await?;
+        let temp = self.restore_file(dir, name, node, w.index).await?;
         #[cfg(all(test, unix))]
         meta_via_handle_tests::before_meta(&temp.temp.path(), &path);
         // metadata 經寫入內容的同一個 handle 套用（ADR 019 A3）：路徑在寫完
@@ -525,9 +635,9 @@ impl Repository {
         let TempFile { file, temp } = temp;
         drop(file);
         temp.commit(name)?;
-        summary.files += 1;
+        w.summary.files += 1;
         if let Some(k) = hardlink_key {
-            hardlinks.insert(k, dir.child_rel(name));
+            w.hardlinks.insert(k, dir.child_rel(name));
         }
         applied.and(owner)
     }
@@ -537,46 +647,40 @@ impl Repository {
     /// 之後被搬走、原位換成 symlink，子項目與 metadata 都跟著真目錄走，不會
     /// 落到 symlink 指的地方。handle 在子項目還原期間一直開著：同時開著的
     /// 數目是遞迴深度，不是 entry 數。
-    #[allow(clippy::too_many_arguments)] // 同 restore_node
     async fn restore_dir(
         &self,
+        w: &mut Walk<'_>,
+        parent: &mut dyn OpenDir,
         node: &Entry,
-        parent: &DirHandle,
         name: &OsStr,
         depth: usize,
-        target_dir: &DirHandle,
-        index: &ReloadableIndex,
-        summary: &mut RestoreSummary,
-        hardlinks: &mut HardLinks,
     ) -> Result<()> {
-        let dir = parent.create_child_dir(name)?;
+        let mut dir = PendingDir::child(parent, name, node);
+        dir.create()?;
         let children = self.read_tree_chain(&node.subtree).await?;
-        // 既有的唯讀目錄先暫時加上擁有者寫入權（ADR 019 A2）。放在讀完子 tree
-        // 之後：從這裡到下面重新套 mode 之間沒有提早 return——子項目的錯誤記進
-        // summary、不往上拋；迴圈裡的 bytes_to_name 在 unix（唯一會加寫入權的
-        // 平台）不會失敗。
-        let loosened = make_owner_writable(&dir, node)?;
+        // 既有的唯讀目錄在第一個子項目寫進去之前暫時加上擁有者寫入權（ADR 019 A2，
+        // [`PendingDir::open`]）。在讀完子 tree 之後：從那裡到下面重新套 mode 之間沒有
+        // 提早 return——子項目的錯誤記進 summary、不往上拋；迴圈裡的 bytes_to_name 在
+        // unix（唯一會加寫入權的平台）不會失敗。
         for child in children {
             if let Err(e) = fsmeta::validate_child_name(&child.name) {
-                summary
+                w.summary
                     .errors
-                    .push(format!("{}: {e}", dir.path().display()));
+                    .push(format!("{}: {e}", dir.location().display()));
                 continue;
             }
             let child_name = fsmeta::bytes_to_name(&child.name)?;
-            self.restore_node(
-                &child,
-                &dir,
-                &child_name,
-                depth + 1,
-                target_dir,
-                index,
-                summary,
-                hardlinks,
-            )
-            .await;
+            dir.open()?;
+            self.restore_node(w, &mut dir, &child, &child_name, depth + 1)
+                .await;
         }
-        summary.dirs += 1;
+        let PendingDir {
+            handle, loosened, ..
+        } = dir;
+        let Some(dir) = handle else {
+            return Ok(());
+        };
+        w.summary.dirs += 1;
         #[cfg(all(test, unix))]
         meta_via_handle_tests::before_meta(dir.path(), dir.path());
         // 子項目都寫完後才設目錄的 mtime，否則會被後續寫入覆蓋；順序見 apply_meta。
