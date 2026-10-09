@@ -433,6 +433,16 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
   455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
+## M12：v4 格式（2026-10-10 設計草稿，待負責人確認）
+
+起因：ADR 017 的 v4 草稿，加上 ADR 025 留下要改格式的 V19、V21。負責人同意先修完審查、合進 main、
+再開 `v4` 分支，並說明系統還沒上線、相容性不重要。
+
+- 設計：ADR 026（範圍與每個要選的地方）與 `docs/format-v4.md`（規格全文，確認並開始實作時取代
+  `docs/format.md`）。樹進 `mpacks/`、`Root.t`、樹段 8 MiB 上限、`IndexPack.kind`、mpack 的 `.r1`、
+  backup 零覆寫、`kist/v4/*`、GC 補條款；v4 不讀 v3。
+- 程式碼還沒動。七個實作階段見 ADR 026，每段完成照常 commit、回報、等確認。
+
 ## 已接受的限制（非待辦）
 
 - **Windows VSS 與 Windows 路徑語意驗證**：裁示為已接受的限制，自路線圖移除
