@@ -169,12 +169,18 @@ kist restore --dry-run latest /tmp/out --include '*.pdf'          # 只列出會
 - `--exclude`：不還原比對到的節點（目錄整棵不走）。與 `--include` 同時比對到時排除優先。
 - 與 backup 不同，restore 的樣式也比對 root 本身與它的上層：root 是 `/tmp/data` 的 snapshot，
   `--exclude tmp` 會排除整個 root。只想排除 root 底下名為 `tmp` 的目錄，寫 `/tmp/data/**/tmp`。
-- 沒有選到任何東西的 `--include`（比對不到，或比對到的全被排除）印警告、結束碼 3，`--json` 的
-  `unmatched_includes` 列出它們；其他選到的照樣還原。
+- 沒有選到任何東西的 include 樣式印警告、結束碼 3，`--json` 的 `unmatched_includes` 列出它們；其他選到
+  的照樣還原。一條樣式要涵蓋某個被還原的節點（比對到它或它的上層）才算選到東西：比對不到、比對到的全被
+  排除、或全被後面的 `!` 取消，都算沒選到。還原有錯誤時（例如某個目錄建不起來），失敗處底下沒有走到，
+  警告會註明這一點，不說成 snapshot 裡沒有。
+- 只有 `!` 樣式的 include 什麼都選不到，以結束碼 1 結束。
 - 硬連結的第一個名字沒被選到時，後面的名字還原成內容相同的獨立檔案。
 - `SNAPSHOT:PATH`（同 restic）：PATH 是 snapshot 裡的一個目錄（某個 root、root 裡的目錄，或幾個 root
   共同的上層），它的內容直接放進目標，不重建上面的路徑；目標本身不套那個目錄的 metadata。樣式照樣比對
-  snapshot 裡的完整路徑。PATH 不在 snapshot 裡或不是目錄時，以結束碼 1 結束。
+  snapshot 裡的完整路徑。PATH 不在 snapshot 裡或不是目錄時，以結束碼 1 結束，什麼都不建；PATH 所在的
+  root 被樣式排除時也照樣檢查。
+- root 的落點（`<target>/<原本的路徑>`）建不起來時（例如那裡擋著 symlink），整個還原以結束碼 1 結束，
+  即使 include 只選到更深的節點。
 - `--dry-run`：列出會寫的目錄、檔案、symlink（`dir`／`file`／`link` 加上目標底下的路徑），目標連建都
   不建；計數與「沒選到東西」的警告和真的還原相同。只讀 tree、不讀檔案內容，所以壞掉的 chunk、目標處
   擋著的東西這類錯誤只有真的還原才看得到。
@@ -193,7 +199,7 @@ kist restore --dry-run latest /tmp/out --include '*.pdf'          # 只列出會
 - snapshot 的 `paths` 原本是 OS bytes，JSON 裡以 UTF-8 呈現，非 UTF-8 的位元組會換成 U+FFFD。
 - `forget` / `prune` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個。
 - `backup` 的 `report.excluded`：被排除樣式比對到的項目數；`restore` 的 `unmatched_includes`：沒選到
-  東西的 `--include` 樣式，`dry_run`：是不是 `--dry-run`（是的話計數是「會還原」的）。
+  東西的 include 樣式（定義見上面的部分還原），`dry_run`：是不是 `--dry-run`（是的話計數是「會還原」的）。
 - `run --once --json` 印出 JobOutcome 陣列；常駐模式下每件工作結束印一行 JSON（NDJSON）。
 
 ### 設定檔與排程

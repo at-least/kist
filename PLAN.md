@@ -400,8 +400,8 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 ## M11：排除規則與部分還原（2026-10-10）【完成】
 
 起因：2026-10-09 與 restic 0.19.1 的功能比對，日常最先撞到的兩個缺口。負責人指示補上。分支
-`exclude-and-partial-restore`，三個 commit；設計、假設與證據見 ADR 020。格式不變（kist-format、
-`docs/format.md` 沒動）。
+`exclude-and-partial-restore`；設計、假設與證據見 ADR 020–025。格式不變（kist-format 沒動；
+`docs/format.md` 只更正 §9 一句錯誤的說明，見第六批）。
 
 - backup 的排除：`--exclude`、`--exclude-file`、設定檔 `[backup] exclude`。新的 `kist-core::filter`
   模組逐段比對樣式（`/` 開頭錨定，否則任何深度；`*`、`?`、`[...]`、整段 `**`、`\` 跳脫；`?` 是一個
@@ -422,10 +422,16 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   gitignore 行為）與不分大小寫的樣式（backup `--iexclude`／`--iexclude-file`、restore `--iinclude`／
   `--iexclude` 與樣式檔、設定檔 `iexclude`）。
 - 第五批（ADR 024）：`backup --files-from`／`--files-from-verbatim`／`--files-from-raw`（`-`＝標準輸入，
-  名稱與切法同 restic、不展開萬用字元）。至此 2026-10-09 比對時列在「來源篩選」與「部分還原」兩列的項目都
-  做了，只剩大括號維持字面字元（restic 與 gitignore 都沒有）。
-- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 443 過 1 略過（原 395）。
-  依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
+  名稱同 restic、不展開萬用字元；切法原本說同 restic，審查實測有出入，見第六批）。至此 2026-10-09 比對時
+  列在「來源篩選」與「部分還原」兩列的項目都做了，只剩大括號維持字面字元（restic 與 gitignore 都沒有）。
+- 第六批（ADR 025）：`/code-review` 的審查修正，八個 commit。巢狀的指名來源不再被排除；沒有 header 的記號只看
+  在不在；樣式比對與來源規劃從平方降到線性；`SNAPSHOT:PATH` 先驗證再建目錄；include 要涵蓋被還原的節點才
+  算選到東西，只有 `!` 的 include 是錯誤；唯讀目錄的 xattr、落點失敗、dry run 的目錄數；清單與樣式檔的
+  讀法（BOM、CRLF、raw 的格式錯誤、`-` 只能一次、沒有樣式的 include 樣式檔）；`Exclusions::new` 與平台
+  檢查。V19（檔案來源的判別有歧義）與 V21（每個 root 一個 tree）要改格式，留給 v4；`docs/format.md` §9
+  「沒有歧義代價」那句是錯的，已更正。
+- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
+  455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
 ## 已接受的限制（非待辦）
 
