@@ -135,8 +135,9 @@ kist backup / --one-file-system                # 不進入別的檔案系統（o
 
 - 記號檔：目錄裡有 `NAME` 時，除了記號本身，目錄的內容都不備份，目錄本身照備。寫成 `NAME:HEADER` 時，
   記號必須是開頭為 HEADER 的檔案。`--exclude-caches` 就是 `CACHEDIR.TAG` 加上規格的簽章
-  （<https://bford.info/cachedir/>；cargo 的 target 目錄與 `~/.cargo/registry` 都有這個檔）。每個目錄每個
-  記號查一次：本機是一次 lstat，遠端來源是多列一次那個目錄。
+  （<https://bford.info/cachedir/>；cargo 的 target 目錄與 `~/.cargo/registry` 都有這個檔）。沒有 HEADER
+  的記號只看在不在，讀不了也算數。每個目錄每個記號查一次：本機是一次 lstat，有 HEADER 時再讀開頭；遠端
+  來源是多列一次那個目錄。
 - 大小：`k`／`m`／`g`／`t` 以 1024 為底、不分大小寫；只排除比它大的，剛好等於的照備。
 - `--one-file-system`：裝置號碼和它所屬來源不同的目錄（掛載點，**也包括 btrfs 的子卷**）照備成空目錄，
   底下不走。`/home` 是另一個檔案系統或子卷時，`kist backup / --one-file-system` 不含 `/home` 的內容，

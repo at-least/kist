@@ -428,3 +428,45 @@ async fn a_named_source_inside_another_is_never_excluded() {
         "x/other 與 m/drop 照樣被排除"
     );
 }
+
+/// 審查修正：沒有 header 的記號只看在不在，讀不了（權限 000）也算數——restic 0.19.1 同樣
+/// 會排除該目錄的內容。記號本身照樣備份，讀不了就是一個略過的錯誤。
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_marker_without_a_header_still_counts() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    files(
+        &src,
+        &[("d/x.txt", b"x"), ("d/.nobackup", b""), ("y.txt", b"y")],
+    );
+    std::fs::set_permissions(
+        src.join("d/.nobackup"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let repo = t.open().await;
+    let opts = with(Exclusions {
+        patterns: PathFilter::new(&[".nobackup"]).unwrap(),
+        if_present: vec![Marker::parse(".nobackup").unwrap()],
+        ..Exclusions::default()
+    });
+    let s = repo.backup(std::slice::from_ref(&src), opts).await.unwrap();
+    assert_eq!(s.report.errors, 0, "{:?}", s.report);
+    assert_eq!(s.report.excluded, 2, "x.txt 與記號本身：{:?}", s.report);
+    std::fs::set_permissions(
+        src.join("d/.nobackup"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let target = tempfile::tempdir_in(t.dir.path()).unwrap().keep();
+    repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let abs = std::fs::canonicalize(&src).unwrap();
+    assert_eq!(
+        names_under(&target.join(abs.strip_prefix("/").unwrap())),
+        set(&["d", "y.txt"])
+    );
+}
