@@ -58,6 +58,10 @@ password_file = "/tmp/p"
 paths = ["/etc"]
 schedule = "0 2 * * *"
 gc_grace = "48h"
+exclude_if_present = [".nobackup"]
+exclude_caches = true
+exclude_larger_than = "100M"
+one_file_system = true
 [forget]
 keep_daily = 7
 keep_within = "2w"
@@ -75,6 +79,16 @@ on = ["failure", "success"]
         cfg.backup.as_ref().unwrap().gc_grace,
         Some(std::time::Duration::from_secs(48 * 3600))
     );
+    let exclusions = cfg.backup.as_ref().unwrap().exclusions().unwrap();
+    assert_eq!(exclusions.larger_than, Some(100 << 20));
+    assert_eq!(
+        exclusions.if_present,
+        [
+            kist_core::Marker::parse(".nobackup").unwrap(),
+            kist_core::Marker::cachedir_tag()
+        ]
+    );
+    assert!(exclusions.one_file_system);
     assert_eq!(
         cfg.forget.as_ref().unwrap().policy().keep_within,
         Some(std::time::Duration::from_secs(14 * 86_400))
@@ -100,6 +114,8 @@ on = ["failure", "success"]
         ("repo = \"/x\"\npassword_file = \"/p\"\npassword = \"inline\"\n[backup]\npaths = [\"/e\"]\n", "unknown field"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"3 days\"\n", "unknown unit"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude = [\"*.tmp\", \"[bad\"]\n", "[backup] exclude: invalid pattern \"[bad\""),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_if_present = [\"a/b\"]\n", "[backup] exclude_if_present"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = \"1MB\"\n", "unknown unit"),
     ];
     for (text, needle) in bad {
         let err = Config::parse(text)

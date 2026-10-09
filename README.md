@@ -106,6 +106,25 @@ kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行�
 - 樣式寫錯（例如沒關上的 `[`、夾在字裡的 `**`、`.`／`..` 段）時，backup 在碰 repo 之前就以結束碼 1
   結束；樣式檔裡的錯誤點名 `檔案:行號`。設定檔裡寫錯，`kist run`／`kist serve` 起不來。
 
+樣式以外的排除條件（設定檔的對應鍵寫在括號裡）：
+
+```sh
+kist backup ~ --exclude-caches                 # 有 CACHEDIR.TAG 的快取目錄（exclude_caches = true）
+kist backup ~ --exclude-if-present .nobackup   # 有 .nobackup 的目錄（exclude_if_present = [".nobackup"]）
+kist backup ~ --exclude-larger-than 2G         # 大於 2 GiB 的檔案（exclude_larger_than = "2G"）
+kist backup / --one-file-system                # 不進入別的檔案系統（one_file_system = true）
+```
+
+- 記號檔：目錄裡有 `NAME` 時，除了記號本身，目錄的內容都不備份，目錄本身照備。寫成 `NAME:HEADER` 時，
+  記號必須是開頭為 HEADER 的檔案。`--exclude-caches` 就是 `CACHEDIR.TAG` 加上規格的簽章
+  （<https://bford.info/cachedir/>；cargo 的 target 目錄與 `~/.cargo/registry` 都有這個檔）。每個目錄每個
+  記號查一次：本機是一次 lstat，遠端來源是多列一次那個目錄。
+- 大小：`k`／`m`／`g`／`t` 以 1024 為底、不分大小寫；只排除比它大的，剛好等於的照備。
+- `--one-file-system`：裝置號碼和它所屬來源不同的目錄（掛載點，**也包括 btrfs 的子卷**）照備成空目錄，
+  底下不走。`/home` 是另一個檔案系統或子卷時，`kist backup / --one-file-system` 不含 `/home` 的內容，
+  要一起備就把 `/home` 也列成來源。只適用 unix 的本機來源（遠端來源與 Windows 直接報錯）。
+- 這些條件和樣式一樣不排除指名的來源本身，被排除的都計進 `excluded`（掛載點、被清空內容的目錄裡每一項各算一個）。
+
 ### 部分還原（`restore --include`／`--exclude`）
 
 ```sh

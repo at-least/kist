@@ -112,9 +112,57 @@ pub struct BackupOptions {
     pub progress: Option<ProgressCallback>,
     /// 備份來源（預設 [`SourceSpec::LocalPaths`]：`paths` 是本機路徑）。
     pub source: SourceSpec,
-    /// 排除樣式（ADR 020）：比對到的檔案與目錄不進 snapshot（目錄整棵不走），計進
-    /// [`BackupReport::excluded`]。指名的來源本身不比對。空的（預設）＝不排除。
-    pub exclude: PathFilter,
+    /// 排除規則（ADR 020、021）：被排除的不進 snapshot，計進 [`BackupReport::excluded`]。
+    /// 指名的來源本身不排除。預設＝什麼都不排除。
+    pub exclude: Exclusions,
+}
+
+/// backup 的排除規則（ADR 020、021）。[`Default`]＝什麼都不排除。被排除的項目都計進
+/// [`BackupReport::excluded`]；指名的來源本身一律照備，規則只管它們底下的東西。
+#[derive(Debug, Clone, Default)]
+pub struct Exclusions {
+    /// 路徑樣式：比對到的檔案與目錄不進 snapshot（目錄整棵不走）。
+    pub patterns: PathFilter,
+    /// 記號檔：目錄裡有其中任何一個時，除了記號檔本身，目錄的內容都不備份；目錄本身照備。
+    pub if_present: Vec<Marker>,
+    /// 比這大（bytes）的檔案不備份；剛好等於的照備。
+    pub larger_than: Option<u64>,
+    /// 不進入別的檔案系統：裝置號碼與它所屬來源不同的目錄（掛載點、btrfs 子卷）照備成
+    /// 空目錄，這樣的檔案（單一檔案的 bind mount）不備份。只適用本機來源。
+    pub one_file_system: bool,
+}
+
+/// [`Exclusions::if_present`] 的記號檔：名稱，加上檔案開頭必須是的 bytes（空的＝任何
+/// 種類、任何內容都算）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    name: Vec<u8>,
+    header: Vec<u8>,
+}
+
+impl Marker {
+    /// `NAME` 或 `NAME:HEADER`（同 restic 的 `--exclude-if-present`）。NAME 是單一路徑元件；
+    /// 有 HEADER 時，記號必須是開頭為 HEADER 的一般檔案。
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (name, header) = spec.split_once(':').unwrap_or((spec, ""));
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(CoreError::Usage(format!(
+                "exclude marker {spec:?}: NAME must be a single file name (NAME or NAME:HEADER)"
+            )));
+        }
+        Ok(Self {
+            name: name.as_bytes().to_vec(),
+            header: header.as_bytes().to_vec(),
+        })
+    }
+
+    /// CACHEDIR.TAG（<https://bford.info/cachedir/>）：開頭是規格固定的 43 bytes 簽章。
+    pub fn cachedir_tag() -> Self {
+        Self {
+            name: b"CACHEDIR.TAG".to_vec(),
+            header: b"Signature: 8a477f597d28d172789f06886806bc55".to_vec(),
+        }
+    }
 }
 
 /// **過程計數**（v3 起不在格式裡——它們依 GC 狀態與去重順序而變，不同實作
@@ -207,6 +255,8 @@ struct FileFacts {
 /// xattr 讀取與進度顯示用。
 struct SourceCtx {
     source: Arc<dyn Source>,
+    /// [`Exclusions::one_file_system`] 時，這個本機目錄來源本身的裝置號碼；否則 `None`。
+    root_dev: Option<u64>,
 }
 
 impl SourceCtx {
@@ -338,8 +388,8 @@ struct Backup {
     /// 切塊緩衝池（每個 2×chunker.max）：整個 backup 重用同一批，不在每個
     /// 檔案各配一次。單執行緒走訪時通常只有一個；池化是為了之後並行切塊。
     chunk_bufs: Vec<Vec<u8>>,
-    /// 排除樣式（見 [`BackupOptions::exclude`]）。
-    exclude: PathFilter,
+    /// 排除規則（見 [`BackupOptions::exclude`]）。
+    exclude: Exclusions,
 }
 
 /// 一個檔案在 tree 裡的內容：大小、chunk 清單、content 型態（DIRECT／INDIRECT）。
@@ -695,6 +745,19 @@ impl Repository {
                 opts.parity
             )));
         }
+        // 遠端來源沒有裝置號碼可比，非 unix 的 capture 一律給 0：與其默默整個走進去，
+        // 不如一開始就拒絕。
+        if opts.exclude.one_file_system && !matches!(opts.source, SourceSpec::LocalPaths) {
+            return Err(CoreError::Usage(
+                "one-file-system compares local device numbers; it works on local source paths only"
+                    .to_owned(),
+            ));
+        }
+        if opts.exclude.one_file_system && cfg!(not(unix)) {
+            return Err(CoreError::Usage(
+                "one-file-system is not supported on this platform (no device numbers)".to_owned(),
+            ));
+        }
 
         // snapshot 的時間 = 開始時間：任何在這之後改動的檔案，下一次都必須重讀
         let started = opts.now.unwrap_or_else(time::OffsetDateTime::now_utc);
@@ -824,8 +887,16 @@ impl Repository {
                 .map(|(_, t)| *t);
             let tree = match plan {
                 RootPlan::LocalDir(path) => {
+                    let root_dev = if b.exclude.one_file_system {
+                        let meta = std::fs::symlink_metadata(&path)
+                            .map_err(|e| CoreError::io(&path, e))?;
+                        Some(kist_backend::fsmeta::capture(&meta).dev)
+                    } else {
+                        None
+                    };
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(path.clone())?),
+                        root_dev,
                     };
                     let state = b.root_state(&pb)?;
                     b.walk_dir(&ctx, b"", parent_subtree, 1, state).await?
@@ -850,6 +921,7 @@ impl Repository {
                     })?;
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(parent.to_path_buf())?),
+                        root_dev: None,
                     };
                     let item = local_file_item(&path, &name)?;
                     let parent_entry = parent_file_entry(self, parent_subtree, &name).await;
@@ -873,7 +945,10 @@ impl Repository {
                     b.write_tree(Tree::new(vec![entry], None)).await?
                 }
                 RootPlan::Remote(source) => {
-                    let ctx = SourceCtx { source };
+                    let ctx = SourceCtx {
+                        source,
+                        root_dev: None,
+                    };
                     // 遠端 root 的型態要靠列根判別：「恰好一個 File 且名稱＝
                     // 定位的最後元件」→ 檔案來源（與 restore 的 file-root
                     // 規則一致，docs/format.md §9）。這合約要求 Source 在
@@ -1048,11 +1123,37 @@ impl Backup {
     /// （[`fsmeta::locator_components`]，與 restore 的落點同一套）走下去。來源本身
     /// 符合樣式也照備——它是指名的，樣式只管它底下的東西。
     fn root_state(&self, locator: &[u8]) -> Result<FilterState> {
-        let mut state = self.exclude.start();
+        let patterns = &self.exclude.patterns;
+        let mut state = patterns.start();
         for name in fsmeta::locator_components(locator)? {
-            state = self.exclude.descend(&state, name);
+            state = patterns.descend(&state, name);
         }
         Ok(state)
+    }
+
+    /// `dir_rel` 裡出現的記號檔（[`Exclusions::if_present`]）名稱；沒有記號規則或一個都
+    /// 沒有 → `None`。判斷不了的記號（讀取錯誤）記警告、當作沒有：目錄照常整個備份，
+    /// 不會因此少備東西。
+    async fn markers_in(&self, ctx: &SourceCtx, dir_rel: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let mut found = Vec::new();
+        for marker in &self.exclude.if_present {
+            let rel = join_rel(dir_rel, &marker.name);
+            let source = Arc::clone(&ctx.source);
+            let limit = marker.header.len();
+            // probe 可能 block_on 遠端 API（同 list），在 blocking 執行緒上跑。
+            let probe =
+                crate::blocking(move || source.probe(&rel, limit).map_err(CoreError::from)).await;
+            match probe {
+                Ok(Some(head)) if head == marker.header => found.push(marker.name.clone()),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "{}: cannot check for {}: {e}; backing the directory up in full",
+                    ctx.display_path(dir_rel),
+                    String::from_utf8_lossy(&marker.name)
+                ),
+            }
+        }
+        (!found.is_empty()).then_some(found)
     }
 
     /// 回報目前進度（有 callback 才做）。
@@ -1066,7 +1167,8 @@ impl Backup {
         );
     }
 
-    /// 處理一個目錄項目，回傳它的 tree 節點；讀不到的回 `None`（略過並警告）。
+    /// 處理一個目錄項目，回傳它的 tree 節點；讀不到的（略過並警告）與在別的檔案系統上的
+    /// 檔案（[`Exclusions::one_file_system`]）回 `None`。
     /// 不論結果如何（寫進 tree、略過、記成錯誤），做完都回報一次進度。
     /// `filter`：這個項目在排除樣式裡的狀態，是目錄時往下走用。
     async fn process_entry(
@@ -1109,6 +1211,11 @@ impl Backup {
         } else {
             None
         };
+        // 不跨檔案系統（ADR 021）：裝置號碼與來源不同的目錄照備成空目錄，檔案不備份。
+        let other_fs = match (ctx.root_dev, &posix) {
+            (Some(root), Some(p)) => p.dev != root,
+            _ => false,
+        };
         let mut entry = Entry {
             name: item.name.clone(),
             kind: 0,
@@ -1145,9 +1252,17 @@ impl Backup {
                     Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
                     _ => None,
                 };
-                let subtree = self
-                    .walk_dir(ctx, rel, parent_subtree, depth + 1, filter)
-                    .await?;
+                let subtree = if other_fs {
+                    tracing::debug!(
+                        "{}: on another file system; kept as an empty directory",
+                        ctx.display_path(rel)
+                    );
+                    self.report.excluded += 1;
+                    self.write_tree(Tree::new(Vec::new(), None)).await?
+                } else {
+                    self.walk_dir(ctx, rel, parent_subtree, depth + 1, filter)
+                        .await?
+                };
                 self.stats.dirs += 1;
                 entry.kind = node_type::DIR;
                 entry.subtree = subtree;
@@ -1173,6 +1288,14 @@ impl Backup {
                 etag,
                 vern,
             } => {
+                if other_fs {
+                    tracing::debug!(
+                        "{}: on another file system; excluded",
+                        ctx.display_path(rel)
+                    );
+                    self.report.excluded += 1;
+                    return Ok(None);
+                }
                 let facts = FileFacts {
                     size,
                     posix,
@@ -1275,6 +1398,13 @@ impl Backup {
             // Source 合約說條目已依名稱 bytes 排序且**惰性**yield（清單不整批
             // 常駐記憶體——100 萬條目目錄的門檻，ADR 011）。
 
+            // 記號檔（ADR 021）：這一層有記號 → 只留記號檔本身。
+            let markers = if self.exclude.if_present.is_empty() {
+                None
+            } else {
+                self.markers_in(ctx, dir_rel).await
+            };
+
             let mut children: Vec<Entry> = Vec::new();
             let mut prev = None;
             while let Some(item) = listing.next_item() {
@@ -1289,8 +1419,15 @@ impl Backup {
                 let child_rel = join_rel(dir_rel, &item.name);
                 // 排除先於其他檢查：被排除的過深目錄不算略過的錯誤。跳過一個名字不影響
                 // parent 串流（take_name 只要求查詢名稱遞增）。
-                let child_filter = self.exclude.descend(&filter, &item.name);
-                if child_filter.is_match() {
+                let child_filter = self.exclude.patterns.descend(&filter, &item.name);
+                let too_large = match (self.exclude.larger_than, &item.kind) {
+                    (Some(limit), SourceItemKind::File { size, .. }) => *size > limit,
+                    _ => false,
+                };
+                let beside_marker = markers
+                    .as_ref()
+                    .is_some_and(|names| !names.contains(&item.name));
+                if child_filter.is_match() || too_large || beside_marker {
                     tracing::debug!("{}: excluded", ctx.display_path(&child_rel));
                     self.report.excluded += 1;
                     continue;

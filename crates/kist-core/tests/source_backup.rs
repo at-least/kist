@@ -452,7 +452,10 @@ async fn excludes_match_a_remote_root_by_its_restore_path() {
     }
     let repo = t.open().await;
     let opts = BackupOptions {
-        exclude: kist_core::PathFilter::new(&["/bucket/data/skip", "*.log"]).unwrap(),
+        exclude: kist_core::Exclusions {
+            patterns: kist_core::PathFilter::new(&["/bucket/data/skip", "*.log"]).unwrap(),
+            ..kist_core::Exclusions::default()
+        },
         ..source_opts(injected(&src))
     };
     let s = repo.backup(&[], opts).await.unwrap();
@@ -473,4 +476,23 @@ async fn excludes_match_a_remote_root_by_its_restore_path() {
     );
     assert!(!base.join("skip").exists());
     assert!(!base.join("logs/a.log").exists());
+}
+
+/// `one_file_system` 看的是本機的裝置號碼，遠端來源沒有：開始前就拒絕，不默默忽略。
+#[tokio::test]
+async fn one_file_system_is_refused_for_remote_sources() {
+    let t = TestRepo::new().await;
+    let mut src = FakeSource::new("mem://bucket/data", meta_kind::S3);
+    src.put("a", b"a".to_vec(), 1_600_000_000_000_000_000, Some("a"));
+    let repo = t.open().await;
+    let opts = BackupOptions {
+        exclude: kist_core::Exclusions {
+            one_file_system: true,
+            ..kist_core::Exclusions::default()
+        },
+        ..source_opts(injected(&src))
+    };
+    let err = repo.backup(&[], opts).await.unwrap_err();
+    assert!(err.to_string().contains("one-file-system"), "{err}");
+    assert_eq!(t.count("snapshots"), 0);
 }

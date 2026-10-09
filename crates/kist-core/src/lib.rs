@@ -31,8 +31,8 @@ pub mod restore;
 pub mod snapshots;
 
 pub use backup::{
-    BackupOptions, BackupProgress, BackupSummary, PreparedBackup, ProgressCallback, SourceSpec,
-    DEFAULT_GC_GRACE,
+    BackupOptions, BackupProgress, BackupSummary, Exclusions, Marker, PreparedBackup,
+    ProgressCallback, SourceSpec, DEFAULT_GC_GRACE,
 };
 pub use check::{CheckOptions, CheckReport};
 pub use filter::{PathFilter, PatternError};

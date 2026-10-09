@@ -16,6 +16,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use kist_app::client_id;
 use kist_app::duration::parse_duration;
+use kist_app::size::parse_size;
 
 use std::path::PathBuf;
 
@@ -23,8 +24,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use kist_backend::{Backend, RepoLocation};
 use kist_core::{
-    BackupOptions, CheckOptions, ForgetOptions, ForgetSummary, InitOptions, PathFilter,
-    PruneOptions, PruneReport, Repository, RestoreOptions, RetentionPolicy, SourceSpec,
+    BackupOptions, CheckOptions, Exclusions, ForgetOptions, ForgetSummary, InitOptions, Marker,
+    PathFilter, PruneOptions, PruneReport, Repository, RestoreOptions, RetentionPolicy, SourceSpec,
 };
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
@@ -162,6 +163,23 @@ enum Command {
         /// whitespace is trimmed; empty lines and lines starting with `#` are skipped.
         #[arg(long, value_name = "FILE")]
         exclude_file: Vec<PathBuf>,
+        /// Leave out the contents of every directory that contains NAME (repeatable). With
+        /// `NAME:HEADER`, only when NAME is a file that starts with HEADER. The directory
+        /// and the marker itself are kept.
+        #[arg(long, value_name = "NAME[:HEADER]")]
+        exclude_if_present: Vec<String>,
+        /// Leave out the contents of cache directories tagged with a CACHEDIR.TAG file that
+        /// carries the standard signature (https://bford.info/cachedir/); the tag is kept.
+        #[arg(long)]
+        exclude_caches: bool,
+        /// Leave out files larger than SIZE: bytes, or a number with k, m, g or t
+        /// (powers of 1024). Named source files are kept.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        exclude_larger_than: Option<u64>,
+        /// Do not descend into other file systems (mount points, btrfs subvolumes): such
+        /// directories are kept as empty directories. Local source paths on unix only.
+        #[arg(long)]
+        one_file_system: bool,
     },
     /// List snapshots.
     Snapshots {
@@ -497,11 +515,28 @@ async fn run(cli: Cli) -> Result<()> {
             parity,
             exclude,
             exclude_file,
+            exclude_if_present,
+            exclude_caches,
+            exclude_larger_than,
+            one_file_system,
         } => {
             if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
                 anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
             }
-            let exclude = exclude_filter(&exclude, &exclude_file)?;
+            let mut if_present = exclude_if_present
+                .iter()
+                .map(|spec| Marker::parse(spec))
+                .collect::<Result<Vec<_>, _>>()
+                .context("--exclude-if-present")?;
+            if exclude_caches {
+                if_present.push(Marker::cachedir_tag());
+            }
+            let exclude = Exclusions {
+                patterns: exclude_filter(&exclude, &exclude_file)?,
+                if_present,
+                larger_than: exclude_larger_than,
+                one_file_system,
+            };
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
             let remote_url = paths

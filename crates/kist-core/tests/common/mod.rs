@@ -43,7 +43,7 @@ pub fn backup_options() -> BackupOptions {
         parity: 0,
         progress: None,
         source: kist_core::SourceSpec::default(),
-        exclude: kist_core::PathFilter::default(),
+        exclude: kist_core::Exclusions::default(),
     }
 }
 

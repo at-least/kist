@@ -1125,7 +1125,7 @@ mod meta_via_handle_tests {
                     parity: 0,
                     progress: None,
                     source: SourceSpec::default(),
-                    exclude: crate::PathFilter::default(),
+                    exclude: crate::Exclusions::default(),
                 },
             )
             .await

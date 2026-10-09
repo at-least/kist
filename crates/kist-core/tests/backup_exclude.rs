@@ -8,12 +8,45 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use kist_core::{BackupOptions, PathFilter, RestoreOptions};
+use kist_core::{BackupOptions, Exclusions, Marker, PathFilter, RestoreOptions};
 
 fn excluding(patterns: &[&str]) -> BackupOptions {
+    with(Exclusions {
+        patterns: PathFilter::new(patterns).unwrap(),
+        ..Exclusions::default()
+    })
+}
+
+fn with(exclude: Exclusions) -> BackupOptions {
     BackupOptions {
-        exclude: PathFilter::new(patterns).unwrap(),
+        exclude,
         ..backup_options()
+    }
+}
+
+/// 備份 `src` 再整份還原，回傳還原出來、相對於 `src` 落點的路徑集合與 backup 的 excluded。
+async fn round_trip(t: &TestRepo, src: &Path, opts: BackupOptions) -> (BTreeSet<PathBuf>, u64) {
+    let repo = t.open().await;
+    let s = repo.backup(&[src.to_path_buf()], opts).await.unwrap();
+    assert_eq!(s.report.errors, 0, "{:?}", s.report);
+    let target = tempfile::tempdir_in(t.dir.path()).unwrap().keep();
+    let r = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let abs = std::fs::canonicalize(src).unwrap();
+    (
+        names_under(&target.join(abs.strip_prefix("/").unwrap())),
+        s.report.excluded,
+    )
+}
+
+fn files(root: &Path, entries: &[(&str, &[u8])]) {
+    for (rel, content) in entries {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
     }
 }
 
@@ -157,4 +190,124 @@ fn a_remote_root_keeps_user_host_and_port_as_its_first_component() {
         state = filter.descend(&state, name);
     }
     assert!(state.is_match());
+}
+
+/// 目錄裡有記號檔時，除了記號檔本身，內容都不備份（目錄本身照備）。指名的來源裡有記號檔
+/// 也一樣——記號檔管的是內容，不是來源本身。記號是目錄也算有。
+#[tokio::test]
+async fn a_marker_file_excludes_the_rest_of_its_directory() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    files(
+        &src,
+        &[
+            ("proj/.nobackup", b""),
+            ("proj/a.txt", b"a"),
+            ("proj/sub/b", b"b"),
+            ("other/c", b"c"),
+            ("d/.nobackup/inside", b"kept with the marker"),
+            ("d/e", b"e"),
+        ],
+    );
+    let marker = || Exclusions {
+        if_present: vec![Marker::parse(".nobackup").unwrap()],
+        ..Exclusions::default()
+    };
+    let (got, excluded) = round_trip(&t, &src, with(marker())).await;
+    assert_eq!(
+        got,
+        set(&[
+            "d",
+            "d/.nobackup",
+            "d/.nobackup/inside",
+            "other",
+            "other/c",
+            "proj",
+            "proj/.nobackup",
+        ])
+    );
+    assert_eq!(excluded, 3, "proj/a.txt、proj/sub、d/e");
+
+    let (got, _) = round_trip(&t, &src.join("proj"), with(marker())).await;
+    assert_eq!(got, set(&[".nobackup"]));
+}
+
+/// `--exclude-caches`：CACHEDIR.TAG 的開頭必須是規格的 43 bytes 簽章（https://bford.info/cachedir/），
+/// 內容不對的照常備份。
+#[tokio::test]
+async fn cachedir_tags_must_carry_the_signature() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    files(
+        &src,
+        &[
+            (
+                "good/CACHEDIR.TAG",
+                b"Signature: 8a477f597d28d172789f06886806bc55\n# a cache\n",
+            ),
+            ("good/x", b"x"),
+            ("bad/CACHEDIR.TAG", b"Signature: not the right one"),
+            ("bad/y", b"y"),
+        ],
+    );
+    let opts = with(Exclusions {
+        if_present: vec![Marker::cachedir_tag()],
+        ..Exclusions::default()
+    });
+    let (got, excluded) = round_trip(&t, &src, opts).await;
+    assert_eq!(
+        got,
+        set(&[
+            "bad",
+            "bad/CACHEDIR.TAG",
+            "bad/y",
+            "good",
+            "good/CACHEDIR.TAG"
+        ])
+    );
+    assert_eq!(excluded, 1);
+}
+
+#[test]
+fn marker_specs_are_name_and_optional_header() {
+    assert_eq!(
+        Marker::parse("x:abc").unwrap(),
+        Marker::parse("x:abc").unwrap()
+    );
+    assert_eq!(
+        Marker::parse("CACHEDIR.TAG:Signature: 8a477f597d28d172789f06886806bc55").unwrap(),
+        Marker::cachedir_tag()
+    );
+    for bad in ["", ":abc", "a/b", ".", "..", "./x"] {
+        assert!(Marker::parse(bad).is_err(), "{bad:?} 不是單一路徑元件");
+    }
+}
+
+/// `--exclude-larger-than`：比上限大的檔案不備份，剛好等於上限的照備；指名的檔案來源不排除。
+#[tokio::test]
+async fn files_larger_than_the_limit_are_left_out() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    files(
+        &src,
+        &[
+            ("small", &[1u8; 10]),
+            ("exact", &[2u8; 100]),
+            ("dir/big", &[3u8; 1000]),
+        ],
+    );
+    let limit = || Exclusions {
+        larger_than: Some(100),
+        ..Exclusions::default()
+    };
+    let (got, excluded) = round_trip(&t, &src, with(limit())).await;
+    assert_eq!(got, set(&["dir", "exact", "small"]));
+    assert_eq!(excluded, 1);
+
+    let repo = t.open().await;
+    let s = repo
+        .backup(&[src.join("dir/big")], with(limit()))
+        .await
+        .unwrap();
+    assert_eq!((s.stats.files, s.report.excluded), (1, 0));
 }

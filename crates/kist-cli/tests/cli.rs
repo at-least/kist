@@ -1070,3 +1070,127 @@ fn restore_include_and_exclude() {
         "寫錯樣式時什麼都不建"
     );
 }
+
+/// `--exclude-caches`、`--exclude-if-present`、`--exclude-larger-than`（ADR 021）端到端。
+#[test]
+fn backup_excludes_by_marker_and_size() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    std::fs::create_dir_all(src.join("cache")).unwrap();
+    std::fs::write(
+        src.join("cache/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("cache/blob"), b"cached").unwrap();
+    std::fs::create_dir_all(src.join("scratch")).unwrap();
+    std::fs::write(src.join("scratch/.nobackup"), b"").unwrap();
+    std::fs::write(src.join("scratch/tmp"), b"tmp").unwrap();
+    env.ok(&["init"]);
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--exclude-caches",
+        "--exclude-if-present",
+        ".nobackup",
+        "--exclude-larger-than",
+        "1M",
+        src.to_str().unwrap(),
+    ]))
+    .unwrap();
+    // cache/blob、scratch/tmp、big.bin（3 MiB）
+    assert_eq!(v["report"]["excluded"], 3, "{v}");
+
+    let target = env.dir.path().join("out");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert!(restored.join("cache/CACHEDIR.TAG").is_file());
+    assert!(!restored.join("cache/blob").exists());
+    assert!(restored.join("scratch/.nobackup").is_file());
+    assert!(!restored.join("scratch/tmp").exists());
+    assert!(!restored.join("big.bin").exists());
+    assert!(restored.join("a.txt").is_file());
+
+    let err = env.fails(&[
+        "backup",
+        "--exclude-larger-than",
+        "1MB",
+        src.to_str().unwrap(),
+    ]);
+    assert!(err.contains("unknown unit"), "{err}");
+    let err = env.fails(&[
+        "backup",
+        "--exclude-if-present",
+        "a/b",
+        src.to_str().unwrap(),
+    ]);
+    assert!(err.contains("single file name"), "{err}");
+}
+
+/// `--one-file-system`：在 user＋mount namespace 裡把 tmpfs 掛到來源底下再 backup（出了
+/// namespace 掛載就不見，snapshot 留在 repo）。掛載點照備成空目錄、計一個 excluded；不加旗標的
+/// 對照組會走進去。沒有 unshare 或不准 unprivileged namespace 的環境印出原因後略過。
+#[cfg(target_os = "linux")]
+#[test]
+fn one_file_system_keeps_mount_points_empty() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    std::fs::create_dir_all(src.join("mnt")).unwrap();
+    std::fs::write(src.join("a.txt"), b"a").unwrap();
+    env.ok(&["init"]);
+    let backup_in_namespace = |flags: &str| {
+        let script = format!(
+            "mount -t tmpfs none '{mnt}' && echo inner > '{mnt}/f' && '{kist}' backup --json {flags} '{src}'",
+            mnt = src.join("mnt").display(),
+            kist = env!("CARGO_BIN_EXE_kist"),
+            src = src.display(),
+        );
+        Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
+            .env("KIST_REPO", env.repo())
+            .env("KIST_PASSWORD", "cli test password")
+            .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+            .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
+            .env_remove("RUST_LOG")
+            .output()
+    };
+    let out = match backup_in_namespace("--one-file-system") {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            eprintln!(
+                "skipping: backup in a user+mount namespace failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("skipping: cannot run unshare: {e}");
+            return;
+        }
+    };
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "{v}");
+    let target = env.dir.path().join("out");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert!(restored.join("mnt").is_dir(), "掛載點本身照備");
+    assert!(!restored.join("mnt/f").exists(), "掛載點底下不走");
+    assert!(restored.join("a.txt").is_file());
+
+    // 對照組：不加旗標就會走進掛載點（證明上面的 tmpfs 真的掛上了）。
+    let out = backup_in_namespace("").unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let target = env.dir.path().join("out2");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(std::fs::read(restored.join("mnt/f")).unwrap(), b"inner\n");
+}

@@ -412,11 +412,13 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   tree 都不讀（刪掉無關子樹的 tree 物件，整份還原報錯、部分還原不報）；沒選到東西的 include 印警告、
   結束碼 3、JSON 的 `unmatched_includes`。restore 的樣式也比對 root 本身與它的上層（與 backup 不對稱，
   README 寫明）。
-- 沒做（ADR 020「沒做」）：`--exclude-caches`、`--exclude-if-present`、`--one-file-system`、
-  `--exclude-larger-than`、`--iexclude`、`--files-from`、restore 的 `--dry-run` 與 `snap:子目錄`。
-- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 421 過 1 略過（原
-  395；filter 9、backup_exclude 4、source_backup 1、restore_select 9、kist-app 1、CLI 2）。依賴沒變，
-  cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
+- 第二批（ADR 021）：`--exclude-if-present NAME[:HEADER]`、`--exclude-caches`、`--exclude-larger-than`、
+  `--one-file-system` 與對應的設定鍵。`BackupOptions.exclude` 改成 `Exclusions`；`Source` 新增 `probe`
+  判斷記號檔。`--one-file-system` 以 user＋mount namespace 裡的 tmpfs 端到端測過，另對 btrfs 子卷手動跑過。
+- 還沒做：`--iexclude`、`--files-from`、restore 的 `--dry-run` 與 `snap:子目錄`、restore 的樣式檔、反向樣式
+  與大括號。
+- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 431 過 1 略過（原 395）。
+  依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
 ## 已接受的限制（非待辦）
 
