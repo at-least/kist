@@ -346,4 +346,23 @@ async fn negated_and_ignore_case_excludes() {
     .await;
     assert_eq!(got, set(&["Documents", "Documents/a"]));
     assert_eq!(excluded, 3, "Music、top.txt、junk.TMP");
+
+    // 目錄一旦被排除就整棵不走，裡面的東西加不回來（restic 文件寫的限制，同 gitignore）。
+    let patterns = PathFilter::new(&[
+        format!("{}/Music", abs.display()),
+        format!("!{}/Music/b", abs.display()),
+    ])
+    .unwrap();
+    let (got, _) = round_trip(
+        &t,
+        &src,
+        with(Exclusions {
+            patterns,
+            ..Exclusions::default()
+        }),
+    )
+    .await;
+    assert!(!got.contains(Path::new("Music")), "{got:?}");
+    assert!(!got.contains(Path::new("Music/b")), "{got:?}");
+    assert!(got.contains(Path::new("top.txt")));
 }

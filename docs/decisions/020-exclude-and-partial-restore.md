@@ -1,6 +1,6 @@
 # ADR 020：排除規則與部分還原
 
-日期：2026-10-10　狀態：已採用
+日期：2026-10-10　狀態：已採用（`!` 的部分由 ADR 023 修訂：改成反向樣式）
 
 ## 背景
 
@@ -44,7 +44,8 @@ gitignore／restic 風格的子集，規則全在 `crates/kist-core/src/filter.r
 
 直接報錯的寫法，每一條都是「不報錯的話會默默比對不到東西」：空樣式、`/`、`//`（空段）、`.`／`..`
 段（snapshot 的路徑沒有這種段；`./build` 這種相對寫法最常見）、夾在字裡的 `**`、沒關上的 `[`、
-反向的區間、結尾的 `\`、開頭的 `!`（反向樣式不支援，字面的 `!` 寫 `\!`）。大括號是字面字元。
+反向的區間、結尾的 `\`、開頭的 `!`（反向樣式不支援，字面的 `!` 寫 `\!`；ADR 023 起 `!` 是反向樣式）。
+大括號是字面字元。
 
 ### 3. 不用 globset，自寫逐段比對
 
@@ -105,6 +106,10 @@ gitignore／restic 風格的子集，規則全在 `crates/kist-core/src/filter.r
 比對 restic 時列過、這次刻意不做的：`--exclude-caches`、`--exclude-if-present`、`--one-file-system`、
 `--exclude-larger-than`、不分大小寫的 `--iexclude`、`--files-from`；restore 的 `--dry-run`、
 `snap:子目錄` 寫法、`--include-file`／`--exclude-file`；反向樣式（`!`）與大括號。
+
+後續：記號檔、大小、檔案系統邊界（ADR 021），`SNAPSHOT:PATH`、dry run、restore 的樣式檔（ADR 022），反向
+與不分大小寫的樣式（ADR 023），`--files-from`（ADR 024）都已補上。大括號維持字面字元：restic 與 gitignore
+都沒有這個語法，不算缺口。
 
 ## 後果
 
