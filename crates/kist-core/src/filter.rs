@@ -197,16 +197,26 @@ impl FilterState {
     }
 
     /// 樣式 `p` 走到第 `i` 段，連同 `**` 可以什麼都不吃的那些位置。
+    ///
+    /// `start` 依樣式編號遞增加入，`descend` 依上一層的順序往下走，所以 `active` 與
+    /// `matched` 永遠依樣式編號分組遞增：同一條樣式的重複只可能出現在尾端那一組。只檢查
+    /// 那一組（審查修正：原本每次都掃整串，每個項目的成本是不錨定樣式數的平方）。
     fn add(&mut self, p: usize, mut i: usize, pattern: &Pattern) {
         let comps = &pattern.comps;
         loop {
             if i == comps.len() {
-                if !self.matched.contains(&p) {
+                if self.matched.last() != Some(&p) {
                     self.matched.push(p);
                 }
                 return;
             }
-            if !self.active.contains(&(p, i)) {
+            let seen = self
+                .active
+                .iter()
+                .rev()
+                .take_while(|&&(q, _)| q == p)
+                .any(|&(_, j)| j == i);
+            if !seen {
                 self.active.push((p, i));
                 self.positive_alive |= !pattern.negated;
             }
