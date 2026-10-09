@@ -238,6 +238,13 @@ fn temp_file_mode(dir: &DirHandle, name: &OsStr, node: &Entry) -> Result<u32> {
     Ok(dir.file_mode(name)?.unwrap_or(0o666))
 }
 
+/// 間接內容：串起來的清單 chunk → `ChunkList`（含版本檢查）→ chunk id。
+fn chunk_ids_of(list: &[u8]) -> Result<Vec<ChunkId>> {
+    parse_chunk_list(list)
+        .map(|l| l.chunks)
+        .map_err(|e| CoreError::corrupt("<chunk list>", e.to_string()))
+}
+
 /// 硬連結的第二個以後的名字：從還原目標的 handle 沿第一個名字的相對路徑
 /// `first` 逐層重新開到它所在的那一層（O_NOFOLLOW；途中被換成 symlink 就開
 /// 不起來，呼叫端退回複製），再 linkat 到 `dir` 的 `name`（ADR 019 A4）。
@@ -603,19 +610,9 @@ impl Repository {
         let path = dir.child_path(name);
         // 先看一眼正式名處：擋著 symlink 之類就不必下載內容（commit 前會再看一次）。
         refuse_in_the_way(dir, name)?;
-        let chunk_ids = if node.content == content_type::DIRECT {
-            node.chunks.clone()
-        } else {
-            let mut bytes = Vec::new();
-            for id in &node.chunks {
-                bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
-            }
-            let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
-                key: "<chunk list>".to_owned(),
-                reason: e.to_string(),
-            })?;
-            list.chunks
-        };
+        let chunk_ids = self
+            .resolve_chunks_reloading(&node.chunks, node.content, index)
+            .await?;
         // 內容寫進新建的暫存檔，不開正式名：以前以 write＋create＋truncate
         // 開正式名，失敗後呼叫端再 remove_file，連還沒開檔就失敗（間接內容的
         // 清單讀不到）的情況也會刪掉使用者原有的檔。
@@ -657,11 +654,25 @@ impl Repository {
         for id in chunks {
             bytes.extend_from_slice(&self.read_chunk(id, index).await?);
         }
-        let list = parse_chunk_list(&bytes).map_err(|e| CoreError::Corrupt {
-            key: "<chunk list>".to_owned(),
-            reason: e.to_string(),
-        })?;
-        Ok(list.chunks)
+        chunk_ids_of(&bytes)
+    }
+
+    /// 同 `resolve_chunks`，但 chunk 讀取走 [`Self::read_chunk_reloading`]
+    /// （restore 與 mount 用：開始得早的一方手上的 index 可能已被 prune 搬動）。
+    pub async fn resolve_chunks_reloading(
+        &self,
+        chunks: &[ChunkId],
+        content: u8,
+        index: &ReloadableIndex,
+    ) -> Result<Vec<ChunkId>> {
+        if content == content_type::DIRECT {
+            return Ok(chunks.to_vec());
+        }
+        let mut bytes = Vec::new();
+        for id in chunks {
+            bytes.extend_from_slice(&self.read_chunk_reloading(id, index).await?);
+        }
+        chunk_ids_of(&bytes)
     }
 
     /// 同 `read_chunk`，但 chunk 不在 index 或它的 pack 不見了時重新載入 index 再試一次：

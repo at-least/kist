@@ -47,36 +47,41 @@ pub fn path_to_bytes(path: &Path) -> Result<Vec<u8>> {
     name_to_bytes(path.as_os_str())
 }
 
-/// v3 的 root 定位字串（`Root.path`）→ restore 目標底下的相對路徑。
-/// 本機絕對路徑 `/srv/data` → `srv/data`；帶 scheme 的遠端定位去掉 scheme
-/// 後切段：`s3://bucket/prefix` → `bucket/prefix`、`sftp://host/path` →
-/// `host/path`（docs/format.md §9 的 restore 映射）。
-pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
+/// v3 的 root 定位字串（`Root.path`）→ 路徑組件：restore 與 mount 共用的
+/// 切段規則（docs/format.md §9）——去掉 `scheme://`、以 `/` 切段、空與 `.`
+/// 組件丟掉、`..` 映射成 `__parent__`（restore 不往目標之外走；字面 `..` 在
+/// FUSE 目錄裡是核心自己的東西）；組件含 NUL 就拒：NUL 不是路徑元件
+/// （Unix 的 bytes_to_name 什麼都收），也不是合法的 FUSE 目錄項位元組。
+pub fn locator_components(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     // 去掉 `scheme://`（有 scheme 且後接 // 才剝；Windows 的 `C:` 不會中）。
     let rest = match bytes.iter().position(|&b| b == b':') {
         Some(i) if bytes.len() >= i + 3 && &bytes[i + 1..i + 3] == b"//" => &bytes[i + 3..],
         _ => bytes,
     };
-    let mut rel = PathBuf::new();
-    for comp in rest.split(|&b| b == b'/') {
-        match comp {
-            b"" | b"." => {}
-            b".." => rel.push("__parent__"),
-            // NUL 不是路徑元件：Unix 的 bytes_to_name 什麼
-            // 都收，得在這裡擋。
-            name if name.contains(&0) => {
-                return Err(crate::CoreError::Corrupt {
-                    key: "<locator>".to_owned(),
-                    reason: format!(
-                        "locator component {:?} is not a path component",
-                        String::from_utf8_lossy(name)
-                    ),
-                })
-            }
-            name => rel.push(bytes_to_name(name)?),
-        }
-    }
-    Ok(rel)
+    rest.split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+        .map(|c| match c {
+            b".." => Ok(b"__parent__" as &[u8]),
+            name if name.contains(&0) => Err(CoreError::corrupt(
+                "<locator>",
+                format!(
+                    "locator component {:?} is not a path component",
+                    String::from_utf8_lossy(name)
+                ),
+            )),
+            name => Ok(name),
+        })
+        .collect()
+}
+
+/// [`locator_components`] → restore 目標底下的相對路徑。本機絕對路徑
+/// `/srv/data` → `srv/data`；遠端定位 `s3://bucket/prefix` → `bucket/prefix`、
+/// `sftp://host/path` → `host/path`。
+pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
+    locator_components(bytes)?
+        .into_iter()
+        .map(bytes_to_name)
+        .collect()
 }
 
 /// restore 用：tree 裡的子節點名稱來自 repo 內容，必須是「單一路徑元件」。

@@ -63,7 +63,8 @@ impl VirtualRoot {
     pub fn build(roots: impl IntoIterator<Item = (Root, RootContents)>) -> Result<Self, String> {
         let mut levels: HashMap<Vec<u8>, Vec<VEntry>> = HashMap::new();
         for (root, contents) in roots {
-            let comps = locator_components(root.path.as_slice())?;
+            let comps = kist_core::fsmeta::locator_components(root.path.as_slice())
+                .map_err(|e| e.to_string())?;
             let Some((last, parents)) = comps.split_last() else {
                 match contents {
                     RootContents::Flatten(entries) => {
@@ -113,33 +114,6 @@ impl VirtualRoot {
         let i = level.partition_point(|v| v.name() < name);
         level.get(i).filter(|v| v.name() == name)
     }
-}
-
-/// root 定位 → 組件（與 fsmeta::locator_to_relative 同一套規則：
-/// 去 scheme、`/` 切段、空與 `.` 組件正規化掉）。
-pub(crate) fn locator_components(path: &[u8]) -> Result<Vec<&[u8]>, String> {
-    let rest = match path.iter().position(|&b| b == b':') {
-        Some(i) if path.len() >= i + 3 && &path[i + 1..i + 3] == b"//" => &path[i + 3..],
-        _ => path,
-    };
-    rest.split(|&b| b == b'/')
-        .filter(|c| !c.is_empty() && *c != b".")
-        // `..` 映射成 `__parent__`：與 fsmeta::locator_to_relative 同一套
-        // 規則——字面 `..` 是 FUSE 核心自己的東西，虛擬層重複吐一個只會是
-        // 不可達的同名 entry。
-        .map(|c| {
-            if c == b".." {
-                Ok(b"__parent__" as &[u8])
-            } else if c.contains(&0u8) {
-                // NUL 不是合法的 FUSE 目錄項位元組：restore 的
-                // fsmeta::locator_to_relative 也拒，mount 不得是讀取
-                // 通路中唯一收下的。
-                Err(format!("locator contains a NUL byte: {c:?}"))
-            } else {
-                Ok(c)
-            }
-        })
-        .collect()
 }
 
 /// root 的葉組件 → 攜帶 subtree 的合成 DIR entry（posix 形狀：mount 的

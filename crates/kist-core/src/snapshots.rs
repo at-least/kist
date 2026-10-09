@@ -29,7 +29,8 @@ impl SnapshotInfo {
     }
 }
 
-pub(crate) fn timestamp_of(key: &str) -> &str {
+/// snapshot key 的末段（timestamp；mount 的 timestamp 目錄層也用它）。
+pub fn timestamp_of(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
 }
 
