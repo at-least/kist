@@ -18,6 +18,7 @@ pub mod backup;
 pub mod cache;
 pub mod check;
 mod dirhandle;
+pub mod filter;
 pub mod forget;
 pub mod fsmeta;
 pub mod index;
@@ -30,10 +31,11 @@ pub mod restore;
 pub mod snapshots;
 
 pub use backup::{
-    BackupOptions, BackupProgress, BackupSummary, PreparedBackup, ProgressCallback, SourceSpec,
-    DEFAULT_GC_GRACE,
+    BackupOptions, BackupProgress, BackupSummary, Exclusions, Marker, PreparedBackup,
+    ProgressCallback, SourceSpec, DEFAULT_GC_GRACE,
 };
 pub use check::{CheckOptions, CheckReport};
+pub use filter::{PathFilter, PatternError};
 pub use forget::{ForgetOptions, ForgetSummary, RetentionPolicy};
 pub use index::{ChunkIndex, ChunkLocation};
 /// parity 份數的上限。CLI 與 kist-app 的設定檢查都用它，不各寫字面值
@@ -42,7 +44,7 @@ pub use kist_format::parity::MAX_PARITY_SHARDS;
 pub use prune::{PruneOptions, PrunePlan, PruneReport, MAX_EFFECTIVE_BLOBS};
 pub use rebuild::RebuildSummary;
 pub use repo::{InitOptions, Repository};
-pub use restore::{ReloadableIndex, RestoreOptions, RestoreSummary};
+pub use restore::{Planned, ReloadableIndex, RestoreOptions, RestoreSummary};
 pub use snapshots::SnapshotInfo;
 
 use std::path::PathBuf;

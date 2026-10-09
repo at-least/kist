@@ -429,3 +429,70 @@ async fn url_source_works_for_a_local_path() {
     let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
     assert_same_tree(&src, &restored);
 }
+
+/// 遠端來源的排除樣式比對「還原落點」的路徑：定位 `mem://bucket/data` 切段成
+/// `/bucket/data`，錨定樣式要從那裡寫起（ADR 020）。
+#[tokio::test]
+async fn excludes_match_a_remote_root_by_its_restore_path() {
+    let t = TestRepo::new().await;
+    let mut src = FakeSource::new("mem://bucket/data", meta_kind::S3);
+    for rel in [
+        "keep.txt",
+        "skip/x.bin",
+        "logs/a.log",
+        "logs/keep.txt",
+        "data/skip/y",
+    ] {
+        src.put(
+            rel,
+            rel.as_bytes().to_vec(),
+            1_600_000_000_000_000_000,
+            Some(rel),
+        );
+    }
+    let repo = t.open().await;
+    let opts = BackupOptions {
+        exclude: kist_core::Exclusions {
+            patterns: kist_core::PathFilter::new(&["/bucket/data/skip", "*.log"]).unwrap(),
+            ..kist_core::Exclusions::default()
+        },
+        ..source_opts(injected(&src))
+    };
+    let s = repo.backup(&[], opts).await.unwrap();
+    assert_eq!(s.report.excluded, 2, "{:?}", s.report);
+
+    let target = t.dir.path().join("out");
+    let r = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let base = target.join("bucket/data");
+    assert!(base.join("keep.txt").is_file());
+    assert!(base.join("logs/keep.txt").is_file());
+    assert!(
+        base.join("data/skip/y").is_file(),
+        "錨定樣式不比對更深處的同名目錄"
+    );
+    assert!(!base.join("skip").exists());
+    assert!(!base.join("logs/a.log").exists());
+}
+
+/// `one_file_system` 看的是本機的裝置號碼，遠端來源沒有：開始前就拒絕，不默默忽略。
+#[tokio::test]
+async fn one_file_system_is_refused_for_remote_sources() {
+    let t = TestRepo::new().await;
+    let mut src = FakeSource::new("mem://bucket/data", meta_kind::S3);
+    src.put("a", b"a".to_vec(), 1_600_000_000_000_000_000, Some("a"));
+    let repo = t.open().await;
+    let opts = BackupOptions {
+        exclude: kist_core::Exclusions {
+            one_file_system: true,
+            ..kist_core::Exclusions::default()
+        },
+        ..source_opts(injected(&src))
+    };
+    let err = repo.backup(&[], opts).await.unwrap_err();
+    assert!(err.to_string().contains("one-file-system"), "{err}");
+    assert_eq!(t.count("snapshots"), 0);
+}

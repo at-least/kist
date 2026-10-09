@@ -134,6 +134,7 @@ async fn run_job_inner(
                 parity: b.parity,
                 progress,
                 source: kist_core::SourceSpec::default(),
+                exclude: b.exclusions()?,
             };
             let summary = repo.backup(&b.paths, opts).await?;
             let incomplete = summary.report.errors > 0;

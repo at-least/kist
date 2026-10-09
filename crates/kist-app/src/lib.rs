@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod notify;
 pub mod schedule;
 pub mod server;
+pub mod size;
 
 pub use config::Config;
 pub use daemon::{Daemon, DaemonHandle, TriggerError};

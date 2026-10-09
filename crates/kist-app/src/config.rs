@@ -11,6 +11,12 @@
 //! paths = ["/home", "/etc"]
 //! schedule = "0 2 * * *"      # 5 或 6 欄（秒選填）cron；省略 = 只在 `run --once` 時跑
 //! gc_grace = "72h"            # 選填；沒寫取同檔的 [prune] grace，不得比它長
+//! exclude = ["*.tmp", "node_modules", "/home/me/.cache"]   # 選填；同 CLI 的 --exclude（ADR 020）
+//! iexclude = ["*.bak"]                  # 選填；同 --iexclude（不分大小寫，排在 exclude 之後）
+//! exclude_if_present = [".nobackup"]    # 選填；同 --exclude-if-present（NAME 或 NAME:HEADER）
+//! exclude_caches = true                 # 選填；同 --exclude-caches（CACHEDIR.TAG）
+//! exclude_larger_than = "1G"            # 選填；同 --exclude-larger-than（1024 為底）
+//! one_file_system = true                # 選填；同 --one-file-system
 //!
 //! [forget]                     # 選填；需要 Delete 權限，建議放在維護主機的設定裡
 //! keep_daily = 7
@@ -76,6 +82,43 @@ pub struct BackupSection {
     /// 每個 pack 旁存幾片 Reed-Solomon 同位（0..=8；0 = 不存，預設）。
     #[serde(default)]
     pub parity: u8,
+    /// 排除樣式，規則同 CLI 的 `--exclude`（ADR 020，`kist_core::filter`）。
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// 不分大小寫的排除樣式，同 `--iexclude`（ADR 023；`!` 的順序上排在 `exclude` 之後）。
+    #[serde(default)]
+    pub iexclude: Vec<String>,
+    /// 記號檔，同 `--exclude-if-present`（`NAME` 或 `NAME:HEADER`，ADR 021）。
+    #[serde(default)]
+    pub exclude_if_present: Vec<String>,
+    /// 同 `--exclude-caches`：有 CACHEDIR.TAG（簽章正確）的目錄只留那個檔。
+    #[serde(default)]
+    pub exclude_caches: bool,
+    /// 同 `--exclude-larger-than`：`"100M"` 之類，1024 為底。
+    #[serde(default, with = "crate::size::serde_opt")]
+    pub exclude_larger_than: Option<u64>,
+    /// 同 `--one-file-system`。
+    #[serde(default)]
+    pub one_file_system: bool,
+}
+
+impl BackupSection {
+    /// 這一節的排除規則（ADR 020、021）。載入設定時（[`Config::validate`]）就跑一次：
+    /// 寫錯的樣式或記號讓 `kist run`／`kist serve` 起不來，不會等到排程時間才失敗。
+    pub fn exclusions(&self) -> Result<kist_core::Exclusions> {
+        let patterns = kist_core::PathFilter::new(&self.exclude)
+            .map_err(|e| AppError::Config(format!("[backup] exclude: {e}")))?
+            .and_ignoring_case(&self.iexclude)
+            .map_err(|e| AppError::Config(format!("[backup] iexclude: {e}")))?;
+        kist_core::Exclusions::new(
+            patterns,
+            &self.exclude_if_present,
+            self.exclude_caches,
+            self.exclude_larger_than,
+            self.one_file_system,
+        )
+        .map_err(|e| AppError::Config(format!("[backup] {e}")))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -172,6 +215,7 @@ impl Config {
                     kist_core::MAX_PARITY_SHARDS
                 )));
             }
+            b.exclusions()?;
         }
         if let Some(f) = &self.forget {
             let policy = f.policy();

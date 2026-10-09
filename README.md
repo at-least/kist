@@ -31,9 +31,11 @@ export KIST_PASSWORD=...                # 或 --password-file，或互動輸入
 
 kist init                               # 建立 repo
 kist backup ~/Documents ~/Photos        # 備份，產生一個 snapshot
+kist backup ~ --exclude node_modules --exclude '*.tmp'   # 排除規則，見「排除規則」一節
 kist backup sftp://nas.local/srv/data   # 遠端來源也能備：讀遠端、本機切塊加密後上傳
 kist snapshots                          # 列出 snapshot
 kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路徑>
+kist restore latest /tmp/out --include ~/Documents/report.pdf   # 部分還原，見「部分還原」一節
 kist check                              # 檢查一致性（不下載資料）
 kist check --read-data                  # 下載並驗證每個 chunk
 kist rebuild-index                      # index 物件遺失或損壞時，從 pack 重建
@@ -43,8 +45,8 @@ kist prune                              # 回收空間（兩階段，見下）
 kist forget --keep-last 10 --prune      # 一次做完
 ```
 
-結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
-請看警告。
+結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗或 `--include` 沒選到東西（restore）、
+或刪不掉（prune）——請看警告。
 
 `restore` 先把每個檔寫進同目錄的隱藏暫存檔 `.kist-restore-*`，完整寫好才 rename 成正式名：還原失敗
 時目標處原有的檔不動（以前會被刪掉），擋路的 symlink、目錄或特殊檔回報錯誤、不動它；再還原到先前
@@ -80,6 +82,114 @@ mode（以前從不 chown：別人的 4755 檔會還原成 root 擁有的 setuid
 > `--password-file` 優先於 `KIST_PASSWORD`，而它也吃環境變數 `KIST_PASSWORD_FILE`：有匯出的話先
 > `unset KIST_PASSWORD_FILE`。`kist run` 一直是這個讀法，不受影響。
 
+### 從清單讀來源路徑（`backup --files-from`）
+
+```sh
+kist backup --files-from ~/backup-list.txt               # 一行一個；去前後空白，空行與 # 開頭的行略過
+kist backup --files-from-verbatim list.txt               # 一行就是一個路徑，照原樣
+find ~/proj -name '*.db' -print0 | kist backup --files-from-raw -   # NUL 分隔，從標準輸入讀
+```
+
+旗標名稱同 restic，但**不展開萬用字元**：列的路徑照字面找，不存在就以結束碼 1 結束、不留 snapshot。
+可以和命令列的路徑一起給；讀完一個路徑都沒有也是結束碼 1。切法：
+
+- 兩種文字清單：開頭的 UTF-8 BOM 去掉，行尾的 `\r`（CRLF）去掉，verbatim 也是（同 restic）。restic 只對
+  具名檔案去 BOM、標準輸入不去；kist 兩邊都去。UTF-16 的清單（restic 會轉碼）不支援，請存成 UTF-8。
+- raw：每個名字都要以 NUL 結尾、不能是空的，否則結束碼 1（同 restic）。
+- `-`（標準輸入）整個命令只能給一次（清單與樣式檔合計）；給兩次以結束碼 1 結束，不會讓後面那個默默讀到
+  空的。
+
+### 排除規則（`backup --exclude`）
+
+```sh
+kist backup ~ --exclude node_modules --exclude '*.tmp' --exclude "$HOME/.cache"
+kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行與 # 開頭的行略過
+```
+
+被排除的檔案與目錄不進 snapshot（目錄整棵不走），數量印在 backup 的摘要（`excluded: N`）與
+`--json` 的 `report.excluded`。設定檔寫成 `[backup] exclude = ["node_modules", "*.tmp"]`。樣式檔
+的行與 `--files-from` 的文字清單同樣切（BOM、CRLF），去掉前後空白；`-` 是標準輸入。
+
+樣式比對的是節點在 snapshot 裡的路徑，也就是整份還原時它在目標底下的位置：
+
+- 本機來源是 **canonical 絕對路徑**（symlink 已解開，與 `kist snapshots` 的 PATHS 欄位相同）。
+  遠端來源只去掉 `scheme://`，第一段是 URL 裡的 `[user@]host[:port]` 原樣：`sftp://nas/srv/data`
+  底下的 `x` 是 `/nas/srv/data/x`，`sftp://me@nas:2222/srv/data` 底下的是 `/me@nas:2222/srv/data/x`。
+- `/` 開頭的樣式從路徑頂端比起；其他樣式在每一層都比對（`*.tmp`、`node_modules`、`build/out`）。
+- 以 `/` 分段，每段比對恰好一個路徑元件：`*` 任意多個字元、`?` 一個字元（CJK 字也是一個）、
+  `[abc]`／`[a-z]`／`[!a]` 一個字元、`\` 讓下一個字元照字面。整段只有 `**` 時比對零或多個元件
+  （`/home/me/**/build`）。區分大小寫；結尾的 `/` 會被去掉。
+- 指名的來源本身不會被排除（`kist backup ~/proj --exclude proj` 照樣備份 `~/proj`）。包在另一個指名來源
+  裡的也一樣：它併進外層的 root，但排除條件不排除它；它的上層被排除時，只沿著通往它的路徑備份。
+- `!` 開頭是反向樣式（同 restic 文件描述的 gitignore 行為）：樣式依序編號，一個路徑上**最後**一個比對到
+  它的樣式決定它排不排除。`kist backup ~ --exclude "$HOME/*" --exclude "!$HOME/Documents"` 只備
+  Documents。被排除的目錄整棵不走，裡面的東西加不回來。字面的 `!` 寫成 `\!`。編號的順序：`--exclude` 的
+  值、`--exclude-file` 的行，然後是 `--iexclude` 的值、`--iexclude-file` 的行。
+- `--iexclude`／`--iexclude-file`（設定檔 `iexclude`）：同上，但不分大小寫（CJK 以外有大小寫的字也折，
+  不成 UTF-8 的 byte 不折）。
+- 大括號是字面字元（`{a,b}` 不展開）。
+- 樣式寫錯（例如沒關上的 `[`、夾在字裡的 `**`、`.`／`..` 段）時，backup 在碰 repo 之前就以結束碼 1
+  結束；樣式檔裡的錯誤點名 `檔案:行號`。設定檔裡寫錯，`kist run`／`kist serve` 起不來。
+
+樣式以外的排除條件（設定檔的對應鍵寫在括號裡）：
+
+```sh
+kist backup ~ --exclude-caches                 # 有 CACHEDIR.TAG 的快取目錄（exclude_caches = true）
+kist backup ~ --exclude-if-present .nobackup   # 有 .nobackup 的目錄（exclude_if_present = [".nobackup"]）
+kist backup ~ --exclude-larger-than 2G         # 大於 2 GiB 的檔案（exclude_larger_than = "2G"）
+kist backup / --one-file-system                # 不進入別的檔案系統（one_file_system = true）
+```
+
+- 記號檔：目錄裡有 `NAME` 時，除了記號本身，目錄的內容都不備份，目錄本身照備。寫成 `NAME:HEADER` 時，
+  記號必須是開頭為 HEADER 的檔案。`--exclude-caches` 就是 `CACHEDIR.TAG` 加上規格的簽章
+  （<https://bford.info/cachedir/>；cargo 的 target 目錄與 `~/.cargo/registry` 都有這個檔）。沒有 HEADER
+  的記號只看在不在，讀不了也算數。每個目錄每個記號查一次：本機是一次 lstat，有 HEADER 時再讀開頭；遠端
+  來源是多列一次那個目錄。
+- 大小：`k`／`m`／`g`／`t` 以 1024 為底、不分大小寫；只排除比它大的，剛好等於的照備。
+- `--one-file-system`：裝置號碼和它所屬來源不同的目錄（掛載點，**也包括 btrfs 的子卷**）照備成空目錄，
+  底下不走。`/home` 是另一個檔案系統或子卷時，`kist backup / --one-file-system` 不含 `/home` 的內容，
+  要一起備就把 `/home` 也列成來源。只適用 unix 的本機來源（遠端來源與 Windows 直接報錯）。
+- 這些條件和樣式一樣不排除指名的來源本身，被排除的都計進 `excluded`（掛載點、被清空內容的目錄裡每一項各算一個）。
+
+### 部分還原（`restore --include`／`--exclude`）
+
+```sh
+kist restore latest /tmp/out --include /home/me/docs/report.pdf   # 只還原這個檔
+kist restore latest /tmp/out --include /home/me/docs              # 整個目錄
+kist restore latest /tmp/out --include '*.pdf' --exclude /home/me/old
+kist restore latest:/home/me/docs /tmp/docs                       # 目錄的內容直接放進 /tmp/docs
+kist restore --dry-run latest /tmp/out --include '*.pdf'          # 只列出會寫什麼
+```
+
+- 樣式規則與 `backup --exclude` 相同，比對的是節點整份還原時在目標底下的路徑（也是 `kist mount`
+  裡 `<client>/<timestamp>/` 之下看到的路徑）。檔案照樣落在 `<target>/<原本的路徑>`。
+- `--include`：只還原比對到的節點與它們底下的一切。通往它們的上層目錄照樣建立、套記錄的 mode 與
+  時間（也計進 `dirs`）；沒被選到的分支一個目錄也不建。錨定的 include 只讀它路徑上的 tree，其他子樹的
+  tree 不讀；不錨定的 include（`*.pdf`）要走過整棵樹才找得到。
+- `--exclude`：不還原比對到的節點（目錄整棵不走）。與 `--include` 同時比對到時排除優先。
+- 與 backup 不同，restore 的樣式也比對 root 本身與它的上層：root 是 `/tmp/data` 的 snapshot，
+  `--exclude tmp` 會排除整個 root。只想排除 root 底下名為 `tmp` 的目錄，寫 `/tmp/data/**/tmp`。
+- 沒有選到任何東西的 include 樣式印警告、結束碼 3，`--json` 的 `unmatched_includes` 列出它們；其他選到
+  的照樣還原。一條樣式要涵蓋某個被還原的節點（比對到它或它的上層）才算選到東西：比對不到、比對到的全被
+  排除、或全被後面的 `!` 取消，都算沒選到。還原有錯誤時（例如某個目錄建不起來），失敗處底下沒有走到，
+  警告會註明這一點，不說成 snapshot 裡沒有。
+- 只有 `!` 樣式的 include 什麼都選不到，以結束碼 1 結束。
+- 硬連結的第一個名字沒被選到時，後面的名字還原成內容相同的獨立檔案。
+- `SNAPSHOT:PATH`（同 restic）：PATH 是 snapshot 裡的一個目錄（某個 root、root 裡的目錄，或幾個 root
+  共同的上層），它的內容直接放進目標，不重建上面的路徑；目標本身不套那個目錄的 metadata。樣式照樣比對
+  snapshot 裡的完整路徑。PATH 不在 snapshot 裡或不是目錄時，以結束碼 1 結束，什麼都不建；PATH 所在的
+  root 被樣式排除時也照樣檢查。
+- root 的落點（`<target>/<原本的路徑>`）建不起來時（例如那裡擋著 symlink），整個還原以結束碼 1 結束，
+  即使 include 只選到更深的節點。
+- `--dry-run`：列出會寫的目錄、檔案、symlink（`dir`／`file`／`link` 加上目標底下的路徑），目標連建都
+  不建；計數與「沒選到東西」的警告和真的還原相同。只讀 tree、不讀檔案內容，所以壞掉的 chunk、目標處
+  擋著的東西這類錯誤只有真的還原才看得到。
+- `--include-file`／`--exclude-file`：樣式一行一條，格式同 `backup --exclude-file`（`-` 是標準輸入）。不分
+  大小寫的版本是 `--iinclude`、`--iexclude` 與 `--iinclude-file`、`--iexclude-file`。一條樣式都沒有的
+  include 樣式檔（空的、只有註解）以結束碼 1 結束：照讀的話 include 是空的，等於整份還原。
+- include 也可以用 `!` 從選到的目錄裡取消一部分（`--include /home/me/docs --include '!/home/me/docs/old'`）；
+  「沒選到東西」的檢查不看反向樣式。
+
 ### `--json`
 
 `backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild-index` / `run` 都支援
@@ -88,6 +198,8 @@ mode（以前從不 chown：別人的 4755 檔會還原成 root 擁有的 setuid
 - 內容 id（`root` 等）在 JSON 裡是 hex 字串（repo 格式不受影響，仍是 bytes）。
 - snapshot 的 `paths` 原本是 OS bytes，JSON 裡以 UTF-8 呈現，非 UTF-8 的位元組會換成 U+FFFD。
 - `forget` / `prune` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個。
+- `backup` 的 `report.excluded`：被排除樣式比對到的項目數；`restore` 的 `unmatched_includes`：沒選到
+  東西的 include 樣式（定義見上面的部分還原），`dry_run`：是不是 `--dry-run`（是的話計數是「會還原」的）。
 - `run --once --json` 印出 JobOutcome 陣列；常駐模式下每件工作結束印一行 JSON（NDJSON）。
 
 ### 設定檔與排程
@@ -101,6 +213,7 @@ timezone = "local"                        # 排程用的時區，或 "utc"
 [backup]
 paths = ["/home", "/etc"]
 schedule = "0 2 * * *"                    # cron（5 欄；前面可多加一欄秒）
+exclude = ["node_modules", "*.tmp"]       # 選填；規則見「排除規則」
 
 [notify]
 webhook_url = "https://example.com/hook"  # 每件工作結束 POST 一個 JSON

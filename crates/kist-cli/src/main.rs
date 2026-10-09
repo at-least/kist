@@ -16,6 +16,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use kist_app::client_id;
 use kist_app::duration::parse_duration;
+use kist_app::size::parse_size;
 
 use std::path::PathBuf;
 
@@ -23,8 +24,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use kist_backend::{Backend, RepoLocation};
 use kist_core::{
-    BackupOptions, CheckOptions, ForgetOptions, ForgetSummary, InitOptions, PruneOptions,
-    PruneReport, Repository, RestoreOptions, RetentionPolicy, SourceSpec,
+    BackupOptions, CheckOptions, Exclusions, ForgetOptions, ForgetSummary, InitOptions, PathFilter,
+    Planned, PruneOptions, PruneReport, Repository, RestoreOptions, RestoreSummary,
+    RetentionPolicy, SourceSpec,
 };
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
@@ -138,8 +140,24 @@ enum Command {
         #[command(flatten)]
         repo: RepoArgs,
         /// Files or directories to back up, or one remote source URL.
-        #[arg(required = true)]
+        #[arg(required_unless_present_any = ["files_from", "files_from_verbatim", "files_from_raw"])]
         paths: Vec<PathBuf>,
+        /// Read more source paths from FILE (`-` = standard input, at most once per command),
+        /// one per line (repeatable). Surrounding whitespace is trimmed; empty lines and lines
+        /// starting with `#` are skipped; a leading UTF-8 byte order mark and CRLF line ends
+        /// are accepted. Paths are taken literally: wildcards are not expanded.
+        #[arg(long, value_name = "FILE")]
+        files_from: Vec<PathBuf>,
+        /// Like --files-from, but every line is a path exactly as written (no trimming, `#`
+        /// is not a comment; a CR before the line end is dropped); only empty lines are
+        /// skipped.
+        #[arg(long, value_name = "FILE")]
+        files_from_verbatim: Vec<PathBuf>,
+        /// Like --files-from, but every path ends with a NUL byte (as written by
+        /// `find -print0`), so any file name works. An empty name, or a last name without its
+        /// NUL, is an error.
+        #[arg(long, value_name = "FILE")]
+        files_from_raw: Vec<PathBuf>,
         /// File holding this machine's client id (created on first use).
         #[arg(long, env = "KIST_CLIENT_ID_FILE")]
         client_id_file: Option<PathBuf>,
@@ -151,6 +169,43 @@ enum Command {
         /// (0 = none; 2 = 12.5% overhead, repairs up to 2 damaged sixteenths).
         #[arg(long, value_name = "0..=8", default_value = "0")]
         parity: u8,
+        /// Leave out files and directories matching PATTERN (repeatable). A leading `/`
+        /// anchors it at the top of the snapshot path (for local sources the canonical
+        /// absolute path); otherwise it matches at any depth. `*`, `?` and `[...]` stay
+        /// within one path component, a `**` component spans any number. The named
+        /// source paths themselves are never excluded.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Read exclude patterns from FILE (`-` = standard input), one per line (repeatable).
+        /// Surrounding whitespace is trimmed; empty lines and lines starting with `#` are
+        /// skipped; a leading UTF-8 byte order mark and CRLF line ends are accepted.
+        #[arg(long, value_name = "FILE")]
+        exclude_file: Vec<PathBuf>,
+        /// Like --exclude, ignoring case (repeatable). For `!` patterns the order is:
+        /// --exclude, --exclude-file lines, --iexclude, --iexclude-file lines; the last
+        /// pattern matching a path decides.
+        #[arg(long, value_name = "PATTERN")]
+        iexclude: Vec<String>,
+        /// Like --exclude-file, the patterns ignoring case (repeatable).
+        #[arg(long, value_name = "FILE")]
+        iexclude_file: Vec<PathBuf>,
+        /// Leave out the contents of every directory that contains NAME (repeatable). With
+        /// `NAME:HEADER`, only when NAME is a file that starts with HEADER. The directory
+        /// and the marker itself are kept.
+        #[arg(long, value_name = "NAME[:HEADER]")]
+        exclude_if_present: Vec<String>,
+        /// Leave out the contents of cache directories tagged with a CACHEDIR.TAG file that
+        /// carries the standard signature (https://bford.info/cachedir/); the tag is kept.
+        #[arg(long)]
+        exclude_caches: bool,
+        /// Leave out files larger than SIZE: bytes, or a number with k, m, g or t
+        /// (powers of 1024). Named source files are kept.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        exclude_larger_than: Option<u64>,
+        /// Do not descend into other file systems (mount points, btrfs subvolumes): such
+        /// directories are kept as empty directories. Local source paths on unix only.
+        #[arg(long)]
+        one_file_system: bool,
     },
     /// List snapshots.
     Snapshots {
@@ -169,11 +224,50 @@ enum Command {
     Restore {
         #[command(flatten)]
         repo: RepoArgs,
-        /// Snapshot to restore: `latest`, a full id, or a unique timestamp prefix.
+        /// Snapshot to restore: `latest`, a full id, or a unique timestamp prefix. Append
+        /// `:PATH` (a directory in the snapshot, e.g. `latest:/home/me/docs`) to restore only
+        /// that directory's contents straight into TARGET.
         snapshot: String,
         /// Directory to restore into (the original absolute paths are recreated beneath it).
         /// Should be empty: existing files are overwritten; symlinks in the way (pre-existing or snapshot-planted) are refused, not followed.
         target: PathBuf,
+        /// Restore only nodes matching PATTERN and everything below them (repeatable); the
+        /// directories on the way are created with their recorded metadata. Patterns match
+        /// the node's path in the snapshot (for local sources the original absolute path),
+        /// with the same rules as `backup --exclude`, also with SNAPSHOT:PATH. A pattern
+        /// that selects nothing (no match, or every match excluded) is reported and the
+        /// exit code is 3.
+        #[arg(long, value_name = "PATTERN")]
+        include: Vec<String>,
+        /// Read --include patterns from FILE (`-` = standard input), one per line (repeatable;
+        /// same format as `backup --exclude-file`). A file without any pattern is an error:
+        /// it would restore everything.
+        #[arg(long, value_name = "FILE")]
+        include_file: Vec<PathBuf>,
+        /// Like --include, ignoring case (repeatable).
+        #[arg(long, value_name = "PATTERN")]
+        iinclude: Vec<String>,
+        /// Like --include-file, the patterns ignoring case (repeatable).
+        #[arg(long, value_name = "FILE")]
+        iinclude_file: Vec<PathBuf>,
+        /// Do not restore nodes matching PATTERN (a directory with everything below it;
+        /// repeatable). Wins over --include.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Read --exclude patterns from FILE (`-` = standard input), one per line (repeatable).
+        #[arg(long, value_name = "FILE")]
+        exclude_file: Vec<PathBuf>,
+        /// Like --exclude, ignoring case (repeatable).
+        #[arg(long, value_name = "PATTERN")]
+        iexclude: Vec<String>,
+        /// Like --exclude-file, the patterns ignoring case (repeatable).
+        #[arg(long, value_name = "FILE")]
+        iexclude_file: Vec<PathBuf>,
+        /// List what would be restored (`dir`, `file`, `link` and the path under TARGET)
+        /// without writing anything; TARGET is not even created. Only trees are read, so
+        /// errors that need file data (a damaged chunk) do not show up.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Verify the repository's integrity.
     Check {
@@ -261,6 +355,167 @@ enum Command {
     },
     /// Print version information.
     Version,
+}
+
+/// `--files-from*` 的三種切法（ADR 024，名稱同 restic；都不展開萬用字元）。文字的兩種：開頭的
+/// UTF-8 BOM 去掉，行尾的 `\r` 去掉（[`text_lines`]）。
+#[derive(Clone, Copy)]
+enum Listing {
+    /// 一行一個；去掉前後空白，空行與 `#` 開頭的行略過。
+    Plain,
+    /// 一行一個，照原樣；只略過空行。
+    Verbatim,
+    /// NUL 結尾，照原樣（名字裡可以有換行；[`raw_names`]）。
+    Raw,
+}
+
+/// `--files-from*` 的每個檔案（`-` 是標準輸入）裡列的來源路徑。
+fn listed_paths(files: &[PathBuf], how: Listing) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for file in files {
+        let bytes = read_input(file, "source paths")?;
+        let names: Vec<&[u8]> = match how {
+            Listing::Plain => text_lines(&bytes)
+                .map(trim_line)
+                .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
+                .collect(),
+            Listing::Verbatim => text_lines(&bytes).filter(|line| !line.is_empty()).collect(),
+            Listing::Raw => {
+                raw_names(&bytes).with_context(|| format!("--files-from-raw {}", file.display()))?
+            }
+        };
+        for name in names {
+            out.push(
+                path_from_bytes(name)
+                    .with_context(|| format!("a source path listed in {}", file.display()))?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// 清單或樣式檔的內容；`-` 是標準輸入（[`stdin_at_most_once`] 先確定只有一個 `-`）。
+fn read_input(file: &std::path::Path, what: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if file.as_os_str() == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {what} from standard input"))?;
+        return Ok(bytes);
+    }
+    std::fs::read(file).with_context(|| format!("reading {what} from {}", file.display()))
+}
+
+/// 標準輸入只能讀一次：`-` 給了不只一次時直接報錯，不然後面的默默讀到空的（審查修正）。
+fn stdin_at_most_once<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    if files.into_iter().filter(|f| f.as_os_str() == "-").count() > 1 {
+        bail!("`-` (standard input) is given more than once; standard input can be read only once");
+    }
+    Ok(())
+}
+
+/// 文字清單與樣式檔的行（同 restic）：開頭的 UTF-8 BOM 去掉，以 `\n` 切，行尾的一個 `\r`
+/// 去掉（CRLF）。
+fn text_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    bytes
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+}
+
+/// 一行的前後空白去掉：Unicode 的空白（同 restic 的 TrimSpace）；不成 UTF-8 的行只去 ASCII
+/// 空白。
+fn trim_line(line: &[u8]) -> &[u8] {
+    match std::str::from_utf8(line) {
+        Ok(text) => text.trim().as_bytes(),
+        Err(_) => line.trim_ascii(),
+    }
+}
+
+/// `--files-from-raw` 的名字（同 restic）：每個都以 NUL 結尾，不能是空的。
+fn raw_names(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(body) = bytes.strip_suffix(b"\0") else {
+        bail!("the last name does not end with a NUL byte");
+    };
+    body.split(|&b| b == 0)
+        .map(|name| {
+            if name.is_empty() {
+                bail!("empty name (two NUL bytes in a row, or a NUL first)");
+            }
+            Ok(name)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+/// 非 unix：檔名必須是 UTF-8。
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        String::from_utf8(bytes.to_vec()).context("not UTF-8")?,
+    ))
+}
+
+/// 一種樣式的來源：(旗標名, 旗標的值, 樣式檔)。
+type PatternSource<'a> = (&'a str, &'a [String], &'a [PathBuf]);
+
+/// 樣式是選取（restore 的 include）還是排除。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Include,
+    Exclude,
+}
+
+/// 命令列的樣式加上樣式檔，合成一組樣式（ADR 020、023；backup 的 `--exclude`、restore 的
+/// `--include`／`--exclude`）：先是區分大小寫的（旗標的值、再來樣式檔的行），然後是不分的
+/// （`--i…`）——`!` 反向樣式看的就是這個順序。
+fn pattern_filter(
+    exact: PatternSource<'_>,
+    ignore_case: PatternSource<'_>,
+    role: Role,
+) -> Result<PathFilter> {
+    let filter = PathFilter::new(&pattern_lines(exact, role)?)?;
+    Ok(filter.and_ignoring_case(&pattern_lines(ignore_case, role)?)?)
+}
+
+/// 旗標的值加上樣式檔（`-` 是標準輸入）的每一行。樣式檔一行一條（[`text_lines`]）：去掉前後
+/// 空白，空行與 `#` 開頭的行略過；寫錯的在這裡就點名出處（旗標名，或 `檔案:行號`）。include 的
+/// 樣式檔一條樣式都沒有時是錯（審查修正）：少了它們 include 就是空的，等於整份還原，而不是
+/// 「只還原那些」。exclude 的空樣式檔只是什麼都不排除。
+fn pattern_lines((flag, patterns, files): PatternSource<'_>, role: Role) -> Result<Vec<String>> {
+    let mut all = patterns.to_vec();
+    PathFilter::new(&all).context(flag.to_owned())?;
+    for file in files {
+        let bytes = read_input(file, "patterns")?;
+        let before = all.len();
+        for (n, line) in text_lines(&bytes).enumerate() {
+            let line = trim_line(line);
+            if line.is_empty() || line.starts_with(b"#") {
+                continue;
+            }
+            let at = || format!("{}:{}", file.display(), n + 1);
+            let line = std::str::from_utf8(line).with_context(|| format!("{}: not UTF-8", at()))?;
+            PathFilter::new(&[line]).with_context(at)?;
+            all.push(line.to_owned());
+        }
+        if role == Role::Include && all.len() == before {
+            bail!(
+                "{flag}-file {}: no patterns (an include list without patterns would restore \
+                 everything)",
+                file.display()
+            );
+        }
+    }
+    Ok(all)
 }
 
 fn main() {
@@ -447,14 +702,50 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Backup {
             repo,
-            paths,
+            mut paths,
+            files_from,
+            files_from_verbatim,
+            files_from_raw,
             client_id_file,
             gc_grace,
             parity,
+            exclude,
+            exclude_file,
+            iexclude,
+            iexclude_file,
+            exclude_if_present,
+            exclude_caches,
+            exclude_larger_than,
+            one_file_system,
         } => {
             if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
                 anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
             }
+            stdin_at_most_once(
+                files_from
+                    .iter()
+                    .chain(&files_from_verbatim)
+                    .chain(&files_from_raw)
+                    .chain(&exclude_file)
+                    .chain(&iexclude_file),
+            )?;
+            paths.extend(listed_paths(&files_from, Listing::Plain)?);
+            paths.extend(listed_paths(&files_from_verbatim, Listing::Verbatim)?);
+            paths.extend(listed_paths(&files_from_raw, Listing::Raw)?);
+            if paths.is_empty() {
+                bail!("no source paths to back up (the --files-from lists are empty)");
+            }
+            let exclude = Exclusions::new(
+                pattern_filter(
+                    ("--exclude", &exclude, &exclude_file),
+                    ("--iexclude", &iexclude, &iexclude_file),
+                    Role::Exclude,
+                )?,
+                &exclude_if_present,
+                exclude_caches,
+                exclude_larger_than,
+                one_file_system,
+            )?;
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
             let remote_url = paths
@@ -484,6 +775,7 @@ async fn run(cli: Cli) -> Result<()> {
                 parity,
                 progress: None,
                 source,
+                exclude,
             };
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;
@@ -505,6 +797,12 @@ async fn run(cli: Cli) -> Result<()> {
                     rep.chunks_new,
                     rep.packs_new
                 );
+                if rep.excluded > 0 {
+                    println!(
+                        "  excluded: {} item(s) matching the exclude patterns",
+                        rep.excluded
+                    );
+                }
             }
             if rep.errors > 0 {
                 // snapshot 已經寫出（不含那些項目）；結束碼 3 讓排程器知道要看警告
@@ -574,15 +872,70 @@ async fn run(cli: Cli) -> Result<()> {
             repo,
             snapshot,
             target,
+            include,
+            include_file,
+            iinclude,
+            iinclude_file,
+            exclude,
+            exclude_file,
+            iexclude,
+            iexclude_file,
+            dry_run,
         } => {
+            // `SNAPSHOT:PATH`（同 restic）：snapshot 的寫法裡沒有 `:`。
+            let (snapshot, subtree) = match snapshot.split_once(':') {
+                Some((snapshot, path)) => (
+                    snapshot.to_owned(),
+                    kist_core::restore::subtree_components(path)?,
+                ),
+                None => (snapshot, Vec::new()),
+            };
+            stdin_at_most_once(
+                include_file
+                    .iter()
+                    .chain(&iinclude_file)
+                    .chain(&exclude_file)
+                    .chain(&iexclude_file),
+            )?;
+            let opts = RestoreOptions {
+                include: pattern_filter(
+                    ("--include", &include, &include_file),
+                    ("--iinclude", &iinclude, &iinclude_file),
+                    Role::Include,
+                )?,
+                exclude: pattern_filter(
+                    ("--exclude", &exclude, &exclude_file),
+                    ("--iexclude", &iexclude, &iexclude_file),
+                    Role::Exclude,
+                )?,
+                subtree,
+            };
             let r = open_repo(&repo).await?;
             let key = r.resolve_snapshot(&snapshot).await?;
-            let summary = r.restore(&key, &target, RestoreOptions::default()).await?;
+            let summary = if dry_run {
+                let mut list = |path: &std::path::Path, kind: Planned| {
+                    if !json {
+                        let kind = match kind {
+                            Planned::Dir => "dir ",
+                            Planned::File => "file",
+                            Planned::Symlink => "link",
+                        };
+                        println!("{kind} {}", path.display());
+                    }
+                };
+                r.plan_restore(&key, &target, opts, &mut list).await?
+            } else {
+                r.restore(&key, &target, opts).await?
+            };
             if json {
-                print_json(&summary)?;
+                print_json(&RestoreJson {
+                    dry_run,
+                    summary: &summary,
+                })?;
             } else {
                 println!(
-                    "restored {} to {}: {} files, {} dirs, {} symlinks",
+                    "{} {} to {}: {} files, {} dirs, {} symlinks",
+                    if dry_run { "would restore" } else { "restored" },
                     short_snapshot_id(&key),
                     target.display(),
                     summary.files,
@@ -590,15 +943,34 @@ async fn run(cli: Cli) -> Result<()> {
                     summary.symlinks
                 );
             }
+            let mut problems = Vec::new();
             if !summary.errors.is_empty() {
                 for e in &summary.errors {
                     eprintln!("error: {e}");
                 }
-                return Err(Incomplete(format!(
+                problems.push(format!(
                     "{} item(s) could not be restored",
                     summary.errors.len()
-                ))
-                .into());
+                ));
+            }
+            if !summary.unmatched_includes.is_empty() {
+                // 樣式可能來自 --include、--iinclude 或樣式檔，訊息不點名旗標。有錯誤時，失敗的
+                // 目錄底下沒有走到，比對也許在那裡（審查修正）。
+                let why = if summary.errors.is_empty() {
+                    "no match in this snapshot, or every match is excluded or negated"
+                } else {
+                    "no match among the items reached; the errors above may hide matches"
+                };
+                for p in &summary.unmatched_includes {
+                    eprintln!("warning: include pattern {p:?} selected nothing: {why}");
+                }
+                problems.push(format!(
+                    "{} include pattern(s) selected nothing",
+                    summary.unmatched_includes.len()
+                ));
+            }
+            if !problems.is_empty() {
+                return Err(Incomplete(problems.join("; ")).into());
             }
             Ok(())
         }
@@ -949,6 +1321,14 @@ impl ForgetJson {
                 .collect(),
         }
     }
+}
+
+/// `restore --json`：加上 dry_run（`--dry-run` 時計數是「會還原」的，什麼都沒寫）。
+#[derive(serde::Serialize)]
+struct RestoreJson<'a> {
+    dry_run: bool,
+    #[serde(flatten)]
+    summary: &'a RestoreSummary,
 }
 
 /// `prune --json`：加上 dry_run（report 本身不帶，但消費者需要知道刪了沒）。

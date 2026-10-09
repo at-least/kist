@@ -73,6 +73,7 @@ fn backup_options(client: [u8; 16], now: OffsetDateTime) -> BackupOptions {
         parity: 2,
         progress: None,
         source: kist_core::SourceSpec::default(),
+        exclude: kist_core::Exclusions::default(),
     }
 }
 

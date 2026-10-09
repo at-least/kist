@@ -397,6 +397,42 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   釘住）。gate：fmt／clippy／windows-gnu clippy 乾淨、nextest 394 過 1 略過、deny ok。
 - 待辦：ADR 019「待負責人決定」第 1 點的第三～五批（A7／A9／A13／A14 起）。
 
+## M11：排除規則與部分還原（2026-10-10）【完成】
+
+起因：2026-10-09 與 restic 0.19.1 的功能比對，日常最先撞到的兩個缺口。負責人指示補上。分支
+`exclude-and-partial-restore`；設計、假設與證據見 ADR 020–025。格式不變（kist-format 沒動；
+`docs/format.md` 只更正 §9 一句錯誤的說明，見第六批）。
+
+- backup 的排除：`--exclude`、`--exclude-file`、設定檔 `[backup] exclude`。新的 `kist-core::filter`
+  模組逐段比對樣式（`/` 開頭錨定，否則任何深度；`*`、`?`、`[...]`、整段 `**`、`\` 跳脫；`?` 是一個
+  字元）。沒用 globset：probe 實測它的 `?` 吃一個 byte、單一 CJK 字對不上。指名的來源本身不排除。
+  `report.excluded` 計數。
+- restore 重構（行為不變）：每層目錄改成待建的 `PendingDir`，第一次往裡面寫才建。
+- 部分還原：`restore --include`／`--exclude`。沒被選到的分支一個目錄也不建，不可能被選到的子樹連
+  tree 都不讀（刪掉無關子樹的 tree 物件，整份還原報錯、部分還原不報）；沒選到東西的 include 印警告、
+  結束碼 3、JSON 的 `unmatched_includes`。restore 的樣式也比對 root 本身與它的上層（與 backup 不對稱，
+  README 寫明）。
+- 第二批（ADR 021）：`--exclude-if-present NAME[:HEADER]`、`--exclude-caches`、`--exclude-larger-than`、
+  `--one-file-system` 與對應的設定鍵。`BackupOptions.exclude` 改成 `Exclusions`；`Source` 新增 `probe`
+  判斷記號檔。`--one-file-system` 以 user＋mount namespace 裡的 tmpfs 端到端測過，另對 btrfs 子卷手動跑過。
+- 第三批（ADR 022）：`restore SNAPSHOT:PATH`（`RestoreOptions.subtree`，目錄內容直接放進目標）、
+  `restore --dry-run`（`Repository::plan_restore`，與真的還原共用落點與選取，測試逐一比對兩者的結果）、
+  restore 的 `--include-file`／`--exclude-file`。
+- 第四批（ADR 023）：反向樣式（`!`，一個路徑上最後一個比對到的樣式決定，同 restic 文件描述的
+  gitignore 行為）與不分大小寫的樣式（backup `--iexclude`／`--iexclude-file`、restore `--iinclude`／
+  `--iexclude` 與樣式檔、設定檔 `iexclude`）。
+- 第五批（ADR 024）：`backup --files-from`／`--files-from-verbatim`／`--files-from-raw`（`-`＝標準輸入，
+  名稱同 restic、不展開萬用字元；切法原本說同 restic，審查實測有出入，見第六批）。至此 2026-10-09 比對時
+  列在「來源篩選」與「部分還原」兩列的項目都做了，只剩大括號維持字面字元（restic 與 gitignore 都沒有）。
+- 第六批（ADR 025）：`/code-review` 的審查修正，八個 commit。巢狀的指名來源不再被排除；沒有 header 的記號只看
+  在不在；樣式比對與來源規劃從平方降到線性；`SNAPSHOT:PATH` 先驗證再建目錄；include 要涵蓋被還原的節點才
+  算選到東西，只有 `!` 的 include 是錯誤；唯讀目錄的 xattr、落點失敗、dry run 的目錄數；清單與樣式檔的
+  讀法（BOM、CRLF、raw 的格式錯誤、`-` 只能一次、沒有樣式的 include 樣式檔）；`Exclusions::new` 與平台
+  檢查。V19（檔案來源的判別有歧義）與 V21（每個 root 一個 tree）要改格式，留給 v4；`docs/format.md` §9
+  「沒有歧義代價」那句是錯的，已更正。
+- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
+  455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
+
 ## 已接受的限制（非待辦）
 
 - **Windows VSS 與 Windows 路徑語意驗證**：裁示為已接受的限制，自路線圖移除

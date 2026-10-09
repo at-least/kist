@@ -81,6 +81,49 @@ pub trait Source: Send + Sync + 'static {
     fn local_path(&self, _rel: &[u8]) -> Option<std::path::PathBuf> {
         None
     }
+
+    /// `rel` 處有沒有東西：沒有 → `Ok(None)`；`limit` 大於 0 而且是一般檔案 → 它開頭
+    /// 最多 `limit` bytes；其他（`limit` 是 0、目錄、symlink；symlink 不跟隨）→ 空的
+    /// bytes，不讀內容。給 backup 的記號檔（`--exclude-if-present`、`--exclude-caches`）
+    /// 判斷用。預設列上一層目錄找同名條目——遠端來源每次判斷多一次列舉；本機來源以
+    /// lstat 覆寫。
+    fn probe(
+        &self,
+        rel: &[u8],
+        limit: usize,
+    ) -> std::result::Result<Option<Vec<u8>>, BackendError> {
+        let (dir, name) = match rel.iter().rposition(|&b| b == b'/') {
+            Some(i) => (&rel[..i], &rel[i + 1..]),
+            None => (&b""[..], rel),
+        };
+        let mut items = self.list(dir)?;
+        let mut found = false;
+        while let Some(item) = items.next_item() {
+            let item = item?;
+            // 清單依名稱排序：同名條目相鄰（物件儲存可以同時有物件 `X` 與前綴 `X/`）。
+            match item.name.as_slice().cmp(name) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => found = true,
+            }
+            if limit == 0 {
+                break;
+            }
+            if matches!(item.kind, SourceItemKind::File { .. }) {
+                return read_head(self.read(rel)?, limit).map(Some).map_err(|e| {
+                    BackendError::Source(format!("{}: {e}", String::from_utf8_lossy(rel)))
+                });
+            }
+        }
+        Ok(found.then(Vec::new))
+    }
+}
+
+/// 讀 `reader` 開頭最多 `limit` bytes。
+fn read_head(reader: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut head = Vec::new();
+    reader.take(limit as u64).read_to_end(&mut head)?;
+    Ok(head)
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +196,27 @@ impl Source for LocalSource {
         let f = std::fs::File::open(&path)
             .map_err(|e| BackendError::Source(format!("{}: {e}", path.display())))?;
         Ok(Box::new(f))
+    }
+
+    fn probe(
+        &self,
+        rel: &[u8],
+        limit: usize,
+    ) -> std::result::Result<Option<Vec<u8>>, BackendError> {
+        let path = self.join(rel);
+        let fail = |e: std::io::Error| BackendError::Source(format!("{}: {e}", path.display()));
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(fail(e)),
+        };
+        // 不需要 header 時在不在就夠：讀不了的記號照樣算在（審查修正）。只開一般檔：
+        // FIFO 沒有寫端時 open 會一直等。
+        if limit == 0 || !meta.is_file() {
+            return Ok(Some(Vec::new()));
+        }
+        let file = std::fs::File::open(&path).map_err(fail)?;
+        read_head(file, limit).map(Some).map_err(fail)
     }
 }
 
@@ -541,6 +605,110 @@ mod tests {
     #[tokio::test]
     async fn open_source_rejects_unknown_schemes() {
         assert!(open_source("gopher://x").await.is_err());
+    }
+
+    /// `probe`（backup 的記號檔用）：不存在 → None；一般檔 → 開頭最多 limit bytes；
+    /// 目錄與 symlink → 存在、內容空（symlink 不跟隨）。
+    #[cfg(unix)]
+    #[test]
+    fn local_source_probes_without_following_symlinks() {
+        let dir = std::env::temp_dir().join(format!("kist-source-probe-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub/d")).unwrap();
+        std::fs::write(dir.join("sub/tag"), b"Signature: abc and more").unwrap();
+        std::os::unix::fs::symlink("tag", dir.join("sub/link")).unwrap();
+        let src = LocalSource::new(dir.clone()).unwrap();
+        assert_eq!(src.probe(b"sub/none", 9).unwrap(), None);
+        assert_eq!(
+            src.probe(b"sub/tag", 9).unwrap(),
+            Some(b"Signature".to_vec())
+        );
+        assert_eq!(src.probe(b"sub/tag", 0).unwrap(), Some(Vec::new()));
+        assert_eq!(src.probe(b"sub/d", 9).unwrap(), Some(Vec::new()));
+        assert_eq!(src.probe(b"sub/link", 9).unwrap(), Some(Vec::new()));
+        // 審查修正：不需要 header 時一次 lstat 就夠，讀不了的記號照樣算在（以 root 執行時
+        // 讀得了，結果相同）。
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.join("sub/locked"), b"x").unwrap();
+        std::fs::set_permissions(
+            dir.join("sub/locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        assert_eq!(src.probe(b"sub/locked", 0).unwrap(), Some(Vec::new()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 沒有覆寫 `probe` 的來源走預設：列上一層、找同名條目、檔案才讀開頭。
+    #[test]
+    fn default_probe_uses_the_parent_listing() {
+        struct Fake {
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        struct Items(std::vec::IntoIter<SourceItem>);
+        impl SortedItems for Items {
+            fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
+                self.0.next().map(Ok)
+            }
+        }
+        impl Source for Fake {
+            fn locator(&self) -> &[u8] {
+                b"fake://x"
+            }
+            fn meta_kind(&self) -> u8 {
+                kist_format::tree::meta_kind::GENERIC
+            }
+            fn list(
+                &self,
+                dir: &[u8],
+            ) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError> {
+                let file = |name: &[u8]| SourceItem {
+                    name: name.to_vec(),
+                    kind: SourceItemKind::File {
+                        size: 5,
+                        mtime_ns: 0,
+                        etag: None,
+                        vern: None,
+                    },
+                };
+                let dir_item = |name: &[u8]| SourceItem {
+                    name: name.to_vec(),
+                    kind: SourceItemKind::Dir,
+                };
+                let items = match dir {
+                    // 物件儲存可以同時有物件 `both` 與前綴 `both/`：清單裡目錄排在前面。
+                    b"a" => vec![
+                        dir_item(b"both"),
+                        file(b"both"),
+                        file(b"m"),
+                        dir_item(b"sub"),
+                    ],
+                    _ => Vec::new(),
+                };
+                Ok(Box::new(Items(items.into_iter())))
+            }
+            fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
+                assert!(
+                    file == b"a/m" || file == b"a/both",
+                    "只讀被找到的那個檔：{file:?}"
+                );
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(std::io::Cursor::new(b"hello".to_vec())))
+            }
+        }
+        let fake = Fake {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let reads = || fake.reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(fake.probe(b"a/m", 3).unwrap(), Some(b"hel".to_vec()));
+        assert_eq!(fake.probe(b"a/sub", 3).unwrap(), Some(Vec::new()));
+        assert_eq!(fake.probe(b"a/zzz", 3).unwrap(), None);
+        assert_eq!(fake.probe(b"top", 3).unwrap(), None);
+        assert_eq!(reads(), 1);
+        // 審查修正：不需要 header 時只看在不在，不讀內容（遠端是一次 GET）。
+        assert_eq!(fake.probe(b"a/m", 0).unwrap(), Some(Vec::new()));
+        assert_eq!(reads(), 1, "limit 0 不讀檔");
+        // 同名的目錄與檔案：要比 header 時看檔案那一個。
+        assert_eq!(fake.probe(b"a/both", 3).unwrap(), Some(b"hel".to_vec()));
     }
 }
 

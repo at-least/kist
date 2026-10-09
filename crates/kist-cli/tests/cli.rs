@@ -22,6 +22,12 @@ impl Env {
 
     /// 執行 kist，回傳 (exit ok, stdout, stderr)。密碼與 client id 檔都走環境變數，不碰使用者家目錄。
     fn kist(&self, args: &[&str]) -> (bool, String, String) {
+        let (code, stdout, stderr) = self.kist_code(args);
+        (code == Some(0), stdout, stderr)
+    }
+
+    /// 同 [`Env::kist`]，但回傳結束碼本身（區分 1 的失敗與 3 的不完整）。
+    fn kist_code(&self, args: &[&str]) -> (Option<i32>, String, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_kist"))
             .args(args)
             .env("KIST_REPO", self.repo())
@@ -32,7 +38,7 @@ impl Env {
             .output()
             .unwrap();
         (
-            out.status.success(),
+            out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
@@ -51,6 +57,31 @@ impl Env {
         let (ok, stdout, stderr) = self.kist(args);
         assert!(!ok, "kist {args:?} should have failed\nstdout: {stdout}");
         stderr
+    }
+
+    /// 同 [`Env::kist_code`]，標準輸入是 `input`（用到它的測試只在 unix 跑）。
+    #[cfg(unix)]
+    fn kist_stdin(&self, args: &[&str], input: &[u8]) -> (Option<i32>, String, String) {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kist"))
+            .args(args)
+            .env("KIST_REPO", self.repo())
+            .env("KIST_PASSWORD", "cli test password")
+            .env("KIST_CLIENT_ID_FILE", self.dir.path().join("client-id"))
+            .env("KIST_CACHE_DIR", self.dir.path().join("cache"))
+            .env_remove("RUST_LOG")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     }
 }
 
@@ -922,4 +953,685 @@ fn check_json_repair_output_is_pure_json() {
             .any(|v| v.as_str().is_some_and(|s| s.ends_with(&victim_id))),
         "壞掉的 pack {victim_id} 應該被修復：{report}"
     );
+}
+
+/// 審查修正：清單與樣式檔的讀法。文字清單與樣式檔開頭的 UTF-8 BOM 去掉、CRLF 的 `\r`
+/// 去掉（verbatim 也是）；raw 的空名字與少了結尾 NUL 是錯；`-`（標準輸入）只能給一次，樣式檔
+/// 也可以是 `-`；一條樣式都沒有的 include 樣式檔是錯（不然 include 是空的、整份還原）。
+#[cfg(unix)]
+#[test]
+fn list_and_pattern_files_are_read_strictly() {
+    use serde_json::Value;
+    use std::os::unix::ffi::OsStrExt;
+
+    let env = Env::new();
+    let one = env.dir.path().join("data/one");
+    let two = env.dir.path().join("data/two");
+    for dir in [&one, &two] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("f"), b"f").unwrap();
+    }
+    std::fs::write(one.join("x.tmp"), b"tmp").unwrap();
+    let (one_b, two_b) = (one.as_os_str().as_bytes(), two.as_os_str().as_bytes());
+    let file = |name: &str, bytes: &[u8]| {
+        let path = env.dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let snapshots = || {
+        let v: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+        v.as_array().unwrap().len()
+    };
+    env.ok(&["init"]);
+
+    // BOM＋CRLF：--files-from 與 --files-from-verbatim 都讀到這兩個路徑。
+    let list = file(
+        "bom-crlf.txt",
+        &[b"\xef\xbb\xbf", one_b, b"\r\n", two_b, b"\r\n"].concat(),
+    );
+    for flag in ["--files-from", "--files-from-verbatim"] {
+        let v: Value = serde_json::from_str(&env.ok(&["backup", "--json", flag, &list])).unwrap();
+        assert_eq!(v["roots"].as_array().unwrap().len(), 2, "{flag}: {v}");
+    }
+
+    // 樣式檔：BOM 之後的第一行就是樣式；也可以從標準輸入讀。
+    let patterns = file("exclude.txt", b"\xef\xbb\xbf*.tmp\r\n");
+    let one_s = one.to_str().unwrap();
+    let v: Value =
+        serde_json::from_str(&env.ok(&["backup", "--json", "--exclude-file", &patterns, one_s]))
+            .unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "{v}");
+    let (code, out, err) = env.kist_stdin(
+        &["backup", "--json", "--exclude-file", "-", one_s],
+        b"*.tmp\n",
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "{v}");
+
+    // raw：空名字、少了結尾的 NUL 都是錯；`-` 給兩次也是。都不留 snapshot。
+    let before = snapshots();
+    let raw_empty = file("raw-empty", &[one_b, b"\0\0", two_b, b"\0"].concat());
+    let raw_open = file("raw-open", &[one_b, b"\0", two_b].concat());
+    for (args, needle) in [
+        (vec!["backup", "--files-from-raw", &raw_empty], "empty name"),
+        (vec!["backup", "--files-from-raw", &raw_open], "NUL"),
+        (
+            vec!["backup", "--files-from", "-", "--files-from-verbatim", "-"],
+            "standard input",
+        ),
+        (
+            vec!["backup", "--files-from", "-", "--exclude-file", "-"],
+            "standard input",
+        ),
+    ] {
+        let (code, _, err) = env.kist_stdin(&args, &[one_b, b"\n"].concat());
+        assert_eq!(code, Some(1), "{args:?}: {err}");
+        assert!(err.contains(needle), "{args:?}: {err}");
+    }
+    assert_eq!(snapshots(), before);
+
+    // 一條樣式都沒有的 include 樣式檔：結束碼 1，目標不建。exclude 的空樣式檔照常。
+    let empty = file("empty.txt", b"");
+    let comments = file("comments.txt", b"# none\n\n   \n");
+    for (flag, list) in [
+        ("--include-file", &empty),
+        ("--include-file", &comments),
+        ("--iinclude-file", &empty),
+    ] {
+        let target = env.dir.path().join("never");
+        let (code, _, err) =
+            env.kist_code(&["restore", "latest", target.to_str().unwrap(), flag, list]);
+        assert_eq!(code, Some(1), "{flag} {list}: {err}");
+        assert!(err.contains("no patterns"), "{err}");
+        assert!(!target.exists());
+    }
+    let target = env.dir.path().join("out");
+    env.ok(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--exclude-file",
+        &empty,
+    ]);
+}
+
+/// `backup --exclude`／`--exclude-file`（ADR 020）：樣式檔一行一條，空行與 `#` 開頭的行略過、
+/// 前後空白去掉；寫錯的樣式在碰 repo 之前就以 exit 1 結束，並點名出處。
+#[test]
+fn backup_excludes_from_flags_and_files() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    std::fs::write(src.join("junk.tmp"), b"junk").unwrap();
+    std::fs::create_dir_all(src.join("sub/cache")).unwrap();
+    std::fs::write(src.join("sub/cache/c"), b"cache").unwrap();
+    let list = env.dir.path().join("exclude.txt");
+    std::fs::write(&list, "# comment\n\n  cache  \r\n").unwrap();
+
+    env.ok(&["init"]);
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--exclude",
+        "*.tmp",
+        "--exclude-file",
+        list.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(v["report"]["excluded"], 2, "{v}");
+    assert_eq!(v["stats"]["files"], 3, "{v}");
+
+    let out = env.ok(&[
+        "backup",
+        "--exclude",
+        "*.tmp",
+        "--exclude-file",
+        list.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    assert!(out.contains("excluded: 2"), "{out}");
+
+    let target = env.dir.path().join("out");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert!(restored.join("a.txt").is_file());
+    assert!(restored.join("sub/b.txt").is_file());
+    assert!(!restored.join("junk.tmp").exists());
+    assert!(!restored.join("sub/cache").exists());
+
+    let (code, _, err) = env.kist_code(&["backup", "--exclude", "[oops", src.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "寫錯的樣式是硬失敗：{err}");
+    assert!(err.contains("invalid pattern \"[oops\""), "{err}");
+    std::fs::write(&list, "ok\n[unclosed\n").unwrap();
+    let (code, _, err) = env.kist_code(&[
+        "backup",
+        "--exclude-file",
+        list.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains(&format!("{}:2", list.display())),
+        "要點名檔案與行號：{err}"
+    );
+    assert!(err.contains("unclosed"), "{err}");
+    let snapshots: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+    assert_eq!(
+        snapshots.as_array().unwrap().len(),
+        2,
+        "寫錯樣式的 backup 不留 snapshot"
+    );
+}
+
+/// `restore --include`／`--exclude`（ADR 020）：只還原選到的；沒比對到任何東西的 include
+/// 印警告、結束碼 3（選到的照樣還原）；寫錯的樣式在碰 repo 之前以結束碼 1 結束。
+#[test]
+fn restore_include_and_exclude() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let abs = std::fs::canonicalize(&src).unwrap();
+    let rel = abs.strip_prefix("/").unwrap();
+
+    // exclude 優先：sub 被選到，但裡面的 b.txt 被排除——sub 照樣建成空目錄。
+    let target = env.dir.path().join("out");
+    let sub = format!("{}/sub", abs.display());
+    let out = env.ok(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        &sub,
+        "--include",
+        "*.bin",
+        "--exclude",
+        "*.txt",
+    ]);
+    assert!(out.contains("1 files, 1 dirs"), "{out}");
+    assert!(target.join(rel).join("big.bin").is_file());
+    assert!(target.join(rel).join("sub").is_dir());
+    assert!(!target.join(rel).join("sub/b.txt").exists());
+    assert!(!target.join(rel).join("a.txt").exists());
+
+    let target = env.dir.path().join("out2");
+    let (code, stdout, stderr) = env.kist_code(&[
+        "restore",
+        "--json",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        "*.txt",
+        "--include",
+        "*.docx",
+    ]);
+    assert_eq!(code, Some(3), "沒比對到的 include 是不完整：{stderr}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["files"], 2, "{v}");
+    assert_eq!(v["unmatched_includes"], serde_json::json!(["*.docx"]));
+    assert!(
+        stderr.contains("\"*.docx\" selected nothing"),
+        "要點名沒選到東西的樣式：{stderr}"
+    );
+    assert!(target.join(rel).join("a.txt").is_file());
+
+    let (code, _, stderr) = env.kist_code(&[
+        "restore",
+        "latest",
+        env.dir.path().join("out3").to_str().unwrap(),
+        "--exclude",
+        "a**",
+    ]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("--exclude"), "{stderr}");
+    assert!(
+        !env.dir.path().join("out3").exists(),
+        "寫錯樣式時什麼都不建"
+    );
+}
+
+/// 審查修正：還原有錯誤時，失敗的目錄底下沒有走到，沒選到東西的 include 不能說成「snapshot
+/// 裡沒有」。訊息也不點名 `--include`（樣式可能來自樣式檔或 `--iinclude`）。
+#[test]
+fn unmatched_includes_after_errors_are_not_claimed_absent() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::write(src.join("docs/a.pdf"), b"a").unwrap();
+    std::fs::write(src.join("docs/b.txt"), b"b").unwrap();
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let abs = std::fs::canonicalize(&src).unwrap();
+    let rel = abs.strip_prefix("/").unwrap();
+    // docs 要建的地方擋著一個一般檔：a.pdf 之後 docs 整個放棄，b.txt 沒走到。
+    let target = env.dir.path().join("out");
+    std::fs::create_dir_all(target.join(rel)).unwrap();
+    std::fs::write(target.join(rel).join("docs"), b"in the way").unwrap();
+    let (code, _, stderr) = env.kist_code(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        "*.pdf",
+        "--include",
+        "*.txt",
+    ]);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains(
+            "include pattern \"*.txt\" selected nothing: no match among the items reached"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no match in this snapshot"), "{stderr}");
+    assert!(!stderr.contains("--include"), "{stderr}");
+}
+
+/// `--exclude-caches`、`--exclude-if-present`、`--exclude-larger-than`（ADR 021）端到端。
+#[test]
+fn backup_excludes_by_marker_and_size() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    std::fs::create_dir_all(src.join("cache")).unwrap();
+    std::fs::write(
+        src.join("cache/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("cache/blob"), b"cached").unwrap();
+    std::fs::create_dir_all(src.join("scratch")).unwrap();
+    std::fs::write(src.join("scratch/.nobackup"), b"").unwrap();
+    std::fs::write(src.join("scratch/tmp"), b"tmp").unwrap();
+    env.ok(&["init"]);
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--exclude-caches",
+        "--exclude-if-present",
+        ".nobackup",
+        "--exclude-larger-than",
+        "1M",
+        src.to_str().unwrap(),
+    ]))
+    .unwrap();
+    // cache/blob、scratch/tmp、big.bin（3 MiB）
+    assert_eq!(v["report"]["excluded"], 3, "{v}");
+
+    let target = env.dir.path().join("out");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert!(restored.join("cache/CACHEDIR.TAG").is_file());
+    assert!(!restored.join("cache/blob").exists());
+    assert!(restored.join("scratch/.nobackup").is_file());
+    assert!(!restored.join("scratch/tmp").exists());
+    assert!(!restored.join("big.bin").exists());
+    assert!(restored.join("a.txt").is_file());
+
+    let err = env.fails(&[
+        "backup",
+        "--exclude-larger-than",
+        "1MB",
+        src.to_str().unwrap(),
+    ]);
+    assert!(err.contains("unknown unit"), "{err}");
+    let err = env.fails(&[
+        "backup",
+        "--exclude-if-present",
+        "a/b",
+        src.to_str().unwrap(),
+    ]);
+    assert!(err.contains("single file name"), "{err}");
+}
+
+/// `--one-file-system`：在 user＋mount namespace 裡把 tmpfs 掛到來源底下再 backup（出了
+/// namespace 掛載就不見，snapshot 留在 repo）。掛載點照備成空目錄、計一個 excluded；不加旗標的
+/// 對照組會走進去。沒有 unshare 或不准 unprivileged namespace 的環境印出原因後略過。
+#[cfg(target_os = "linux")]
+#[test]
+fn one_file_system_keeps_mount_points_empty() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    std::fs::create_dir_all(src.join("mnt")).unwrap();
+    std::fs::write(src.join("a.txt"), b"a").unwrap();
+    env.ok(&["init"]);
+    // extra：另外指名的來源（在 namespace 裡才存在，掛載之後才建）。
+    let backup_in_namespace = |flags: &str, extra: &str| {
+        let script = format!(
+            "mount -t tmpfs none '{mnt}' && echo inner > '{mnt}/f' && mkdir '{mnt}/deep' \
+             && echo deeper > '{mnt}/deep/g' && '{kist}' backup --json {flags} '{src}' {extra}",
+            mnt = src.join("mnt").display(),
+            kist = env!("CARGO_BIN_EXE_kist"),
+            src = src.display(),
+        );
+        Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
+            .env("KIST_REPO", env.repo())
+            .env("KIST_PASSWORD", "cli test password")
+            .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+            .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
+            .env_remove("RUST_LOG")
+            .output()
+    };
+    let out = match backup_in_namespace("--one-file-system", "") {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            eprintln!(
+                "skipping: backup in a user+mount namespace failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("skipping: cannot run unshare: {e}");
+            return;
+        }
+    };
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "{v}");
+    let target = env.dir.path().join("out");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert!(restored.join("mnt").is_dir(), "掛載點本身照備");
+    assert!(!restored.join("mnt/f").exists(), "掛載點底下不走");
+    assert!(restored.join("a.txt").is_file());
+
+    // 對照組：不加旗標就會走進掛載點（證明上面的 tmpfs 真的掛上了）。
+    let out = backup_in_namespace("", "").unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let target = env.dir.path().join("out2");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(std::fs::read(restored.join("mnt/f")).unwrap(), b"inner\n");
+
+    // 審查修正：掛載點本身也指名時整個照備，它是自己的邊界。
+    let mnt = src.join("mnt");
+    let out = backup_in_namespace("--one-file-system", &format!("'{}'", mnt.display())).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["report"]["excluded"], 0, "{v}");
+    let target = env.dir.path().join("out3");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(std::fs::read(restored.join("mnt/f")).unwrap(), b"inner\n");
+    assert_eq!(
+        std::fs::read(restored.join("mnt/deep/g")).unwrap(),
+        b"deeper\n"
+    );
+
+    // 指名的路徑在掛載點更底下時，只沿著通往它的方向穿過掛載點。
+    let deep = src.join("mnt/deep");
+    let out = backup_in_namespace("--one-file-system", &format!("'{}'", deep.display())).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "掛載點裡的 f：{v}");
+    let target = env.dir.path().join("out4");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(
+        std::fs::read(restored.join("mnt/deep/g")).unwrap(),
+        b"deeper\n"
+    );
+    assert!(!restored.join("mnt/f").exists(), "掛載點的其他內容照樣不備");
+}
+
+/// `restore SNAPSHOT:PATH`、`--dry-run`、`--include-file`（ADR 022）。
+#[test]
+fn restore_subtree_dry_run_and_pattern_files() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let abs = std::fs::canonicalize(&src).unwrap();
+
+    // SNAPSHOT:PATH：那個目錄的內容直接放進目標。
+    let target = env.dir.path().join("sub-only");
+    let spec = format!("latest:{}/sub", abs.display());
+    env.ok(&["restore", &spec, target.to_str().unwrap()]);
+    assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"world\n");
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+
+    // --dry-run：列出會寫的東西，目標連建都不建。
+    let target = env.dir.path().join("dry");
+    let list = env.dir.path().join("include.txt");
+    std::fs::write(&list, "# text files only\n*.txt\n").unwrap();
+    let out = env.ok(&[
+        "restore",
+        "--dry-run",
+        "latest",
+        target.to_str().unwrap(),
+        "--include-file",
+        list.to_str().unwrap(),
+    ]);
+    let rel = abs.strip_prefix("/").unwrap();
+    let file = |p: &str| format!("file {}", target.join(rel).join(p).display());
+    assert!(out.contains(&file("a.txt")), "{out}");
+    assert!(out.contains(&file("sub/b.txt")), "{out}");
+    assert!(
+        out.contains(&format!("dir  {}", target.join(rel).join("sub").display())),
+        "{out}"
+    );
+    assert!(!out.contains("big.bin"), "{out}");
+    assert!(out.contains("would restore"), "{out}");
+    assert!(!target.exists(), "dry run 不建目標");
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "restore",
+        "--json",
+        "--dry-run",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        "*.txt",
+    ]))
+    .unwrap();
+    assert_eq!(
+        (v["dry_run"].clone(), v["files"].clone(), v["dirs"].clone()),
+        (Value::Bool(true), 2.into(), 1.into()),
+        "{v}"
+    );
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "restore",
+        "--json",
+        "latest",
+        env.dir.path().join("real").to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(v["dry_run"], false);
+
+    for (spec, needle) in [
+        (
+            format!("latest:{}/nope", abs.display()),
+            "not in this snapshot",
+        ),
+        ("latest:relative/path".to_owned(), "starts with `/`"),
+        (format!("latest:{}/a.txt", abs.display()), "not a directory"),
+    ] {
+        let (code, _, err) =
+            env.kist_code(&["restore", &spec, env.dir.path().join("x").to_str().unwrap()]);
+        assert_eq!(code, Some(1), "{spec}: {err}");
+        assert!(err.contains(needle), "{spec}: {err}");
+    }
+}
+
+/// 反向樣式與不分大小寫的旗標（ADR 023）：backup 只備 sub（`!` 加回來），restore 用不分
+/// 大小寫的 include 選檔。
+#[test]
+fn negated_and_case_insensitive_patterns() {
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    std::fs::write(src.join("sub/C.TXT"), b"upper").unwrap();
+    let abs = std::fs::canonicalize(&src).unwrap();
+    env.ok(&["init"]);
+    let all = format!("{}/*", abs.display());
+    let keep = format!("!{}/sub", abs.display());
+    let out = env.ok(&[
+        "backup",
+        "--exclude",
+        &all,
+        "--exclude",
+        &keep,
+        "--iexclude",
+        "c.txt",
+        src.to_str().unwrap(),
+    ]);
+    assert!(
+        out.contains("excluded: 3"),
+        "a.txt、big.bin、sub/C.TXT：{out}"
+    );
+
+    let target = env.dir.path().join("out");
+    env.ok(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--iinclude",
+        "*.TXT",
+    ]);
+    let restored = target.join(abs.strip_prefix("/").unwrap());
+    assert!(restored.join("sub/b.txt").is_file());
+    assert!(!restored.join("a.txt").exists());
+    assert!(!restored.join("sub/C.TXT").exists());
+    let err = env.fails(&["backup", "--iexclude", "[x", src.to_str().unwrap()]);
+    assert!(err.contains("--iexclude"), "{err}");
+}
+
+/// `--files-from`、`--files-from-verbatim`、`--files-from-raw`（ADR 024）：來源路徑從檔案讀，
+/// 可以和命令列的路徑一起給；`-` 是標準輸入。三種的差別只在怎麼切行。
+#[cfg(unix)]
+#[test]
+fn backup_reads_source_paths_from_files() {
+    use serde_json::Value;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let env = Env::new();
+    let base = env.dir.path().join("data");
+    for name in [
+        "one",
+        "two",
+        "trailing space ",
+        "new\nline",
+        "three",
+        "four",
+    ] {
+        std::fs::create_dir_all(base.join(name)).unwrap();
+        std::fs::write(base.join(name).join("f"), name).unwrap();
+    }
+    env.ok(&["init"]);
+    let roots = |v: &Value| -> Vec<String> {
+        v["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r["path"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // 一般：去掉前後空白，空行與 `#` 略過。
+    let plain = env.dir.path().join("plain.txt");
+    std::fs::write(
+        &plain,
+        format!(
+            "# my list\n\n  {}  \r\n{}\n",
+            base.join("one").display(),
+            base.join("two").display()
+        ),
+    )
+    .unwrap();
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--files-from",
+        plain.to_str().unwrap(),
+        base.join("three").to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(roots(&v), ["one", "three", "two"]);
+
+    // verbatim：一行就是一個路徑，空白照留（只略過空行）。
+    let verbatim = env.dir.path().join("verbatim.txt");
+    std::fs::write(
+        &verbatim,
+        format!("{}\n\n", base.join("trailing space ").display()),
+    )
+    .unwrap();
+    let v: Value = serde_json::from_str(&env.ok(&[
+        "backup",
+        "--json",
+        "--files-from-verbatim",
+        verbatim.to_str().unwrap(),
+    ]))
+    .unwrap();
+    assert_eq!(roots(&v), ["trailing space "]);
+
+    // raw：NUL 結尾，名字裡可以有換行；從標準輸入讀。
+    let mut raw = Vec::new();
+    raw.extend_from_slice(base.join("new\nline").as_os_str().as_bytes());
+    raw.push(0);
+    raw.extend_from_slice(base.join("four").as_os_str().as_bytes());
+    raw.push(0);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kist"))
+        .args(["backup", "--json", "--files-from-raw", "-"])
+        .env("KIST_REPO", env.repo())
+        .env("KIST_PASSWORD", "cli test password")
+        .env("KIST_CLIENT_ID_FILE", env.dir.path().join("client-id"))
+        .env("KIST_CACHE_DIR", env.dir.path().join("cache"))
+        .env_remove("RUST_LOG")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&raw).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(roots(&v), ["four", "new\nline"]);
+
+    // 讀完是空的、或列了不存在的路徑：結束碼 1，不留 snapshot。
+    let empty = env.dir.path().join("empty.txt");
+    std::fs::write(&empty, "# nothing\n").unwrap();
+    let (code, _, err) = env.kist_code(&["backup", "--files-from", empty.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("no source paths"), "{err}");
+    let globbed = env.dir.path().join("globbed.txt");
+    std::fs::write(&globbed, format!("{}/*\n", base.display())).unwrap();
+    let (code, _, err) = env.kist_code(&["backup", "--files-from", globbed.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "沒有萬用字元展開：{err}");
+    let snapshots: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
+    assert_eq!(snapshots.as_array().unwrap().len(), 3);
 }

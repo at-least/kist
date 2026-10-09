@@ -22,6 +22,7 @@ fn client(id: u8, now: OffsetDateTime) -> BackupOptions {
         parity: 0,
         progress: None,
         source: kist_core::SourceSpec::default(),
+        exclude: kist_core::Exclusions::default(),
     }
 }
 fn prune_opts(now: OffsetDateTime) -> PruneOptions {

@@ -51,13 +51,21 @@ timezone = "utc"
 
 #[test]
 fn config_parses_and_validates() {
-    let good = r#"
+    // one_file_system 只有 unix 支援；其他平台載入時就報錯（下面的 bad）。
+    let good = format!(
+        r#"
 repo = "/tmp/x"
 password_file = "/tmp/p"
 [backup]
 paths = ["/etc"]
 schedule = "0 2 * * *"
 gc_grace = "48h"
+exclude = ["/home/*", "!/home/me"]
+iexclude = ["*.BAK"]
+exclude_if_present = [".nobackup"]
+exclude_caches = true
+exclude_larger_than = "100M"
+one_file_system = {}
 [forget]
 keep_daily = 7
 keep_within = "2w"
@@ -68,13 +76,42 @@ repack_below = 40
 [notify]
 webhook_url = "https://example.com/hook"
 on = ["failure", "success"]
-"#;
-    let cfg = Config::parse(good).unwrap();
+"#,
+        cfg!(unix)
+    );
+    let cfg = Config::parse(&good).unwrap();
     cfg.validate().unwrap();
     assert_eq!(
         cfg.backup.as_ref().unwrap().gc_grace,
         Some(std::time::Duration::from_secs(48 * 3600))
     );
+    let exclusions = cfg.backup.as_ref().unwrap().exclusions().unwrap();
+    assert_eq!(exclusions.larger_than, Some(100 << 20));
+    assert_eq!(
+        exclusions.if_present,
+        [
+            kist_core::Marker::parse(".nobackup").unwrap(),
+            kist_core::Marker::cachedir_tag()
+        ]
+    );
+    assert_eq!(exclusions.one_file_system, cfg!(unix));
+    // 大小也可以直接寫 bytes 的整數（審查修正：原本只收字串，整數是載入錯誤）。
+    let sized = Config::parse(
+        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = 1048576\n",
+    )
+    .unwrap();
+    sized.validate().unwrap();
+    assert_eq!(
+        sized
+            .backup
+            .as_ref()
+            .unwrap()
+            .exclusions()
+            .unwrap()
+            .larger_than,
+        Some(1 << 20)
+    );
+    assert_eq!(exclusions.patterns.len(), 3, "exclude 兩條、iexclude 一條");
     assert_eq!(
         cfg.forget.as_ref().unwrap().policy().keep_within,
         Some(std::time::Duration::from_secs(14 * 86_400))
@@ -99,7 +136,21 @@ on = ["failure", "success"]
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[notify]\nwebhook_url = \"https://x\"\non = [\"sometimes\"]\n", "unknown event"),
         ("repo = \"/x\"\npassword_file = \"/p\"\npassword = \"inline\"\n[backup]\npaths = [\"/e\"]\n", "unknown field"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"3 days\"\n", "unknown unit"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude = [\"*.tmp\", \"[bad\"]\n", "[backup] exclude: invalid pattern \"[bad\""),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_if_present = [\"a/b\"]\n", "[backup] exclude marker \"a/b\""),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = \"1MB\"\n", "unknown unit"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = -1\n", "a size"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = 1.5\n", "a size"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\niexclude = [\"a**\"]\n", "[backup] iexclude"),
     ];
+    let mut bad = bad.to_vec();
+    if cfg!(not(unix)) {
+        // 審查修正：原本載入時照收，每次排程的 backup 才失敗。
+        bad.push((
+            "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\none_file_system = true\n",
+            "not supported on this platform",
+        ));
+    }
     for (text, needle) in bad {
         let err = Config::parse(text)
             .and_then(|c| c.validate())
@@ -260,6 +311,35 @@ async fn run_once_executes_backup_forget_prune_in_order() {
         outcomes[1].detail["removed"].as_array().map(|a| a.len()),
         Some(1)
     );
+}
+
+/// `[backup] exclude` 與 CLI 的 `--exclude` 同一套樣式（ADR 020）：比對到的不進 snapshot，
+/// 計數出現在工作結果的 report 裡。
+#[tokio::test]
+async fn run_once_backup_honours_exclude() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path()).await;
+    let password = write_password(dir.path());
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("cache")).unwrap();
+    std::fs::write(src.join("a.txt"), b"keep").unwrap();
+    std::fs::write(src.join("b.tmp"), b"drop").unwrap();
+    std::fs::write(src.join("cache/c.txt"), b"drop").unwrap();
+    let text = config_text(
+        &repo,
+        &password,
+        dir.path(),
+        &format!(
+            "[backup]\npaths = [{:?}]\nexclude = [\"*.tmp\", \"cache\"]\n",
+            src.display().to_string()
+        ),
+    );
+    let cfg = Config::parse(&text).unwrap();
+    cfg.validate().unwrap();
+    let outcomes = Daemon::new(cfg).unwrap().run_once(None, |_| {}).await;
+    assert_eq!(outcomes[0].status, JobStatus::Success, "{:?}", outcomes[0]);
+    assert_eq!(outcomes[0].detail["stats"]["files"].as_u64(), Some(1));
+    assert_eq!(outcomes[0].detail["report"]["excluded"].as_u64(), Some(2));
 }
 
 /// 同一份設定只寫 `[prune] grace`：backup 的閘門要用它（ADR 019 A5），不是 72h 預設。
