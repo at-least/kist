@@ -549,6 +549,37 @@ async fn overly_deep_tree_chain_body() {
         "restore 要在上限處回錯：{:?}",
         summary.errors.first()
     );
+
+    // 審查修正：dry run 的目錄數與真的還原一致。上限處的節點被選到、它的上層沒有時，真的
+    // 還原為了寫它先把上層建好（都計數），dry run 原本沒算。
+    let deepest = format!("/deep{}", "/d".repeat(kist_core::MAX_TREE_DEPTH));
+    let opts = RestoreOptions {
+        include: kist_core::PathFilter::new(&[&deepest]).unwrap(),
+        ..RestoreOptions::default()
+    };
+    let real = repo
+        .restore(&key_path, &t.dir.path().join("out-deepest"), opts.clone())
+        .await
+        .unwrap();
+    let plan = repo
+        .plan_restore(
+            &key_path,
+            &t.dir.path().join("plan-deepest"),
+            opts,
+            &mut |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        real.dirs,
+        kist_core::MAX_TREE_DEPTH as u64 - 1,
+        "{:?}",
+        real.errors
+    );
+    assert_eq!(
+        (plan.dirs, plan.errors.len(), &plan.unmatched_includes),
+        (real.dirs, real.errors.len(), &real.unmatched_includes)
+    );
 }
 
 /// 間接內容的 chunk 清單同樣要比 `v`（format.md §16：≠3 拒絕；ADR 019 A10）。
@@ -942,6 +973,80 @@ async fn restore_twice_over_read_only_files_and_dirs() {
     );
     assert_no_restore_temp(&restored);
     assert_no_restore_temp(&restored.join("rodir"));
+}
+
+/// 審查修正：既有的唯讀目錄裡一個子項目都沒寫（空目錄，或子項目被排除）時，套 metadata
+/// 之前也要暫時加寫入權：設 user.* xattr 要寫入權。原本只在第一次往裡面寫之前加，第二次
+/// 還原時 xattr 設不進去（EACCES），記錄的時間也沒套回去。
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_twice_over_read_only_dirs_nothing_is_written_into() {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+    let chmod = |p: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let dirs = ["empty", "full"];
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("empty")).unwrap();
+    std::fs::create_dir_all(src.join("full")).unwrap();
+    std::fs::write(src.join("full").join("f"), b"f").unwrap();
+    for d in dirs {
+        xattr::set(src.join(d), OsStr::new("user.k"), b"1").unwrap();
+        chmod(&src.join(d), 0o555);
+    }
+    let repo = t.open().await;
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    let abs = std::fs::canonicalize(&src).unwrap();
+    let target = t.dir.path().join("out");
+    let restored = target.join(abs.strip_prefix("/").unwrap());
+    let first = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    // 第二次之前把時間改掉，看記錄的時間有沒有套回去；第二次排除 full/f，full 裡什麼都不寫。
+    let old = filetime::FileTime::from_unix_time(946_684_800, 0);
+    for d in dirs {
+        filetime::set_file_mtime(restored.join(d), old).unwrap();
+    }
+    let opts = RestoreOptions {
+        exclude: kist_core::PathFilter::new(&[&format!("{}/full/f", abs.display())]).unwrap(),
+        ..RestoreOptions::default()
+    };
+    let second = repo.restore(&s.snapshot_key, &target, opts).await.unwrap();
+
+    // 先收齊觀察值、把目錄改回可寫，再斷言：斷言失敗時 TempDir 才刪得掉。
+    let observe = |p: &std::path::Path| {
+        let meta = std::fs::metadata(p).unwrap();
+        (
+            format!("{:o}", meta.permissions().mode() & 0o7777),
+            filetime::FileTime::from_last_modification_time(&meta),
+            xattr::get(p, "user.k").unwrap(),
+        )
+    };
+    let seen: Vec<_> = dirs.iter().map(|d| observe(&restored.join(d))).collect();
+    let want: Vec<_> = dirs
+        .iter()
+        .map(|d| {
+            (
+                String::from("555"),
+                observe(&src.join(d)).1,
+                Some(b"1".to_vec()),
+            )
+        })
+        .collect();
+    for d in dirs {
+        chmod(&src.join(d), 0o755);
+        chmod(&restored.join(d), 0o755);
+    }
+    assert!(first.errors.is_empty(), "第一次：{first:?}");
+    assert!(second.errors.is_empty(), "第二次：{second:?}");
+    assert_eq!(seen, want, "(mode, mtime, user.k) of {dirs:?}");
 }
 
 /// 同一個 snapshot 還原兩次，硬連結關係要還在（ADR 019 A2）。第二次時正式名

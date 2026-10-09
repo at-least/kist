@@ -454,6 +454,9 @@ struct PendingDir<'p> {
     prepared: bool,
     /// 暫時加上寫入權之前的權限：套 metadata 失敗時放回去。
     loosened: Option<std::fs::Permissions>,
+    /// 上一次建立這一層失敗了（之後建起來就清掉）：root 的落點用它判斷整個 restore 要不要
+    /// 回錯（[`Repository::restore`]）。
+    create_failed: bool,
 }
 
 enum Make {
@@ -487,6 +490,7 @@ impl<'p> PendingDir<'p> {
             handle: None,
             prepared: false,
             loosened: None,
+            create_failed: false,
         }
     }
 
@@ -503,6 +507,7 @@ impl<'p> PendingDir<'p> {
             handle,
             prepared,
             loosened,
+            create_failed,
             ..
         } = self;
         let handle = match handle {
@@ -510,17 +515,19 @@ impl<'p> PendingDir<'p> {
             slot @ None => {
                 let above = parent.open()?;
                 let created = match make {
-                    Make::Base(rel) => above.create_dirs(rel)?,
-                    Make::Child(name) => above.create_child_dir(name)?,
+                    Make::Base(rel) => above.create_dirs(rel),
+                    Make::Child(name) => above.create_child_dir(name),
                 };
-                &*slot.insert(created)
+                *create_failed = created.is_err();
+                &*slot.insert(created?)
             }
         };
         if for_writing && !*prepared {
-            *prepared = true;
             if *loosen {
                 *loosened = make_owner_writable(handle)?;
             }
+            // 成功之後才記：失敗時下一次寫入前再試（審查修正）。
+            *prepared = true;
         }
         Ok(handle)
     }
@@ -793,6 +800,12 @@ impl Repository {
                 }
                 self.restore_node(&mut w, &mut base, &entry, &name, 1, child)
                     .await;
+                // 落點等底下有東西要寫才建；在更深處建不起來（例如擋著 symlink）時，與一開始
+                // 就建不起來一樣，整個 restore 回錯，不是每個子樹各記一個錯（審查修正）。再建
+                // 一次，拿到落點自己的錯誤。
+                if base.create_failed {
+                    base.create()?;
+                }
             }
         }
         w.summary.unmatched_includes = w.select.unmatched();
@@ -986,6 +999,10 @@ impl Repository {
                     continue;
                 };
                 let path = base.join(fsmeta::bytes_to_name(&entry.name)?);
+                // 與真的還原同一個時機：被選到的子項目還原之前先建好這一層。
+                if child.selected {
+                    p.open();
+                }
                 self.plan_node(&mut p, &entry, path, 1, child).await;
             }
             p.levels.pop();
@@ -1086,6 +1103,9 @@ impl Repository {
                 continue;
             };
             let child_path = path.join(fsmeta::bytes_to_name(&child.name)?);
+            if child_pos.selected {
+                p.open();
+            }
             self.plan_node(p, &child, child_path, depth + 1, child_pos)
                 .await;
         }
@@ -1240,6 +1260,11 @@ impl Repository {
             }
             self.restore_node(w, &mut dir, &child, &child_name, depth + 1, child_pos)
                 .await;
+        }
+        // 套 metadata 之前，既有的唯讀目錄也要先暫時加寫入權（設 user.* xattr 要寫入權）：
+        // 一個子項目都沒寫進去時（空目錄、子項目全被排除）還沒加過（審查修正）。
+        if dir.handle.is_some() {
+            dir.open()?;
         }
         let PendingDir {
             handle, loosened, ..

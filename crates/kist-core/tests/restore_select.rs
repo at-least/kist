@@ -300,6 +300,34 @@ async fn only_negated_includes_are_an_error() {
     assert!(!target.exists());
 }
 
+/// 審查修正：落點建不起來（擋著一個指到外面的 symlink）時，即使落點是等底下有東西要寫
+/// 才建（include 只選到更深的節點），也與一開始就建不起來一樣：整個 restore 回錯，不是每個
+/// 子樹各記一個錯。什麼都不經過 symlink 寫出去。
+#[cfg(unix)]
+#[tokio::test]
+async fn a_landing_that_cannot_be_created_fails_the_whole_restore() {
+    let f = fixture().await;
+    let outside = f.t.dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    for opts in [
+        RestoreOptions::default(),
+        select(&["*.pdf"], &[]),
+        select(&["*.jpg", "*.pdf"], &[]),
+    ] {
+        let target = tempfile::tempdir_in(f.t.dir.path()).unwrap().keep();
+        let landing = target.join(f.abs.strip_prefix("/").unwrap());
+        std::fs::create_dir_all(landing.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &landing).unwrap();
+        let err = f.repo.restore(&f.key, &target, opts).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("{}: a symlink is in the way", landing.display())),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+}
+
 /// 剪枝的證據：把 photos 子目錄的 tree 物件刪掉。整份還原會撞到它（證明這個測試抓得到
 /// 「有去讀」）；只 include docs 的還原完全不碰它。
 #[tokio::test]
