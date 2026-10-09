@@ -397,6 +397,27 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   釘住）。gate：fmt／clippy／windows-gnu clippy 乾淨、nextest 394 過 1 略過、deny ok。
 - 待辦：ADR 019「待負責人決定」第 1 點的第三～五批（A7／A9／A13／A14 起）。
 
+## M11：排除規則與部分還原（2026-10-10）【完成】
+
+起因：2026-10-09 與 restic 0.19.1 的功能比對，日常最先撞到的兩個缺口。負責人指示補上。分支
+`exclude-and-partial-restore`，三個 commit；設計、假設與證據見 ADR 020。格式不變（kist-format、
+`docs/format.md` 沒動）。
+
+- backup 的排除：`--exclude`、`--exclude-file`、設定檔 `[backup] exclude`。新的 `kist-core::filter`
+  模組逐段比對樣式（`/` 開頭錨定，否則任何深度；`*`、`?`、`[...]`、整段 `**`、`\` 跳脫；`?` 是一個
+  字元）。沒用 globset：probe 實測它的 `?` 吃一個 byte、單一 CJK 字對不上。指名的來源本身不排除。
+  `report.excluded` 計數。
+- restore 重構（行為不變）：每層目錄改成待建的 `PendingDir`，第一次往裡面寫才建。
+- 部分還原：`restore --include`／`--exclude`。沒被選到的分支一個目錄也不建，不可能被選到的子樹連
+  tree 都不讀（刪掉無關子樹的 tree 物件，整份還原報錯、部分還原不報）；沒選到東西的 include 印警告、
+  結束碼 3、JSON 的 `unmatched_includes`。restore 的樣式也比對 root 本身與它的上層（與 backup 不對稱，
+  README 寫明）。
+- 沒做（ADR 020「沒做」）：`--exclude-caches`、`--exclude-if-present`、`--one-file-system`、
+  `--exclude-larger-than`、`--iexclude`、`--files-from`、restore 的 `--dry-run` 與 `snap:子目錄`。
+- gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli）乾淨、nextest 420 過 1 略過（原
+  395；filter 9、backup_exclude 3、source_backup 1、restore_select 9、kist-app 1、CLI 2）。依賴沒變，
+  cargo deny 不受影響。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
+
 ## 已接受的限制（非待辦）
 
 - **Windows VSS 與 Windows 路徑語意驗證**：裁示為已接受的限制，自路線圖移除

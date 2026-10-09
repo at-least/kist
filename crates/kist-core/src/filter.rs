@@ -424,6 +424,10 @@ mod tests {
         assert!(matches("**/z", b"/z"));
         assert!(matches("/**", b"/anything/at/all"));
         assert!(!matches("/a/**/z", b"/b/z"));
+        // README 的例子：只排除 root `/tmp/data` 底下名為 tmp 的目錄，不排除 root 本身。
+        assert!(!matches("/tmp/data/**/tmp", b"/tmp/data"));
+        assert!(matches("/tmp/data/**/tmp", b"/tmp/data/tmp"));
+        assert!(matches("/tmp/data/**/tmp", b"/tmp/data/x/tmp"));
     }
 
     #[test]

@@ -14,14 +14,24 @@ use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
 use kist_format::{keys, ChunkId};
 
 use crate::dirhandle::{DirHandle, Kind};
+use crate::filter::{FilterState, PathFilter};
 use crate::fsmeta;
 use crate::index::{ChunkIndex, ChunkLocator};
 use crate::pack::decode_chunk;
 use crate::repo::Repository;
 use crate::{blocking, CoreError, Result, MAX_TREE_DEPTH};
 
+/// 部分還原（ADR 020）：兩組樣式都空時還原整個 snapshot。樣式比對的路徑是節點整份還原時
+/// 在目標底下的位置（本機來源＝原本的絕對路徑），規則見 [`crate::filter`]。
 #[derive(Debug, Clone, Default)]
-pub struct RestoreOptions {}
+pub struct RestoreOptions {
+    /// 只還原比對到的節點與它們底下的一切；沿途的上層目錄照樣建立、套記錄的 metadata、
+    /// 計進 `dirs`。沒有東西被選到的分支一個目錄也不建；底下不可能被選到的子樹連 tree
+    /// 都不讀。空的＝全部。
+    pub include: PathFilter,
+    /// 不還原比對到的節點（目錄整棵不走）。與 `include` 同時比對到時，排除優先。
+    pub exclude: PathFilter,
+}
 
 /// 讀取途中 chunk 的 pack 不見了（prune 的 repack 把它搬走了）就重新載入的 index。
 /// 重載最多每分鐘一次：真的壞掉的 repo 不會每個 chunk 都重載一遍。
@@ -86,6 +96,10 @@ pub struct RestoreSummary {
     pub dirs: u64,
     pub symlinks: u64,
     pub errors: Vec<String>,
+    /// 沒有選到任何節點的 include 樣式（原文，照給的順序）：snapshot 裡比對不到，或比對
+    /// 到的全被 exclude 排除（被排除的子樹不會走進去，裡面的比對也就不算）。多半是打錯字
+    /// 或選錯 snapshot：CLI 對它們印警告、以結束碼 3 結束。
+    pub unmatched_includes: Vec<String>,
 }
 
 /// 硬連結表：(dev, inode) → 第一個還原出來的名字相對於還原目標的路徑元件。
@@ -476,6 +490,85 @@ struct Walk<'w> {
     summary: RestoreSummary,
     /// 範圍是**整個 snapshot、跨 roots**（docs/format.md §8.3）。
     hardlinks: HardLinks,
+    select: Select<'w>,
+}
+
+/// 部分還原的選取（[`RestoreOptions`]）：每個節點的 [`Pos`] 從上一層往下走一步。
+struct Select<'o> {
+    include: &'o PathFilter,
+    exclude: &'o PathFilter,
+    /// 每條 include 樣式有沒有比對到過沒被排除的節點
+    /// （[`RestoreSummary::unmatched_includes`]）。
+    hit: Vec<bool>,
+}
+
+/// 一個節點在兩組樣式裡的位置。
+#[derive(Clone)]
+struct Pos {
+    include: FilterState,
+    exclude: FilterState,
+    /// 自己或某個上層被 include 比對到（沒有 include 時一律是）：要還原。
+    selected: bool,
+}
+
+impl<'o> Select<'o> {
+    fn new(opts: &'o RestoreOptions) -> Self {
+        Self {
+            include: &opts.include,
+            exclude: &opts.exclude,
+            hit: vec![false; opts.include.len()],
+        }
+    }
+
+    /// 路徑頂端（還沒走過任何元件）。
+    fn start(&self) -> Pos {
+        Pos {
+            include: self.include.start(),
+            exclude: self.exclude.start(),
+            selected: self.include.is_empty(),
+        }
+    }
+
+    /// `parent` 底下的 `name`；被 exclude 比對到 → `None`。
+    fn child(&mut self, parent: &Pos, name: &[u8]) -> Option<Pos> {
+        let exclude = self.exclude.descend(&parent.exclude, name);
+        if exclude.is_match() {
+            return None;
+        }
+        let include = self.include.descend(&parent.include, name);
+        for &p in include.matched() {
+            self.hit[p] = true;
+        }
+        Some(Pos {
+            selected: parent.selected || include.is_match(),
+            include,
+            exclude,
+        })
+    }
+
+    /// 從頂端沿 `names` 走到底；途中被 exclude 比對到 → `None`（那底下全部不還原）。
+    fn walk(&mut self, names: &[&[u8]]) -> Option<Pos> {
+        let mut pos = self.start();
+        for name in names {
+            pos = self.child(&pos, name)?;
+        }
+        Some(pos)
+    }
+
+    /// `parent` 底下的 `entry` 要不要走：被排除、或沒被選到而且底下也不可能有東西被
+    /// 選到 → `None`。
+    fn visit(&mut self, parent: &Pos, entry: &Entry) -> Option<Pos> {
+        let pos = self.child(parent, &entry.name)?;
+        (pos.selected || (entry.kind == node_type::DIR && pos.include.may_match_below()))
+            .then_some(pos)
+    }
+
+    fn unmatched(&self) -> Vec<String> {
+        (0..self.include.len())
+            .filter(|&p| !self.hit[p])
+            .map(|p| self.include.pattern(p).to_owned())
+            .collect()
+    }
 }
 
 impl Repository {
@@ -494,7 +587,7 @@ impl Repository {
         &self,
         snapshot_key: &str,
         target: &Path,
-        _opts: RestoreOptions,
+        opts: RestoreOptions,
     ) -> Result<RestoreSummary> {
         let snapshot = self.read_snapshot(snapshot_key).await?;
         let index = ReloadableIndex::new(self.load_index().await?);
@@ -507,9 +600,17 @@ impl Repository {
             index: &index,
             summary: RestoreSummary::default(),
             hardlinks: HardLinks::new(),
+            select: Select::new(&opts),
         };
         for root in &snapshot.roots {
             let rel = fsmeta::locator_to_relative(root.path.as_slice())?;
+            // 先沿 root 的定位走（ADR 020）：定位或它的上層被排除、或底下不可能有東西被
+            // 選到，這個 root 連 tree 都不讀、落點也不建。
+            let names = fsmeta::locator_components(root.path.as_slice())?;
+            match w.select.walk(&names) {
+                Some(pos) if pos.selected || pos.include.may_match_below() => {}
+                _ => continue,
+            }
             let entries = self.read_tree_chain(&root.tree).await?;
             // v3 的 restore 映射（docs/format.md §9）：目錄來源的 entries 放在
             // `target/<locator>` 之下；**檔案/symlink 來源**（root tree 恰好一個
@@ -525,17 +626,37 @@ impl Repository {
             } else {
                 rel.as_path()
             };
-            // 落點建不起來（例如擋著 symlink）：整個 restore 回錯，不是某一項的錯。
+            // entries 在選取上的上一層：目錄來源是定位本身，檔案來源是定位的上一層
+            // （entry 就是定位的最後一段）。
+            let base_names = if file_root {
+                names.split_last().map_or(&[][..], |(_, above)| above)
+            } else {
+                &names[..]
+            };
+            let Some(base_pos) = w.select.walk(base_names) else {
+                continue;
+            };
+            // 落點建不起來（例如擋著 symlink）：整個 restore 回錯，不是某一項的錯。沒被
+            // 選到的落點等到底下真的有東西要寫才建（[`PendingDir`]）。
             let mut base = PendingDir::base(&mut top, base_rel);
-            base.create()?;
+            if base_pos.selected {
+                base.create()?;
+            }
             for entry in entries {
                 // v3：節點名一律是單一路徑元件（合成根已淘汰）。
                 fsmeta::validate_child_name(&entry.name)?;
+                let Some(pos) = w.select.visit(&base_pos, &entry) else {
+                    continue;
+                };
                 let name = fsmeta::bytes_to_name(&entry.name)?;
-                base.open()?;
-                self.restore_node(&mut w, &mut base, &entry, &name, 1).await;
+                if pos.selected {
+                    base.open()?;
+                }
+                self.restore_node(&mut w, &mut base, &entry, &name, 1, pos)
+                    .await;
             }
         }
+        w.summary.unmatched_includes = w.select.unmatched();
         Ok(w.summary)
     }
 
@@ -545,6 +666,8 @@ impl Repository {
     /// chain 只能出自腐壞或敵意 repo——記錄錯誤、不深入，否則遞迴會把
     /// process 墊進 stack overflow。這個上限同時是同時開著的目錄 handle 數的
     /// 上限（每層一個，ADR 019 A4）。
+    /// `pos`：這個節點在選取上的位置（[`Select::visit`] 放行的才會走到這裡：檔案與
+    /// symlink 一定是被選到的，目錄則可能只是「底下也許有東西被選到」）。
     fn restore_node<'a, 'w: 'a>(
         &'a self,
         w: &'a mut Walk<'w>,
@@ -552,6 +675,7 @@ impl Repository {
         node: &'a Entry,
         name: &'a OsStr,
         depth: usize,
+        pos: Pos,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
             // 完整路徑只用在錯誤訊息；實際操作都經 `dir`（ADR 019 A4）。
@@ -567,7 +691,7 @@ impl Repository {
                             ),
                         })
                     } else {
-                        self.restore_dir(w, dir, node, name, depth).await
+                        self.restore_dir(w, dir, node, name, depth, pos).await
                     }
                 }
                 node_type::FILE => match dir.open() {
@@ -647,6 +771,9 @@ impl Repository {
     /// 之後被搬走、原位換成 symlink，子項目與 metadata 都跟著真目錄走，不會
     /// 落到 symlink 指的地方。handle 在子項目還原期間一直開著：同時開著的
     /// 數目是遞迴深度，不是 entry 數。
+    ///
+    /// 沒被選到的目錄（`pos.selected` 是 false，ADR 020）先不建：底下第一次有東西要寫
+    /// 才沿路建上來；到最後都沒建的就不計數、不套 metadata。
     async fn restore_dir(
         &self,
         w: &mut Walk<'_>,
@@ -654,9 +781,12 @@ impl Repository {
         node: &Entry,
         name: &OsStr,
         depth: usize,
+        pos: Pos,
     ) -> Result<()> {
         let mut dir = PendingDir::child(parent, name, node);
-        dir.create()?;
+        if pos.selected {
+            dir.create()?;
+        }
         let children = self.read_tree_chain(&node.subtree).await?;
         // 既有的唯讀目錄在第一個子項目寫進去之前暫時加上擁有者寫入權（ADR 019 A2，
         // [`PendingDir::open`]）。在讀完子 tree 之後：從那裡到下面重新套 mode 之間沒有
@@ -669,9 +799,14 @@ impl Repository {
                     .push(format!("{}: {e}", dir.location().display()));
                 continue;
             }
+            let Some(child_pos) = w.select.visit(&pos, &child) else {
+                continue;
+            };
             let child_name = fsmeta::bytes_to_name(&child.name)?;
-            dir.open()?;
-            self.restore_node(w, &mut dir, &child, &child_name, depth + 1)
+            if child_pos.selected {
+                dir.open()?;
+            }
+            self.restore_node(w, &mut dir, &child, &child_name, depth + 1, child_pos)
                 .await;
         }
         let PendingDir {

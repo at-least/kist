@@ -35,6 +35,7 @@ kist backup ~ --exclude node_modules --exclude '*.tmp'   # 排除規則，見「
 kist backup sftp://nas.local/srv/data   # 遠端來源也能備：讀遠端、本機切塊加密後上傳
 kist snapshots                          # 列出 snapshot
 kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路徑>
+kist restore latest /tmp/out --include ~/Documents/report.pdf   # 部分還原，見「部分還原」一節
 kist check                              # 檢查一致性（不下載資料）
 kist check --read-data                  # 下載並驗證每個 chunk
 kist rebuild-index                      # index 物件遺失或損壞時，從 pack 重建
@@ -44,8 +45,8 @@ kist prune                              # 回收空間（兩階段，見下）
 kist forget --keep-last 10 --prune      # 一次做完
 ```
 
-結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗（restore）或刪不掉（prune）——
-請看警告。
+結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗或 `--include` 沒選到東西（restore）、
+或刪不掉（prune）——請看警告。
 
 `restore` 先把每個檔寫進同目錄的隱藏暫存檔 `.kist-restore-*`，完整寫好才 rename 成正式名：還原失敗
 時目標處原有的檔不動（以前會被刪掉），擋路的 symlink、目錄或特殊檔回報錯誤、不動它；再還原到先前
@@ -104,6 +105,26 @@ kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行�
 - 樣式寫錯（例如沒關上的 `[`、夾在字裡的 `**`、`.`／`..` 段）時，backup 在碰 repo 之前就以結束碼 1
   結束；樣式檔裡的錯誤點名 `檔案:行號`。設定檔裡寫錯，`kist run`／`kist serve` 起不來。
 
+### 部分還原（`restore --include`／`--exclude`）
+
+```sh
+kist restore latest /tmp/out --include /home/me/docs/report.pdf   # 只還原這個檔
+kist restore latest /tmp/out --include /home/me/docs              # 整個目錄
+kist restore latest /tmp/out --include '*.pdf' --exclude /home/me/old
+```
+
+- 樣式規則與 `backup --exclude` 相同，比對的是節點整份還原時在目標底下的路徑（也是 `kist mount`
+  裡 `<client>/<timestamp>/` 之下看到的路徑）。檔案照樣落在 `<target>/<原本的路徑>`。
+- `--include`：只還原比對到的節點與它們底下的一切。通往它們的上層目錄照樣建立、套記錄的 mode 與
+  時間（也計進 `dirs`）；沒被選到的分支一個目錄也不建。錨定的 include 只讀它路徑上的 tree，其他子樹的
+  tree 不讀；不錨定的 include（`*.pdf`）要走過整棵樹才找得到。
+- `--exclude`：不還原比對到的節點（目錄整棵不走）。與 `--include` 同時比對到時排除優先。
+- 與 backup 不同，restore 的樣式也比對 root 本身與它的上層：root 是 `/tmp/data` 的 snapshot，
+  `--exclude tmp` 會排除整個 root。只想排除 root 底下名為 `tmp` 的目錄，寫 `/tmp/data/**/tmp`。
+- 沒有選到任何東西的 `--include`（比對不到，或比對到的全被排除）印警告、結束碼 3，`--json` 的
+  `unmatched_includes` 列出它們；其他選到的照樣還原。
+- 硬連結的第一個名字沒被選到時，後面的名字還原成內容相同的獨立檔案。
+
 ### `--json`
 
 `backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild-index` / `run` 都支援
@@ -112,6 +133,8 @@ kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行�
 - 內容 id（`root` 等）在 JSON 裡是 hex 字串（repo 格式不受影響，仍是 bytes）。
 - snapshot 的 `paths` 原本是 OS bytes，JSON 裡以 UTF-8 呈現，非 UTF-8 的位元組會換成 U+FFFD。
 - `forget` / `prune` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個。
+- `backup` 的 `report.excluded`：被排除樣式比對到的項目數；`restore` 的 `unmatched_includes`：沒選到
+  東西的 `--include` 樣式。
 - `run --once --json` 印出 JobOutcome 陣列；常駐模式下每件工作結束印一行 JSON（NDJSON）。
 
 ### 設定檔與排程

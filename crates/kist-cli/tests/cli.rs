@@ -1000,3 +1000,73 @@ fn backup_excludes_from_flags_and_files() {
         "寫錯樣式的 backup 不留 snapshot"
     );
 }
+
+/// `restore --include`／`--exclude`（ADR 020）：只還原選到的；沒比對到任何東西的 include
+/// 印警告、結束碼 3（選到的照樣還原）；寫錯的樣式在碰 repo 之前以結束碼 1 結束。
+#[test]
+fn restore_include_and_exclude() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    let src = env.dir.path().join("src");
+    make_source(&src);
+    env.ok(&["init"]);
+    env.ok(&["backup", src.to_str().unwrap()]);
+    let abs = std::fs::canonicalize(&src).unwrap();
+    let rel = abs.strip_prefix("/").unwrap();
+
+    // exclude 優先：sub 被選到，但裡面的 b.txt 被排除——sub 照樣建成空目錄。
+    let target = env.dir.path().join("out");
+    let sub = format!("{}/sub", abs.display());
+    let out = env.ok(&[
+        "restore",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        &sub,
+        "--include",
+        "*.bin",
+        "--exclude",
+        "*.txt",
+    ]);
+    assert!(out.contains("1 files, 1 dirs"), "{out}");
+    assert!(target.join(rel).join("big.bin").is_file());
+    assert!(target.join(rel).join("sub").is_dir());
+    assert!(!target.join(rel).join("sub/b.txt").exists());
+    assert!(!target.join(rel).join("a.txt").exists());
+
+    let target = env.dir.path().join("out2");
+    let (code, stdout, stderr) = env.kist_code(&[
+        "restore",
+        "--json",
+        "latest",
+        target.to_str().unwrap(),
+        "--include",
+        "*.txt",
+        "--include",
+        "*.docx",
+    ]);
+    assert_eq!(code, Some(3), "沒比對到的 include 是不完整：{stderr}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["files"], 2, "{v}");
+    assert_eq!(v["unmatched_includes"], serde_json::json!(["*.docx"]));
+    assert!(
+        stderr.contains("\"*.docx\" selected nothing"),
+        "要點名沒選到東西的樣式：{stderr}"
+    );
+    assert!(target.join(rel).join("a.txt").is_file());
+
+    let (code, _, stderr) = env.kist_code(&[
+        "restore",
+        "latest",
+        env.dir.path().join("out3").to_str().unwrap(),
+        "--exclude",
+        "a**",
+    ]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("--exclude"), "{stderr}");
+    assert!(
+        !env.dir.path().join("out3").exists(),
+        "寫錯樣式時什麼都不建"
+    );
+}

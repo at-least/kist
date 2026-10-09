@@ -185,6 +185,18 @@ enum Command {
         /// Directory to restore into (the original absolute paths are recreated beneath it).
         /// Should be empty: existing files are overwritten; symlinks in the way (pre-existing or snapshot-planted) are refused, not followed.
         target: PathBuf,
+        /// Restore only nodes matching PATTERN and everything below them (repeatable); the
+        /// directories on the way are created with their recorded metadata. Patterns match
+        /// the path a node gets under TARGET in a full restore (for local sources the
+        /// original absolute path), with the same rules as `backup --exclude`. A pattern
+        /// that selects nothing (no match, or every match excluded) is reported and the
+        /// exit code is 3.
+        #[arg(long, value_name = "PATTERN")]
+        include: Vec<String>,
+        /// Do not restore nodes matching PATTERN (a directory with everything below it;
+        /// repeatable). Wins over --include.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
     },
     /// Verify the repository's integrity.
     Check {
@@ -616,10 +628,16 @@ async fn run(cli: Cli) -> Result<()> {
             repo,
             snapshot,
             target,
+            include,
+            exclude,
         } => {
+            let opts = RestoreOptions {
+                include: PathFilter::new(&include).context("--include")?,
+                exclude: PathFilter::new(&exclude).context("--exclude")?,
+            };
             let r = open_repo(&repo).await?;
             let key = r.resolve_snapshot(&snapshot).await?;
-            let summary = r.restore(&key, &target, RestoreOptions::default()).await?;
+            let summary = r.restore(&key, &target, opts).await?;
             if json {
                 print_json(&summary)?;
             } else {
@@ -632,15 +650,30 @@ async fn run(cli: Cli) -> Result<()> {
                     summary.symlinks
                 );
             }
+            let mut problems = Vec::new();
             if !summary.errors.is_empty() {
                 for e in &summary.errors {
                     eprintln!("error: {e}");
                 }
-                return Err(Incomplete(format!(
+                problems.push(format!(
                     "{} item(s) could not be restored",
                     summary.errors.len()
-                ))
-                .into());
+                ));
+            }
+            if !summary.unmatched_includes.is_empty() {
+                for p in &summary.unmatched_includes {
+                    eprintln!(
+                        "warning: --include {p:?} selected nothing: no match in this snapshot, \
+                         or every match is excluded"
+                    );
+                }
+                problems.push(format!(
+                    "{} --include pattern(s) selected nothing",
+                    summary.unmatched_includes.len()
+                ));
+            }
+            if !problems.is_empty() {
+                return Err(Incomplete(problems.join("; ")).into());
             }
             Ok(())
         }
