@@ -222,10 +222,7 @@ pub fn decode_trailer(
     sealed: &[u8],
     data_end: usize,
 ) -> Result<PackTrailer> {
-    let corrupt = |reason: String| CoreError::Corrupt {
-        key: key.to_owned(),
-        reason,
-    };
+    let corrupt = |reason: String| CoreError::corrupt(key, reason);
     let plain = keys
         .open_pack_trailer(sealed)
         .map_err(|e| corrupt(format!("trailer: {e}")))?;
@@ -248,10 +245,7 @@ pub fn decode_trailer(
 pub fn validate_trailer(key: &str, trailer: &PackTrailer, data_end: usize) -> Result<()> {
     const MAX_CHUNKER_MAX: u64 = 64 * 1024 * 1024;
     const MAX_ENTRY_LEN: u64 = MAX_CHUNKER_MAX + 1 + (pack::CHUNK_NONCE_LEN + pack::TAG_LEN) as u64;
-    let corrupt = |reason: String| CoreError::Corrupt {
-        key: key.to_owned(),
-        reason,
-    };
+    let corrupt = |reason: String| CoreError::corrupt(key, reason);
     if trailer.entries.is_empty() {
         return Err(corrupt("trailer lists no chunks".to_owned()));
     }

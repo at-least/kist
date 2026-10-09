@@ -452,60 +452,8 @@ impl Repository {
                     }
                 }
                 node_type::FILE => {
-                    let hardlink_key = (node.nlink.unwrap_or(0) > 1)
-                        .then_some((node.dev.unwrap_or(0), node.inode.unwrap_or(0)))
-                        .filter(|k| k.1 != 0);
-                    if let Some(k) = hardlink_key {
-                        if let Some(first) = hardlinks.get(&k) {
-                            match link_to_first(target_dir, first, dir, name) {
-                                Ok(()) => {
-                                    summary.files += 1;
-                                    return;
-                                }
-                                Err(e) => {
-                                    let first_path =
-                                        target_dir.path().join(first.iter().collect::<PathBuf>());
-                                    tracing::warn!(
-                                        "{}: cannot hard-link to {}: {e}; restoring a copy",
-                                        path.display(),
-                                        first_path.display()
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // 硬連結失敗後的複製也走這裡：同樣是暫存檔＋rename（ADR 019 A2）。
-                    match self.restore_file(dir, name, node, index).await {
-                        Ok(temp) => {
-                            #[cfg(all(test, unix))]
-                            meta_via_handle_tests::before_meta(&temp.temp.path(), &path);
-                            // metadata 經寫入內容的同一個 handle 套用（ADR 019 A3）：
-                            // 路徑在寫完之後被換成 symlink，也改不到外面的檔。
-                            // 順序與擁有者見 apply_meta（ADR 019 A43）。
-                            let (applied, owner) = apply_meta(&temp.file, &path, node);
-                            let meta = applied.and(owner);
-                            // metadata 套不上（例如目標檔案系統不收 xattr）時內容仍是
-                            // 對的：照樣 rename 成正式名、記下這個錯。那時記錄的 mode
-                            // 沒套上，檔案停在建檔時的權限（temp_file_mode：0o600）。
-                            // 先關檔再 rename：Windows 上 rename 開著的檔要看共用模式，
-                            // 關掉最單純；unix 沒有差別。
-                            let TempFile { file, temp } = temp;
-                            drop(file);
-                            match temp.commit(name) {
-                                Ok(()) => {
-                                    summary.files += 1;
-                                    if let Some(k) = hardlink_key {
-                                        hardlinks.insert(k, dir.child_rel(name));
-                                    }
-                                    meta
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
-                        // 暫存檔已隨錯誤被 drop 刪掉；正式名底下原有的檔沒被碰過，
-                        // 不能再像以前那樣 remove_file(path)（ADR 019 A2）。
-                        Err(e) => Err(e),
-                    }
+                    self.restore_file_entry(node, dir, name, target_dir, index, summary, hardlinks)
+                        .await
                 }
                 node_type::SYMLINK => restore_symlink(dir, name, node, summary),
                 other => Err(CoreError::Corrupt {
@@ -518,6 +466,63 @@ impl Repository {
                 summary.errors.push(format!("{}: {e}", path.display()));
             }
         })
+    }
+
+    /// 還原一個 FILE 節點：硬連結的第二個以後的名字先試 link 到第一個，不成
+    /// 就退回複製；複製走暫存檔＋rename（ADR 019 A2）。commit 成功才計數、
+    /// 才記進硬連結表——metadata 套不上時也是（內容已經對了，錯另外回）。
+    #[allow(clippy::too_many_arguments)] // 同 restore_node
+    async fn restore_file_entry(
+        &self,
+        node: &Entry,
+        dir: &DirHandle,
+        name: &OsStr,
+        target_dir: &DirHandle,
+        index: &ReloadableIndex,
+        summary: &mut RestoreSummary,
+        hardlinks: &mut HardLinks,
+    ) -> Result<()> {
+        let path = dir.child_path(name);
+        let hardlink_key = (node.nlink.unwrap_or(0) > 1)
+            .then_some((node.dev.unwrap_or(0), node.inode.unwrap_or(0)))
+            .filter(|k| k.1 != 0);
+        if let Some(first) = hardlink_key.and_then(|k| hardlinks.get(&k)) {
+            match link_to_first(target_dir, first, dir, name) {
+                Ok(()) => {
+                    summary.files += 1;
+                    return Ok(());
+                }
+                Err(e) => {
+                    let first_path = target_dir.path().join(first.iter().collect::<PathBuf>());
+                    tracing::warn!(
+                        "{}: cannot hard-link to {}: {e}; restoring a copy",
+                        path.display(),
+                        first_path.display()
+                    );
+                }
+            }
+        }
+        // 硬連結失敗後的複製也走這裡。失敗時暫存檔隨錯誤被 drop 刪掉；正式名
+        // 底下原有的檔沒被碰過，不能再像以前那樣 remove_file(path)（ADR 019 A2）。
+        let temp = self.restore_file(dir, name, node, index).await?;
+        #[cfg(all(test, unix))]
+        meta_via_handle_tests::before_meta(&temp.temp.path(), &path);
+        // metadata 經寫入內容的同一個 handle 套用（ADR 019 A3）：路徑在寫完
+        // 之後被換成 symlink，也改不到外面的檔。順序與擁有者見 apply_meta
+        // （ADR 019 A43）。
+        let (applied, owner) = apply_meta(&temp.file, &path, node);
+        // metadata 套不上（例如目標檔案系統不收 xattr）時內容仍是對的：照樣
+        // rename 成正式名、記下這個錯。那時記錄的 mode 沒套上，檔案停在建檔時
+        // 的權限（temp_file_mode：0o600）。先關檔再 rename：Windows 上 rename
+        // 開著的檔要看共用模式，關掉最單純；unix 沒有差別。
+        let TempFile { file, temp } = temp;
+        drop(file);
+        temp.commit(name)?;
+        summary.files += 1;
+        if let Some(k) = hardlink_key {
+            hardlinks.insert(k, dir.child_rel(name));
+        }
+        applied.and(owner)
     }
 
     /// 還原 `parent` 這一層裡的目錄 `name`：建立（或沿用）並開著它，子項目都

@@ -800,13 +800,11 @@ impl PrunePlan {
             // 當成「樹不在」——誤刪活著的復活訊號，下一輪 prune 會把
             // 進行中 backup 重用中的樹當死的刪掉（同函式刪除迴圈對
             // 錯誤種類的分法）。
-            match repo.backend().head(&keys::tree(&tree_id)).await {
-                Err(BackendError::NotFound(_)) => match repo.backend().delete(&key).await {
+            if !repo.backend().exists(&keys::tree(&tree_id)).await? {
+                match repo.backend().delete(&key).await {
                     Ok(()) | Err(BackendError::NotFound(_)) => {}
                     Err(e) => return Err(e.into()),
-                },
-                Err(e) => return Err(e.into()),
-                Ok(_) => {}
+                }
             }
         }
         Ok(self.report)

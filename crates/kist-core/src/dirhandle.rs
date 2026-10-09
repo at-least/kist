@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::{CoreError, Result};
 
-/// 目標之下的一層目錄。clone 只多一份 `Arc`，不多開 fd。
+/// 目標之下的一層目錄。clone 不多開 fd（`file` 是 `Arc`），只複製路徑。
 #[derive(Clone)]
 pub(crate) struct DirHandle {
     /// 已開的目錄（unix：`O_RDONLY|O_DIRECTORY`，目標之下的每一層另加
@@ -249,12 +249,19 @@ mod imp {
             }
         }
 
+        /// `name` 的 lstat（不跟隨 symlink）；沒有就是 `None`。
+        fn stat_child(&self, name: &OsStr) -> Result<Option<rustix::fs::Stat>> {
+            match rustix::fs::statat(&*self.file, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => Ok(Some(stat)),
+                Err(e) if e == Errno::NOENT => Ok(None),
+                Err(e) => Err(CoreError::io(self.child_path(name), e.into())),
+            }
+        }
+
         /// `name` 處現有的東西（不跟隨 symlink）；沒有就是 `None`。
         pub(crate) fn kind_of(&self, name: &OsStr) -> Result<Option<Kind>> {
-            let stat = match rustix::fs::statat(&*self.file, name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat) => stat,
-                Err(e) if e == Errno::NOENT => return Ok(None),
-                Err(e) => return Err(CoreError::io(self.child_path(name), e.into())),
+            let Some(stat) = self.stat_child(name)? else {
+                return Ok(None);
             };
             Ok(Some(match FileType::from_raw_mode(stat.st_mode) {
                 FileType::RegularFile => Kind::File,
@@ -279,16 +286,17 @@ mod imp {
         /// `name` 處若是一般檔，回傳它的權限位元（0o777 以內，不跟隨 symlink）；
         /// 沒有東西、或不是一般檔就是 `None`。
         pub(crate) fn file_mode(&self, name: &OsStr) -> Result<Option<u32>> {
-            let stat = match rustix::fs::statat(&*self.file, name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat) => stat,
-                Err(e) if e == Errno::NOENT => return Ok(None),
-                Err(e) => return Err(CoreError::io(self.child_path(name), e.into())),
+            let Some(stat) = self.stat_child(name)? else {
+                return Ok(None);
             };
             if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
                 return Ok(None);
             }
-            // st_mode 的型別因平台而異（Linux u32、macOS u16），放得進 u32。
-            Ok(Some(stat.st_mode as u32 & 0o777))
+            // st_mode 的型別因平台而異（Linux u32、macOS u16），放得進 u32；
+            // Linux 上這個 cast 是同型別，clippy 會嫌。
+            #[allow(clippy::unnecessary_cast)]
+            let mode = stat.st_mode as u32;
+            Ok(Some(mode & 0o777))
         }
 
         /// 同一層裡把 `from` 改名成 `to`（`to` 已存在就取代它；rename 不跟隨
@@ -332,10 +340,8 @@ mod imp {
             other: &DirHandle,
             other_name: &OsStr,
         ) -> bool {
-            let a = rustix::fs::statat(&*self.file, name, AtFlags::SYMLINK_NOFOLLOW);
-            let b = rustix::fs::statat(&*other.file, other_name, AtFlags::SYMLINK_NOFOLLOW);
-            match (a, b) {
-                (Ok(a), Ok(b)) => a.st_dev == b.st_dev && a.st_ino == b.st_ino,
+            match (self.stat_child(name), other.stat_child(other_name)) {
+                (Ok(Some(a)), Ok(Some(b))) => a.st_dev == b.st_dev && a.st_ino == b.st_ino,
                 _ => false,
             }
         }
@@ -343,12 +349,11 @@ mod imp {
         /// 設 symlink `name` 本身的時間（atime＝mtime），不跟隨。有些平台不支援
         /// 設 symlink 本身的時間；失敗不算錯（與以前以路徑設時一樣）。
         pub(crate) fn set_symlink_mtime(&self, name: &OsStr, mtime_ns: i64) {
-            // rem_euclid 落在 0..1e9，u32 放得下（與 fsmeta 的換算相同，1970 年
-            // 前的負值照實）。
-            let nanos = mtime_ns.rem_euclid(1_000_000_000) as u32;
+            // 奈秒的拆法只有 fsmeta::file_time 一份（1970 年前的負值照實）。
+            let t = crate::fsmeta::file_time(mtime_ns);
             let at = Timespec {
-                tv_sec: mtime_ns.div_euclid(1_000_000_000),
-                tv_nsec: Nsecs::from(nanos),
+                tv_sec: t.unix_seconds(),
+                tv_nsec: Nsecs::from(t.nanoseconds()),
             };
             let times = Timestamps {
                 last_access: at,

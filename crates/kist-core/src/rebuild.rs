@@ -73,10 +73,7 @@ impl Repository {
     /// 讀一個 pack 的 trailer → IndexPack。只 range read 檔尾與 trailer。
     async fn read_pack_index(&self, id: ObjectId, size: u64) -> Result<IndexPack> {
         let key = keys::pack(&id);
-        let corrupt = |reason: String| CoreError::Corrupt {
-            key: key.clone(),
-            reason,
-        };
+        let corrupt = |reason: String| CoreError::corrupt(&key, reason);
         if size < (pack::HEADER_LEN + FOOTER_LEN) as u64 {
             return Err(corrupt(format!("pack is only {size} bytes")));
         }

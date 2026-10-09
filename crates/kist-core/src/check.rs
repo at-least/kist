@@ -192,9 +192,14 @@ impl Repository {
     }
 
     /// 整包 pack 的 hash 在 blocking 執行緒算：BLAKE3 掃可達數十 MiB 的內容，
-    /// 屬 PLAN 點名的 CPU 密集工作，不該佔住 async worker。
-    async fn hash_matches(bytes: Arc<Vec<u8>>, expected: ObjectId) -> Result<bool> {
-        blocking(move || Ok(ObjectId::of(&bytes) == expected)).await
+    /// 屬 PLAN 點名的 CPU 密集工作，不該佔住 async worker。`bytes` 搬進去
+    /// 再帶回來（同 backup.rs 的 handle_finished），呼叫端之後還要用。
+    async fn hash_matches(bytes: Vec<u8>, expected: ObjectId) -> Result<(Vec<u8>, bool)> {
+        blocking(move || {
+            let ok = ObjectId::of(&bytes) == expected;
+            Ok((bytes, ok))
+        })
+        .await
     }
 
     /// 下載整個 pack：名稱 = hash(bytes)、trailer 解得開、trailer 與 index 一致、每個 chunk 解得開且 ID 相符。
@@ -217,9 +222,8 @@ impl Repository {
         // PLAN：hash 屬 CPU 密集——整包 pack 的 BLAKE3（可達數十 MiB）在
         // blocking 執行緒算，不佔住 async worker（同一原則：下面的 trailer／
         // chunk 解密驗證也在 blocking 裡）。
-        let bytes = Arc::new(bytes);
-        let hash_ok = match Self::hash_matches(Arc::clone(&bytes), *id).await {
-            Ok(ok) => ok,
+        let (bytes, hash_ok) = match Self::hash_matches(bytes, *id).await {
+            Ok(r) => r,
             Err(e) => {
                 report.errors.push(format!("{key}: {e}"));
                 return;
@@ -252,12 +256,11 @@ impl Repository {
                 report.errors.push(not_stuck);
                 return;
             };
-            let b = Arc::new(b);
-            match Self::hash_matches(Arc::clone(&b), *id).await {
-                Ok(true) => b,
+            match Self::hash_matches(b, *id).await {
+                Ok((b, true)) => b,
                 // hash 對不起來是「修復沒生效」；hash 工作本身失敗
                 // （blocking 執行緒壞掉）是另一回事，照實回。
-                Ok(false) => {
+                Ok((_, false)) => {
                     report.errors.push(not_stuck);
                     return;
                 }

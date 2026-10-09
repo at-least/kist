@@ -143,10 +143,7 @@ pub fn meta_of_entry(entry: &Entry) -> FsMeta {
 /// 只有一個（sftp 的選填欄位）當成沒記錄：只改 uid 會留下 root 的 gid，
 /// setgid 指向 gid 0 一樣是提權。
 pub fn owner_of_entry(entry: &Entry) -> Option<(u32, u32)> {
-    match (entry.uid, entry.gid) {
-        (Some(uid), Some(gid)) => Some((uid, gid)),
-        _ => None,
-    }
+    entry.uid.zip(entry.gid)
 }
 
 /// backup 快速路徑的完整判斷：size 相同，且 [`unchanged`] 成立。
@@ -245,16 +242,9 @@ pub fn apply_xattrs(
         }
         let name = std::ffi::OsStr::from_bytes(name);
         // 本機的 I/O 錯誤，不是 repo 損壞（ADR 019 A30）：維持 Io、保留錯誤
-        // 種類，訊息帶 xattr 名稱（寫法同 owner_error）。
+        // 種類，訊息帶 xattr 名稱。
         file.set_xattr(name, value.as_ref()).map_err(|e| {
-            let kind = e.kind();
-            CoreError::io(
-                path,
-                std::io::Error::new(
-                    kind,
-                    format!("setting xattr {}: {e}", name.to_string_lossy()),
-                ),
-            )
+            io_with_context(path, format!("setting xattr {}", name.to_string_lossy()), e)
         })?;
     }
     Ok(())
@@ -386,11 +376,14 @@ pub(crate) fn check_owner_ids(uid: u32, gid: u32) -> std::io::Result<()> {
 
 /// 擁有者設不回去的錯誤（記進該節點）：訊息帶記錄的 uid／gid。
 pub(crate) fn owner_error(path: &Path, uid: u32, gid: u32, e: std::io::Error) -> CoreError {
+    io_with_context(path, format!("restoring owner uid {uid} gid {gid}"), e)
+}
+
+/// 本機 I/O 錯誤加上下文：維持 `Io`、保留錯誤種類（ADR 019 A30），訊息是
+/// `{context}: {e}`。
+fn io_with_context(path: &Path, context: String, e: std::io::Error) -> CoreError {
     let kind = e.kind();
-    CoreError::io(
-        path,
-        std::io::Error::new(kind, format!("restoring owner uid {uid} gid {gid}: {e}")),
-    )
+    CoreError::io(path, std::io::Error::new(kind, format!("{context}: {e}")))
 }
 
 #[cfg(all(test, unix))]

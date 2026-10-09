@@ -99,19 +99,17 @@ impl DiskTable {
     pub fn build(path: &Path, mut records: Vec<TableRecord>) -> Result<Self> {
         records.sort_by_key(|r| r.id);
         records.dedup_by(|later, earlier| later.id == earlier.id);
-        Self::build_sorted::<std::convert::Infallible>(path, records.into_iter().map(Ok))
+        Self::build_sorted(path, records.into_iter().map(Ok))
     }
 
     /// 同 [`build`]，但紀錄由呼叫端**串流**給入（必須已依 ID 排序、無重複）。
     /// 讓增量合併可以 k-way merge 舊表與新紀錄，不用把整張表物化成 Vec
-    ///（100 萬 chunk ≈ 96 MiB）。
-    pub fn build_sorted<E>(
+    ///（100 萬 chunk ≈ 96 MiB）。串流裡的錯誤（舊表的 I/O 錯誤）照原樣回，
+    /// 由 repo.rs 的 `index_load_error` 歸類。
+    pub fn build_sorted(
         path: &Path,
-        records: impl IntoIterator<Item = std::result::Result<TableRecord, E>>,
-    ) -> Result<Self>
-    where
-        E: std::fmt::Display,
-    {
+        records: impl IntoIterator<Item = Result<TableRecord>>,
+    ) -> Result<Self> {
         let tmp = path.with_extension("tbl.tmp");
         {
             let file = File::create(&tmp).map_err(|e| CoreError::io(&tmp, e))?;
@@ -123,10 +121,7 @@ impl DiskTable {
             header[16..24].copy_from_slice(&count.to_le_bytes());
             w.write_all(&header).map_err(|e| CoreError::io(&tmp, e))?;
             for record in records {
-                let r = record.map_err(|e| CoreError::Corrupt {
-                    key: "index cache".to_owned(),
-                    reason: e.to_string(),
-                })?;
+                let r = record?;
                 w.write_all(&r.encode())
                     .map_err(|e| CoreError::io(&tmp, e))?;
                 count += 1;
@@ -147,10 +142,7 @@ impl DiskTable {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        let corrupt = |reason: &str| CoreError::Corrupt {
-            key: path.display().to_string(),
-            reason: reason.to_owned(),
-        };
+        let corrupt = |reason: &str| CoreError::corrupt(path.display().to_string(), reason);
         let mut file = File::open(path).map_err(|e| CoreError::io(path, e))?;
         let mut header = [0u8; HEADER_LEN as usize];
         file.read_exact(&mut header)
@@ -425,6 +417,7 @@ impl ChunkLocator for ChunkIndex {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -467,5 +460,16 @@ mod tests {
         fresh_first.add_pack_ranked(&fresh_pack, is_marked);
         fresh_first.add_pack_ranked(&marked_pack, is_marked);
         assert_eq!(location_of(&fresh_first), fresh_pack.pack);
+    }
+
+    /// 串流進來的紀錄錯誤要照原樣回：增量合併時舊表的 `read_record` 回的是
+    /// 本機快取的 I/O 錯誤，不是損壞（repo.rs 的 `index_load_error` 只對
+    /// 真損壞建議 rebuild-index）；在這裡包成 Corrupt 會讓那個歸類失效。
+    #[test]
+    fn build_sorted_passes_record_errors_through_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = CoreError::io("<index cache>", std::io::Error::other("disk read failed"));
+        let err = DiskTable::build_sorted(&dir.path().join("index.tbl"), [Err(io)]).unwrap_err();
+        assert!(matches!(err, CoreError::Io { .. }), "got {err:?}");
     }
 }

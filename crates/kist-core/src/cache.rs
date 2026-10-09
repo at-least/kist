@@ -63,16 +63,16 @@ impl IndexCache {
         &self.dir
     }
 
-    fn manifest_path(&self) -> PathBuf {
-        self.dir.join("manifest.cbor")
+    fn manifest_path(dir: &Path) -> PathBuf {
+        dir.join("manifest.cbor")
     }
 
-    fn table_path(&self) -> PathBuf {
-        self.dir.join("index.tbl")
+    fn table_path(dir: &Path) -> PathBuf {
+        dir.join("index.tbl")
     }
 
     fn read_manifest(&self) -> Option<Manifest> {
-        let bytes = std::fs::read(self.manifest_path()).ok()?;
+        let bytes = std::fs::read(Self::manifest_path(&self.dir)).ok()?;
         let m: Manifest = cbor::decode(&bytes).ok()?;
         (m.version == MANIFEST_VERSION).then_some(m)
     }
@@ -88,7 +88,7 @@ impl IndexCache {
         let manifest = self.read_manifest();
         let table = manifest
             .as_ref()
-            .and_then(|_| DiskTable::open(&self.table_path()).ok());
+            .and_then(|_| DiskTable::open(&Self::table_path(&self.dir)).ok());
 
         // 決定：增量、重建、或直接用
         match (manifest, table) {
@@ -185,11 +185,7 @@ impl IndexCache {
         F: Fn(ObjectId) -> Fut,
         Fut: std::future::Future<Output = Result<IndexBlob>>,
     {
-        let mut m = Merged {
-            records: Vec::new(),
-            kept: Vec::new(),
-            packs: Vec::new(),
-        };
+        let mut m = Merged::default();
         for id in live {
             let blob = fetch(*id).await?;
             if !blob.supersedes.is_empty() {
@@ -217,11 +213,7 @@ impl IndexCache {
             .iter()
             .flat_map(|(_, b)| b.supersedes.iter().copied())
             .collect();
-        let mut m = Merged {
-            records: Vec::new(),
-            kept: Vec::new(),
-            packs: Vec::new(),
-        };
+        let mut m = Merged::default();
         for (id, blob) in &blobs {
             if superseded.contains(id) {
                 continue;
@@ -250,16 +242,16 @@ impl IndexCache {
             }),
             None => Box::new(new_records.into_iter().map(Ok)),
         };
-        let table = DiskTable::build_sorted(&dir.join("index.tbl"), records)?;
+        let table = DiskTable::build_sorted(&Self::table_path(dir), records)?;
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             blobs,
             packs: packs.clone(),
         };
-        let tmp = dir.join("manifest.cbor.tmp");
+        let manifest_path = Self::manifest_path(dir);
+        let tmp = manifest_path.with_extension("cbor.tmp");
         std::fs::write(&tmp, cbor::encode(&manifest)?).map_err(|e| CoreError::io(&tmp, e))?;
-        std::fs::rename(&tmp, dir.join("manifest.cbor"))
-            .map_err(|e| CoreError::io(dir.join("manifest.cbor"), e))?;
+        std::fs::rename(&tmp, &manifest_path).map_err(|e| CoreError::io(&manifest_path, e))?;
         Ok(ChunkIndex::with_base(
             Arc::new(table),
             packs.into_iter().collect(),
@@ -309,6 +301,7 @@ where
 }
 
 /// 重建一遍的結果：合併好的紀錄、併入的 blob、pack 清單。
+#[derive(Default)]
 struct Merged {
     records: Vec<TableRecord>,
     kept: Vec<ObjectId>,
