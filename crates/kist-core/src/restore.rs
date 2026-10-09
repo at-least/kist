@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use kist_format::snapshot::Root;
 use kist_format::tree::{content_type, node_type, parse_chunk_list, Entry};
-use kist_format::{keys, ChunkId};
+use kist_format::{keys, ChunkId, TreeId};
 
 use crate::dirhandle::{DirHandle, Kind};
 use crate::filter::{FilterState, PathFilter};
@@ -63,6 +63,20 @@ pub fn subtree_components(path: &str) -> Result<Vec<Vec<u8>>> {
 fn subtree_display(subtree: &[Vec<u8>]) -> String {
     let parts: Vec<_> = subtree.iter().map(|c| String::from_utf8_lossy(c)).collect();
     format!("/{}", parts.join("/"))
+}
+
+/// SNAPSHOT:PATH 指到的不是目錄。
+fn not_a_directory(subtree: &[Vec<u8>]) -> CoreError {
+    CoreError::Usage(format!(
+        "{} is not a directory in this snapshot",
+        subtree_display(subtree)
+    ))
+}
+
+/// v3 的檔案/symlink 來源（docs/format.md §9）：root tree 恰好一個非目錄 entry、名稱＝
+/// 定位的末段 `last`。
+fn is_file_root(last: &[u8], entries: &[Entry]) -> bool {
+    entries.len() == 1 && entries[0].kind != node_type::DIR && entries[0].name == last
 }
 
 /// [`Repository::plan_restore`]（dry run）回報的節點種類。
@@ -625,8 +639,20 @@ struct Placement {
     rel: PathBuf,
     /// 落點在選取上的位置。
     pos: Pos,
-    /// 要放進落點的條目。
-    entries: Vec<Entry>,
+    /// 落點的末段與上一層的選取位置。root 的條目恰好是一個與末段同名的非目錄時，這個 root
+    /// 是檔案來源（docs/format.md §9），條目改放在上一層；讀到 tree 才知道，所以留到
+    /// 第二輪（[`Repository::open_placement`]）。SNAPSHOT:PATH 是 root 本身或在它裡面時
+    /// 沒有：第一輪已經確定是目錄。
+    file_root: Option<(Vec<u8>, Pos)>,
+    content: Content,
+}
+
+/// 要放進落點的條目。
+enum Content {
+    /// 第二輪才讀：同時只有一個 root 的條目在記憶體裡。
+    Tree(TreeId),
+    /// 第一輪已經讀過：SNAPSHOT:PATH 就是 root 本身（或 root 是 `/`，定位沒有任何段）。
+    Read(Vec<Entry>),
 }
 
 enum Placed {
@@ -634,7 +660,7 @@ enum Placed {
     Elsewhere,
     /// 與 subtree 有關，但選取上整個不必走（被排除，或底下不可能有東西被選到）。
     Pruned,
-    Here(Placement),
+    Here(Box<Placement>),
 }
 
 /// dry run（[`Repository::plan_restore`]）的走訪狀態。
@@ -688,6 +714,11 @@ impl Repository {
         opts: RestoreOptions,
     ) -> Result<RestoreSummary> {
         let snapshot = self.read_snapshot(snapshot_key).await?;
+        let mut select = Select::new(&opts);
+        // 第一輪：每個 root 的落點。SNAPSHOT:PATH 不對時在建立任何目錄之前就回錯（審查修正）。
+        let placements = self
+            .place_roots(&snapshot.roots, &opts.subtree, &mut select)
+            .await?;
         let index = ReloadableIndex::new(self.load_index().await?);
         std::fs::create_dir_all(target).map_err(|e| CoreError::io(target, e))?;
         // 目標本身的 handle，整個 restore 都開著：每個 root 從它往下走；硬連結
@@ -698,58 +729,73 @@ impl Repository {
             index: &index,
             summary: RestoreSummary::default(),
             hardlinks: HardLinks::new(),
-            select: Select::new(&opts),
+            select,
         };
-        let mut found = opts.subtree.is_empty();
-        for root in &snapshot.roots {
-            let placement = match self.place_root(root, &opts.subtree, &mut w.select).await? {
-                Placed::Elsewhere => continue,
-                Placed::Pruned => {
-                    found = true;
-                    continue;
-                }
-                Placed::Here(placement) => {
-                    found = true;
-                    placement
-                }
-            };
+        for placement in placements {
+            let (rel, pos, entries) = self.open_placement(placement).await?;
             // 落點建不起來（例如擋著 symlink）：整個 restore 回錯，不是某一項的錯。沒被
             // 選到的落點等到底下真的有東西要寫才建（[`PendingDir`]）。
-            let mut base = PendingDir::base(&mut top, &placement.rel);
-            if placement.pos.selected {
+            let mut base = PendingDir::base(&mut top, &rel);
+            if pos.selected {
                 base.create()?;
             }
-            for entry in placement.entries {
-                // v3：節點名一律是單一路徑元件（合成根已淘汰）。
-                fsmeta::validate_child_name(&entry.name)?;
-                let Some(pos) = w.select.visit(&placement.pos, &entry) else {
+            for entry in entries {
+                // 名稱不合法時記錯、其他照常還原，與目錄裡的子項目同一套規則。格式讀取時
+                // 已經拒絕分隔符、NUL、`.`、`..`，會到這裡的只有 Windows 上帶反斜線的名字。
+                if let Err(e) = fsmeta::validate_child_name(&entry.name) {
+                    w.summary
+                        .errors
+                        .push(format!("{}: {e}", base.location().display()));
+                    continue;
+                }
+                let Some(child) = w.select.visit(&pos, &entry) else {
                     continue;
                 };
                 let name = fsmeta::bytes_to_name(&entry.name)?;
-                if pos.selected {
+                if child.selected {
                     base.open()?;
                 }
-                self.restore_node(&mut w, &mut base, &entry, &name, 1, pos)
+                self.restore_node(&mut w, &mut base, &entry, &name, 1, child)
                     .await;
             }
-        }
-        if !found {
-            return Err(CoreError::Usage(format!(
-                "{} is not in this snapshot",
-                subtree_display(&opts.subtree)
-            )));
         }
         w.summary.unmatched_includes = w.select.unmatched();
         Ok(w.summary)
     }
 
-    /// 一個 root 的落點（ADR 020、022）。先沿 root 的定位走：定位或它的上層被排除、或底下
-    /// 不可能有東西被選到，連 tree 都不讀（[`Placed::Pruned`]）。v3 的 restore 映射
-    /// （docs/format.md §9）：目錄來源的 entries 放在 `<定位>` 底下；**檔案/symlink 來源**
-    /// （root tree 恰好一個非目錄 entry、名稱＝定位的末段）放在 `<定位去掉末段>` 底下——與
-    /// v2「絕對路徑還原」的落點一致，「目錄恰好只含一個同名檔案」的還原結果也相同，所以
-    /// 這個判別沒有歧義代價。`subtree` 不是空的時，落點是去掉 subtree 之後的部分；subtree
-    /// 在 root 裡面時，沿 tree 走到那個目錄，它的內容直接放進目標。
+    /// 第一輪：每個 root 的落點（[`Repository::place_root`]）。`subtree` 不在任何 root 裡
+    /// → 錯誤；這時還沒建任何東西。
+    async fn place_roots(
+        &self,
+        roots: &[Root],
+        subtree: &[Vec<u8>],
+        select: &mut Select<'_>,
+    ) -> Result<Vec<Placement>> {
+        let mut placements = Vec::new();
+        let mut found = subtree.is_empty();
+        for root in roots {
+            match self.place_root(root, subtree, select).await? {
+                Placed::Elsewhere => {}
+                Placed::Pruned => found = true,
+                Placed::Here(placement) => {
+                    found = true;
+                    placements.push(*placement);
+                }
+            }
+        }
+        if !found {
+            return Err(CoreError::Usage(format!(
+                "{} is not in this snapshot",
+                subtree_display(subtree)
+            )));
+        }
+        Ok(placements)
+    }
+
+    /// 一個 root 的落點（ADR 020、022）。v3 的 restore 映射（docs/format.md §9）：目錄
+    /// 來源的 entries 放在 `<定位>` 底下；**檔案/symlink 來源**（root tree 恰好一個非目錄
+    /// entry、名稱＝定位的末段）放在 `<定位去掉末段>` 底下。`subtree` 不是空的時，落點是
+    /// 去掉 subtree 之後的部分；subtree 在 root 裡面時見 [`Repository::place_inside`]。
     async fn place_root(
         &self,
         root: &Root,
@@ -766,53 +812,93 @@ impl Repository {
         if shared < names.len().min(subtree.len()) {
             return Ok(Placed::Elsewhere);
         }
-        match select.walk(names.iter().copied()) {
-            Some(pos) if Select::worth_walking(&pos) => {}
-            _ => return Ok(Placed::Pruned),
-        }
-        let mut entries = self.read_tree_chain(&root.tree).await?;
-        let file_root = entries.len() == 1
-            && entries[0].kind != node_type::DIR
-            && names.last() == Some(&entries[0].name.as_slice());
-        // entries 的上一層：目錄來源是定位本身，檔案來源是定位的上一層。
-        let base: &[&[u8]] = if file_root {
-            names.split_last().map_or(&[][..], |(_, above)| above)
-        } else {
-            &names
+        let Some((last, above)) = names.split_last().filter(|_| subtree.len() < names.len()) else {
+            return self.place_inside(root, &names, subtree, select).await;
         };
-        if subtree.len() <= base.len() {
-            // subtree 是落點或它的上層（前面已確定是開頭）：落點是去掉它之後的部分。
-            let Some(pos) = select.walk(base.iter().copied()) else {
-                return Ok(Placed::Pruned);
-            };
-            let rel = base[subtree.len()..]
-                .iter()
-                .map(|name| fsmeta::bytes_to_name(name))
-                .collect::<Result<PathBuf>>()?;
-            return Ok(Placed::Here(Placement { rel, pos, entries }));
+        // subtree 是定位的上層，一定存在。沿定位走：定位或它的上層被排除、或底下不可能有
+        // 東西被選到，這個 root 連 tree 都不讀、落點也不建。
+        let Some(parent) = select.walk(above.iter().copied()) else {
+            return Ok(Placed::Pruned);
+        };
+        let pos = match select.child(&parent, last) {
+            Some(pos) if Select::worth_walking(&pos) => pos,
+            _ => return Ok(Placed::Pruned),
+        };
+        let rel = names[subtree.len()..]
+            .iter()
+            .map(|name| fsmeta::bytes_to_name(name))
+            .collect::<Result<PathBuf>>()?;
+        Ok(Placed::Here(Box::new(Placement {
+            rel,
+            pos,
+            file_root: Some((last.to_vec(), parent)),
+            content: Content::Tree(root.tree),
+        })))
+    }
+
+    /// SNAPSHOT:PATH 是這個 root 本身或在它的定位底下：先沿 tree 確認那個路徑存在、是
+    /// 目錄，再看選取——打錯的路徑不能因為 root 被選取剪掉，就以「什麼都沒還原」成功
+    /// 結束（審查修正）。它的內容直接放進目標本身。
+    async fn place_inside(
+        &self,
+        root: &Root,
+        names: &[&[u8]],
+        subtree: &[Vec<u8>],
+        select: &mut Select<'_>,
+    ) -> Result<Placed> {
+        let mut entries = self.read_tree_chain(&root.tree).await?;
+        if names
+            .last()
+            .is_some_and(|name| is_file_root(name, &entries))
+        {
+            return Err(not_a_directory(subtree));
         }
-        // subtree 在這個 root 裡面：沿 tree 走到那個目錄。
-        for wanted in &subtree[base.len()..] {
+        // 最後一層的條目第二輪才讀。
+        let mut unread = None;
+        for wanted in &subtree[names.len()..] {
+            if let Some(id) = unread {
+                entries = self.read_tree_chain(&id).await?;
+            }
             let Some(entry) = entries.iter().find(|e| e.name == *wanted) else {
                 return Ok(Placed::Elsewhere);
             };
             if entry.kind != node_type::DIR || entry.subtree.is_zero() {
-                return Err(CoreError::Usage(format!(
-                    "{} is not a directory in this snapshot",
-                    subtree_display(subtree)
-                )));
+                return Err(not_a_directory(subtree));
             }
-            let next = entry.subtree;
-            entries = self.read_tree_chain(&next).await?;
+            unread = Some(entry.subtree);
         }
-        let Some(pos) = select.walk(subtree.iter().map(Vec::as_slice)) else {
-            return Ok(Placed::Pruned);
+        let content = match unread {
+            Some(id) => Content::Tree(id),
+            None => Content::Read(entries),
         };
-        Ok(Placed::Here(Placement {
-            rel: PathBuf::new(),
-            pos,
-            entries,
-        }))
+        match select.walk(subtree.iter().map(Vec::as_slice)) {
+            Some(pos) if Select::worth_walking(&pos) => Ok(Placed::Here(Box::new(Placement {
+                rel: PathBuf::new(),
+                pos,
+                file_root: None,
+                content,
+            }))),
+            _ => Ok(Placed::Pruned),
+        }
+    }
+
+    /// 第二輪：讀落點的條目；檔案來源的條目改放在落點的上一層。回傳落點、它的選取位置、
+    /// 條目。
+    async fn open_placement(&self, placement: Placement) -> Result<(PathBuf, Pos, Vec<Entry>)> {
+        let entries = match placement.content {
+            Content::Tree(id) => self.read_tree_chain(&id).await?,
+            Content::Read(entries) => entries,
+        };
+        let Placement {
+            mut rel, mut pos, ..
+        } = placement;
+        if let Some((name, parent)) = placement.file_root {
+            if is_file_root(&name, &entries) {
+                rel.pop();
+                pos = parent;
+            }
+        }
+        Ok((rel, pos, entries))
     }
 
     /// dry run（ADR 022）：與 [`Repository::restore`] 同樣的落點與選取，但什麼都不寫，連
@@ -828,49 +914,39 @@ impl Repository {
         on_node: &mut dyn FnMut(&Path, Planned),
     ) -> Result<RestoreSummary> {
         let snapshot = self.read_snapshot(snapshot_key).await?;
+        let mut select = Select::new(&opts);
+        let placements = self
+            .place_roots(&snapshot.roots, &opts.subtree, &mut select)
+            .await?;
         let mut p = Plan {
-            select: Select::new(&opts),
+            select,
             summary: RestoreSummary::default(),
             on_node,
             levels: Vec::new(),
         };
-        let mut found = opts.subtree.is_empty();
-        for root in &snapshot.roots {
-            let placement = match self.place_root(root, &opts.subtree, &mut p.select).await? {
-                Placed::Elsewhere => continue,
-                Placed::Pruned => {
-                    found = true;
-                    continue;
-                }
-                Placed::Here(placement) => {
-                    found = true;
-                    placement
-                }
-            };
-            let base = target.join(&placement.rel);
+        for placement in placements {
+            let (rel, pos, entries) = self.open_placement(placement).await?;
+            let base = target.join(&rel);
             p.levels.push(PlanLevel {
                 path: base.clone(),
                 snapshot_dir: false,
                 created: false,
             });
-            if placement.pos.selected {
+            if pos.selected {
                 p.open();
             }
-            for entry in placement.entries {
-                fsmeta::validate_child_name(&entry.name)?;
-                let Some(pos) = p.select.visit(&placement.pos, &entry) else {
+            for entry in entries {
+                if let Err(e) = fsmeta::validate_child_name(&entry.name) {
+                    p.summary.errors.push(format!("{}: {e}", base.display()));
+                    continue;
+                }
+                let Some(child) = p.select.visit(&pos, &entry) else {
                     continue;
                 };
                 let path = base.join(fsmeta::bytes_to_name(&entry.name)?);
-                self.plan_node(&mut p, &entry, path, 1, pos).await;
+                self.plan_node(&mut p, &entry, path, 1, child).await;
             }
             p.levels.pop();
-        }
-        if !found {
-            return Err(CoreError::Usage(format!(
-                "{} is not in this snapshot",
-                subtree_display(&opts.subtree)
-            )));
         }
         p.summary.unmatched_includes = p.select.unmatched();
         Ok(p.summary)

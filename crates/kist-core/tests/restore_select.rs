@@ -445,6 +445,27 @@ async fn a_subtree_spanning_several_roots() {
     };
     repo.restore(&key, &target, opts).await.unwrap();
     assert_eq!(under(&target), set(&["p2.jpg"]));
+    // 檔案來源本身不是目錄，root 被排除時也一樣（審查修正）。dry run 一樣。
+    let file = abs.join("readme.txt");
+    for exclude in [
+        PathFilter::default(),
+        PathFilter::new(&[&file.display().to_string()]).unwrap(),
+    ] {
+        for path in [file.clone(), file.join("x")] {
+            let opts = RestoreOptions {
+                subtree: subtree(&path),
+                exclude: exclude.clone(),
+                ..RestoreOptions::default()
+            };
+            let err = repo.restore(&key, &target, opts.clone()).await.unwrap_err();
+            assert!(err.to_string().contains("not a directory"), "{err}");
+            let err = repo
+                .plan_restore(&key, &target, opts, &mut |_, _| {})
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not a directory"), "{err}");
+        }
+    }
 }
 
 // --- dry run（`Repository::plan_restore`，ADR 022）：與真的還原寫出來的完全一致 ---
@@ -556,4 +577,66 @@ async fn ignore_case_patterns_select_and_exclude() {
     };
     let (_, got) = f.restore(opts).await;
     assert_eq!(got, set(&["docs", "docs/old", "docs/old/a.pdf"]));
+}
+
+/// 審查修正：SNAPSHOT:PATH 在一個被剪掉的 root 裡面時，照樣先確認路徑存在、是目錄——
+/// 打錯的路徑不能因為 root 被排除就以「什麼都沒還原」成功結束。dry run 一樣。
+#[tokio::test]
+async fn a_subtree_is_checked_even_when_its_root_is_pruned() {
+    let f = fixture().await;
+    let target = f.t.dir.path().join("t");
+    let root = f.abs.display().to_string();
+    for (path, needle) in [
+        (f.abs.join("typo"), "not in this snapshot"),
+        (f.abs.join("readme.txt"), "not a directory"),
+    ] {
+        let opts = RestoreOptions {
+            subtree: subtree(&path),
+            exclude: PathFilter::new(&[&root]).unwrap(),
+            ..RestoreOptions::default()
+        };
+        let err = f
+            .repo
+            .restore(&f.key, &target, opts.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(needle),
+            "{}: {err}",
+            path.display()
+        );
+        let err = f
+            .repo
+            .plan_restore(&f.key, &target, opts, &mut |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(needle),
+            "dry run {}: {err}",
+            path.display()
+        );
+    }
+    // 對照：路徑存在、只是被排除時，什麼都不還原，不是錯誤。
+    let opts = RestoreOptions {
+        subtree: subtree(&f.abs.join("docs")),
+        exclude: PathFilter::new(&[&root]).unwrap(),
+        ..RestoreOptions::default()
+    };
+    let summary = f.repo.restore(&f.key, &target, opts).await.unwrap();
+    assert_eq!((summary.files, summary.dirs), (0, 0));
+}
+
+/// 審查修正：SNAPSHOT:PATH 不對時，在建立任何目錄之前就回錯。
+#[tokio::test]
+async fn a_bad_subtree_creates_no_target_directory() {
+    let f = fixture().await;
+    for path in [f.abs.join("nope"), f.abs.join("readme.txt")] {
+        let target = f.t.dir.path().join("new/dir/x");
+        let opts = RestoreOptions {
+            subtree: subtree(&path),
+            ..RestoreOptions::default()
+        };
+        f.repo.restore(&f.key, &target, opts).await.unwrap_err();
+        assert!(!f.t.dir.path().join("new").exists(), "{}", path.display());
+    }
 }
