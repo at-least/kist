@@ -255,8 +255,65 @@ struct FileFacts {
 /// xattr 讀取與進度顯示用。
 struct SourceCtx {
     source: Arc<dyn Source>,
-    /// [`Exclusions::one_file_system`] 時，這個本機目錄來源本身的裝置號碼；否則 `None`。
-    root_dev: Option<u64>,
+    /// 這個 root 底下另外被指名的路徑。
+    named: Named,
+}
+
+/// 一個 root 底下另外被指名的來源：`/a` 與 `/a/b` 同時給時 b 併進 a 的 root，但 b 仍是
+/// 指名的，排除規則不排除它（審查修正）。
+#[derive(Default)]
+struct Named {
+    /// 指名的路徑（相對於 root，`/` 分隔）。
+    paths: HashSet<Vec<u8>>,
+    /// 它們的上層（root 本身除外）：被排除時仍沿著通往指名路徑的方向走進去。
+    toward: HashSet<Vec<u8>>,
+}
+
+impl Named {
+    fn new(paths: Vec<Vec<u8>>) -> Self {
+        let mut toward = HashSet::new();
+        for path in &paths {
+            let mut at = path.as_slice();
+            while let Some(i) = at.iter().rposition(|&b| b == b'/') {
+                at = &at[..i];
+                toward.insert(at.to_vec());
+            }
+        }
+        Self {
+            paths: paths.into_iter().collect(),
+            toward,
+        }
+    }
+}
+
+/// 走訪到一個項目時，它在排除規則裡的位置。
+struct Visit {
+    /// 目錄巢狀深度（root 的子女 = 1）。
+    depth: usize,
+    /// 排除樣式的狀態。
+    filter: FilterState,
+    /// [`Exclusions::one_file_system`] 的邊界：這段子樹所屬檔案系統的裝置號碼。
+    dev_bound: Option<u64>,
+    /// 上層已被排除，只沿著通往指名路徑的方向走：其他子項目都不備份。
+    pass_through: bool,
+    /// 這個項目本身是指名的來源：排除規則不排除它。
+    named: bool,
+    /// 這個項目在通往某個指名路徑的路上。
+    toward_named: bool,
+}
+
+impl Visit {
+    /// 一個 root 本身（指名的）。
+    fn root(filter: FilterState, dev_bound: Option<u64>) -> Self {
+        Self {
+            depth: 1,
+            filter,
+            dev_bound,
+            pass_through: false,
+            named: true,
+            toward_named: false,
+        }
+    }
 }
 
 impl SourceCtx {
@@ -272,6 +329,18 @@ impl SourceCtx {
     fn join_local(&self, rel: &[u8]) -> Option<PathBuf> {
         self.source.local_path(rel)
     }
+}
+
+/// 相對路徑 → 來源層的 rel bytes（各段以 `/` 接起來，與 [`join_rel`] 同一種寫法）。
+fn rel_bytes(rel: &Path) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for comp in rel.components() {
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(&fsmeta::name_to_bytes(comp.as_os_str())?);
+    }
+    Ok(out)
 }
 
 /// rel 路徑 join：來源層的路徑一律以 `/` 分隔的 bytes。
@@ -333,8 +402,9 @@ fn local_file_item(path: &Path, name: &[u8]) -> Result<SourceItem> {
 
 /// 備份來源的規劃結果（`backup_prepare` 決定好，走訪端照做）。
 enum RootPlan {
-    /// 本機目錄：來源根在該目錄，rel 從空字串開始。
-    LocalDir(PathBuf),
+    /// 本機目錄：來源根在該目錄，rel 從空字串開始。`named`：併進它的其他指名路徑
+    /// （相對於它，`/` 分隔）。
+    LocalDir { path: PathBuf, named: Vec<Vec<u8>> },
     /// 本機檔案/symlink：來源根在其父目錄，root tree 只有最後元件一個 entry。
     LocalFile(PathBuf),
     /// 遠端/注入來源：root 型態（目錄或單一檔案）走訪前用 `list(b"")` 判別。
@@ -778,27 +848,40 @@ impl Repository {
                 }
                 with_bytes.sort();
                 with_bytes.dedup();
-                // `/a` 與 `/a/b` 同時給：只留 `/a`，否則 b 會備份兩次、restore 時重建同一條路徑
-                let mut kept: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+                // `/a` 與 `/a/b` 同時給：b 併進 a 的 root（否則 b 會備份兩次、restore 時重建
+                // 同一條路徑），但記下來，走訪 a 時排除規則不排除它（審查修正）。依 bytes
+                // 排序後上層一定排在前面；查上層用雜湊表，n 個來源是 O(n × 深度)。
+                let mut kept: Vec<(Vec<u8>, PathBuf, Vec<Vec<u8>>)> = Vec::new();
+                let mut kept_index: HashMap<PathBuf, usize> = HashMap::new();
                 for (bytes, path) in with_bytes {
-                    if kept.iter().any(|(_, outer)| path.starts_with(outer)) {
-                        tracing::warn!(
-                            "{}: already covered by another source path; skipped",
-                            path.display()
+                    let outer = path
+                        .ancestors()
+                        .skip(1)
+                        .find_map(|a| kept_index.get(a).map(|&i| (a, i)));
+                    if let Some((outer, i)) = outer {
+                        let rel = path
+                            .strip_prefix(outer)
+                            .map_err(|e| CoreError::Usage(format!("{}: {e}", path.display())))?;
+                        tracing::info!(
+                            "{}: inside source {}; backed up as part of it",
+                            path.display(),
+                            outer.display()
                         );
+                        kept[i].2.push(rel_bytes(rel)?);
                         continue;
                     }
-                    kept.push((bytes, path));
+                    kept_index.insert(path.clone(), kept.len());
+                    kept.push((bytes, path, Vec::new()));
                 }
                 kept.into_iter()
-                    .map(|(bytes, path)| {
+                    .map(|(bytes, path, named)| {
                         // 檔案（或 symlink）當 root：root tree 含單一 entry
                         // （名稱 = 路徑的最後元件）——mount/restore 瀏覽成
                         // `base/<name>`。root 必須讀得到，錯了就失敗。
                         let meta = std::fs::symlink_metadata(&path)
                             .map_err(|e| CoreError::io(&path, e))?;
                         let plan = if meta.is_dir() {
-                            RootPlan::LocalDir(path)
+                            RootPlan::LocalDir { path, named }
                         } else {
                             RootPlan::LocalFile(path)
                         };
@@ -837,7 +920,7 @@ impl Repository {
 
         let parent = self.find_parent(&opts.client_id, &path_bytes).await?;
         // 每個 root 各自開 parent 串流（v3：parent 的同 path root 才是這個 root 的 parent）。
-        let parent_roots: Vec<(Vec<u8>, TreeId)> = parent
+        let parent_roots: HashMap<Vec<u8>, TreeId> = parent
             .as_ref()
             .map(|(_, snap)| {
                 snap.roots
@@ -881,12 +964,10 @@ impl Repository {
         // 最後元件）——mount/restore 瀏覽成 `base/<name>`。
         let mut roots = Vec::new();
         for (pb, plan) in plans {
-            let parent_subtree = parent_roots
-                .iter()
-                .find(|(pp, _)| pp.as_slice() == pb.as_slice())
-                .map(|(_, t)| *t);
+            let parent_subtree = parent_roots.get(&pb).copied();
             let tree = match plan {
-                RootPlan::LocalDir(path) => {
+                RootPlan::LocalDir { path, named } => {
+                    // [`Exclusions::one_file_system`]：這個目錄來源本身的裝置號碼是第一道邊界。
                     let root_dev = if b.exclude.one_file_system {
                         let meta = std::fs::symlink_metadata(&path)
                             .map_err(|e| CoreError::io(&path, e))?;
@@ -896,10 +977,10 @@ impl Repository {
                     };
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(path.clone())?),
-                        root_dev,
+                        named: Named::new(named),
                     };
-                    let state = b.root_state(&pb)?;
-                    b.walk_dir(&ctx, b"", parent_subtree, 1, state).await?
+                    let visit = Visit::root(b.root_state(&pb)?, root_dev);
+                    b.walk_dir(&ctx, b"", parent_subtree, visit).await?
                 }
                 RootPlan::LocalFile(path) => {
                     let name = pb
@@ -921,7 +1002,7 @@ impl Repository {
                     })?;
                     let ctx = SourceCtx {
                         source: Arc::new(LocalSource::new(parent.to_path_buf())?),
-                        root_dev: None,
+                        named: Named::default(),
                     };
                     let item = local_file_item(&path, &name)?;
                     let parent_entry = parent_file_entry(self, parent_subtree, &name).await;
@@ -932,8 +1013,7 @@ impl Repository {
                             &name,
                             item,
                             parent_entry.as_ref(),
-                            1,
-                            FilterState::default(),
+                            Visit::root(FilterState::default(), None),
                         )
                         .await?
                     else {
@@ -947,7 +1027,7 @@ impl Repository {
                 RootPlan::Remote(source) => {
                     let ctx = SourceCtx {
                         source,
-                        root_dev: None,
+                        named: Named::default(),
                     };
                     // 遠端 root 的型態要靠列根判別：「恰好一個 File 且名稱＝
                     // 定位的最後元件」→ 檔案來源（與 restore 的 file-root
@@ -985,8 +1065,7 @@ impl Repository {
                                 b"",
                                 item,
                                 parent_entry.as_ref(),
-                                1,
-                                FilterState::default(),
+                                Visit::root(FilterState::default(), None),
                             )
                             .await?
                         else {
@@ -997,8 +1076,8 @@ impl Repository {
                         };
                         b.write_tree(Tree::new(vec![entry], None)).await?
                     } else {
-                        let state = b.root_state(&pb)?;
-                        b.walk_dir(&ctx, b"", parent_subtree, 1, state).await?
+                        let visit = Visit::root(b.root_state(&pb)?, None);
+                        b.walk_dir(&ctx, b"", parent_subtree, visit).await?
                     }
                 }
             };
@@ -1170,18 +1249,17 @@ impl Backup {
     /// 處理一個目錄項目，回傳它的 tree 節點；讀不到的（略過並警告）與在別的檔案系統上的
     /// 檔案（[`Exclusions::one_file_system`]）回 `None`。
     /// 不論結果如何（寫進 tree、略過、記成錯誤），做完都回報一次進度。
-    /// `filter`：這個項目在排除樣式裡的狀態，是目錄時往下走用。
+    /// `visit`：這個項目在排除規則裡的位置，是目錄時往下走用。
     async fn process_entry(
         &mut self,
         ctx: &SourceCtx,
         rel: &[u8],
         item: SourceItem,
         parent: Option<&Entry>,
-        depth: usize,
-        filter: FilterState,
+        visit: Visit,
     ) -> Result<Option<Entry>> {
         let node = self
-            .process_entry_inner(ctx, rel, item, parent, depth, filter)
+            .process_entry_inner(ctx, rel, item, parent, visit)
             .await?;
         let display = ctx.display_path(rel);
         self.report_phase("files", Some(display));
@@ -1194,8 +1272,7 @@ impl Backup {
         rel: &[u8],
         item: SourceItem,
         parent: Option<&Entry>,
-        depth: usize,
-        filter: FilterState,
+        visit: Visit,
     ) -> Result<Option<Entry>> {
         let mk = ctx.source.meta_kind();
         // 來源能證明什麼就記什麼（docs/format.md §8 的 metadata 聯集）：
@@ -1211,9 +1288,10 @@ impl Backup {
         } else {
             None
         };
-        // 不跨檔案系統（ADR 021）：裝置號碼與來源不同的目錄照備成空目錄，檔案不備份。
-        let other_fs = match (ctx.root_dev, &posix) {
-            (Some(root), Some(p)) => p.dev != root,
+        // 不跨檔案系統（ADR 021）：裝置號碼與邊界不同的目錄照備成空目錄，檔案不備份。
+        // 指名的項目例外，目錄自己成為新的邊界；通往指名路徑的目錄只沿那個方向走進去。
+        let other_fs = match (visit.dev_bound, &posix) {
+            (Some(bound), Some(p)) => p.dev != bound && !visit.named,
             _ => false,
         };
         let mut entry = Entry {
@@ -1252,7 +1330,7 @@ impl Backup {
                     Some(e) if e.kind == node_type::DIR && !e.subtree.is_zero() => Some(e.subtree),
                     _ => None,
                 };
-                let subtree = if other_fs {
+                let subtree = if other_fs && !visit.toward_named {
                     tracing::debug!(
                         "{}: on another file system; kept as an empty directory",
                         ctx.display_path(rel)
@@ -1260,8 +1338,19 @@ impl Backup {
                     self.report.excluded += 1;
                     self.write_tree(Tree::new(Vec::new(), None)).await?
                 } else {
-                    self.walk_dir(ctx, rel, parent_subtree, depth + 1, filter)
-                        .await?
+                    let dev_bound = match (visit.named, visit.dev_bound, &posix) {
+                        (true, Some(_), Some(p)) => Some(p.dev),
+                        _ => visit.dev_bound,
+                    };
+                    let inside = Visit {
+                        depth: visit.depth + 1,
+                        filter: visit.filter,
+                        dev_bound,
+                        pass_through: visit.pass_through || other_fs,
+                        named: false,
+                        toward_named: false,
+                    };
+                    self.walk_dir(ctx, rel, parent_subtree, inside).await?
                 };
                 self.stats.dirs += 1;
                 entry.kind = node_type::DIR;
@@ -1354,15 +1443,15 @@ impl Backup {
 
     /// 遞迴走訪一個目錄的**內容**，回傳它（最後一段）tree 的名稱。
     /// v3 的根目錄也走這裡（roots[].tree = 根目錄內容的 tree）。
-    /// `filter`：這個目錄在排除樣式裡的狀態；每個子項目從它往下走一步。
+    /// `visit`：這個目錄在排除規則裡的位置；每個子項目從它往下走一步（`named` 與
+    /// `toward_named` 是項目自己的，這裡不看）。
     /// `Send`：讓整個 backup 的 future 能被 `tokio::spawn`（daemon 在別的 task 上跑工作）。
     fn walk_dir<'a>(
         &'a mut self,
         ctx: &'a SourceCtx,
         dir_rel: &'a [u8],
         parent_subtree: Option<TreeId>,
-        depth: usize,
-        filter: FilterState,
+        visit: Visit,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TreeId>> + Send + 'a>> {
         Box::pin(async move {
             let mut parent_stream = match parent_subtree {
@@ -1398,8 +1487,9 @@ impl Backup {
             // Source 合約說條目已依名稱 bytes 排序且**惰性**yield（清單不整批
             // 常駐記憶體——100 萬條目目錄的門檻，ADR 011）。
 
-            // 記號檔（ADR 021）：這一層有記號 → 只留記號檔本身。
-            let markers = if self.exclude.if_present.is_empty() {
+            // 記號檔（ADR 021）：這一層有記號 → 只留記號檔本身。只沿指名路徑走的目錄
+            // 不必看（反正只走那個方向）。
+            let markers = if self.exclude.if_present.is_empty() || visit.pass_through {
                 None
             } else {
                 self.markers_in(ctx, dir_rel).await
@@ -1418,8 +1508,16 @@ impl Backup {
                 };
                 let child_rel = join_rel(dir_rel, &item.name);
                 // 排除先於其他檢查：被排除的過深目錄不算略過的錯誤。跳過一個名字不影響
-                // parent 串流（take_name 只要求查詢名稱遞增）。
-                let child_filter = self.exclude.patterns.descend(&filter, &item.name);
+                // parent 串流（take_name 只要求查詢名稱遞增）。指名的項目不排除；被排除、
+                // 但底下有指名路徑的目錄只沿著那個方向走進去。
+                let named = ctx.named.paths.contains(&child_rel);
+                let toward_named = !named && ctx.named.toward.contains(&child_rel);
+                if visit.pass_through && !named && !toward_named {
+                    tracing::debug!("{}: excluded", ctx.display_path(&child_rel));
+                    self.report.excluded += 1;
+                    continue;
+                }
+                let child_filter = self.exclude.patterns.descend(&visit.filter, &item.name);
                 let too_large = match (self.exclude.larger_than, &item.kind) {
                     (Some(limit), SourceItemKind::File { size, .. }) => *size > limit,
                     _ => false,
@@ -1427,7 +1525,8 @@ impl Backup {
                 let beside_marker = markers
                     .as_ref()
                     .is_some_and(|names| !names.contains(&item.name));
-                if child_filter.is_match() || too_large || beside_marker {
+                let excluded = !named && (child_filter.is_match() || too_large || beside_marker);
+                if excluded && !toward_named {
                     tracing::debug!("{}: excluded", ctx.display_path(&child_rel));
                     self.report.excluded += 1;
                     continue;
@@ -1437,7 +1536,8 @@ impl Backup {
                 // 過深」的來源目錄寫進去——寫得出、還原不回＝自造損壞。
                 // 跳過並記帳（與讀不到的項目同一套帳）；遞迴本身也因此
                 // 有界，深來源不再吃堆疊。
-                if matches!(item.kind, SourceItemKind::Dir) && depth >= crate::MAX_TREE_DEPTH {
+                if matches!(item.kind, SourceItemKind::Dir) && visit.depth >= crate::MAX_TREE_DEPTH
+                {
                     let display = ctx.display_path(&child_rel);
                     self.skip(
                         &display,
@@ -1453,15 +1553,16 @@ impl Backup {
                     Some(s) => s.take_name(&item.name).await,
                     None => None,
                 };
+                let child = Visit {
+                    depth: visit.depth,
+                    filter: child_filter,
+                    dev_bound: visit.dev_bound,
+                    pass_through: !named && (visit.pass_through || excluded),
+                    named,
+                    toward_named,
+                };
                 let entry = self
-                    .process_entry(
-                        ctx,
-                        &child_rel,
-                        item,
-                        parent_entry.as_ref(),
-                        depth,
-                        child_filter,
-                    )
+                    .process_entry(ctx, &child_rel, item, parent_entry.as_ref(), child)
                     .await?;
                 if let Some(entry) = entry {
                     children.push(entry);

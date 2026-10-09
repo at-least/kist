@@ -366,3 +366,65 @@ async fn negated_and_ignore_case_excludes() {
     assert!(!got.contains(Path::new("Music/b")), "{got:?}");
     assert!(got.contains(Path::new("top.txt")));
 }
+
+/// 審查修正：指名的來源包在另一個指名來源裡時，仍然是指名的——外層走訪到它時，排除樣式、
+/// 大小上限、記號檔都不排除它；它在被排除的目錄底下時，那些上層只沿著通往它的路徑走進去。
+#[tokio::test]
+async fn a_named_source_inside_another_is_never_excluded() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    files(
+        &src,
+        &[
+            ("keep/k.txt", b"k"),
+            ("big.bin", &[7u8; 5000]),
+            ("small.txt", b"s"),
+            ("x/y/f", b"f"),
+            ("x/other", b"o"),
+            ("m/.nobackup", b""),
+            ("m/z/g", b"g"),
+            ("m/drop", b"d"),
+        ],
+    );
+    let abs = std::fs::canonicalize(&src).unwrap();
+    let repo = t.open().await;
+    let opts = with(Exclusions {
+        patterns: PathFilter::new(&["keep", &format!("{}/x", abs.display())]).unwrap(),
+        if_present: vec![Marker::parse(".nobackup").unwrap()],
+        larger_than: Some(1000),
+        ..Exclusions::default()
+    });
+    let named = [
+        src.clone(),
+        src.join("keep"),
+        src.join("big.bin"),
+        src.join("x/y"),
+        src.join("m/z"),
+    ];
+    let s = repo.backup(&named, opts).await.unwrap();
+    assert_eq!(s.report.errors, 0, "{:?}", s.report);
+    assert_eq!(s.roots.len(), 1, "巢狀的指名來源仍併進外層的 root");
+    let target = tempfile::tempdir_in(t.dir.path()).unwrap().keep();
+    let r = repo
+        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        names_under(&target.join(abs.strip_prefix("/").unwrap())),
+        set(&[
+            "big.bin",
+            "keep",
+            "keep/k.txt",
+            "m",
+            "m/.nobackup",
+            "m/z",
+            "m/z/g",
+            "small.txt",
+            "x",
+            "x/y",
+            "x/y/f",
+        ]),
+        "x/other 與 m/drop 照樣被排除"
+    );
+}

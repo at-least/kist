@@ -1143,9 +1143,11 @@ fn one_file_system_keeps_mount_points_empty() {
     std::fs::create_dir_all(src.join("mnt")).unwrap();
     std::fs::write(src.join("a.txt"), b"a").unwrap();
     env.ok(&["init"]);
-    let backup_in_namespace = |flags: &str| {
+    // extra：另外指名的來源（在 namespace 裡才存在，掛載之後才建）。
+    let backup_in_namespace = |flags: &str, extra: &str| {
         let script = format!(
-            "mount -t tmpfs none '{mnt}' && echo inner > '{mnt}/f' && '{kist}' backup --json {flags} '{src}'",
+            "mount -t tmpfs none '{mnt}' && echo inner > '{mnt}/f' && mkdir '{mnt}/deep' \
+             && echo deeper > '{mnt}/deep/g' && '{kist}' backup --json {flags} '{src}' {extra}",
             mnt = src.join("mnt").display(),
             kist = env!("CARGO_BIN_EXE_kist"),
             src = src.display(),
@@ -1159,7 +1161,7 @@ fn one_file_system_keeps_mount_points_empty() {
             .env_remove("RUST_LOG")
             .output()
     };
-    let out = match backup_in_namespace("--one-file-system") {
+    let out = match backup_in_namespace("--one-file-system", "") {
         Ok(out) if out.status.success() => out,
         Ok(out) => {
             eprintln!(
@@ -1183,7 +1185,7 @@ fn one_file_system_keeps_mount_points_empty() {
     assert!(restored.join("a.txt").is_file());
 
     // 對照組：不加旗標就會走進掛載點（證明上面的 tmpfs 真的掛上了）。
-    let out = backup_in_namespace("").unwrap();
+    let out = backup_in_namespace("", "").unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -1193,6 +1195,44 @@ fn one_file_system_keeps_mount_points_empty() {
     env.ok(&["restore", "latest", target.to_str().unwrap()]);
     let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
     assert_eq!(std::fs::read(restored.join("mnt/f")).unwrap(), b"inner\n");
+
+    // 審查修正：掛載點本身也指名時整個照備，它是自己的邊界。
+    let mnt = src.join("mnt");
+    let out = backup_in_namespace("--one-file-system", &format!("'{}'", mnt.display())).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["report"]["excluded"], 0, "{v}");
+    let target = env.dir.path().join("out3");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(std::fs::read(restored.join("mnt/f")).unwrap(), b"inner\n");
+    assert_eq!(
+        std::fs::read(restored.join("mnt/deep/g")).unwrap(),
+        b"deeper\n"
+    );
+
+    // 指名的路徑在掛載點更底下時，只沿著通往它的方向穿過掛載點。
+    let deep = src.join("mnt/deep");
+    let out = backup_in_namespace("--one-file-system", &format!("'{}'", deep.display())).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["report"]["excluded"], 1, "掛載點裡的 f：{v}");
+    let target = env.dir.path().join("out4");
+    env.ok(&["restore", "latest", target.to_str().unwrap()]);
+    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    assert_eq!(
+        std::fs::read(restored.join("mnt/deep/g")).unwrap(),
+        b"deeper\n"
+    );
+    assert!(!restored.join("mnt/f").exists(), "掛載點的其他內容照樣不備");
 }
 
 /// `restore SNAPSHOT:PATH`、`--dry-run`、`--include-file`（ADR 022）。

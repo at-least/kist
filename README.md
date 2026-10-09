@@ -112,7 +112,8 @@ kist backup ~ --exclude-file ~/.config/kist/exclude    # 一行一條；空行�
 - 以 `/` 分段，每段比對恰好一個路徑元件：`*` 任意多個字元、`?` 一個字元（CJK 字也是一個）、
   `[abc]`／`[a-z]`／`[!a]` 一個字元、`\` 讓下一個字元照字面。整段只有 `**` 時比對零或多個元件
   （`/home/me/**/build`）。區分大小寫；結尾的 `/` 會被去掉。
-- 指名的來源本身不會被排除（`kist backup ~/proj --exclude proj` 照樣備份 `~/proj`）。
+- 指名的來源本身不會被排除（`kist backup ~/proj --exclude proj` 照樣備份 `~/proj`）。包在另一個指名來源
+  裡的也一樣：它併進外層的 root，但排除條件不排除它；它的上層被排除時，只沿著通往它的路徑備份。
 - `!` 開頭是反向樣式（同 restic 文件描述的 gitignore 行為）：樣式依序編號，一個路徑上**最後**一個比對到
   它的樣式決定它排不排除。`kist backup ~ --exclude "$HOME/*" --exclude "!$HOME/Documents"` 只備
   Documents。被排除的目錄整棵不走，裡面的東西加不回來。字面的 `!` 寫成 `\!`。編號的順序：`--exclude` 的
