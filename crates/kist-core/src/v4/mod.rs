@@ -8,14 +8,20 @@
 //! - [`cache`]：本地快取：看過的世代、分片、delta、mpack、驗證過的持有者（§3、B2）。
 //! - [`state`]：讀取端的世代：最大世代的 head、map、delta，與一個 ID 的持有者（§10、B1）。
 //! - [`read`]：從持有者讀一項（依序嘗試、驗證失敗換下一個）與 metadata 的讀取（§10）。
+//! - [`live`]：restore、mount、check 的讀取端：退回較舊的世代、持有者全部失敗時重新載入一次（§10）。
 //! - [`backup`]：B1–B5（§11.2）。
+//! - [`snapshots`]：列出、選取與讀取 snapshot（主體不行讀 `.r1`，§9）。
 
 pub mod backup;
 pub mod cache;
+pub mod live;
 pub mod pack;
 pub mod read;
 pub mod repo;
+pub mod snapshots;
 pub mod state;
 
 pub use backup::{BackupOptions, BackupReport, BackupSummary, Clock, PreparedBackup, Reading};
+pub use live::Live;
 pub use repo::{InitOptions, Repo};
+pub use snapshots::SnapshotInfo;

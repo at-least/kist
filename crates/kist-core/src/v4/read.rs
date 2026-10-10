@@ -114,6 +114,12 @@ impl Reader {
         }
     }
 
+    /// 與別的讀取端共用記憶體裡的 mpack（重新載入之後沿用：mpack 以內容命名）。
+    pub fn with_mpacks(mut self, mpacks: Arc<Mpacks>) -> Self {
+        self.mpacks = mpacks;
+        self
+    }
+
     /// 開始時從本地快取載入的驗證記錄。
     pub fn with_verified(self, known: HashSet<(ItemId, ObjectId)>) -> Self {
         self.lock_verified().known = known;
@@ -224,10 +230,13 @@ impl Reader {
     async fn read(&self, id: ItemId, kind: Kind) -> Result<Vec<u8>> {
         let holders = self.state.read_candidates(&id, kind);
         if holders.is_empty() {
-            return Err(CoreError::corrupt(
-                format!("{id}"),
-                "no holder in the map or the deltas",
-            ));
+            return Err(CoreError::Unavailable {
+                what: format!("{id}"),
+                reasons: format!(
+                    "no holder in generation {}'s map or the deltas",
+                    self.state.gen.g
+                ),
+            });
         }
         let mut reasons = Vec::new();
         for h in &holders {
@@ -248,7 +257,10 @@ impl Reader {
                 }
             }
         }
-        Err(CoreError::corrupt(format!("{id}"), reasons.join("; ")))
+        Err(CoreError::Unavailable {
+            what: format!("{id}"),
+            reasons: reasons.join("; "),
+        })
     }
 
     pub async fn chunk(&self, id: &ChunkId) -> Result<Vec<u8>> {
@@ -307,6 +319,42 @@ impl Reader {
         }
     }
 
+    /// 一個目錄的全部 entry，依名稱。
+    pub async fn entries(&self, tree: &MetaId) -> Result<Vec<Entry>> {
+        self.dir(tree).await?.rest(self).await
+    }
+
+    /// 目錄裡名稱等於 `name` 的 entry：沿 Dir 的索引只讀涵蓋它的那一段（§7 的查找；mount 的 lookup 與
+    /// SNAPSHOT:PATH 用）。
+    pub async fn lookup(&self, tree: &MetaId, name: &[u8]) -> Result<Option<Entry>> {
+        let mut item = self.item(tree).await?;
+        loop {
+            match item {
+                Item::Seg(s) => {
+                    return Ok(s
+                        .entries
+                        .binary_search_by(|e| e.n.as_slice().cmp(name))
+                        .ok()
+                        .map(|i| s.entries[i].clone()))
+                }
+                Item::Dir(d) => {
+                    // 涵蓋 name 的是最後一個 first ≤ name 的段（first 嚴格遞增，§7）
+                    let i = d.segs.partition_point(|s| s.first.as_slice() <= name);
+                    let Some(i) = i.checked_sub(1) else {
+                        return Ok(None);
+                    };
+                    item = self.segment(&d, i, kind::SEG).await?;
+                }
+                _ => {
+                    return Err(CoreError::corrupt(
+                        format!("{tree}"),
+                        "a directory tree must be a segment or a directory index",
+                    ))
+                }
+            }
+        }
+    }
+
     /// 載入第 i 段並照 §7 檢查。
     async fn segment(&self, dir: &Dir, i: usize, leaf: u8) -> Result<Item> {
         let child = self.item(&dir.segs[i].id).await?;
@@ -348,8 +396,12 @@ impl Reader {
                 .read_candidates(&(*id).into(), Kind::Data)
                 .first()
                 .map(|h| h.entry.r)
-                .ok_or_else(|| {
-                    CoreError::corrupt(format!("chunk {id}"), "no holder in the map or the deltas")
+                .ok_or_else(|| CoreError::Unavailable {
+                    what: format!("chunk {id}"),
+                    reasons: format!(
+                        "no holder in generation {}'s map or the deltas",
+                        self.state.gen.g
+                    ),
                 })
         };
         let ids: Vec<ChunkId> = if entry.ct == content_type::DIRECT {

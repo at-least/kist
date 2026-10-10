@@ -613,21 +613,6 @@ struct Parent {
 }
 
 impl Repo {
-    /// 讀一個 snapshot（`key` 可以是 `.r1`）：`K_snap` 解密（AAD 是主體的 key 路徑）、解碼、內容與 key 核對。
-    pub async fn read_snapshot(&self, key: &Key) -> Result<Snapshot> {
-        let Key::Snapshot { client, ts, .. } = key else {
-            return Err(CoreError::corrupt(key.path(), "not a snapshot key"));
-        };
-        let bytes = self.backend().get(&key.path()).await?;
-        let plain = self
-            .keys()
-            .open_snapshot(client, ts, &bytes)
-            .map_err(|e| CoreError::corrupt(key.path(), e.to_string()))?;
-        let snap = Snapshot::decode(&plain)?;
-        snap.check_key(key)?;
-        Ok(snap)
-    }
-
     /// B1：列出來的最大世代。列表從看過的世代開始；它不在列表裡就警告、改列全部。最大世代的 `.r1` 不在列表
     /// 裡（寫入者在兩次 PUT 之間或已經當掉）→ 等 `wait` 再列一次，仍然沒有就停止（§11.2）。
     async fn newest_for_backup(&self, wait: Duration) -> Result<Generation> {

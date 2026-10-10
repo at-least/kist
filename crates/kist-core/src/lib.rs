@@ -125,6 +125,10 @@ pub enum CoreError {
         #[source]
         source: kist_backend::BackendError,
     },
+    /// v4 的讀取（§10）：一項沒有持有者，或每一份都驗證失敗。restore、mount 與 check 在這時重新載入一次世代
+    /// 再試（[`v4::live`]）。
+    #[error("no usable copy of {what}: {reasons}")]
+    Unavailable { what: String, reasons: String },
 }
 
 impl CoreError {

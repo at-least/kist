@@ -225,6 +225,28 @@ fn walk_tree<'a>(
     })
 }
 
+/// 依名稱排好、保證切成至少 `segs` 段的檔名（§7：這一段已有 1024 項之後，名稱的 cut hash 成立就在它之後切）。
+/// K_cut 由每個 repo 亂數的 master 推導，固定的一組名稱可能剛好不切，所以依這個 repo 的金鑰挑名稱。
+pub fn names_with_cuts(repo: &Repo, segs: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_seg = 0usize;
+    let mut cuts = 0usize;
+    let mut i = 0u32;
+    while cuts + 1 < segs || in_seg == 0 {
+        let name = format!("f{i:06}");
+        i += 1;
+        let cut =
+            in_seg >= kist_format::v4::meta::MIN_SEG_ITEMS && repo.keys().is_cut(name.as_bytes());
+        out.push(name);
+        in_seg += 1;
+        if cut {
+            cuts += 1;
+            in_seg = 0;
+        }
+    }
+    out
+}
+
 /// 確定性的測試資料（"kist/test/<seed>" 的 BLAKE3 XOF），壓不動。
 pub fn data(seed: &str, n: usize) -> Vec<u8> {
     let mut h = blake3::Hasher::new();
@@ -359,6 +381,7 @@ pub mod hooked {
         inner: InMemory,
         counts: Mutex<BTreeMap<&'static str, usize>>,
         puts: Mutex<Vec<String>>,
+        ranged: Mutex<Vec<String>>,
         /// 這些 key 第一次寫入成功之後回「已存在」。
         pub echo: Mutex<Vec<String>>,
     }
@@ -386,6 +409,12 @@ pub mod hooked {
         pub fn reset(&self) {
             self.counts.lock().unwrap().clear();
             self.puts.lock().unwrap().clear();
+            self.ranged.lock().unwrap().clear();
+        }
+
+        /// range read 過的 key，依順序。
+        pub fn ranged(&self) -> Vec<String> {
+            self.ranged.lock().unwrap().clone()
         }
 
         pub fn puts(&self) -> Vec<String> {
@@ -431,6 +460,7 @@ pub mod hooked {
             self.bump(if options.head {
                 "head"
             } else if options.range.is_some() {
+                self.ranged.lock().unwrap().push(location.to_string());
                 "range"
             } else {
                 "get"
@@ -444,6 +474,7 @@ pub mod hooked {
             ranges: &[std::ops::Range<u64>],
         ) -> object_store::Result<Vec<Bytes>> {
             self.bump("range");
+            self.ranged.lock().unwrap().push(location.to_string());
             self.inner.get_ranges(location, ranges).await
         }
 
