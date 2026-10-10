@@ -1,9 +1,9 @@
 # kist repo 格式（v4）
 
 > **狀態：設計已確認（2026-10-10，見 ADR 026），實作中。** 本文件是 v4 的唯一權威副本：`kist_format::v4`
-> 與 `kist_crypto::v4`（實作第 2 段，已完成）照它實作，第 3 段起的程式碼也照它寫；改動格式必須同時改程式碼、
-> 向量與本文件。kist-core、kist-mount、kist-cli 在第 3–6 段遷移之前仍用 v3，`docs/format.md` 繼續描述
-> 它們，v3 的模組移除時一併刪除。
+> 與 `kist_crypto::v4`（實作第 2 段）、kist-backend 的 v4 契約（第 3 段）照它實作，之後各段的程式碼也照它
+> 寫；改動格式必須同時改程式碼、向量與本文件。kist-core、kist-mount、kist-cli 在第 4–6 段遷移之前仍用 v3，
+> `docs/format.md` 繼續描述它們，v3 的模組移除時一併刪除。
 > v4 不支援 v3：config 的 `v` 不是 4 就拒絕，沒有遷移（負責人：「不需要支援上一代，目前都還在內部開發
 > 階段」）。
 > 第一版草稿（commit `054c7e1`，「v3 加樹進 pack」）已被否決；本版從需求與 bug 歷史重新推導，
@@ -366,8 +366,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 只在通過條件寫入探針的後端上執行。同一台主機以檔案鎖保證一次一個。
 
-- **P0** 建立 `maint/probe-<亂數>`，再以同名建立一次，必須得到「已存在」；HEAD 它，後端時間與本機牆鐘
-  相差超過 5 分鐘 → 拒絕。記下探針的後端時間 `N_P`。結束時刪掉探針。
+- **P0** 後端的條件建立不是原子的（`rclone://`，§12）→ 拒絕，什麼都不寫。否則建立 `maint/probe-<亂數>`，
+  再以同名建立一次，必須得到「已存在」；HEAD 它，後端時間與讀完之後的本機牆鐘相差超過 5 分鐘 → 拒絕。
+  記下探針的後端時間 `N_P` 與那一次讀到的本機牆鐘（§11.1 的「P0 時的本機牆鐘」）。P0 結束時不論結果都
+  刪掉探針（也驗證了維護角色能刪）。
 - **P1** 讀列出來的最大世代 g；版本不認得、讀不了、或沒有修改時間 → 拒絕。`T(g)` 比本機時鐘晚超過 `M`
   → 回報，這一輪以「本機時鐘 + M」代替 `T(g)` 當作現在（只會更保守；`T(g)` 當成某個世代的起點時仍用
   原值）。原本在這裡拒絕：一個時間戳錯誤的 head 會讓 GC 停到真實時間追上它，連改 settings 都過不了
@@ -479,11 +481,11 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 | 假設 | 狀態 |
 | --- | --- |
 | LIST 在寫入與刪除之後一致 | AWS S3 有文件；MinIO 只在 xfs/zfs/btrfs；其他後端猜測 |
-| `maint/gen/` 的條件建立是原子的 | S3、Azure、R2、Ceph、MinIO 有文件或原始碼；GCS 用 generation-match 0；SFTP 用 hardlink；本機用 link／O_EXCL；P0 每輪實測 |
+| `maint/gen/` 的條件建立是原子的 | S3、Azure、R2、Ceph、MinIO 有文件或原始碼；GCS 用 generation-match 0；SFTP 用 hardlink；本機用 link／O_EXCL；P0 每輪實測；rclone 橋接不是（先 stat 再 rename），P0 依種類拒絕 |
 | head 的修改時間由後端設定 | 由 P0、P1 與兩個時鐘的規則容錯 |
 | 可見延遲＋經過時間低估＋snapshot PUT 延遲 < 1 小時 | 猜測 |
 | 備份角色寫不了 `maint/`、`keys/`、`config` | S3 以 bucket policy 強制；本機與 SFTP 與 v3 同樣信任 |
-| 單一 PUT 的大小上限夠放一個 pack | 未查證（UNVERIFIED） |
+| 單一 PUT 的大小上限夠放一個 pack | AWS S3 的單一 PUT 最多 5 GB（官方文件，2026-10-11 查）；預設的 pack_target 64 MiB 遠低於它。pack_target 接近 4 GiB、chunk 又很小（avg 接近 256 bytes）時，trailer（每項約 60 bytes）可能讓 pack 超過 5 GB，PUT 失敗、backup 報錯，不會無聲出錯。其他 S3 相容服務未查 |
 | head 的主體與 `.r1` 不會一起遺失 | 猜測；兩份都遺失時，較早讀過 head 的寫入者可以重新建立那一代（P8）。寫入者在兩次 PUT 之間當掉、之後主體才遺失的情況由 P1 的補寫與 B1 處理，GC 模型有這個故障 |
 | 在一個 age 的時間窗內（從一個世代寫成，到從它起算的 age 用完），後端時鐘與寫入者的牆鐘不會都出錯 | 猜測；兩個時鐘的規則（§11.1）保證單一時鐘出錯時只會延後刪除。原本寫「不會同時往同一個方向錯」，沒有排除兩個時鐘在不同時間各錯一次（第二輪外部審查 C1–C3）；「現在」與 P0 的讀數取小之後，這種組合還要那個時鐘從 base head 寫成一直錯到這一輪的 P0 |
 
@@ -501,10 +503,19 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 ## 12. 後端契約
 
 - 必要：只在不存在時建立的單一 PUT、range GET、寫入與刪除之後一致的 LIST（修改時間至少到秒）、HEAD、
-  DELETE（只給維護角色）。
+  DELETE（只給維護角色；刪除不存在的物件算成功，各後端一致）。`maint/gen/` 從上次看過的世代起以
+  start-after 列出（S3 送 `start-after`；本機與 SFTP 列出整個 prefix 再過濾，結果相同）。
 - 不需要：覆寫、分段上傳、條件刪除。
 - 寬鬆後端（`rclone://`、條件寫入沒有文件的 B2 與 Wasabi）：backup 可以用（pack、delta 以內容命名，
-  snapshot 以 client 分前綴、本機鎖保證同一個 client 一次一個）；prune 不能用（P0 不通過就拒絕）。
+  snapshot 以 client 分前綴、本機鎖保證同一個 client 一次一個）；prune 與其他維護命令不能用。
+  `rclone://` 依後端的種類拒絕（P0）：橋接的條件建立是先 stat 再 rename，兩個寫入者同時通過 stat 時後寫的
+  蓋掉先寫的，但依序建立兩次照樣得到「已存在」，P0 的雙重建立看不出來（實作第 3 段在真的 rclone 上
+  重現）。S3 相容服務靠 P0 的雙重建立：忽略 `If-None-Match` 的服務會讓第二次建立成功。
+- 寫入的結果不一定確定：S3 回 5xx 時 client 會重試，第一次其實已寫入的話重試得到「已存在」；逾時的建立
+  不重試，錯誤不代表沒寫入。所以內容命名的 key（pack、mpack、delta、分片）得到「已存在」就是成功；head 的
+  柵欄得到「已存在」或錯誤就停止、不刪（P8；如果其實寫進去了，那一代照樣有效，下一次維護補寫 `.r1`）；
+  snapshot 主體寫入失敗時 commit 與否不明，backup 以錯誤結束，得到「已存在」照 §9 以時間戳 +1 奈秒重試
+  （其實是自己寫進去的話，結果是兩份內容相同的 snapshot）。
 
 ## 13. 冗餘
 
@@ -515,7 +526,7 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   （head 的主體是柵欄）；snapshot 先寫 `.r1` 再寫主體（主體是 commit）。資料 pack 不寫副本。
 - parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。parity 與它對應的 pack 同名（§1）。
   **parity 的排版還沒定義**：預定沿用 v3 的明文 header 與 Reed-Solomon 排版、`v` 改成 4，在第一個寫 parity
-  的實作段（第 3 或第 4 段）寫進這裡並加向量。
+  的實作段（第 4 段的 backup；第 3 段的後端不寫 parity）寫進這裡並加向量。
 - 刪除順序 `.r1` → parity → 主體。
 - `.r1` 在而主體不在：mpack、head、分片是主體遺失（它們先寫主體），讀取端用 `.r1`，`check` 回報，
   `check --repair` 從 `.r1` 重建主體（主體不存在，所以是建立，不是覆寫）。snapshot 先寫 `.r1`，所以也

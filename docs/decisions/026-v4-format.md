@@ -1,8 +1,8 @@
 # ADR 026：v4 格式——從需求重新推導
 
 日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作中。** 規格全文
-在 `docs/format-v4.md`；實作第 2 段（kist-format）完成之前，程式碼仍是 v3，`docs/format.md` 仍描述現有
-程式碼。本 ADR 取代同編號的第一版草稿（commit `054c7e1`）。
+在 `docs/format-v4.md`；kist-core、kist-mount、kist-cli 在第 4–6 段遷移之前仍是 v3，`docs/format.md` 繼續描述
+它們。本 ADR 取代同編號的第一版草稿（commit `054c7e1`）。
 
 ## 一頁白話
 
@@ -330,7 +330,7 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 | --- | --- |
 | 沒有要讀回的 v3 資料，不需要遷移 | 負責人陳述（2026-10-10） |
 | S3 能以 bucket policy 強制 `If-None-Match` | 查證（外部事實 11c） |
-| `maint/gen/` 的條件建立是原子的 | S3、R2、Azure、Ceph、MinIO：文件或原始碼（外部事實 11a、13）；GCS：generation-match 0；SFTP 的 hardlink、本機的 link：v3 已在用；B2、Wasabi：沒有文件。P0 每輪實測，但探針通過不代表每次都原子 |
+| `maint/gen/` 的條件建立是原子的 | S3、R2、Azure、Ceph、MinIO：文件或原始碼（外部事實 11a、13）；GCS：generation-match 0；SFTP 的 hardlink、本機的 link：v3 已在用；B2、Wasabi：沒有文件。P0 每輪實測，但探針通過不代表每次都原子。rclone 橋接不是原子的（先 stat 再 rename），P0 依種類拒絕（實作第三段，第 15 項） |
 | LIST 在寫入與刪除之後一致 | AWS 有文件；MinIO 只在 xfs/zfs/btrfs（v3 已記）；其他後端：猜測 |
 | head 可見的延遲、E 的低估、snapshot PUT 的延遲合計小於 1 小時 | 猜測 |
 | 備份角色寫不了 `maint/`、`keys/`、`config` | S3：bucket policy（部署）；本機與 SFTP：與 v3 同樣的信任 |
@@ -341,7 +341,7 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 | 沿用前先驗證的成本可以接受 | 猜測：一群相似的機器，每台要下載一次別台寫的內容 |
 | 100 萬個 ID 的 map 約 40 MB | 估計（設計者 A） |
 | backup 記憶體不高於 v3、prune 150–250 MiB | 估計 |
-| 單一 PUT 的大小上限放得下一個 pack | 未查（UNVERIFIED） |
+| 單一 PUT 的大小上限放得下一個 pack | AWS S3 的單一 PUT 最多 5 GB（官方文件，2026-10-11 查）。預設的 pack_target 64 MiB 遠低於它；pack_target 接近 4 GiB、chunk 又很小（avg 接近 256 bytes）時，trailer 可能讓 pack 超過，PUT 失敗而 backup 報錯，不會無聲出錯。其他 S3 相容服務未查 |
 
 ## 外部事實（2026-10-10 查證）
 
@@ -610,3 +610,52 @@ commit 訊息還把它當成規格沒寫死。改成 keyed BLAKE3(`K_cache`, 位
 的命令要做哪些跨 config 的檢查（第 6 段）。
 
 **gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 569 增加到 635 個通過，9 個略過。
+
+## 實作第三段：後端（2026-10-11）
+
+負責人：「繼續」（第二段的回報之後）。
+
+**內容**（`crates/kist-backend`；一個程式的 commit `91aa8cc` 與這份文件的 commit）：
+- 寫入：v4 的每一次寫入都是既有的 `put_if_absent`。S3 是帶 `If-None-Match: *` 的單一 PUT，本機（`object_store`
+  的 local）與 SFTP 先寫暫存檔再 hard link（讀過 `object_store` 0.14.1 與 kist 的 SFTP store 的原始碼）。說明裡
+  寫明結果的不確定性與呼叫端的處理：S3 回 5xx 時 client 會重試，第一次已寫入的話重試得到「已存在」；逾時的
+  建立不重試，錯誤不代表沒寫入（讀 `object_store` 的 `retry.rs` 與 `aws/mod.rs`）。這條也寫進 §12。
+- `Backend::probe` 是 P0；`Backend::create_only` 在 rclone 橋接是 false，P0 在寫任何東西之前就拒絕。容差
+  `PROBE_TOLERANCE`（5 分鐘）放在 `kist_format::v4::index`。
+- `Backend::list_after`：以 start-after 列出。S3 送 `start-after`（`PrefixStore` 會替起點加上 prefix），本機與
+  SFTP 列出整個 prefix 再過濾。不含起點本身、含它的 `.r1`，所以讀取端可以從上次看過的世代起列。
+- `Backend::delete`：刪除不存在的物件在各後端一致地算成功。先紅：本機的 `object_store` 回 NotFound，S3、SFTP、
+  rclone 回成功。
+- 測試：`tests/contract_v4.rs` 的六條（只在不存在時建立、修改時間、依 client 分的前綴、start-after、刪除、探針）
+  在本機、MinIO、SFTP、rclone 上都跑過；`tests/probe.rs` 以包裝 `InMemory` 的 store 模擬忽略條件建立的服務、
+  時鐘差 ±10 分鐘與 ±4 分鐘的後端、rclone 的位置。反向檢查：每條規則拿掉之後只有對應的測試失敗。
+
+**找到的規格錯誤**（接續第一段的編號）：
+
+| # | 誰找到的 | 問題 | 嚴重度 | 修正 |
+| --- | --- | --- | --- | --- |
+| 15 | 實作探針時讀 SFTP store 的寫入路徑，在真的 rclone v1.75.2 上重現 | §12 寫寬鬆後端「P0 不通過就拒絕」，但 rclone 橋接的條件建立是先 stat 再 rename：依序建立兩次照樣得到「已存在」，探針通過（「a relaxed backend passed the probe」）；兩個寫入者同時通過 stat 時，後寫的蓋掉先寫的（ADR 014 記過這個競態）。GC 模型的寬鬆後端是「第二次建立也成功」，和 rclone 不同，所以模型裡 P0 擋得住 | 柵欄失效：兩個 prune 可以都以為自己建立了同一代，§11.5 的前提（一代只有一個寫入者）不成立 | 後端依種類回報 `create_only`，P0 對 rclone 直接拒絕；雙重建立留著抓忽略 `If-None-Match` 的 S3 相容服務 |
+
+**與「實作階段」第 3 項的偏離**：
+- 「所有寫入都改成只在不存在時建立的單一 PUT」：v4 不呼叫覆寫，但覆寫的 `put` 還在，給還沒遷移的 v3（`config`
+  與 GC 的 `touch/`）用；說明改成 v3 專用，v3 移除時一起移除（同第二段對 `format.md` 的處理）。
+- 「依 client 分的前綴」：key 在第二段（`kist_format::v4::keys`）就定好了，後端不需要新程式碼；契約測試確認
+  `packs/` 列出所有 client、`packs/<c>` 只列那一台。以 S3 憑證限定每台主機只能寫自己的前綴（負責人決定 1 的
+  部署方式）沒有在 MinIO 上實測。
+- 「修改時間」：沒有新程式碼。`list` 與 `head` 一致（截到秒）、剛建立的物件接近本機時鐘，寫進契約測試；SFTP
+  伺服器沒送修改時間就讓整個操作失敗，是 v3 時已有的處理。
+
+**順帶改變的 v3 行為**：本機刪除不存在的物件原本回 NotFound，v3 的 prune 刪 pack 的那一處把它記成 skipped、
+留著標記；現在和 S3、SFTP 上一樣記成已刪。其他 v3 呼叫端本來就把 NotFound 當成功。
+
+**查證**：假設表裡「單一 PUT 的大小上限放得下一個 pack」原本是 UNVERIFIED。AWS 官方文件：「With a single PUT
+operation, you can upload a single object up to 5 GB in size」。結果寫進假設表與 §11.6。
+
+**環境**：Docker Hub 的 `minio/minio` 現在回 pull access denied，`tests/minio-setup.sh` 起不來。這一段用本機快取的
+`elestio/minio:latest`，裡面正是腳本釘的 RELEASE.2025-09-07T16-13-09Z。腳本沒有改。
+
+**延到後面的**：寫入結果不確定時各呼叫端的處理（第 4、6 段照 §12 實作）；parity 的 v4 排版（這一段沒有寫
+parity 的程式碼，改在第 4 段）。
+
+**gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 635 增加到 643 個通過，9 個略過；帶 S3、SFTP、
+rclone 的環境變數也是 643 個通過。
