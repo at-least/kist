@@ -139,9 +139,10 @@ impl Keys {
         is_cut_hash(blake3::keyed_hash(&self.cut, name).as_bytes())
     }
 
-    /// 本地 index 快取的目錄名稱：`K_cache` 前 16 bytes 的 hex。換 repo 位置就不共用（同 v3）。
-    pub fn cache_dir_name(&self) -> String {
-        self.cache[..16]
+    /// 本地 index 快取的目錄名稱：keyed BLAKE3(`K_cache`, repo 位置) 前 16 bytes 的 hex。換 repo 位置就換目錄
+    /// （同 v3，ADR 004：複製到第二個地方的 repo 可能少了東西，共用快取會讓 client 以為那裡也有）。
+    pub fn cache_dir_name(&self, location: &str) -> String {
+        blake3::keyed_hash(&self.cache, location.as_bytes()).as_bytes()[..16]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()

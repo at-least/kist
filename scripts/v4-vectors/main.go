@@ -126,7 +126,10 @@ func main() {
 	seal("head", subs["index"], []byte("maint/gen/0000000000000003"), []byte("head"))
 	seal("shard", subs["index"], []byte("kist/v4/shard"), []byte("shard"))
 	fmt.Println("META_ID_a0", hex.EncodeToString(keyed(subs["meta-id"], []byte{0xa0})))
-	fmt.Println("CACHE_DIR", hex.EncodeToString(subs["cache"][:16]))
+	// 本地快取的目錄名稱：keyed BLAKE3(K_cache, repo 位置) 的前 16 bytes。換位置就換目錄（同 v3，ADR 004）。
+	for _, loc := range []string{"s3://bucket/prefix", "/srv/repo"} {
+		fmt.Println("CACHE_DIR", loc, hex.EncodeToString(keyed(subs["cache"], []byte(loc))[:16]))
+	}
 	// §7 的切段規則：一段在加入某一項之前已有至少 1024 項、而且那一項的名稱讓切段條件成立，就在它之後切。
 	isCut := func(name []byte) bool {
 		h := keyed(subs["cut"], name)

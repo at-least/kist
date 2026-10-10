@@ -23,7 +23,9 @@ const SLOT_AAD: &str =
 const SLOT_CBOR: &str = "a2617604677772617070656458487777777777777777777777777777777777777777777777774505269d1e7c00929fb00def0510b0b3e5da38134860ff6fe82618372183952b3f42db576520cd3195fac2f14deb7f46";
 const CHUNK_ID_HELLO: &str = "84f7a82b59cadb1e3af4ffb81da787a2090c3b8182bb7abd3f4e9eba219668bc";
 const META_ID_A0: &str = "6fdd2cb1d9a2205b11748f1f7d8813ba4c1a1915560ff0db29a145000506b555";
-const CACHE_DIR: &str = "cc1b0783c21708a79f0180def1b644a6";
+/// keyed BLAKE3(K_cache, repo 位置) 的前 16 bytes：兩個位置各一個。
+const CACHE_DIR_S3: &str = "beafce5396194d378f9efdb817a3bf46";
+const CACHE_DIR_LOCAL: &str = "6b71045927f6291b0cb01e0d6f6880e9";
 /// 從 "n0" 起前三個切段的名稱。
 const CUT_NAMES: [u32; 3] = [4366, 4978, 8177];
 const SEALED_CHUNK: &str =
@@ -107,7 +109,8 @@ fn subkeys_match_the_vectors() {
     let keys = Keys::derive(&MasterKey::from_bytes([0x42; 32]));
     assert_eq!(keys.chunk_id(b"hello").to_hex(), CHUNK_ID_HELLO);
     assert_eq!(keys.meta_id(&[0xa0]).to_hex(), META_ID_A0);
-    assert_eq!(keys.cache_dir_name(), CACHE_DIR);
+    assert_eq!(keys.cache_dir_name("s3://bucket/prefix"), CACHE_DIR_S3);
+    assert_eq!(keys.cache_dir_name("/srv/repo"), CACHE_DIR_LOCAL);
     let cuts: Vec<u32> = (0..=8177)
         .filter(|i| keys.is_cut(format!("n{i}").as_bytes()))
         .collect();
