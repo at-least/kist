@@ -435,7 +435,21 @@ impl Check {
         let mut found = Vec::new();
         for key in self.listed.keys() {
             let id = match Key::parse(key) {
-                Ok(Key::Pack { id, .. }) | Ok(Key::Mpack { id, .. }) => id,
+                Ok(Key::Pack { id, .. }) => id,
+                // mpack 的 .r1：主體也在列表裡時只回報主體一次
+                Ok(Key::Mpack {
+                    client,
+                    id,
+                    replica: true,
+                }) if self.is_listed(&Key::Mpack {
+                    client,
+                    id,
+                    replica: false,
+                }) =>
+                {
+                    continue
+                }
+                Ok(Key::Mpack { id, .. }) => id,
                 _ => continue,
             };
             if state.map.record(&id).is_none() && !state.deltas.contains(&id) {

@@ -288,6 +288,23 @@ async fn packs_in_no_record_or_delta_and_orphans_are_warnings() {
         .put_if_absent(&bad_delta, junk)
         .await
         .unwrap();
+    // 沒有 delta 的 mpack，主體與 .r1 都在：只回報一次
+    let mut w = PackWriter::new(Arc::clone(&keys), Kind::Meta, 64 * 1024, 64 * 1024);
+    let item = Item::Seg(Seg::new(Vec::new())).encode().unwrap();
+    w.add(keys.meta_id(&item).into(), &item).unwrap();
+    let p = w.finish().unwrap().unwrap();
+    let lone_mpack = Key::Mpack {
+        client: client(1),
+        id: p.id,
+        replica: false,
+    }
+    .path();
+    for k in [lone_mpack.clone(), format!("{lone_mpack}.r1")] {
+        repo.backend()
+            .put_if_absent(&k, p.bytes.clone())
+            .await
+            .unwrap();
+    }
     let r = repo.check(PLAIN).await.unwrap();
     assert!(r.errors.is_empty(), "{r:?}");
     assert!(
@@ -295,6 +312,14 @@ async fn packs_in_no_record_or_delta_and_orphans_are_warnings() {
             &r.warnings,
             &format!("{lone_key}: in no map record and no delta")
         ),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.warnings
+            .iter()
+            .filter(|w| w.contains(&lone_mpack))
+            .count(),
+        1,
         "{r:?}"
     );
     assert!(
