@@ -391,19 +391,7 @@ impl Reader {
     /// 檔案的 chunk 清單（依內容順序），連同 §7 的大小檢查：每一段的 `size` 等於它涵蓋的 chunk 明文長度
     /// （取自持有者的 `r`）、全部等於 Entry 的 `size`。
     pub async fn file_chunks(&self, entry: &Entry) -> Result<Vec<ChunkId>> {
-        let chunk_len = |id: &ChunkId| -> Result<u64> {
-            self.state
-                .read_candidates(&(*id).into(), Kind::Data)
-                .first()
-                .map(|h| h.entry.r)
-                .ok_or_else(|| CoreError::Unavailable {
-                    what: format!("chunk {id}"),
-                    reasons: format!(
-                        "no holder in generation {}'s map or the deltas",
-                        self.state.gen.g
-                    ),
-                })
-        };
+        let chunk_len = |id: &ChunkId| self.chunk_len(id);
         let ids: Vec<ChunkId> = if entry.ct == content_type::DIRECT {
             entry.chunks.iter().map(|c| c.to_chunk()).collect()
         } else {
@@ -453,6 +441,22 @@ impl Reader {
         };
         check_file_size(entry, sum_len(&ids, &chunk_len)?)?;
         Ok(ids)
+    }
+
+    /// 一個 chunk 的明文長度：排序最前的持有者記錄的 `r`（§10；讀到時 open_chunk 照樣比對）。mount 用它建隨機讀
+    /// 的邊界表，不必先讀內容。
+    pub fn chunk_len(&self, id: &ChunkId) -> Result<u64> {
+        self.state
+            .read_candidates(&(*id).into(), Kind::Data)
+            .first()
+            .map(|h| h.entry.r)
+            .ok_or_else(|| CoreError::Unavailable {
+                what: format!("chunk {id}"),
+                reasons: format!(
+                    "no holder in generation {}'s map or the deltas",
+                    self.state.gen.g
+                ),
+            })
     }
 
     /// B4：一個 pack 的 trailer，直接從 repo 讀（HEAD 取大小、range 讀檔尾與 trailer），照 §6 檢查。

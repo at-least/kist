@@ -98,15 +98,12 @@ impl Live {
     }
 
     /// 以現在的讀取端執行 `op`；它回 [`CoreError::Unavailable`] 時重新載入一次再執行（§10）。重新載入被限流
-    /// 擋下（距離上次不到 interval、也沒有別人在這之後載入過）就回原本的錯誤。
+    /// 擋下（距離上次因失敗而載入不到 interval、也沒有別人在這之後載入過）就回原本的錯誤。
     pub async fn run<T>(&self, op: impl AsyncFn(Reader) -> Result<T>) -> Result<T> {
         let (epoch, reader) = self.current();
         match op(reader).await {
             Err(e @ CoreError::Unavailable { .. }) => {
-                if self
-                    .reload(Some(epoch), self.interval, &format!("{e}"))
-                    .await
-                {
+                if self.reload_after_failure(epoch, &e).await {
                     op(self.reader()).await
                 } else {
                     Err(e)
@@ -116,20 +113,31 @@ impl Live {
         }
     }
 
-    /// 重新載入。`seen` 是呼叫端用過的 epoch：之後已經有人載入過就不必再載入（回 true，用新的再試）；否則距離
-    /// 上次不到 `interval` 就不載入（回 false）。載入失敗只警告（回 false）：呼叫端回報它原本的錯誤。`why`
-    /// 進警告訊息。
-    pub async fn reload(&self, seen: Option<u64>, interval: Duration, why: &str) -> bool {
+    /// 持有者全部失敗之後的重新載入。`seen` 是失敗的那一次用的 epoch：之後已經有人載入過就不必再載入（回
+    /// true，用新的再試）；否則距離上次因失敗而載入不到 interval 就不載入（回 false）。
+    async fn reload_after_failure(&self, seen: u64, why: &CoreError) -> bool {
         let mut last = self.last_reload.lock().await;
-        if seen.is_some_and(|e| e != self.current().0) {
+        if seen != self.current().0 {
             return true;
         }
-        if last.is_some_and(|t| t.elapsed() < interval) {
+        if last.is_some_and(|t| t.elapsed() < self.interval) {
             return false;
         }
         *last = Some(Instant::now());
+        self.load(&format!("{why}; a prune may have moved it"))
+            .await
+    }
+
+    /// 不限流的重新載入（mount 看到新的 snapshot 時；限流由呼叫端做）。不影響持有者失敗時的限流。
+    pub async fn refresh(&self, why: &str) -> bool {
+        let _serial = self.last_reload.lock().await;
+        self.load(why).await
+    }
+
+    /// 載入列出來的最大世代，換掉現在的讀取端。失敗只警告（回 false）：呼叫端回報它原本的錯誤。
+    async fn load(&self, why: &str) -> bool {
         let g = self.reader().state.gen.g;
-        tracing::warn!("{why}; reloading generation {g} (a prune may have moved the data)");
+        tracing::warn!("{why}; reloading generation {g}");
         match self.repo.usable_state().await {
             Ok((state, _)) => {
                 tracing::info!("reloaded the generation: {g} → {}", state.gen.g);
