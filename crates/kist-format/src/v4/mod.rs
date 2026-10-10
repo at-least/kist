@@ -11,9 +11,11 @@
 //! - [`pack`]：§6 的 pack 與 mpack 排版、trailer 與它的一致性檢查。
 //! - [`meta`]：§7、§8 的 metadata item 與 Entry、切段規則、建構與讀取端驗證。
 //! - [`snapshot`]：§9 的 snapshot、Root、定位的切段與 restore 的落點、roots 的清單。
+//! - [`index`]：§10 的世代 head、map 分片與記錄（含持有者的排序）、delta。
 
 pub mod config;
 pub mod ids;
+pub mod index;
 pub mod keys;
 pub mod meta;
 pub mod pack;

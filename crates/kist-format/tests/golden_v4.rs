@@ -286,3 +286,123 @@ fn root_seg_matches_the_golden_file() {
     check("root_seg.cbor", &bytes);
     assert_eq!(decode_item(&golden("root_seg.cbor")).unwrap(), item);
 }
+
+/// head：g=2、w=1000、parent 0x11×32、分片 0 是 0x22×32（其餘 null）、grace 2 小時、drain {from 2, old_grace
+/// 72 小時}、一個 bad 的 snapshot（first 1）、hold {1..=1, 72 小時}。
+#[test]
+fn head_matches_the_golden_file() {
+    use kist_format::v4::ids::{ClientId, ObjectId};
+    use kist_format::v4::index::{Bad, Drain, Head, Hold, Settings};
+    use kist_format::v4::keys::{Key, SnapTs};
+    let mut h = Head::initial(1000, Settings::defaults(1));
+    h.g = 2;
+    h.parent = Some(ObjectId::from_bytes([0x11; 32]));
+    h.shards[0] = Some(ObjectId::from_bytes([0x22; 32]));
+    h.settings.grace = 2 * 3600;
+    h.drain = Some(Drain {
+        from: 2,
+        old_grace: 72 * 3600,
+    });
+    h.bad = vec![Bad {
+        key: Key::Snapshot {
+            client: ClientId::from_bytes([0x1f; 16]),
+            ts: SnapTs::from_nanos(CREATED_NS).unwrap(),
+            replica: false,
+        }
+        .path(),
+        first: 1,
+    }];
+    h.hold = Some(Hold {
+        from: 1,
+        lost: 1,
+        grace: 72 * 3600,
+    });
+    check("head.cbor", &h.encode().unwrap());
+    assert_eq!(Head::decode(&golden("head.cbor"), 2).unwrap(), h);
+}
+
+/// map 分片 0xaa：一筆 client 0x1f 的 live 資料 pack（since 1），一筆維護角色 repack 出來、held 的 condemned
+/// mpack（since 2、at 3、age 72 小時）。
+#[test]
+fn map_shard_matches_the_golden_file() {
+    use kist_format::v4::ids::{ClientId, ItemId, ObjectId};
+    use kist_format::v4::index::{status, Record, Shard, Status};
+    use kist_format::v4::pack::{Kind, PackEntry};
+    let name = |rest: u8| {
+        let mut b = [rest; 32];
+        b[0] = 0xaa;
+        ObjectId::from_bytes(b)
+    };
+    let entry = |b: u8, o: u64| PackEntry {
+        i: ItemId::from_bytes([b; 32]),
+        o,
+        l: 41,
+        r: 10,
+    };
+    let live = Record {
+        id: name(1),
+        client: ClientId::from_bytes([0x1f; 16]),
+        kind: Kind::Data,
+        size: 106,
+        entries: vec![entry(1, 8), entry(2, 49)],
+        by_prune: false,
+        since: 1,
+        status: Status::LIVE,
+        held: false,
+    };
+    let condemned = Record {
+        id: name(2),
+        client: ClientId::MAINT,
+        kind: Kind::Meta,
+        size: 65,
+        entries: vec![entry(3, 8)],
+        by_prune: true,
+        since: 2,
+        status: Status {
+            s: status::CONDEMNED,
+            at: 3,
+            age: 72 * 3600,
+        },
+        held: true,
+    };
+    let shard = Shard::new(0xaa, vec![condemned, live]);
+    check("map_shard.cbor", &shard.encode().unwrap());
+    assert_eq!(
+        Shard::decode(&golden("map_shard.cbor"), 0xaa).unwrap(),
+        shard
+    );
+}
+
+/// delta：client 0x1f 寫的一個資料 pack（兩項）與一個 mpack（一項）。
+#[test]
+fn delta_matches_the_golden_file() {
+    use kist_format::v4::ids::{ClientId, ItemId, ObjectId};
+    use kist_format::v4::index::{Delta, DeltaPack};
+    use kist_format::v4::pack::{Kind, PackEntry};
+    let entry = |b: u8, o: u64| PackEntry {
+        i: ItemId::from_bytes([b; 32]),
+        o,
+        l: 41,
+        r: 10,
+    };
+    let client = ClientId::from_bytes([0x1f; 16]);
+    let d = Delta::new(
+        client,
+        vec![
+            DeltaPack {
+                id: ObjectId::from_bytes([0x31; 32]),
+                kind: Kind::Data,
+                size: 106,
+                entries: vec![entry(1, 8), entry(2, 49)],
+            },
+            DeltaPack {
+                id: ObjectId::from_bytes([0x32; 32]),
+                kind: Kind::Meta,
+                size: 65,
+                entries: vec![entry(3, 8)],
+            },
+        ],
+    );
+    check("delta.cbor", &d.encode().unwrap());
+    assert_eq!(Delta::decode(&golden("delta.cbor"), &client).unwrap(), d);
+}
