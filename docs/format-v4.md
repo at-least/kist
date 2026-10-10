@@ -478,8 +478,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 ## 13. 冗餘
 
 - head 一律寫 `.r1`（不論 replicas，head 只有幾 KiB）：柵欄靠它擋住主體遺失後被重新建立（P8）。主體
-  在、`.r1` 不在的 head：寫入者還在兩次 PUT 之間，或已經當掉；維護角色讀到時補寫（P1），backup 不拿它
-  決定沿用（B1）。
+  在、`.r1` 不在的 head：寫入者還在兩次 PUT 之間、已經當掉，或 `.r1` 的 PUT 失敗而停止（P8）；維護角色
+  讀到時補寫（P1），backup 不拿它決定沿用（B1）。
 - `replicas=1`（本機預設）：mpack、snapshot、map 分片也寫 `.r1`。mpack 與 head 先寫主體再寫 `.r1`
   （head 的主體是柵欄）；snapshot 先寫 `.r1` 再寫主體（主體是 commit）。資料 pack 不寫副本。
 - parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。
