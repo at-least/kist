@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::core::{
-    fetch, list_heads, load_highest, read_head, read_pack, read_snap, window_passed, Copy, Core,
+    fetch, list_heads, load_highest, now_pair, read_head, read_pack, read_snap, window_passed,
+    Copy, Core, Mutations,
 };
 use crate::types::*;
 use crate::universe::Universe;
@@ -55,6 +56,8 @@ pub struct Prune {
     /// P0 探針的後端時間與本機牆鐘。
     probe_time: Time,
     probe_wall: Time,
+    /// 寫 head 主體的時間（`.r1` 的修改時間不早於它）。
+    head_put_at: Time,
     drain_over: bool,
     /// P1 讀到最新 head 的真實時間；之後寫的分片與 head 不會在這之前開始。
     loaded_at: Time,
@@ -206,6 +209,7 @@ impl Prune {
             under,
             probe_time: 0,
             probe_wall: 0,
+            head_put_at: 0,
             drain_over: false,
             loaded_at: 0,
             g: 0,
@@ -233,6 +237,15 @@ impl Prune {
 
     pub fn phase_name(&self) -> String {
         format!("{:?}", self.phase)
+    }
+
+    /// 「已過一個 grace」的現在（[`now_pair`]）。
+    fn now(&self, muts: Mutations) -> (Time, Time) {
+        now_pair(
+            muts,
+            (self.n_t, self.n_w),
+            (self.probe_time, self.probe_wall),
+        )
     }
 
     /// 已寫 head 主體、還沒寫 `.r1` 的世代。
@@ -285,9 +298,10 @@ impl Prune {
     /// P7d 的兩個時鐘：`T(c) + age ≤ T(g)` 而且 `w(c) + age ≤ w(g)`。
     fn aged(&mut self, core: &Core, at: Gen, age: Time) -> Option<bool> {
         let (t_c, w_c) = self.gen_times(core, at)?;
-        let t_ok = t_c + age <= self.n_t;
-        let w_ok = w_c + age <= self.n_w;
         let muts = core.cfg.mutations;
+        let (n_t, n_w) = self.now(muts);
+        let t_ok = t_c + age <= n_t;
+        let w_ok = w_c + age <= n_w;
         Some(if muts.only_writer_clock {
             w_ok
         } else if muts.only_backend_clock {
@@ -314,7 +328,12 @@ impl Prune {
                 let Some(h) = &self.head else {
                     return refuse(core, "P1: no head to repair".into());
                 };
-                core.repair_head_r1(&h.clone(), self.loaded_at);
+                if !core.repair_head_r1(&h.clone(), self.loaded_at) {
+                    return StepResult::Abort(format!(
+                        "P1: the .r1 of head {} was not written",
+                        self.g
+                    ));
+                }
                 self.phase = PPhase::ListSnaps;
                 StepResult::Continue
             }
@@ -404,7 +423,7 @@ impl Prune {
         self.times.insert(loaded.g, (loaded.t, loaded.head.w));
         self.age = loaded.head.settings.grace;
         let muts = core.cfg.mutations;
-        let now = (self.n_t, self.n_w);
+        let now = self.now(muts);
         if let Some(d) = loaded.head.drain {
             let Some(from) = self.gen_times(core, d.from) else {
                 return refuse(core, format!("P1: head {} is missing", d.from));
@@ -1028,6 +1047,7 @@ impl Prune {
         nh.w = core.host_wall(self.host);
         let g = nh.g;
         let won = core.fence_put(g, &nh, self.loaded_at);
+        self.head_put_at = core.now;
         self.new_head = Some(nh);
         if won {
             core.stats.generations += 1;
@@ -1047,9 +1067,25 @@ impl Prune {
         StepResult::Continue
     }
 
+    /// `.r1` 寫入失敗就不刪任何東西：主體是唯一的一份，它遺失時那一代就像從來沒有寫過，這一輪的刪除
+    /// 也就沒有依據（第二輪外部審查 G1）。主體留著，下一次維護補寫 `.r1`。`.r1` 的修改時間不早於主體
+    /// 寫成的時間（模型的 ε，第二輪外部審查 M1）。
     fn put_head_r1(&mut self, core: &mut Core) -> StepResult {
         if let Some(nh) = &self.new_head {
-            let _ = core.put_since(Key::HeadR1(nh.g), Content::Head(nh.clone()), self.loaded_at);
+            if core.head_r1_put_fails(nh.g) {
+                if !core.cfg.mutations.p9_ignores_head_r1_failure {
+                    return StepResult::Abort(format!(
+                        "P8: the .r1 of head {} was not written; deleting nothing",
+                        nh.g
+                    ));
+                }
+            } else {
+                let _ = core.put_since(
+                    Key::HeadR1(nh.g),
+                    Content::Head(nh.clone()),
+                    self.head_put_at,
+                );
+            }
         }
         if self.bad_only {
             return StepResult::Done;

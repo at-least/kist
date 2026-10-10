@@ -70,6 +70,7 @@ fn add(t: &mut Stats, s: &Stats) {
     t.rebuilds += s.rebuilds;
     t.lone_head_losses += s.lone_head_losses;
     t.head_repairs += s.head_repairs;
+    t.head_r1_failures += s.head_r1_failures;
     t.reads_ok += s.reads_ok;
 }
 
@@ -87,6 +88,7 @@ fn assert_covered(stats: &Stats) {
     assert!(stats.rebuilds > 0, "no rebuild");
     assert!(stats.lone_head_losses > 0, "no lone head body lost");
     assert!(stats.head_repairs > 0, "no head .r1 repaired");
+    assert!(stats.head_r1_failures > 0, "no head .r1 PUT failed");
     assert!(stats.reads_ok > 0, "no restore finished");
 }
 
@@ -191,6 +193,9 @@ fn mutation_named(name: &str) -> Mutations {
         "fence_ignores_r1" => m.fence_ignores_r1 = true,
         "no_head_repair" => m.no_head_repair = true,
         "backup_trusts_lone_head" => m.backup_trusts_lone_head = true,
+        "keep_rule_t_clause" => m.keep_rule_t_clause = true,
+        "now_from_base_head_only" => m.now_from_base_head_only = true,
+        "p9_ignores_head_r1_failure" => m.p9_ignores_head_r1_failure = true,
         other => panic!("unknown mutation {other}"),
     }
     m
@@ -218,6 +223,9 @@ pub const MUTATIONS: &[&str] = &[
     "fence_ignores_r1",
     "no_head_repair",
     "backup_trusts_lone_head",
+    "keep_rule_t_clause",
+    "now_from_base_head_only",
+    "p9_ignores_head_r1_failure",
 ];
 
 /// 探索用（不在 gate 裡）：每個突變各跑一次固定種子的隨機搜尋，印出有沒有找到反例。
@@ -298,6 +306,7 @@ fn lit(a: &Action) -> String {
         Action::SetSkew { host, skew } => format!("Action::SetSkew {{ host: {host}, skew: {skew} }}"),
         Action::BackendSkew(s) => format!("Action::BackendSkew({s})"),
         Action::FailReadback => "Action::FailReadback".into(),
+        Action::FailHeadR1Put => "Action::FailHeadR1Put".into(),
         Action::LoseHeadBody { pick } => format!("Action::LoseHeadBody {{ pick: {pick} }}"),
         Action::LoseLoneHeadBody { pick } => format!("Action::LoseLoneHeadBody {{ pick: {pick} }}"),
         Action::Mal(m) => format!(

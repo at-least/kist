@@ -295,11 +295,17 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - prune 的整輪（P0 到 P9 結束）必須在 `grace − M` 內完成，以同樣的時鐘計；超過就停止，不再寫 head、
   不再刪任何東西。
 - **兩個時鐘的規則**：任何「自某個世代起已過一個 grace」的判斷，後端時間 `T` 與寫入者時間 `w` 都要成立
-  ——P7d 的刪除、drain 的結束、重建 hold 的結束、P5 壞 snapshot 的等待。反過來，判斷「不可能已過一個
-  age」時（重建的沿用條件），任一個時鐘上不夠就成立。這個不對稱是刻意的：兩種寫法都讓單一時鐘出錯只能
-  延後刪除。只看一個時鐘的比較只出現在不承擔安全性的地方：P7b 的年輕規則、P7e、P7g、P9 的分片與
-  delta 清理（最壞是多一次重建或多留一些空間）。這條規則的三個違反（drain、hold、重建的沿用條件）是
-  外部審查在 GC 模型上找到的，之前兩輪設計審查都沒發現。
+  ——P7d 的刪除、drain 的結束、重建 hold 的結束、P5 壞 snapshot 的等待。比較的「現在」每個時鐘取 base
+  head 的值與這一輪 P0 的讀數中較小的：`min(T(g), N_P)` 與 `min(w(g), P0 時的本機牆鐘)`；P5 的等待只用
+  P0 的讀數（等待期間每一輪都停住、不寫 head，`T(g)` 不前進）。取小只會讓現在更早，所以不需要新的假設。
+  原本只用 base head 的值：後端時鐘在寫某個世代 c 時慢了、之後某台主機在寫 base head 時快了，兩邊就都
+  提早成立（第二輪外部審查 C1–C3）；現在「現在」那一側要被騙過，那個時鐘得在 base head 寫成時和這一輪
+  P0 時都錯。反過來，判斷「不可能已過一個 age」時（重建的沿用條件）只看 `w`：`T` 是物件的修改時間，
+  主體遺失時改讀 `.r1`、主體被 `check --repair` 重建時都會變，標 tombstone 那時讀到的 `T` 和現在讀到的
+  可能不同；`w` 在 head 的內容裡，兩份相同（第二輪外部審查 D1：`.r1` 晚了 72 小時才寫，主體遺失之後
+  `T` 的最大減最小變成 0，誠實的時鐘下也資料遺失）。只看一個時鐘的比較只出現在不承擔安全性的地方：P7b
+  的年輕規則、P7e、P7g、P9 的分片與 delta 清理（最壞是多一次重建或多留一些空間）。這條規則的三個違反
+  （drain、hold、重建的沿用條件）是外部審查在 GC 模型上找到的，之前兩輪設計審查都沒發現。
 
 ### 11.2 backup
 
@@ -338,7 +344,7 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   → 以只在不存在時建立的方式補寫 `.r1`（讀到的主體的 bytes），再往下做：寫入者在兩次 PUT 之間當掉時，
   那一代只有一份；在它上面建 g+1 之前先補齊，之後它的主體遺失才不會在世代之間留下空洞（重建要讀範圍內
   每一代的 head，讀不到就永遠拒絕，GC 與所有 backup 都停住；GC 模型找到）。改 settings 與重建讀最新
-  head 時同樣補寫。
+  head 時同樣補寫；補寫失敗就停止，不在只有一份的 head 上建下一代。
 - **P2** 依序列出：`snapshots/`、`deltas/`、`packs/` 與 `mpacks/`（含 `.r1`）、`parity/`、`maint/map/`。
   先列的物件寫在它所依賴的物件之後，所以那些物件一定出現在後列的清單裡。
 - **P3** live 或 condemned 的記錄，主體與 `.r1` 都不在 → 先重新列出 `maint/gen/`：已經有比 g 新的 head，
@@ -368,8 +374,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
     就從記錄移除並回報），寫進全零 client 前綴下的新 pack，**讀回驗證**後記為 `by_prune` 的 live；舊的
     → condemned，保留全部項目。讀回驗證失敗：新 pack 記為 unreadable（`since = g+1`），舊的維持 live，
     回報；
-  - d) condemned（`at = c`、`age`）、不是任何 ID 的正本、`T(c) + age ≤ T(g)` **而且** `w(c) + age ≤ w(g)`
-    → 刪前驗證：它宣稱持有的每個被引用 ID，正本必須是 `by_prune`，或現在在正本那裡解密、重算 ID 成功；
+  - d) condemned（`at = c`、`age`）、不是任何 ID 的正本、`T(c) + age` ≤ 現在的 `T` **而且** `w(c) + age`
+    ≤ 現在的 `w`（§11.1 的現在）→ 刪前驗證：它宣稱持有的每個被引用 ID，正本必須是 `by_prune`，或現在在正本那裡解密、重算 ID 成功；
     驗證失敗就把那個項目從正本的記錄移除並回報，這個 pack 留在 condemned；全部通過 → tombstone
     （`at = g+1`）；
   - e) unreadable：主體與 `.r1` 都不在 → 移除記錄；否則 `since = s`、`T(s) + grace ≤ T(g)` →
@@ -379,7 +385,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
     移除記錄。
 - **P8** 寫出有變動的分片；確認仍在整輪時限內，HEAD `maint/gen/<g+1>.r1`（存在就是輸了），再以只在不存在
   時建立的方式寫 head g+1 的主體——**這兩步合起來是柵欄**：`.r1` 已存在、主體得到「已存在」或超過時限就
-  停止，什麼都不刪，也不拿這份計畫重試。成功之後才寫 head 的 `.r1`。先看 `.r1` 是深度隨機測試找到的：
+  停止，什麼都不刪，也不拿這份計畫重試。成功之後才寫 head 的 `.r1`；寫入失敗（不是「已存在」）→ 不刪
+  任何東西、停止：主體是唯一的一份，它遺失時那一代就像從來沒有寫過，這一輪的刪除就沒有依據（第二輪
+  外部審查 G1：之後主體遺失，每一輪 prune 都以 P3 拒絕；配合偽造的 snapshot，那一代被改寫、資料遺失）。
+  主體留著，下一次維護補寫 `.r1`（P1）；改 settings 與重建一樣。先看 `.r1` 是深度隨機測試找到的：
   主體遺失、`.r1` 還在的世代，原本可以被一個更早讀了 head 的寫入者以不同的內容重新建立。改 settings 與
   重建寫 head 時用同一個柵欄。
 - **P9**（仍在整輪時限內）刪除：tombstone 而仍在列表的 pack（順序 `.r1`、parity、主體；Object Lock
@@ -395,17 +404,17 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - **重建**（最新 head 的分片遺失或壞掉）：維護命令。P0 之後以柵欄寫世代 r ＝ `g_lost + 1`，不走訪
   snapshot、不刪任何東西。`g_lost` 是列出來的最大世代；`g_r` 是分片讀得全的最大世代（head 0 沒有分片，
   一定讀得全）。
-  - 遺失的世代 `g_r+1..g_lost` 的 head 裡，`T` 的最大減最小 < `a`，**或** `w` 的最大減最小 < `a` 時
-    （`a` 是 `g_r` 到 `g_lost` 的 head 裡最小的 grace，drain 的舊 grace 也算）：沿用 `Map(g_r)`，其中
-    condemned 的記錄標成 held；列表裡有、`Map(g_r)` 裡沒有的 pack 照 P4 收錄。標成 tombstone 要兩個時鐘
-    都過了一個 age，任一個時鐘上整段遺失的世代都不到一個 age，`Map(g_r)` 裡 live 的 pack 與之後的新進者
-    就不可能已被標成 tombstone。原本只比兩端的 `T`（`T(g_lost) < T(g_r+1) + a`），後端時鐘倒退時不成立
-    （外部審查）。
+  - 遺失的世代 `g_r+1..g_lost` 的 head 裡，`w` 的最大減最小 < `a` 時（`a` 是 `g_r` 到 `g_lost` 的 head
+    裡最小的 grace，drain 的舊 grace 也算）：沿用 `Map(g_r)`，其中 condemned 的記錄標成 held；列表裡有、
+    `Map(g_r)` 裡沒有的 pack 照 P4 收錄。標成 tombstone 要兩個時鐘都過了一個 age，整段遺失的世代在 `w`
+    上都不到一個 age，`Map(g_r)` 裡 live 的 pack 與之後的新進者就不可能已被標成 tombstone。只看 `w`，見
+    §11.1。原本只比兩端的 `T`（`T(g_lost) < T(g_r+1) + a`），後端時鐘倒退時不成立（外部審查）；之後改成
+    `T` 或 `w` 任一個，又被晚寫的 `.r1` 騙過（第二輪外部審查）。
   - 否則：列表裡的每個 pack 都以 condemned（`at = r`，age 是目前的 age，drain 中就是舊的 grace）、held
     收錄，trailer 照 P4 讀（讀不了 → unreadable）；`Map(g_r)` 的 tombstone 保留。
   - head r 記下 `hold: { from: g_r+1, lost: g_lost, grace: g_r 到 g_lost 的 head 裡最大的 grace }`；已有
-    hold 時合併（`from` 取小、`lost` 與 `grace` 取大）。hold 在兩個時鐘上都過了才結束：`T(g)` ≥ `from..lost`
-    裡最大的 `T` + grace，**而且** `w(g)` ≥ 其中最大的 `w` + grace（g 是 prune 的基礎世代）。原本只比
+    hold 時合併（`from` 取小、`lost` 與 `grace` 取大）。hold 在兩個時鐘上都過了才結束：現在的 `T` ≥
+    `from..lost` 裡最大的 `T` + grace，**而且**現在的 `w` ≥ 其中最大的 `w` + grace（§11.1 的現在）。原本只比
     `T(lost)`：遺失世代裡的刪除者以自己的時鐘計整輪時限，後端時鐘偏慢時 hold 會提早結束（外部審查）。
   - hold 期間：held 的記錄不復活；不 repack、不標 tombstone（P7c、P7d）。原因：在遺失的世代裡被標成
     tombstone 的 pack，可能正被當時的 prune 刪除。backup 本來就不沿用 condemned 的 pack。
@@ -414,9 +423,9 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
     拒絕。held 只在記錄被復活時清掉。
 - **改 settings**：維護命令，P0、P1 之後直接以柵欄寫 head g+1（分片不變、settings 改變），不刪任何
   東西。這不是 ADR 017 否決的 `settings/<gen>`：只有維護角色能寫 `maint/`，而且受柵欄保護。
-- **grace**：調高立刻生效。調低開始 drain：持續一個舊的 grace，在兩個時鐘上都過了才結束（`T(g) ≥
-  T(調低的世代) + 舊 grace` 而且 `w(g) ≥ w(調低的世代) + 舊 grace`；原本只比 `T`，後端時鐘在寫調低的
-  head 時偏慢就提早結束，外部審查），期間新的 condemned 記錄用舊的 `age`，也不接受其他 grace 變更。
+- **grace**：調高立刻生效。調低開始 drain：持續一個舊的 grace，在兩個時鐘上都過了才結束（現在的 `T` ≥
+  `T(調低的世代)` + 舊 grace，而且現在的 `w` ≥ `w(調低的世代)` + 舊 grace，§11.1 的現在；原本只比 `T`，
+  後端時鐘在寫調低的 head 時偏慢就提早結束，外部審查），期間新的 condemned 記錄用舊的 `age`，也不接受其他 grace 變更。
   backup 一律用 `min(grace(g_s), grace(g_c))`。
 
 ### 11.5 不變式與論證（概要）
@@ -445,7 +454,7 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 | 備份角色寫不了 `maint/`、`keys/`、`config` | S3 以 bucket policy 強制；本機與 SFTP 與 v3 同樣信任 |
 | 單一 PUT 的大小上限夠放一個 pack | 未查證（UNVERIFIED） |
 | head 的主體與 `.r1` 不會一起遺失 | 猜測；兩份都遺失時，較早讀過 head 的寫入者可以重新建立那一代（P8）。寫入者在兩次 PUT 之間當掉、之後主體才遺失的情況由 P1 的補寫與 B1 處理，GC 模型有這個故障 |
-| 時鐘出錯時，後端時鐘與寫入者的牆鐘不會同時往同一個方向錯 | 猜測；兩個時鐘的規則（§11.1）只保證單一時鐘出錯時延後刪除 |
+| 在一個 age 的時間窗內（從一個世代寫成，到從它起算的 age 用完），後端時鐘與寫入者的牆鐘不會都出錯 | 猜測；兩個時鐘的規則（§11.1）保證單一時鐘出錯時只會延後刪除。原本寫「不會同時往同一個方向錯」，沒有排除兩個時鐘在不同時間各錯一次（第二輪外部審查 C1–C3）；「現在」與 P0 的讀數取小之後，這種組合還要那個時鐘從 base head 寫成一直錯到這一輪的 P0 |
 
 ### 11.7 對照 v3 的教訓
 

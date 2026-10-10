@@ -50,6 +50,12 @@ pub struct Mutations {
     pub no_head_repair: bool,
     /// backup 在 B1 接受還沒有 `.r1` 的最新 head（加上這條規則之前）。
     pub backup_trusts_lone_head: bool,
+    /// 重建的沿用條件也看 T 的最大減最小（第二輪外部審查 D1 之前）。
+    pub keep_rule_t_clause: bool,
+    /// 「已過一個 grace」的現在只用 base head 的值，不與 P0 的讀數取小（第二輪外部審查 C1–C3 之前）。
+    pub now_from_base_head_only: bool,
+    /// head 的 `.r1` 寫入失敗時照樣往下刪（第二輪外部審查 G1 之前）。
+    pub p9_ignores_head_r1_failure: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +114,8 @@ pub struct Stats {
     pub lone_head_losses: u64,
     /// 維護角色補寫 head `.r1` 的次數。
     pub head_repairs: u64,
+    /// head `.r1` 的 PUT 失敗（故障）的次數。
+    pub head_r1_failures: u64,
     pub reads_ok: u64,
 }
 
@@ -131,6 +139,8 @@ pub struct Core {
     /// 被故障拿掉的分片。
     pub lost_shards: BTreeSet<ShardId>,
     pub fail_next_readback: bool,
+    /// 故障：下一個 head `.r1` 的 PUT 失敗。
+    pub fail_next_head_r1: bool,
     pub reader_failures: Vec<String>,
     /// P3 的「資料遺失」拒絕。模型沒有遺失 pack 的故障，所以出現就是誤報。
     pub alarms: Vec<String>,
@@ -158,6 +168,7 @@ impl Core {
             shard_fault: false,
             lost_shards: BTreeSet::new(),
             fail_next_readback: false,
+            fail_next_head_r1: false,
             reader_failures: Vec::new(),
             alarms: Vec::new(),
             max_skew_seen: 0,
@@ -241,9 +252,13 @@ impl Core {
 
     /// 寫入者在主體與 `.r1` 之間當掉時，那一代只有一份。維護角色在它上面建下一代之前，以只在不存在
     /// 時建立的方式補寫 `.r1`（內容是讀到的主體）；之後主體遺失才不會在世代之間留下空洞。
-    pub fn repair_head_r1(&mut self, head: &HeadBody, since: Time) {
+    /// 補寫失敗就回 false：不在只有一份的 head 上建下一代。
+    pub fn repair_head_r1(&mut self, head: &HeadBody, since: Time) -> bool {
         if self.cfg.mutations.no_head_repair || self.backend.exists(&Key::HeadR1(head.g)) {
-            return;
+            return true;
+        }
+        if self.head_r1_put_fails(head.g) {
+            return false;
         }
         if self
             .put_since(Key::HeadR1(head.g), Content::Head(head.clone()), since)
@@ -252,6 +267,18 @@ impl Core {
             self.stats.head_repairs += 1;
             self.note(format!("repaired the .r1 of head {}", head.g));
         }
+        true
+    }
+
+    /// 故障：這一次 head `.r1` 的 PUT 失敗（物件沒有建立，寫入者收到錯誤）。
+    pub fn head_r1_put_fails(&mut self, g: Gen) -> bool {
+        if !self.fail_next_head_r1 {
+            return false;
+        }
+        self.fail_next_head_r1 = false;
+        self.stats.head_r1_failures += 1;
+        self.note(format!("fault: the .r1 PUT of head {g} failed"));
+        true
     }
 
     /// B1 只從兩份都在的 head 決定沿用：只有一份的 head 遺失之後，那一代可以被別的計畫重新寫出，照它
@@ -277,6 +304,18 @@ impl Core {
 
 /// 「自 `start` 起已過 `span`」：後端時間與寫入者時間都要成立（§11.1）。`start` 與 `now` 都是
 /// （T, w）。
+/// 「自某個世代起已過一個 grace」的現在：每個時鐘取 base head 的值與這一輪 P0 的讀數中較小的。一個
+/// 時鐘只在 base head 寫成時跑快、到這一輪的 P0 已恢復，就騙不到這個比較；原本只用 base head 的值，
+/// 兩個時鐘在不同時間各錯一次，就能讓兩邊都提早成立（第二輪外部審查 C1–C3）。P5 的等待只用 P0 的
+/// 讀數：等待期間不寫 head，`T(g)` 不前進。
+pub fn now_pair(m: Mutations, base: (Time, Time), probe: (Time, Time)) -> (Time, Time) {
+    if m.now_from_base_head_only {
+        base
+    } else {
+        (base.0.min(probe.0), base.1.min(probe.1))
+    }
+}
+
 pub fn window_passed(m: Mutations, start: (Time, Time), now: (Time, Time), span: Time) -> bool {
     let t = start.0 + span <= now.0;
     let w = start.1 + span <= now.1;

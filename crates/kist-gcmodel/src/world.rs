@@ -145,6 +145,8 @@ pub enum Action {
     },
     BackendSkew(i32),
     FailReadback,
+    /// 下一個 head `.r1` 的 PUT 失敗：物件沒有建立，寫入者收到錯誤。
+    FailHeadR1Put,
     /// head 的主體遺失（只在有 `.r1` 的 head 上，讀取端改讀 `.r1`）。
     LoseHeadBody {
         pick: u16,
@@ -535,6 +537,7 @@ impl World {
                 self.core.max_skew_seen = self.core.max_skew_seen.max(skew.abs());
             }
             Action::FailReadback => self.core.fail_next_readback = true,
+            Action::FailHeadR1Put => self.core.fail_next_head_r1 = true,
             Action::CrashHeadWriter { pick } => {
                 let writers: Vec<ActorId> = self
                     .actors
@@ -976,6 +979,7 @@ impl World {
         }
         self.core.skew.clear();
         self.core.backend.skew = 0;
+        self.core.fail_next_head_r1 = false;
         for _ in 0..3 {
             if load_highest(&self.core).is_ok() {
                 break;

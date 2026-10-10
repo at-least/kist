@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::core::{list_heads, load_gen, load_highest, read_head, read_pack, window_passed, Core};
+use crate::core::{
+    list_heads, load_gen, load_highest, now_pair, read_head, read_pack, window_passed, Core,
+};
 use crate::prune::{list_packs, newcomer_record, probe_backend, refuse, Listed};
 use crate::types::*;
 use crate::world::StepResult;
@@ -52,7 +54,10 @@ pub struct SettingsChange {
     pub host: u8,
     pub phase: SPhase,
     target: Time,
+    /// P0 的後端時間與本機牆鐘。
+    probe: (Time, Time),
     loaded_at: Time,
+    head_put_at: Time,
     base_head: Option<HeadBody>,
     new_head: Option<HeadBody>,
 }
@@ -72,7 +77,9 @@ impl SettingsChange {
             host,
             phase: SPhase::Probe,
             target: target.max(MIN_GRACE),
+            probe: (0, 0),
             loaded_at: 0,
+            head_put_at: 0,
             base_head: None,
             new_head: None,
         }
@@ -81,7 +88,8 @@ impl SettingsChange {
     pub fn step(&mut self, core: &mut Core) -> StepResult {
         match self.phase {
             SPhase::Probe => match probe_backend(core, self.host) {
-                Ok(_) => {
+                Ok(t) => {
+                    self.probe = (t, core.host_wall(self.host));
                     self.phase = SPhase::Load;
                     StepResult::Continue
                 }
@@ -103,10 +111,11 @@ impl SettingsChange {
                     let Some((h_from, t_from)) = read_head(core, d.from) else {
                         return refuse(core, format!("settings: head {} is missing", d.from));
                     };
+                    let muts = core.cfg.mutations;
                     let over = window_passed(
-                        core.cfg.mutations,
+                        muts,
                         (t_from, h_from.w),
-                        (now_t, loaded.head.w),
+                        now_pair(muts, (now_t, loaded.head.w), self.probe),
                         d.old_grace,
                     );
                     if !over {
@@ -131,7 +140,12 @@ impl SettingsChange {
                 let Some(h) = &self.base_head else {
                     return refuse(core, "settings: no head to repair".into());
                 };
-                core.repair_head_r1(&h.clone(), self.loaded_at);
+                if !core.repair_head_r1(&h.clone(), self.loaded_at) {
+                    return StepResult::Abort(format!(
+                        "settings: the .r1 of head {} was not written",
+                        h.g
+                    ));
+                }
                 self.phase = SPhase::PutHead;
                 StepResult::Continue
             }
@@ -145,6 +159,7 @@ impl SettingsChange {
                     core.stats.fence_losses += 1;
                     return StepResult::Abort(format!("settings: head {g} already exists"));
                 }
+                self.head_put_at = core.now;
                 core.stats.generations += 1;
                 core.note(format!("settings: grace {} at head {g}", nh.settings.grace));
                 self.new_head = Some(nh);
@@ -155,8 +170,17 @@ impl SettingsChange {
                 let Some(nh) = &self.new_head else {
                     return refuse(core, "settings: no head to replicate".into());
                 };
-                let _ =
-                    core.put_since(Key::HeadR1(nh.g), Content::Head(nh.clone()), self.loaded_at);
+                if core.head_r1_put_fails(nh.g) {
+                    return StepResult::Abort(format!(
+                        "settings: the .r1 of head {} was not written",
+                        nh.g
+                    ));
+                }
+                let _ = core.put_since(
+                    Key::HeadR1(nh.g),
+                    Content::Head(nh.clone()),
+                    self.head_put_at,
+                );
                 StepResult::Done
             }
         }
@@ -180,7 +204,10 @@ pub struct Rebuild {
     pub host: u8,
     pub phase: RPhase,
     start: Time,
+    /// P0 的後端時間與本機牆鐘。
+    probe: (Time, Time),
     loaded_at: Time,
+    head_put_at: Time,
     g_lost: Gen,
     g_r: Gen,
     case_keep: bool,
@@ -199,7 +226,9 @@ impl Rebuild {
             host,
             phase: RPhase::Probe,
             start: 0,
+            probe: (0, 0),
             loaded_at: 0,
+            head_put_at: 0,
             g_lost: 0,
             g_r: 0,
             case_keep: false,
@@ -215,7 +244,8 @@ impl Rebuild {
     pub fn step(&mut self, core: &mut Core) -> StepResult {
         match self.phase {
             RPhase::Probe => match probe_backend(core, self.host) {
-                Ok(_) => {
+                Ok(t) => {
+                    self.probe = (t, core.host_wall(self.host));
                     self.start = core.now;
                     self.phase = RPhase::Load;
                     StepResult::Continue
@@ -227,7 +257,12 @@ impl Rebuild {
                 let Some(h) = &self.base_head else {
                     return refuse(core, "rebuild: no head to repair".into());
                 };
-                core.repair_head_r1(&h.clone(), self.loaded_at);
+                if !core.repair_head_r1(&h.clone(), self.loaded_at) {
+                    return StepResult::Abort(format!(
+                        "rebuild: the .r1 of head {} was not written",
+                        h.g
+                    ));
+                }
                 self.phase = RPhase::Build;
                 StepResult::Continue
             }
@@ -238,8 +273,17 @@ impl Rebuild {
                 let Some(nh) = &self.new_head else {
                     return refuse(core, "rebuild: no head to replicate".into());
                 };
-                let _ =
-                    core.put_since(Key::HeadR1(nh.g), Content::Head(nh.clone()), self.loaded_at);
+                if core.head_r1_put_fails(nh.g) {
+                    return StepResult::Abort(format!(
+                        "rebuild: the .r1 of head {} was not written",
+                        nh.g
+                    ));
+                }
+                let _ = core.put_since(
+                    Key::HeadR1(nh.g),
+                    Content::Head(nh.clone()),
+                    self.head_put_at,
+                );
                 StepResult::Done
             }
         }
@@ -296,12 +340,17 @@ impl Rebuild {
             Ok(l) => l,
             Err(e) => return refuse(core, format!("rebuild: {e:?}")),
         };
-        // 標成 tombstone 要兩個時鐘都過了一個 age；任一個時鐘上整段遺失的世代都不到一個 age，
-        // 就不可能有 Map(g_r) 裡 live 的 pack 被標成 tombstone（外部審查 F3）。
-        self.case_keep = if core.cfg.mutations.one_clock_windows {
+        // 標成 tombstone 要兩個時鐘都過了一個 age；整段遺失的世代在 w 上都不到一個 age，就不可能有
+        // Map(g_r) 裡 live 的 pack 被標成 tombstone（外部審查 F3）。只看 w：T 是物件的修改時間，主體
+        // 遺失時改讀 `.r1`、主體被 check --repair 重建時都會變，標 tombstone 那時讀到的 T 和現在讀到的
+        // 可能不同；w 在 head 的內容裡，兩份相同（第二輪外部審查 D1）。
+        let muts = core.cfg.mutations;
+        self.case_keep = if muts.one_clock_windows {
             t_lost < t_r1 + min_age
-        } else {
+        } else if muts.keep_rule_t_clause {
             t_hi - t_lo < min_age || w_hi - w_lo < min_age
+        } else {
+            w_hi - w_lo < min_age
         };
         self.g_lost = g_lost;
         self.g_r = g_r;
@@ -313,9 +362,9 @@ impl Rebuild {
         if let Some(d) = nh.drain {
             if let Some((h_from, t_from)) = read_head(core, d.from) {
                 let over = window_passed(
-                    core.cfg.mutations,
+                    muts,
                     (t_from, h_from.w),
-                    (t_lost, nh.w),
+                    now_pair(muts, (t_lost, nh.w), self.probe),
                     d.old_grace,
                 );
                 if !over && !core.cfg.mutations.no_drain {
@@ -434,6 +483,7 @@ impl Rebuild {
             core.stats.fence_losses += 1;
             return StepResult::Abort(format!("rebuild: head {g} already exists"));
         }
+        self.head_put_at = core.now;
         core.stats.generations += 1;
         core.stats.rebuilds += 1;
         let kept: BTreeSet<PackId> = self.newmap.keys().copied().collect();

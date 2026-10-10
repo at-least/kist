@@ -130,8 +130,11 @@ fn mutation_no_verify_before_drop_loses_data() {
 
 #[derive(Clone, Copy)]
 enum Jump {
-    /// prune 主機的牆鐘在 P0 之後跳快 200 小時（`w` 太大）。
+    /// prune e 的主機牆鐘在 P0 之後跳快 200 小時（`w(e)` 太大；下一輪的 P0 讀數擋住它）。
     WriterAhead,
+    /// prune c 的主機牆鐘在 P1 之後慢了 80 小時（`w(c)` 太小；在 P1 之前慢，P1 就以本機時鐘 + M 當作
+    /// 現在，什麼都不標）。
+    WriterBehind,
     /// 後端時鐘在 P0 之後慢了 80 小時（`T(c)` 太小）。
     BackendBehind,
 }
@@ -149,11 +152,17 @@ fn clock_fault(muts: Mutations, jump: Jump) -> (World, Option<StepResult>) {
     w.advance(HOUR);
     let c = w.start_prune(0, 0).unwrap();
     assert!(w.run_until(c, "Load"));
-    if let Jump::BackendBehind = jump {
-        w.core.backend.skew = -80 * HOUR;
+    match jump {
+        Jump::BackendBehind => w.core.backend.skew = -80 * HOUR,
+        Jump::WriterBehind => {
+            assert!(w.run_until(c, "ListSnaps"));
+            w.core.skew.insert(0, -80 * HOUR);
+        }
+        Jump::WriterAhead => {}
     }
     assert_eq!(w.finish(c), Some(StepResult::Done));
     w.core.backend.skew = 0;
+    w.core.skew.insert(0, 0);
     assert!(w.core.stats.condemned > 0, "{:?}", w.core.stats);
     w.advance(HOUR);
     let e = w.start_prune(1, 0).unwrap();
@@ -178,13 +187,24 @@ fn a_writer_clock_jump_alone_does_not_delete_early() {
 }
 
 #[test]
+fn a_writer_clock_lag_alone_does_not_delete_early() {
+    let (w, r) = clock_fault(Mutations::default(), Jump::WriterBehind);
+    assert_eq!(r, Some(StepResult::Done));
+    assert_ok(&w);
+    assert_eq!(w.core.stats.packs_deleted, 0);
+}
+
+/// 只比 `w`：寫 head c 時主機的牆鐘慢了，`w(c)` 太小，下一輪就提早刪。原本用 `WriterAhead`
+/// （`w(e)` 太大），「現在」改成與 P0 的讀數取小之後，下一輪 P0 的牆鐘是對的，那條交錯就騙不到
+/// 只比 `w` 的規則了（第二輪外部審查）。
+#[test]
 fn mutation_only_writer_clock_deletes_early() {
     let (w, r) = clock_fault(
         Mutations {
             only_writer_clock: true,
             ..Mutations::default()
         },
-        Jump::WriterAhead,
+        Jump::WriterBehind,
     );
     assert_eq!(r, Some(StepResult::Done));
     assert!(violates_r1(&w), "{:#?}", w.check());
