@@ -17,6 +17,8 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod v4;
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use kist_format::config::{ChunkerParams, Invariants, KdfParams, KeySlot, KDF_ARGON2ID};

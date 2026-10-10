@@ -9,10 +9,6 @@
 //!
 //! CBOR 裡一律是 byte string，路徑裡一律是小寫 hex。
 
-use std::fmt;
-
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
 pub use crate::ids::{ChunkId, ObjectId};
 
 use super::{corrupt, Result};
@@ -53,26 +49,29 @@ macro_rules! id_type {
             }
 
             /// 只接受小寫 hex（[`parse_lower_hex`]）。
-            pub fn from_hex(s: &str) -> Result<Self> {
-                parse_lower_hex::<$len>(stringify!($name), s).map(Self)
+            pub fn from_hex(s: &str) -> $crate::v4::Result<Self> {
+                $crate::v4::ids::parse_lower_hex::<$len>(stringify!($name), s).map(Self)
             }
         }
 
-        impl fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 write!(f, "{}({})", stringify!($name), self.to_hex())
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(&self.to_hex())
             }
         }
 
         /// CBOR（repo 格式）是 byte string；人類可讀的格式（`--json`）是 hex 字串。
-        impl Serialize for $name {
-            fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        impl ::serde::Serialize for $name {
+            fn serialize<S: ::serde::Serializer>(
+                &self,
+                s: S,
+            ) -> ::std::result::Result<S::Ok, S::Error> {
                 if s.is_human_readable() {
                     s.serialize_str(&self.to_hex())
                 } else {
@@ -81,13 +80,15 @@ macro_rules! id_type {
             }
         }
 
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        impl<'de> ::serde::Deserialize<'de> for $name {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                d: D,
+            ) -> ::std::result::Result<Self, D::Error> {
                 if d.is_human_readable() {
-                    let text = String::deserialize(d)?;
+                    let text = <String as ::serde::Deserialize>::deserialize(d)?;
                     return Self::from_hex(&text).map_err(serde::de::Error::custom);
                 }
-                let buf = serde_bytes::ByteBuf::deserialize(d)?;
+                let buf = <::serde_bytes::ByteBuf as ::serde::Deserialize>::deserialize(d)?;
                 let arr: [u8; $len] = buf.into_vec().try_into().map_err(|v: Vec<u8>| {
                     serde::de::Error::invalid_length(v.len(), &concat!($len, " bytes"))
                 })?;
@@ -96,6 +97,8 @@ macro_rules! id_type {
         }
     };
 }
+
+pub(crate) use id_type;
 
 id_type!(
     MetaId,
@@ -112,6 +115,8 @@ impl ClientId {
     /// 維護角色（prune 的 repack 輸出）的 client id。
     pub const MAINT: Self = Self([0u8; 16]);
 }
+
+id_type!(RepoId, 16, "repo id：init 時以 OS 亂數產生的 16 bytes。");
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -7,7 +7,9 @@
 //! 模組一覽：
 //! - [`ids`]：`MetaId`、`ClientId`（`ChunkId`、`ObjectId` 與 v3 相同，從 crate 根重新匯出）。
 //! - [`keys`]：§1 的命名空間：每種物件的 key、`.r1`、解析與驗證。
+//! - [`config`]：§3 的 config 與金鑰槽（金鑰推導在 `kist-crypto` 的 `v4`）。
 
+pub mod config;
 pub mod ids;
 pub mod keys;
 
@@ -36,6 +38,9 @@ pub enum Error {
     /// 不符合規格的內容（讀取端驗證失敗），一律大聲失敗。
     #[error("corrupt {what}: {detail}")]
     Corrupt { what: &'static str, detail: String },
+    /// 寫入端要寫的內容不符合規格：拒絕寫出。
+    #[error("refusing to write {what}: {detail}")]
+    Invalid { what: &'static str, detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -46,6 +51,14 @@ pub fn check_version(what: &'static str, version: u32) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Version { what, version })
+    }
+}
+
+/// 寫入端拒絕寫出。
+pub(crate) fn invalid(what: &'static str, detail: impl Into<String>) -> Error {
+    Error::Invalid {
+        what,
+        detail: detail.into(),
     }
 }
 
