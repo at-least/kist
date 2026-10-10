@@ -43,6 +43,20 @@ async fn round_trip(backend: Backend) {
         "{:?}",
         second.report
     );
+    // 另一台 client 備同樣的內容：別台的副本要先取回驗證（B2，在 blocking 執行緒上以 block_on 走真的網路），
+    // B4 讀只從 delta 得知的 pack 的 trailer
+    let other = Repo::open(backend.clone(), PASSWORD, Some(&dir.path().join("cache2")))
+        .await
+        .unwrap();
+    let copy = dir.path().join("copy");
+    sample_source(&copy);
+    let theirs = other.backup(&[copy], opts(2)).await.unwrap();
+    assert_eq!(theirs.report.chunks_new, 0, "{:?}", theirs.report);
+    assert!(theirs.report.verified > 0, "{:?}", theirs.report);
+    assert!(read_tree(&other, &theirs.snapshot)
+        .await
+        .values()
+        .any(|n| *n == Node::File(data("big", 300 * 1024))));
     // 清掉（只有測試用的前綴）
     for prefix in ["keys", "packs", "mpacks", "deltas", "snapshots", "maint"] {
         for o in backend.list(prefix).await.unwrap() {
