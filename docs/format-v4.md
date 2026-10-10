@@ -1,9 +1,10 @@
 # kist repo 格式（v4）
 
 > **狀態：設計已確認（2026-10-10，見 ADR 026），實作中。** 本文件是 v4 的唯一權威副本：`kist_format::v4`
-> 與 `kist_crypto::v4`（實作第 2 段）、kist-backend 的 v4 契約（第 3 段）照它實作，之後各段的程式碼也照它
-> 寫；改動格式必須同時改程式碼、向量與本文件。kist-core、kist-mount、kist-cli 在第 4–6 段遷移之前仍用 v3，
-> `docs/format.md` 繼續描述它們，v3 的模組移除時一併刪除。
+> 與 `kist_crypto::v4`（實作第 2 段）、kist-backend 的 v4 契約（第 3 段）、kist-core 的 `v4` 模組（init、open
+> 與 backup，第 4 段）照它實作，之後各段的程式碼也照它寫；改動格式必須同時改程式碼、向量與本文件。CLI、
+> kist-app、kist-mount 與 kist-core 的其他命令在第 5–6 段遷移之前仍用 v3，`docs/format.md` 繼續描述它們，
+> v3 的模組移除時一併刪除。
 > v4 不支援 v3：config 的 `v` 不是 4 就拒絕，沒有遷移（負責人：「不需要支援上一代，目前都還在內部開發
 > 階段」）。
 > 第一版草稿（commit `054c7e1`，「v3 加樹進 pack」）已被否決；本版從需求與 bug 歷史重新推導，
@@ -252,7 +253,10 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
   client 的 snapshot 主體的 key。
 - stats：`files`、`symlinks` 按名稱計；`dirs` 是目錄節點數，roots 不算；`bytes` 是內容總和，`(dev, ino)`
   只算一次。過程計數不在格式裡。
-- commit：`replicas=1` 時先寫 `.r1`，再寫主體；主體出現＝commit。同名時時間戳 +1 奈秒重試。
+- commit：`replicas=1` 時先寫 `.r1`，再寫主體；主體出現＝commit。只在不存在時建立得到「已存在」時先讀回
+  比對：bytes 相同就是自己剛寫進去的（S3 回 5xx、client 重試、第一次其實已寫入，§12），commit 已完成；不同
+  才是撞名，時間戳 +1 奈秒、重新密封（AAD 與 `time` 都帶著時間戳），`replicas=1` 時連 `.r1` 一起重寫。讀回
+  失敗就是 commit 與否不明，以錯誤結束。每次密封都用亂數 nonce，所以 bytes 相同幾乎只可能是自己那一份。
 - forget：不刪任何 client 在同一組 roots 上最新的那一份 snapshot（那是下一次 backup 的 parent）；刪除時先
   刪 `.r1` 再刪主體。強制刪除那一份等於讓這個 client 的這組 roots 退役，只能在它沒有進行中的 backup 時
   做，刪除完成之前也不能開始新的 backup：backup 沿用 parent 的子樹時不查子樹裡每個 item 的持有者，靠的是 parent 一直存在（B4 的 HEAD 只能
@@ -356,9 +360,11 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - **B3** 以只在不存在時建立的方式寫 pack（mpack 連同 `.r1`，選配 parity），再寫 delta 列出它們；可以寫
   中間的 delta，重跑時沿用已上傳的 pack。`E ≥ grace − M` 之後不再寫 delta。
 - **B4**（緊接在寫 snapshot 之前）讀列出來的最大世代 `g_c`（必須讀得了；`g_c < g_s` 是錯誤）。要求
-  `E < min(grace(g_s), grace(g_c)) − M`。去重用到的每個 pack：在 `Map(g_c)` 裡 → 不是 tombstone 或
-  unreadable，而且沿用的 ID 都還在它的記錄裡（`g_c = g_s` 時 B2 已經查過）；不在 `Map(g_c)` 裡（來自
-  delta 的）→ HEAD 它，再讀它的 trailer 確認沿用的 ID 在裡面。自己這次寫的 pack 不能是 tombstone。沿用了
+  `E < min(grace(g_s), grace(g_c)) − M`。去重用到的每個 pack：在 `Map(g_c)` 裡 → 不是 tombstone、
+  unreadable 或 unknown，而且沿用的 ID 都還在它的記錄裡（`g_c = g_s` 時 B2 已經查過）；不在 `Map(g_c)`
+  裡：B2 時來自 `Map(g_s)` 的 → 停止（誠實的流程裡 live 的記錄要先成為 tombstone、再過一個 grace 才移除，
+  不會在一次 backup 之內離開 map；GC 模型也是停止）；來自 delta 的 → HEAD 它，再讀它的 trailer 確認沿用的
+  ID 在裡面。自己這次寫的 pack 不能是 tombstone。沿用了
   parent 的子樹時 HEAD parent，不在就停止。任何一項不成立：不 commit，以錯誤結束。
 - **B5** 再檢查一次 `E`；`replicas=1` 時寫 snapshot 的 `.r1`；再檢查一次 `E`；寫 snapshot 主體。commit。
 
@@ -514,8 +520,9 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - 寫入的結果不一定確定：S3 回 5xx 時 client 會重試，第一次其實已寫入的話重試得到「已存在」；逾時的建立
   不重試，錯誤不代表沒寫入。所以內容命名的 key（pack、mpack、delta、分片）得到「已存在」就是成功；head 的
   柵欄得到「已存在」或錯誤就停止、不刪（P8；如果其實寫進去了，那一代照樣有效，下一次維護補寫 `.r1`）；
-  snapshot 主體寫入失敗時 commit 與否不明，backup 以錯誤結束，得到「已存在」照 §9 以時間戳 +1 奈秒重試
-  （其實是自己寫進去的話，結果是兩份內容相同的 snapshot）。
+  snapshot 主體寫入失敗時 commit 與否不明，backup 以錯誤結束；得到「已存在」時照 §9 先讀回比對，bytes 相同
+  就是自己寫進去的，不同才以時間戳 +1 奈秒重試（第 3 段寫這一條時原本只說 +1 奈秒，自己的寫入會變成兩份
+  內容相同的 snapshot；第 4 段改成先比對）。
 
 ## 13. 冗餘
 
@@ -525,8 +532,15 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - `replicas=1`（本機預設）：mpack、snapshot、map 分片也寫 `.r1`。mpack 與 head 先寫主體再寫 `.r1`
   （head 的主體是柵欄）；snapshot 先寫 `.r1` 再寫主體（主體是 commit）。資料 pack 不寫副本。
 - parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。parity 與它對應的 pack 同名（§1）。
-  **parity 的排版還沒定義**：預定沿用 v3 的明文 header 與 Reed-Solomon 排版、`v` 改成 4，在第一個寫 parity
-  的實作段（第 4 段的 backup；第 3 段的後端不寫 parity）寫進這裡並加向量。
+  backup 以選項決定片數（0 不寫），寫失敗只警告：pack 本身已安全，少的只是冗餘。
+- parity 的排版（沿用 v3，`v` 是 4）：明文 CBOR `{v, k, m, pack_size, shard_len, hashes, parity}`。整個寫進
+  repo 的 pack bytes 切成 `k` ＝ 16 片、每片 `shard_len` ＝ ⌈`pack_size` / 16⌉ bytes（最後一片補零），以
+  Reed-Solomon（GF(2^8)，與 v3 相同的矩陣）算出 `m` 片同位，`m` 在 1 到 8；`hashes` 是 16 + `m` 片各自的
+  BLAKE3（資料片在前），`parity` 是 `m` 個 byte string。讀取端拒絕：`v` 不是 4、`k` 不是 16、`m` 越界、
+  `shard_len` 是 0 或超過 64 MiB、與 `pack_size` 不符、片數或長度不對——都在依 header 配置記憶體之前檢查。
+  明文的理由：同位是密文的線性組合，不洩漏內容；偽造或損壞的 parity 最多讓修復失敗，修復的結果以重算 BLAKE3
+  等於 pack 的名稱證明。向量 `golden-v4/parity.cbor`，與 v3 凍結的 `parity-golden.txt` 只差 `v` 那一個 byte。
+  讀取與修復（`check --repair`）在實作第 5 段。
 - 刪除順序 `.r1` → parity → 主體。
 - `.r1` 在而主體不在：mpack、head、分片是主體遺失（它們先寫主體），讀取端用 `.r1`，`check` 回報，
   `check --repair` 從 `.r1` 重建主體（主體不存在，所以是建立，不是覆寫）。snapshot 先寫 `.r1`，所以也
@@ -543,7 +557,7 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 ## 15. 向量與 fixture
 
 每條規範性規則至少一個資料檔向量或測試：金鑰推導與槽；CBOR 十條；切段規則與 Dir 驗證；Root 的種類
-規則；chunk 清單的切段與 ChunkIndex 的 `size`；pack 的種類、上限與解壓上限；head、分片、記錄的編碼；GC 的情境（重疊的 prune、停住的 prune、
+規則；chunk 清單的切段與 ChunkIndex 的 `size`；pack 的種類、上限與解壓上限；head、分片、記錄的編碼；parity 的排版；GC 的情境（重疊的 prune、停住的 prune、
 重建、grace 調低再調高、晚到的 delta、沿用被 forget 的 parent 子樹、不實的 trailer、讀不了的物件）。
 v3 的 fixture 移除，凍結一份 v4 的。
 

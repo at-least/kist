@@ -1,8 +1,9 @@
 # ADR 026：v4 格式——從需求重新推導
 
 日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作中。** 規格全文
-在 `docs/format-v4.md`；kist-core、kist-mount、kist-cli 在第 4–6 段遷移之前仍是 v3，`docs/format.md` 繼續描述
-它們。本 ADR 取代同編號的第一版草稿（commit `054c7e1`）。
+在 `docs/format-v4.md`；kist-core 的 `v4` 模組在第 4 段有了 init、open 與 backup，CLI、kist-app、kist-mount
+與 kist-core 的其他命令在第 5–6 段遷移之前仍是 v3，`docs/format.md` 繼續描述它們。本 ADR 取代同編號的第一版
+草稿（commit `054c7e1`）。
 
 ## 一頁白話
 
@@ -340,6 +341,7 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 | grace 72 小時、M 1 小時、探針容差 5 分鐘 | 沿用 v3 的 grace 與邊際；容差同 Kopia（外部事實 7c） |
 | 沿用前先驗證的成本可以接受 | 猜測：一群相似的機器，每台要下載一次別台寫的內容 |
 | 100 萬個 ID 的 map 約 40 MB | 估計（設計者 A） |
+| backup 記憶體裡的持有者表（`Map(g_s)` 的每一項 40 bytes 的索引，加上記錄本身每項約 60 bytes）100 萬個 ID 約 100 MB | 估計（實作第 4 段）；第 7 段的記憶體 bench 量 |
 | backup 記憶體不高於 v3、prune 150–250 MiB | 估計 |
 | 單一 PUT 的大小上限放得下一個 pack | AWS S3 的單一 PUT 最多 5 GB（官方文件，2026-10-11 查）。預設的 pack_target 64 MiB 遠低於它；pack_target 接近 4 GiB、chunk 又很小（avg 接近 256 bytes）時，trailer 可能讓 pack 超過，PUT 失敗而 backup 報錯，不會無聲出錯。其他 S3 相容服務未查 |
 
@@ -359,8 +361,10 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 
 ## 成本（估計，實作後重量）
 
-- **沒變的 backup**：v4 估計約 6–11 個請求，與目錄數無關。v3 估計每個目錄約 4 個請求（設計者 B 讀碼）；
-  M2 在 v2 時代量過 1 102 個目錄的沒變 backup：MinIO 35 秒，本機 0.8 秒。
+- **沒變的 backup**：v4 估計約 6–11 個請求，與目錄數無關。實作第 4 段在記憶體後端上數過（`v4_backup_dedup.rs`）：
+  10 個與 1000 個目錄都是 11 個請求（pack 還只在 delta 裡時，B4 讀一個 trailer：HEAD 加兩個 range），維護角色
+  收錄進 map 之後 8 個（4 個 list、2 個 get、1 個 head、1 個 put）。真的 S3 上沒有量。v3 估計每個目錄約 4 個
+  請求（設計者 B 讀碼）；M2 在 v2 時代量過 1 102 個目錄的沒變 backup：MinIO 35 秒，本機 0.8 秒。
 - **2000 個 root**：v4 是一個 root 清單，寫進一個 mpack。v3 是 2000 個樹物件，量測 10.96 秒。
 - **還原**：合併 range GET 屬於 client 端的改動，與格式無關，v4 前後都可以做。
 - **prune**：每輪寫一個 head 與有變動的分片（256 片，改動少就寫得少），全部 map 約 40 MB／100 萬個 ID。
@@ -659,3 +663,65 @@ parity 的程式碼，改在第 4 段）。
 
 **gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 635 增加到 643 個通過，9 個略過；帶 S3、SFTP、
 rclone 的環境變數也是 643 個通過。
+
+## 實作第四段：backup（2026-10-11）
+
+負責人：「繼續」（第三段的回報之後）。
+
+**內容**（commit `021d189`、`a15c363`、`a0270f3`、第三步的測試與這份文件的 commit）：
+- kist-format：parity 的 v4 排版（v3 的排版、`v` 是 4；向量與 v3 凍結的 `parity-golden.txt` 只差那一個 byte，
+  測試直接從 v3 的向量改那個 byte 比對）。邊加邊切的 `Segmenter` 與 `DirBuilder`：backup 走訪一百萬項的目錄時
+  不必先收齊全部 entry；`segment` 與 `build_dir` 改用它們實作，§7 的獨立向量照樣通過。
+- `kist_core::v4`：`repo`（init 寫 config、槽、head 0 與 `.r1`；open 先只讀 `v`、只 GET 一個槽）、`cache`
+  （看過的世代、自己最後一個 snapshot、以名稱存的分片／delta／mpack、驗證過的 (item, pack)）、`state` 與
+  `read`（讀取端的世代、§10 的持有者排序、依序嘗試並驗證、mpack 整份讀並快取、B4 的 trailer 檢查；第 5 段的
+  restore、mount、check 沿用）、`backup`（B1–B5）。B2 照 GC 模型的 `trusted_holder`：`by_prune`、自己的前綴、
+  驗證過的才可信，不可信的候選先取回驗證。E ＝ max(牆鐘經過, `CLOCK_BOOTTIME` 經過)。
+- 測試：`v4_backup.rs`、`v4_backup_gc.rs`（B1–B5 每一條拒絕的情境，多數有照常 commit 的對照）、
+  `v4_backup_dedup.rs`（跨 client 的取回驗證與快取、竄改的副本、`by_prune`、請求數）、`v4_backup_backends.rs`
+  （MinIO、SFTP、rclone，依環境變數）。反向檢查 22 項：每條規則拿掉之後只有對應的測試失敗，改回就通過。
+
+**找到的規格錯誤**（接續第三段的編號）：
+
+| # | 誰找到的 | 問題 | 嚴重度 | 修正 |
+| --- | --- | --- | --- | --- |
+| 16 | 實作 B4 時對照 GC 模型的 `gate`（advisor 提醒） | §11.2 B4 只要求持有者在 `Map(g_c)` 裡不是 tombstone 或 unreadable。只從 delta 得知的 pack 可以在 B2 與 B4 之間被 P4 收成 unknown（trailer 解得開、版本不認得）；照原文 B4 放行，snapshot 引用的 ID 就只剩一個不算持有者的 pack（§10）。模型的 gate 三種都停，所以模型裡沒有這個問題 | GC 停住：P5 找不到持有者就拒絕，直到有人 forget 那個 snapshot；資料沒有被刪（unknown 的 pack 不刪） | B4 對 unknown 也停止；`b4_refuses_a_holder_that_was_indexed_as_unknown`，反向對照：拿掉 unknown 就失敗 |
+
+**對規格的其他修改**（format-v4.md）：
+1. §9、§12：snapshot 主體得到「已存在」時先讀回比對：bytes 相同就是自己寫進去的（S3 的 5xx 重試，第三段的
+   回報提過），不同才 +1 奈秒、重新密封、`replicas=1` 時重寫 `.r1`；讀回失敗是 commit 不明。原本只寫 +1 奈秒，
+   自己的寫入會變成兩份內容相同的 snapshot。
+2. §11.2 B4：B2 時來自 `Map(g_s)` 的持有者不在 `Map(g_c)` 裡就停止。原文沒寫；誠實的流程裡不會發生（記錄要
+   先成為 tombstone、再過一個 grace 才移除），模型是停止。
+3. §13：parity 的排版定義完成（欄位、片數、上限、明文的理由、向量）；讀取與修復在第 5 段。§15 加 parity。
+
+**與「實作階段」第 4 項的偏離與實作上的選擇**：
+- CLI、kist-app、kist-mount 沒換：`kist backup` 還是 v3，v4 的 backup 只在函式庫與測試裡。restore 與 prune 還是
+  v3，提早換會讓其他命令讀不了新的 repo；v3 移除時（第 6 段）一起換。
+- init 與 open 放在這一段：backup 需要 v4 的 repo，實作階段的清單沒有列 init。
+- 沿用 parent 的子樹只比對同一條路徑上的 item；GC 模型比對 parent 裡任何位置的 item。比較窄只會少沿用、多判斷，
+  不影響安全；要比對任何位置得先讀完 parent 的整棵樹。沿用由下往上收合，`report.subtrees` 連巢狀的一起算。
+- 數值是猜的：delta 每 16 個 pack 一份（最後再一份）；B1 的 lone head 等 5 秒再列一次；記憶體裡的 mpack 最多
+  64 MiB。
+- 本地快取多了 v3 沒有的兩樣：mpack 的 bytes（沒變的 backup 不必下載 parent 的樹，R5 靠它）與驗證過的
+  (item, pack)（§3 的快取只說 index；ADR 第 8 層的「記住看過的世代」也在這裡）。
+- 走訪的骨架（排除、記號檔、不跨檔案系統、深度上限、硬連結、快速路徑）是 v3 的複製，約 600 行，v3 移除時
+  消失；v3 的 `Marker` 欄位改成 `pub(crate)` 讓兩邊共用。
+- v3 的進度回報（progress callback）與 `BackupSummary` 的序列化沒有搬：CLI 與 kist-app 換過來時一起做。
+- xattrs 合計 256 KiB 的上限在 ext4 上做不出來（單一 xattr 的值最多一個 block）；「放不進格式的項目記成那一項
+  的錯誤」改用超過 1 KiB 的 S3 etag 測。
+
+**量測**：見「成本」一節的「沒變的 backup」（記憶體後端上數請求，與目錄數無關）。
+
+**環境**：同第三段，MinIO 用本機快取的 elestio/minio:latest，以 `docker tag` 標成腳本釘的名稱，腳本沒有改。
+
+**延到後面的**：
+- S3 依 client 分前綴的權限（負責人決定 1）在 MinIO 上實測：第 7 段；要在 `tests/minio-setup.sh` 加一個使用者
+  與政策（容器裡有 `mc`）。
+- 記憶體：持有者表（見「假設」）、驗證過的 (item, pack) 集合、這次寫過的 ID 集合，第 7 段的記憶體 bench 量。
+- parity 的讀取與修復、restore 依序嘗試持有者全部失敗時重新載入一次：第 5 段。
+- 真的 S3 上的請求數：第 7 段。
+- Linux 以外的 E：`Instant` 是否計入休眠沒有驗證（§11.1 的 UNVERIFIED）。
+
+**gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 643 增加到 691 個通過，9 個略過；
+`v4_backup_backends` 在 MinIO、SFTP、rclone 上都過。
