@@ -32,6 +32,8 @@ pub const DEFAULT_GRACE: u64 = 72 * 3600;
 /// pack_target 與 mpack_target 的範圍，與 v3 的 pack_target 相同。
 pub const MIN_PACK_TARGET: u64 = 64 * 1024;
 pub const MAX_PACK_TARGET: u64 = 4 * 1024 * 1024 * 1024;
+/// P0 的時鐘容差（秒，§11.3）：探針的後端時間與本機牆鐘相差超過它，prune 就拒絕。
+pub const PROBE_TOLERANCE: u64 = 5 * 60;
 
 /// 一個 pack 或 mpack 的記錄所在的分片：名稱的第一個 byte。
 pub fn shard_of(id: &ObjectId) -> u8 {

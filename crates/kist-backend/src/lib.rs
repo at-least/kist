@@ -1,8 +1,11 @@
 //! kist 的儲存後端：把 `object_store` 收斂成 kist 需要的少數幾個操作。
 //!
-//! 刻意只暴露這些操作，因為權限模型依賴它們：
-//! - backup 只用 `put` / `put_if_absent` / `get` / `get_range` / `list`；
-//! - `delete` 只有 maintenance（prune）會用。
+//! 刻意只暴露這些操作，因為權限模型依賴它們（v4 的契約見 docs/format-v4.md §12）：
+//! - 每一次寫入都是只在不存在時建立的單一 PUT（[`Backend::put_if_absent`]），不分段上傳、不覆寫；
+//! - 讀取用 `get`、`get_range`、`head`、`list`，`maint/gen/` 從上次看過的世代起 [`Backend::list_after`]；
+//! - `delete` 與 P0 的 [`Backend::probe`] 只有維護角色（prune 與其他維護命令）會用。
+//!
+//! 覆寫（[`Backend::put`]）只給還沒遷移的 v3 程式碼（`config` 與 GC 的 `touch/`），v3 移除時一起移除。
 //!
 //! 支援四種位置（見 [`RepoLocation`]）：本機目錄、`s3://bucket[/prefix]`（AWS S3 與
 //! MinIO 等相容服務）、`sftp://[user@]host[:port]/path` 與 rclone 橋接
@@ -61,6 +64,9 @@ pub enum BackendError {
     Store(#[from] object_store::Error),
     #[error("object {0} has an unrepresentable timestamp")]
     BadTimestamp(String),
+    /// P0 的探針不通過：這個後端上不能執行 prune 與其他維護命令（format-v4.md §11.3、§12）。
+    #[error("backend probe (P0) failed: {0}")]
+    Probe(String),
     #[error("backup source: {0}")]
     Source(String),
 }
@@ -75,7 +81,7 @@ impl From<russh::Error> for BackendError {
 /// list / head 回傳的物件資訊。`modified` 是後端記的最後修改時間
 /// （本機 = 檔案 mtime；S3 = LastModified），GC 用它判斷物件夠不夠「老」。
 /// **一律取整到秒**：S3 的 list 有毫秒、head 只有秒，不取整的話兩邊比較會不一致；
-/// GC 的所有比較都只需要秒級（見 docs/format.md §11.5）。
+/// GC 的所有比較都只需要秒級（見 docs/format.md §11.5；v4 的 `T(g)` 也截到秒，format-v4.md §10）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectInfo {
     pub key: String,
@@ -97,6 +103,15 @@ impl ObjectInfo {
 }
 
 pub type Result<T> = std::result::Result<T, BackendError>;
+
+/// P0 的探針讀到的兩個時鐘（format-v4.md §11.1、§11.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probe {
+    /// 探針的後端修改時間 `N_P`（截到秒）。
+    pub backend: time::OffsetDateTime,
+    /// 讀到 `N_P` 之後的本機牆鐘：§11.1 的「P0 時的本機牆鐘」。
+    pub local: time::OffsetDateTime,
+}
 
 /// repo 在哪裡：使用者給 `--repo` 的字串解析後的結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,9 +293,9 @@ impl Backend {
         }
     }
 
-    /// 寫入（覆蓋既有物件）。覆寫的合法使用者：`config`，以及 GC 的 `touch/*`
-    /// （固定 8 bytes 內容、刷新 mtime；docs/format.md §13.1/§15）——其餘物件
-    /// 一律 [`put_if_absent`](Self::put_if_absent)。
+    /// 寫入（覆蓋既有物件）。**只給 v3**：覆寫的合法使用者是 v3 的 `config` 與 GC 的 `touch/*`
+    /// （固定 8 bytes 內容、刷新 mtime；docs/format.md §13.1/§15）。v4 不覆寫任何物件
+    /// （format-v4.md §1），一律 [`put_if_absent`](Self::put_if_absent)；v3 移除時一起移除。
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         self.store
             .put(&Self::path(key)?, bytes.into())
@@ -289,7 +304,19 @@ impl Backend {
         Ok(())
     }
 
-    /// 只在物件不存在時寫入；已存在回 [`BackendError::AlreadyExists`]。snapshot 用這個。
+    /// 只在物件不存在時寫入；已存在回 [`BackendError::AlreadyExists`]。一次 PUT（S3 帶
+    /// `If-None-Match: *`；本機與 SFTP 先寫暫存檔再 hard link，rclone 橋接是 stat 之後 rename，見
+    /// [`create_only`](Self::create_only)），不分段上傳。
+    ///
+    /// 結果不一定是確定的，呼叫端要照下面處理（format-v4.md §12）：
+    /// - **AlreadyExists 可能是自己寫的**：S3 回 5xx 時 `object_store` 會重試，第一次其實已經寫進去的話，
+    ///   重試得到「已存在」。
+    /// - **錯誤不代表沒寫進去**：逾時的 PUT 不重試（不是冪等的請求），SFTP 在 link 之後斷線也一樣，
+    ///   物件可能已經存在。
+    ///
+    /// 內容命名的 key（pack、mpack、delta、map 分片）得到 AlreadyExists 就是成功；head 的柵欄
+    /// （P8）得到 AlreadyExists 或錯誤就停止、不刪任何東西，寫進去的那一代照樣有效；snapshot 主體的
+    /// 錯誤代表 commit 與否不明。
     pub async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -365,12 +392,93 @@ impl Backend {
         items.into_iter().map(ObjectInfo::from_meta).collect()
     }
 
-    /// 刪除。只有 maintenance 操作會用。
+    /// 只列 prefix 底下、key 依字典序大於 `after` 的物件（不含 `after` 本身；`after` 不必存在）。
+    /// 順序不保證。v4 的讀取端從上次看過的世代起列 `maint/gen/`（format-v4.md §10）：head 永不刪除，
+    /// 每次都從頭列的話，請求數隨世代數成長。S3 送 `start-after`；本機與 SFTP 列出整個 prefix 再過濾，
+    /// 結果相同，只是省不到請求。
+    pub async fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectInfo>> {
+        let prefix = Self::path(prefix)?;
+        let after = Self::path(after)?;
+        let items: Vec<_> = self
+            .store
+            .list_with_offset(Some(&prefix), &after)
+            .try_collect()
+            .await?;
+        items.into_iter().map(ObjectInfo::from_meta).collect()
+    }
+
+    /// 只在不存在時建立是否由後端保證是原子的。rclone 橋接不是：它的條件建立是先 stat 再 rename
+    /// （ADR 014），兩個寫入者同時通過 stat 時後寫的蓋掉先寫的；但依序建立兩次照樣得到 AlreadyExists，
+    /// [`probe`](Self::probe) 的雙重建立看不出來，所以由後端的種類決定。
+    pub fn create_only(&self) -> bool {
+        !matches!(self.location, RepoLocation::Rclone(_))
+    }
+
+    /// P0（format-v4.md §11.3）：後端不是 [`create_only`](Self::create_only) 就直接拒絕；否則建立
+    /// `maint/probe-<亂數>`，以同名再建立一次，必須得到 AlreadyExists（抓得到忽略 `If-None-Match` 的
+    /// S3 相容服務）；HEAD 它，後端時間與本機牆鐘相差超過
+    /// [`PROBE_TOLERANCE`](kist_format::v4::index::PROBE_TOLERANCE) 就拒絕。不論結果都刪掉探針
+    /// （也就驗證了維護角色能刪）。
+    pub async fn probe(&self) -> Result<Probe> {
+        if !self.create_only() {
+            return Err(BackendError::Probe(format!(
+                "{}: the rclone bridge emulates conditional create with stat + rename, which \
+                 is not atomic, so prune and the other maintenance commands cannot run on it; \
+                 backup and restore can (format-v4.md §12)",
+                self.location
+            )));
+        }
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| BackendError::Probe(format!("random name: {e}")))?;
+        let key = kist_format::v4::keys::Key::Probe(nonce).path();
+        let probed = self.probe_at(&key).await;
+        let deleted = self.delete(&key).await;
+        match (probed, deleted) {
+            (Ok(probe), Ok(())) => Ok(probe),
+            (Ok(_), Err(e)) => Err(e),
+            (Err(e), deleted) => {
+                if let Err(d) = deleted {
+                    tracing::warn!("cannot delete the probe {key}: {d}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn probe_at(&self, key: &str) -> Result<Probe> {
+        self.put_if_absent(key, b"kist probe".to_vec()).await?;
+        match self.put_if_absent(key, b"kist probe".to_vec()).await {
+            Err(BackendError::AlreadyExists(_)) => {}
+            Ok(()) => {
+                return Err(BackendError::Probe(format!(
+                    "{} accepted a second create of {key}: it does not honor conditional \
+                     create (If-None-Match), so prune and the other maintenance commands \
+                     cannot run on it",
+                    self.location
+                )))
+            }
+            Err(e) => return Err(e),
+        }
+        let backend = self.head(key).await?.modified;
+        let local = time::OffsetDateTime::now_utc();
+        let tolerance = time::Duration::seconds(kist_format::v4::index::PROBE_TOLERANCE as i64);
+        if (backend - local).abs() > tolerance {
+            return Err(BackendError::Probe(format!(
+                "the backend clock ({backend}) and the local clock ({local}) differ by more \
+                 than {tolerance}; fix the clock before running maintenance"
+            )));
+        }
+        Ok(Probe { backend, local })
+    }
+
+    /// 刪除。只有 maintenance 操作會用。物件不存在也算成功：S3 與 SFTP 本來就這樣，本機的
+    /// `object_store` 會回 NotFound，這裡統一（v4 的 P9 依序刪 `.r1`、parity、主體，前兩個常常不存在）。
     pub async fn delete(&self, key: &str) -> Result<()> {
-        self.store
-            .delete(&Self::path(key)?)
-            .await
-            .map_err(|e| Self::map_err(key, e))
+        match self.store.delete(&Self::path(key)?).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(Self::map_err(key, e)),
+        }
     }
 }
 
