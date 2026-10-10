@@ -60,6 +60,16 @@ pub struct Object {
 /// 對一個完整的 pack（`pack` 的 BLAKE3 必須等於 `pack_id`）算出 m 片同位的
 /// sidecar bytes。確定性：同樣的 pack 與 m 永遠得到同樣的物件。
 pub fn encode(pack_id: &ObjectId, pack: &[u8], m: usize) -> Result<Vec<u8>> {
+    encode_version(pack_id, pack, m, crate::FORMAT_VERSION)
+}
+
+/// [`encode`]，`v` 由呼叫端給：v4 沿用同一個排版、只有 `v` 不同（[`crate::v4::parity`]）。
+pub(crate) fn encode_version(
+    pack_id: &ObjectId,
+    pack: &[u8],
+    m: usize,
+    version: u32,
+) -> Result<Vec<u8>> {
     let corrupt = |msg: String| FormatError::ParityCorrupt(msg);
     if !(1..=MAX_PARITY_SHARDS).contains(&m) {
         return Err(corrupt(format!(
@@ -92,7 +102,7 @@ pub fn encode(pack_id: &ObjectId, pack: &[u8], m: usize) -> Result<Vec<u8>> {
         .map_err(|e| corrupt(format!("encode: {e}")))?;
 
     let obj = Object {
-        v: crate::FORMAT_VERSION,
+        v: version,
         k: DATA_SHARDS as u8,
         m: m as u8,
         pack_size: pack.len() as u64,
@@ -108,8 +118,13 @@ pub fn encode(pack_id: &ObjectId, pack: &[u8], m: usize) -> Result<Vec<u8>> {
 
 /// 解碼並驗證 parity 物件。每個 bound 都在依 header 配置記憶體**之前**檢查。
 pub fn parse(data: &[u8]) -> Result<Object> {
+    parse_version(data, crate::FORMAT_VERSION)
+}
+
+/// [`parse`]，`v` 必須等於 `version`（v4 見 [`crate::v4::parity`]）。
+pub(crate) fn parse_version(data: &[u8], version: u32) -> Result<Object> {
     let obj: Object = cbor::decode(data)?;
-    obj.validate()?;
+    obj.validate(version)?;
     Ok(obj)
 }
 
@@ -118,15 +133,11 @@ impl Object {
         self.m as usize
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, version: u32) -> Result<()> {
         let fail = |msg: String| Err(FormatError::ParityCorrupt(msg));
         let shard_len = self.shard_len as usize;
-        if self.v != crate::FORMAT_VERSION {
-            return fail(format!(
-                "version {}, this build reads {}",
-                self.v,
-                crate::FORMAT_VERSION
-            ));
+        if self.v != version {
+            return fail(format!("version {}, this build reads {version}", self.v));
         }
         if self.k as usize != DATA_SHARDS {
             return fail(format!("{} data shards, want {DATA_SHARDS}", self.k));

@@ -406,3 +406,40 @@ fn delta_matches_the_golden_file() {
     check("delta.cbor", &d.encode().unwrap());
     assert_eq!(Delta::decode(&golden("delta.cbor"), &client).unwrap(), d);
 }
+
+/// 測試用的確定性位元組流（"kist/test/<seed>" 的 BLAKE3 XOF），與 tests/parity.rs 相同。
+fn fake_pack(seed: &str, n: usize) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(format!("kist/test/{seed}").as_bytes());
+    let mut out = vec![0u8; n];
+    hasher.finalize_xof().fill(&mut out);
+    out
+}
+
+/// §13：v4 的 parity 是 v3 的排版、`v` 是 4。獨立核對：v3 凍結的 golden（`testdata/parity-golden.txt`，
+/// 原本與已移除的 Go 實作共用）只差 `v` 那一個 byte（`a7 61 76 03` → `04`）。
+#[test]
+fn parity_is_the_v3_layout_with_version_4() {
+    use kist_format::v4::ids::ObjectId;
+    let text = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/parity-golden.txt"),
+    )
+    .unwrap();
+    let mut lines = text.lines();
+    let id = ObjectId::from_hex(lines.next().unwrap().strip_prefix("pack ").unwrap()).unwrap();
+    let mut expected = hex::decode(lines.next().unwrap().strip_prefix("parity ").unwrap()).unwrap();
+    assert_eq!(expected[..4], [0xa7, 0x61, b'v', 0x03], "v3 golden header");
+    expected[3] = 0x04;
+
+    let pack = fake_pack("golden", 4321);
+    assert_eq!(ObjectId::of(&pack), id);
+    let ours = kist_format::v4::parity::encode(&id, &pack, 2).unwrap();
+    assert_eq!(hex::encode(&ours), hex::encode(&expected));
+    check("parity.cbor", &ours);
+
+    let obj = kist_format::v4::parity::parse(&golden("parity.cbor")).unwrap();
+    let mut bad = pack.clone();
+    bad[100] ^= 0x5a;
+    bad[4000] ^= 0x5a;
+    assert_eq!(obj.repair(&id, &bad).unwrap(), pack);
+}

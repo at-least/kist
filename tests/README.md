@@ -2,8 +2,8 @@
 
 ## S3 / MinIO
 
-S3 相關的測試（`crates/kist-backend/tests/s3.rs`、`crates/kist-core/tests/s3_end_to_end.rs`、
-`crates/kist-cli/tests/cli.rs` 裡的 `s3_*`）預設略過，設了環境變數才會跑：
+S3 相關的測試（`crates/kist-backend/tests/s3.rs`、`contract.rs` 與 `contract_v4.rs` 裡的 `s3_*`、
+`crates/kist-core/tests/s3_end_to_end.rs`、`crates/kist-cli/tests/cli.rs` 裡的 `s3_*`）預設略過，設了環境變數才會跑：
 
 ```sh
 eval "$(sh tests/minio-setup.sh)"   # 起容器、建 bucket、建 Put-only 使用者，並設好環境變數
@@ -17,8 +17,8 @@ docker rm -f kist-minio             # 用完關掉
 
 ## SFTP
 
-SFTP 相關的測試（`crates/kist-backend/tests/sftp.rs`、`contract.rs` 裡的
-`sftp_backend_meets_the_contract`）預設略過，設了環境變數才會跑：
+SFTP 相關的測試（`crates/kist-backend/tests/sftp.rs`、`contract.rs` 與 `contract_v4.rs` 裡的
+`sftp_*`）預設略過，設了環境變數才會跑：
 
 ```sh
 eval "$(sh tests/sftp-setup.sh)"    # 起 atmoz/sftp 容器、keyscan 產 known_hosts、備 key 認證素材
@@ -34,7 +34,8 @@ passphrase 的 ed25519 key（測 `KIST_TEST_SFTP_KEY` / `KIST_TEST_SFTP_KEY_PASS
 
 ## rclone 橋接
 
-rclone 相關的測試（`crates/kist-backend/tests/rclone.rs`、`rclone_bin.rs`）預設略過，
+rclone 相關的測試（`crates/kist-backend/tests/rclone.rs`、`rclone_bin.rs`、`contract_v4.rs` 裡的
+`rclone_*`）預設略過，
 需要 PATH 上有 rclone 並設環境變數：
 
 ```sh
