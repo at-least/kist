@@ -8,10 +8,12 @@
 //! - [`ids`]：`MetaId`、`ClientId`（`ChunkId`、`ObjectId` 與 v3 相同，從 crate 根重新匯出）。
 //! - [`keys`]：§1 的命名空間：每種物件的 key、`.r1`、解析與驗證。
 //! - [`config`]：§3 的 config 與金鑰槽（金鑰推導在 `kist-crypto` 的 `v4`）。
+//! - [`pack`]：§6 的 pack 與 mpack 排版、trailer 與它的一致性檢查。
 
 pub mod config;
 pub mod ids;
 pub mod keys;
+pub mod pack;
 
 use crate::FormatError;
 

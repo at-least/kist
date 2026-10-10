@@ -65,3 +65,50 @@ fn slot_matches_the_independent_vector() {
         &Slot::new(slot.wrapped.clone()).encode().unwrap(),
     );
 }
+
+/// 兩項的 mpack trailer：{v:4, kind:1, entries:[{i:0x01×32, o:8, l:41, r:10}, {i:0x02×32, o:49, l:50, r:100}]}。
+fn two_entry_trailer() -> kist_format::v4::pack::PackTrailer {
+    use kist_format::v4::ids::ItemId;
+    use kist_format::v4::pack::{Kind, PackEntry, PackTrailer};
+    PackTrailer::new(
+        Kind::Meta,
+        vec![
+            PackEntry {
+                i: ItemId::from_bytes([1; 32]),
+                o: 8,
+                l: 41,
+                r: 10,
+            },
+            PackEntry {
+                i: ItemId::from_bytes([2; 32]),
+                o: 49,
+                l: 50,
+                r: 100,
+            },
+        ],
+    )
+}
+
+#[test]
+fn pack_trailer_matches_the_golden_file() {
+    let t = two_entry_trailer();
+    check(
+        "pack_trailer.cbor",
+        &t.encode(99, kist_format::v4::pack::MAX_META_ITEM).unwrap(),
+    );
+}
+
+/// 排版向量：magic、兩項（0x01×41、0x02×50）、trailer（這裡放未密封的 trailer CBOR，只為了排版）、長度、
+/// magic。
+#[test]
+fn pack_layout_matches_the_golden_file() {
+    use kist_format::v4::pack;
+    let trailer = two_entry_trailer().encode(99, pack::MAX_META_ITEM).unwrap();
+    let mut p = pack::begin();
+    p.extend_from_slice(&[0x01; 41]);
+    p.extend_from_slice(&[0x02; 50]);
+    let p = pack::finish(p, &trailer);
+    check("pack_layout.bin", &p);
+    let (start, sealed) = pack::split_trailer(&p).unwrap();
+    assert_eq!((start, sealed), (99, &trailer[..]));
+}

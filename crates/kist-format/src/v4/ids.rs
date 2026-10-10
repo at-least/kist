@@ -118,6 +118,34 @@ impl ClientId {
 
 id_type!(RepoId, 16, "repo id：init 時以 OS 亂數產生的 16 bytes。");
 
+id_type!(
+    ItemId,
+    32,
+    "pack 裡一項的 ID：資料 pack 裡是 chunk ID、mpack 裡是 meta ID（看 trailer 的 `kind`）。"
+);
+
+impl From<ChunkId> for ItemId {
+    fn from(id: ChunkId) -> Self {
+        Self(*id.as_bytes())
+    }
+}
+
+impl From<MetaId> for ItemId {
+    fn from(id: MetaId) -> Self {
+        Self(*id.as_bytes())
+    }
+}
+
+impl ItemId {
+    pub fn to_chunk(self) -> ChunkId {
+        ChunkId::from_bytes(self.0)
+    }
+
+    pub fn to_meta(self) -> MetaId {
+        MetaId::from_bytes(self.0)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
