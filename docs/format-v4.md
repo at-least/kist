@@ -2,9 +2,9 @@
 
 > **狀態：設計已確認（2026-10-10，見 ADR 026），實作中。** 本文件是 v4 的唯一權威副本：`kist_format::v4`
 > 與 `kist_crypto::v4`（實作第 2 段）、kist-backend 的 v4 契約（第 3 段）、kist-core 的 `v4` 模組（init、open
-> 與 backup，第 4 段）照它實作，之後各段的程式碼也照它寫；改動格式必須同時改程式碼、向量與本文件。CLI、
-> kist-app、kist-mount 與 kist-core 的其他命令在第 5–6 段遷移之前仍用 v3，`docs/format.md` 繼續描述它們，
-> v3 的模組移除時一併刪除。
+> 與 backup，第 4 段；restore 與 check，第 5 段）與 kist-mount 的 `v4` 模組（mount 的核心，第 5 段）照它實作，
+> 之後各段的程式碼也照它寫；改動格式必須同時改程式碼、向量與本文件。CLI、kist-app、kist-mount 的 FUSE 介面與
+> kist-core 的其他命令在第 6 段遷移之前仍用 v3，`docs/format.md` 繼續描述它們，v3 的模組移除時一併刪除。
 > v4 不支援 v3：config 的 `v` 不是 4 就拒絕，沒有遷移（負責人：「不需要支援上一代，目前都還在內部開發
 > 階段」）。
 > 第一版草稿（commit `054c7e1`，「v3 加樹進 pack」）已被否決；本版從需求與 bug 歷史重新推導，
@@ -250,7 +250,9 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
 - `parent`：同一個 client、roots 的路徑與 `t` 相同的上一個 snapshot 主體的 key，只用於加速；沒有就省略，
   明寫的 null 也視為沒有。
 - 讀取端：內容的 `client` 與 `time` 必須等於 key 的 client 與時間戳（`.r1` 也一樣）；`parent` 必須是同一個
-  client 的 snapshot 主體的 key。
+  client 的 snapshot 主體的 key。主體讀不了（不見、解不開、內容與 key 不符）就讀 `.r1` 並警告（P5 的順序；
+  `.r1` 在 B4 通過之後才寫，內容自己是完整的）；兩份都不在是「找不到」，不是腐壞。列出 snapshot 時只列主體
+  （主體出現＝commit），只有 `.r1` 的由 check 回報（§13）。
 - stats：`files`、`symlinks` 按名稱計；`dirs` 是目錄節點數，roots 不算；`bytes` 是內容總和，`(dev, ino)`
   只算一次。過程計數不在格式裡。
 - commit：`replicas=1` 時先寫 `.r1`，再寫主體；主體出現＝commit。只在不存在時建立得到「已存在」時先讀回
@@ -314,10 +316,17 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 **讀取端**（backup、restore、mount、check）：
 - 列 `maint/gen/`（從上次看過的世代 start-after），取**列出來的最大世代**，讀主體、不行讀 `.r1`。讀不了
-  或版本不認得：backup 與 prune 停止；restore 與 mount 可以退回較舊的世代並警告。
+  或版本不認得：backup 與 prune 停止；restore、mount 與 check 退回較舊的世代並警告：由大到小取第一個 head
+  與它的全部分片都讀得了的世代，跳過的逐一警告（check 把它們當錯誤回報）。
 - 分片依 hash 快取。delta 只用當下列表裡有的；解不開的 delta 跳過並警告。map 沒提到的 pack 才看 delta。
 - 一個 ID 的持有者依排序逐一嘗試；某一份驗證失敗（解不開或 ID 不符）就試下一份；tombstone 的持有者
-  排最後、只在其他都失敗時才用並警告；全部失敗 → 重新載入一次 → 仍失敗就報錯。
+  排最後、只在其他都失敗時才用並警告；全部失敗 → 重新載入一次 → 仍失敗就報錯。重新載入＝重新列出世代、
+  載入最大可用那一代的 map 與當下列表裡的 delta；主要的情況是開始得比 prune 早的讀取（item 被搬進 prune 的
+  新 pack、記在下一代，舊的 pack 過了 grace 被刪）。限流：兩次因失敗而重新載入之間至少 60 秒（同 v3 的
+  restore），別的讀取在這一項開始之後已經重新載入過就直接用新的再試；被限流擋下就回原本的錯誤。mount 看到
+  沒見過的 snapshot 時另外重新載入（限流 1 秒，與前者分開計）：新的 snapshot 可能引用 mount 載入時還不知道
+  的 pack。check 不重新載入：它回報讀到的那一代。
+- 目錄的查找沿 Dir 的索引只讀涵蓋名稱的那一段（最後一個 `first` ≤ 名稱的段，§7 的檢查照做）。
 
 ## 11. GC 與並行（世代柵欄）
 
@@ -540,12 +549,54 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   `shard_len` 是 0 或超過 64 MiB、與 `pack_size` 不符、片數或長度不對——都在依 header 配置記憶體之前檢查。
   明文的理由：同位是密文的線性組合，不洩漏內容；偽造或損壞的 parity 最多讓修復失敗，修復的結果以重算 BLAKE3
   等於 pack 的名稱證明。向量 `golden-v4/parity.cbor`，與 v3 凍結的 `parity-golden.txt` 只差 `v` 那一個 byte。
-  讀取與修復（`check --repair`）在實作第 5 段。
+  check 讀它、證明修得回（§13.1）。
 - 刪除順序 `.r1` → parity → 主體。
 - `.r1` 在而主體不在：mpack、head、分片是主體遺失（它們先寫主體），讀取端用 `.r1`，`check` 回報，
   `check --repair` 從 `.r1` 重建主體（主體不存在，所以是建立，不是覆寫）。snapshot 先寫 `.r1`，所以也
   可能是 commit 前中斷：prune 照樣當成起點（P5）、`check` 回報，不自動補主體，由使用者 `forget` 或
   決定補回。
+- 在的、但損壞的物件（名稱與內容不符，或解不開）：v4 不覆寫，所以 `check` 只證明修得回——parity 修出的
+  bytes 重算 BLAKE3 等於名稱，或 `.r1` 完好——不寫回。P7c、P7d 也不用 parity：驗證失敗的項目照樣從記錄
+  移除；它若是那個 ID 唯一的持有者，P5 就一直拒絕，直到有人 forget。損壞的副本怎麼修回來還沒有定義（ADR 026
+  規格錯誤第 17 項）。
+
+### 13.1 check
+
+一律讀後端，不用本地快取（快取裡的那一份證明不了後端還在）。不重新載入（§10）。
+
+**不讀資料**（預設）：
+- 每一代的 head：主體與 `.r1` 都在、解得開、bytes 相同；`parent` 等於前一代的 BLAKE3；世代從 0 起沒有空洞
+  （head 永不刪除）。
+- 讀取端用的那一代（§10）：比它新卻被跳過的世代是錯誤；它的分片都在、名稱相符，`replicas=1` 時 `.r1` 也是。
+- 記錄與列表（P3）：live 與 condemned 的 pack 都在、大小等於記錄；`by_prune` 的記錄在全零前綴下；mpack 的
+  主體不在而 `.r1` 在、或 `replicas=1` 而 `.r1` 不在，照下面的修復處理。警告（不是錯誤）：unreadable 與
+  unknown 的記錄、列表裡有而 map 與 delta 都沒提到的 pack（中斷的 backup 留下的，下一次 prune 收錄；mpack 的
+  主體與 `.r1` 只回報一次）、解不開的 delta、delta 提到卻不在列表裡的 pack、對應的 pack 已不在的 parity、
+  只有 `.r1` 的 snapshot。
+- 每一個 snapshot（主體，與只有 `.r1` 的，P5 都當成起點）：讀得出來（主體不行讀 `.r1`，§9），走過它引用的
+  每一個 metadata item 與 chunk（每個 ID 一次）：照 P5，每一個都要有可讀、非 tombstone、種類相符的持有者
+  （只剩 tombstone 是錯誤：prune 會刪它）；目錄的每一段照 §7 檢查；檔案的 chunk 清單（ChunkList、
+  ChunkIndex）與大小照 §7（chunk 的長度取自持有者記錄的 `r`）；巢狀超過實作上限 256 層回報、不深入。讀
+  metadata item 時驗證失敗的副本、只剩 tombstone 讀得到的項目都是錯誤（讀取端會換下一份，check 照樣回報）。
+
+**`--read-data`**：map（live、condemned、tombstone）與 delta 提到的每一個 pack 與 mpack 整份下載：名稱等於
+BLAKE3、trailer 解得開而合乎 §6、每一項解得開而 ID 相符；**記錄 ⊆ trailer**：記錄（或 delta）列出的每一項都在
+trailer 裡、位移與長度相同，驗證不過的項目不能還在記錄裡（P7c、P7d 只會從記錄移除項目，所以反過來不成立）；
+mpack 的 `.r1` 與主體 bytes 相同；有 parity 的修得回自己。損壞的物件有驗證過的完好 bytes（parity 修得回、或
+`.r1` 完好）就回報「修得回」，不寫回（§13）。
+
+**`--repair`**（維護角色；隱含 `--read-data`；寬鬆後端上拒絕，§12；只建立物件，不做 P0）只做只在不存在時
+建立的修復，bytes 一律先驗證（以內容命名的重算名稱，head 與 snapshot 解得開）：
+1. head 的主體不在、`.r1` 完好 → 從 `.r1` 建立主體（柵欄先看 `.r1`，所以不會與寫入者衝突，P8）；
+2. head 的 `.r1` 不在 → 從主體建立（同 P1 的補寫，任何一代都做）；
+3. 分片的主體不在、`.r1` 完好 → 建立主體；`replicas=1` 而 `.r1` 不在 → 建立 `.r1`；
+4. mpack 同上（主體或 `.r1`）；
+5. `replicas=1` 而 snapshot 的 `.r1` 不在 → 從主體建立；
+6. snapshot 的主體不補（§13）。
+「已存在」是別人先建了，算成功。在的、但損壞的物件不動。
+
+不檢查：config 與金鑰槽（開啟 repo 時以槽的 AAD 驗證整份 config，只讀一個槽，§3）；較舊世代的分片（P9 會刪
+兩代都不再引用的分片）。
 
 ## 14. 版本
 
@@ -558,7 +609,9 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 每條規範性規則至少一個資料檔向量或測試：金鑰推導與槽；CBOR 十條；切段規則與 Dir 驗證；Root 的種類
 規則；chunk 清單的切段與 ChunkIndex 的 `size`；pack 的種類、上限與解壓上限；head、分片、記錄的編碼；parity 的排版；GC 的情境（重疊的 prune、停住的 prune、
-重建、grace 調低再調高、晚到的 delta、沿用被 forget 的 parent 子樹、不實的 trailer、讀不了的物件）。
+重建、grace 調低再調高、晚到的 delta、沿用被 forget 的 parent 子樹、不實的 trailer、讀不了的物件）；讀取端
+（持有者的順序、驗證失敗換下一份、重新載入與限流、退回較舊的世代、restore 依 `Root.t` 的落點）；§13.1 的
+每一條 check 規則與每一種修復。
 v3 的 fixture 移除，凍結一份 v4 的。
 
 ## 16. 設計決定 × 教訓

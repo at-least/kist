@@ -1,8 +1,9 @@
 # ADR 026：v4 格式——從需求重新推導
 
 日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作中。** 規格全文
-在 `docs/format-v4.md`；kist-core 的 `v4` 模組在第 4 段有了 init、open 與 backup，CLI、kist-app、kist-mount
-與 kist-core 的其他命令在第 5–6 段遷移之前仍是 v3，`docs/format.md` 繼續描述它們。本 ADR 取代同編號的第一版
+在 `docs/format-v4.md`；kist-core 的 `v4` 模組在第 4 段有了 init、open 與 backup，第 5 段有了 restore 與 check，
+kist-mount 的 `v4` 模組有了 mount 的核心；CLI、kist-app、kist-mount 的 FUSE 介面與 kist-core 的其他命令在第 6 段
+遷移之前仍是 v3，`docs/format.md` 繼續描述它們。本 ADR 取代同編號的第一版
 草稿（commit `054c7e1`）。
 
 ## 一頁白話
@@ -343,6 +344,8 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 | 100 萬個 ID 的 map 約 40 MB | 估計（設計者 A） |
 | backup 記憶體裡的持有者表（`Map(g_s)` 的每一項 40 bytes 的索引，加上記錄本身每項約 60 bytes）100 萬個 ID 約 100 MB | 估計（實作第 4 段）；第 7 段的記憶體 bench 量 |
 | backup 記憶體不高於 v3、prune 150–250 MiB | 估計 |
+| check 的成本：每一代的 head 讀兩份、讀取端那一代的分片全讀，走過的 ID 各記 32 bytes（目錄、清單、chunk 各一個集合） | 估計（實作第 5 段）；第 7 段的 bench 量 |
+| mount 第一次讀一個檔案時解析整個 chunk 清單（同 v3）就夠快 | 猜測；ChunkIndex 的 `size` 可以讓隨機讀只讀需要的段，沒做 |
 | 單一 PUT 的大小上限放得下一個 pack | AWS S3 的單一 PUT 最多 5 GB（官方文件，2026-10-11 查）。預設的 pack_target 64 MiB 遠低於它；pack_target 接近 4 GiB、chunk 又很小（avg 接近 256 bytes）時，trailer 可能讓 pack 超過，PUT 失敗而 backup 報錯，不會無聲出錯。其他 S3 相容服務未查 |
 
 ## 外部事實（2026-10-10 查證）
@@ -725,3 +728,73 @@ rclone 的環境變數也是 643 個通過。
 
 **gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 643 增加到 691 個通過，9 個略過；
 `v4_backup_backends` 在 MinIO、SFTP、rclone 上都過。
+
+## 實作第五段：讀取路徑（2026-10-11）
+
+負責人：「繼續」（第四段的回報之後）。
+
+**內容**（commit `17bdd22`、`039ecaf`、`e689d0c`、`8e54441`、`85cbe94`、`3c36131`、`fc6cea9` 與這份文件的 commit）：
+- 讀取端（`kist_core::v4::live`、`snapshots`、`read`）：`usable_state` 由大到小取第一個 head 與全部分片都讀得了的
+  世代，跳過的回傳原因；`Live::run` 在持有者全部失敗（新的錯誤 `Unavailable`）時重新載入一次再試，限流 60 秒、
+  以 epoch 判斷別人是不是已經載入過；`Live::refresh` 不限流，給 mount 用。snapshot 主體讀不了讀 `.r1`，兩份都
+  不在是 `SnapshotNotFound`；列出、選取 snapshot（同 v3 的指定方式）。`Reader::lookup` 沿 Dir 的索引只讀一段。
+- restore 與 dry run（`kist_core::v4::restore`）：落點照 `Root.t`；部分還原、SNAPSHOT:PATH、dry run 的規則同 v3。
+- mount 的核心（`kist_mount::v4::FsCore`）：與 v3 同樣的方法；頂層照 `Root.t` 展開、目錄依索引查找、chunk 的
+  長度取自持有者的 `r`、兩條重新載入各自限流。
+- check（`kist_core::v4::check`）：§13.1，規格原本沒有這一節。
+- 第四段留下的不穩定測試（見下）。
+- 測試：`v4_read.rs`（9）、`v4_restore.rs`（28，其中 19 個搬自 v3 的 `restore_hardening.rs`）、
+  `v4_restore_select.rs`（21，搬自 `restore_select.rs`）、`v4_restore_fd_limit.rs`（1）、`v4_check.rs`（25）、
+  kist-mount 的 `v4_fs_read.rs`（13，搬自 `fs_read.rs` 再加 v4 的）與 4 個單元測試；`v4_backup_backends.rs` 在
+  真的後端上加了 restore 與 `check --read-data`。反向檢查 47 項（讀取端 8、restore 9、mount 4、check 26），每一項
+  都讓對應的測試失敗。
+
+**找到的規格錯誤**（接續第四段的編號）：
+
+| # | 誰找到的 | 問題 | 嚴重度 | 修正 |
+| --- | --- | --- | --- | --- |
+| 17 | 實作 `check --repair` 時（advisor 指出 P7c、P7d 的後果） | §13 說 parity「讀取與修復（`check --repair`）在實作第 5 段」，但 §1、§0.4 不許覆寫，§11.5 的不變式 1 說只有 P9 會刪 pack：在的、但損壞的 pack 沒有合規的方法把修好的 bytes 寫回去。更糟的是 P7c、P7d 驗證失敗就把項目從記錄移除（當成不實的），不先試 parity | parity 在現在的規格裡救不回任何東西：位元損壞的項目若是那個 ID 唯一的持有者，prune 驗證時把它移除，P5 就一直拒絕、直到有人 forget，那個 snapshot 也還原不了那一項——即使 parity 修得回。資料不會被 kist 刪掉（P7d 驗證失敗時 pack 留在 condemned） | 這一段不修：check 只證明修得回（parity 修出的 bytes 重算 BLAKE3 等於名稱，或 `.r1` 完好），列在 `repairable`、不寫回；選項放進回報的疑問（見下） |
+
+選項（給負責人）：
+- **A** `check --repair` 先刪再建立：要維護角色，多一個 P9 以外的刪除者（違反不變式 1 的字面），而且刪與建之間
+  當掉會失去整個 pack（parity 需要損壞的那一份當資料片），必須先把修好的 bytes 寫進本地暫存。
+- **C** 讀取路徑在持有者全部失敗時以 parity 在記憶體修復：不寫任何東西，代價是每次失敗下載整個 pack 與 parity，
+  要一個修好的 pack 的小快取；修不了 P7c、P7d 的問題。
+- **D** P7c、P7d 在宣告項目不實之前先以 parity 在記憶體修復，修得回（重算 BLAKE3 等於名稱）就經 P7c 既有的
+  `by_prune` 路徑寫進新的 pack：符合「只有 P9 刪」與「記錄只來自 prune 驗證過的資料」，是第 6 段的工作。建議 D，
+  restore 要不要再加 C 另外決定。
+
+**對規格的其他修改**（format-v4.md）：
+1. §9：主體讀不了讀 `.r1`；兩份都不在是「找不到」；列出時只列主體。
+2. §10：退回較舊世代的條件（head 與全部分片）與 check 回報跳過的世代；「重新載入一次」寫明內容、60 秒的限流與
+   epoch 規則（原文只說「一次」，限流沿用 v3 的 restore）；mount 看到新 snapshot 的重新載入另外計；目錄依索引查找。
+3. §13：在的、但損壞的物件不寫回（第 17 項）；新的 §13.1 check：不讀資料、`--read-data`、`--repair` 的六種只在
+   不存在時建立的修復、不檢查的東西。§15 加讀取端與 check 的情境。
+
+**與「實作階段」第 5 項的偏離與實作上的選擇**：
+- CLI 的 `kist restore`、`kist mount`、`kist check` 與 FUSE 介面沒換，還是 v3；v4 的讀取路徑只在函式庫與測試裡，
+  v3 移除時（第 6 段）一起換。
+- restore 的檔案系統那一層不複製（與第四段的走訪不同）：v3 `restore.rs` 的暫存檔加 rename、擋路的東西、目錄
+  handle、硬連結、唯讀目錄、選取、metadata 的順序改成 `pub(crate)`，吃 Entry 的函式改用 `RestoreEntry` trait，
+  v3 與 v4 的 Entry 各實作一份。理由：那一層是 ADR 019 的強化，複製一份就失去 v3 那 62 個測試的覆蓋；共用之後
+  v3 的測試照樣覆蓋它，v4 只搬走訪層的測試。v4 只寫走訪。代價是這一段改到了 CLI 還在用的 v3 restore（只有可見性
+  與型別，v3 的測試全過）。v3 移除時把這一層搬進 v4。
+- mount 的核心是新寫的（約 700 行），v3 的 `corefs.rs` 與 `vpath.rs` 在 v3 移除時刪掉；v4 的去重 inode 表與 chunk
+  LRU 照 v3。
+- mount 第一次讀一個檔案時解析整個 chunk 清單（同 v3），ChunkIndex 的 `size` 沒有用來跳段。
+- 兩條重新載入原本共用一個時間戳：mount 看到新 snapshot 的那一次會擋住之後 60 秒內的失敗重試，寫測試時才發現，
+  改成各自限流（v3 本來就分開）。mount 開始時先列出 snapshot 再載入世代，那些 snapshot 不觸發重新載入。
+- check 的成本與記憶體（見「假設」）沒有量；`--repair` 只建立物件、不做 P0（不需要刪除權限）。
+- 第四段的 `one_changed_file_in_a_large_directory_rewrites_one_segment` 不穩定：兩萬個固定名稱在亂數的 K_cut 下約
+  1% 完全不切段。實驗：3000 把亂數金鑰有 21 把不切（0.70%）；重跑原測試 220 次失敗 5 次；改用依這個 repo 的
+  K_cut 挑名稱（`names_with_cuts`）之後 300 次 0 次失敗。
+
+**環境**：同第四段（MinIO 用本機快取的映像以 `docker tag` 標成腳本釘的名稱，腳本沒有改）。
+
+**延到後面的**：
+- 第 17 項的修法（建議 D，第 6 段）與要不要加 C。
+- ChunkIndex 的跳段讀、check 的成本與記憶體：第 7 段的 bench。
+- CLI 與 FUSE 介面換成 v4、`snapshots`／`restore`／`check` 的輸出與 JSON：第 6 段。
+
+**gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 691 增加到 792 個通過，9 個略過；帶 S3、SFTP、rclone
+的環境變數也是 792 個通過，`v4_backup_backends` 的 3 個在 MinIO、SFTP、rclone 上都過。
