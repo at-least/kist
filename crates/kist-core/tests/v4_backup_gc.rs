@@ -569,3 +569,42 @@ async fn b5_checks_the_elapsed_time_again_before_the_body() {
     );
     assert!(t.keys("snapshots").await.is_empty());
 }
+
+/// B4：只從 delta 得知的 pack 在 B2 與 B4 之間被 P4 收成 unknown（trailer 解得開、版本不認得）→ 它不是持有者
+/// （§10），不 commit。只要求「不是 tombstone 或 unreadable」的話會放行，snapshot 引用的 ID 就沒有持有者。
+#[tokio::test]
+async fn b4_refuses_a_holder_that_was_indexed_as_unknown() {
+    let t = TestRepo::new().await;
+    t.open_as("c2")
+        .await
+        .backup(&[src(&t, "two")], opts(2))
+        .await
+        .unwrap();
+    let repo = t.open_as("c1").await;
+    let prepared = repo
+        .backup_prepare(&[src(&t, "one")], opts(1))
+        .await
+        .unwrap();
+    assert!(prepared.report().chunks_reused > 0);
+    let records = index_everything(&repo, &BTreeMap::new()).await;
+    let marks: BTreeMap<ObjectId, Status> = data_packs_of(&records, 2)
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                Status {
+                    s: status::UNKNOWN,
+                    at: 0,
+                    age: 0,
+                },
+            )
+        })
+        .collect();
+    let records = index_everything(&repo, &marks).await;
+    write_generation(&repo, records, false).await;
+    let err = prepared.commit().await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::NotCommitted(m) if m.contains("unknown version")),
+        "{err}"
+    );
+}
