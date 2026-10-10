@@ -112,3 +112,111 @@ fn pack_layout_matches_the_golden_file() {
     let (start, sealed) = pack::split_trailer(&p).unwrap();
     assert_eq!((start, sealed), (99, &trailer[..]));
 }
+
+/// DeriveKey("kist/v4/cut", master 0x42×32)，由 scripts/v4-vectors 的 Go 程式算出。
+const CUT_KEY: &str = "54ea4d4e979f0304865575bf18fd56070b27c3411cc1017b2f4cb207485d4a8b";
+
+fn is_cut(name: &[u8]) -> bool {
+    let mut key = [0u8; 32];
+    hex::decode_to_slice(CUT_KEY, &mut key).unwrap();
+    kist_format::v4::meta::is_cut_hash(blake3::keyed_hash(&key, name).as_bytes())
+}
+
+/// meta ID 不在這個向量裡比對，用無 key 的 BLAKE3 代替。
+fn plain_id(bytes: &[u8]) -> kist_format::v4::ids::MetaId {
+    kist_format::v4::ids::MetaId::from_bytes(*blake3::hash(bytes).as_bytes())
+}
+
+/// §7 的切段規則：目錄 n0..n19999（依 bytes 排序），正式的上限。每段的第一個名稱與項數由 Go 程式獨立算出。
+#[test]
+fn directory_segmentation_matches_the_independent_vector() {
+    use kist_format::v4::meta::{
+        build_dir, decode_item, meta_kind, node_type, Entry, Item, Limits,
+    };
+    let mut names: Vec<Vec<u8>> = (0..20000).map(|i| format!("n{i}").into_bytes()).collect();
+    names.sort();
+    let entries: Vec<Entry> = names
+        .into_iter()
+        .map(|n| {
+            let mut e = Entry::new(n, node_type::FILE, meta_kind::GENERIC);
+            e.mtime = Some(1);
+            e
+        })
+        .collect();
+    let built = build_dir(entries, Limits::V4, &is_cut, &plain_id).unwrap();
+    let items: std::collections::HashMap<_, _> = built
+        .items
+        .iter()
+        .map(|(id, b)| (*id, decode_item(b).unwrap()))
+        .collect();
+    let Item::Dir(root) = &items[&built.root] else {
+        panic!("the root is not a Dir");
+    };
+    assert_eq!(root.level, 1);
+    let got: Vec<(String, usize)> = root
+        .segs
+        .iter()
+        .map(|s| match &items[&s.id] {
+            Item::Seg(seg) => (
+                String::from_utf8(s.first.clone()).unwrap(),
+                seg.entries.len(),
+            ),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let expected = [
+        ("n0", 1960),
+        ("n11761", 7116),
+        ("n18166", 4667),
+        ("n4367", 4234),
+        ("n8178", 1164),
+        ("n9225", 859),
+    ];
+    let expected: Vec<(String, usize)> =
+        expected.iter().map(|(n, c)| (n.to_string(), *c)).collect();
+    assert_eq!(got, expected);
+}
+
+/// chunk 清單的切段與 ChunkIndex 的 size：ID = BLAKE3(i 的 u32 little-endian)、明文長度 1000+i，i 從 0 到
+/// 19999。每段的長度與明文長度合計由 Go 程式獨立算出。
+#[test]
+fn chunk_list_segmentation_and_sizes_match_the_independent_vector() {
+    use kist_format::v4::ids::ChunkId;
+    use kist_format::v4::meta::{build_chunks, content_type, decode_item, Item, Limits};
+    let chunks: Vec<(ChunkId, u64)> = (0..20000u32)
+        .map(|i| {
+            (
+                ChunkId::from_bytes(*blake3::hash(&i.to_le_bytes()).as_bytes()),
+                1000 + u64::from(i),
+            )
+        })
+        .collect();
+    let built = build_chunks(chunks, Limits::V4, &is_cut, &plain_id).unwrap();
+    assert_eq!((built.ct, built.chunks.len()), (content_type::INDIRECT, 1));
+    let items: std::collections::HashMap<_, _> = built
+        .items
+        .iter()
+        .map(|(id, b)| (*id, decode_item(b).unwrap()))
+        .collect();
+    let Item::ChunkIndex(root) = &items[&built.chunks[0].to_meta()] else {
+        panic!("the root is not a ChunkIndex");
+    };
+    assert_eq!(root.level, 1);
+    let got: Vec<(usize, u64)> = root
+        .parts
+        .iter()
+        .map(|p| match &items[&p.id] {
+            Item::ChunkList(l) => (l.chunks.len(), p.size),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (3865, 11332180),
+            (8020, 71173490),
+            (2770, 39526515),
+            (5345, 97957815)
+        ]
+    );
+}

@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"sort"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -126,6 +127,47 @@ func main() {
 	seal("shard", subs["index"], []byte("kist/v4/shard"), []byte("shard"))
 	fmt.Println("META_ID_a0", hex.EncodeToString(keyed(subs["meta-id"], []byte{0xa0})))
 	fmt.Println("CACHE_DIR", hex.EncodeToString(subs["cache"][:16]))
+	// §7 的切段規則：一段在加入某一項之前已有至少 1024 項、而且那一項的名稱讓切段條件成立，就在它之後切。
+	isCut := func(name []byte) bool {
+		h := keyed(subs["cut"], name)
+		return (uint16(h[0])|uint16(h[1])<<8)&0x0fff == 0
+	}
+	// 目錄：名稱 n0..n19999 依 bytes 排序。
+	var names []string
+	for i := 0; i < 20000; i++ {
+		names = append(names, fmt.Sprintf("n%d", i))
+	}
+	sort.Strings(names)
+	count, first := 0, ""
+	for _, n := range names {
+		if count == 0 {
+			first = n
+		}
+		cut := count >= 1024 && isCut([]byte(n))
+		count++
+		if cut {
+			fmt.Println("DIR_SEG", first, count)
+			count = 0
+		}
+	}
+	if count > 0 {
+		fmt.Println("DIR_SEG", first, count)
+	}
+	// chunk 清單：ID = BLAKE3(i 的 u32 little-endian)，明文長度 1000+i，名稱是 ID 的 32 bytes。
+	count, sum := 0, uint64(0)
+	for i := 0; i < 20000; i++ {
+		id := blake3.Sum256([]byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)})
+		cut := count >= 1024 && isCut(id[:])
+		count++
+		sum += uint64(1000 + i)
+		if cut {
+			fmt.Println("CHUNK_SEG", count, sum)
+			count, sum = 0, 0
+		}
+	}
+	if count > 0 {
+		fmt.Println("CHUNK_SEG", count, sum)
+	}
 	// 切段：前兩個 byte little-endian 的低 12 位元為 0 的名稱，從 "n0" 起找前三個。
 	found := 0
 	for i := 0; found < 3; i++ {

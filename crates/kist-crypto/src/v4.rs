@@ -15,6 +15,7 @@
 use kist_format::v4::config::{Kdf, Slot};
 use kist_format::v4::ids::{ChunkId, ClientId, MetaId};
 use kist_format::v4::keys::{Gen, Key, SnapTs};
+use kist_format::v4::meta::is_cut_hash;
 use kist_format::v4::{AAD_DELTA, AAD_PACK_TRAILER, AAD_SHARD, AAD_SLOT};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -135,9 +136,7 @@ impl Keys {
     /// §7 的切段條件：keyed BLAKE3(`K_cut`, 名稱) 的前兩個 byte 以 little-endian 讀成整數，低 12 位元
     /// 全為 0。
     pub fn is_cut(&self, name: &[u8]) -> bool {
-        let h = blake3::keyed_hash(&self.cut, name);
-        let b = h.as_bytes();
-        u16::from_le_bytes([b[0], b[1]]) & 0x0fff == 0
+        is_cut_hash(blake3::keyed_hash(&self.cut, name).as_bytes())
     }
 
     /// 本地 index 快取的目錄名稱：`K_cache` 前 16 bytes 的 hex。換 repo 位置就不共用（同 v3）。
