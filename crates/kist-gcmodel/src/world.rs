@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backup::Backup;
 use crate::check::check;
-use crate::core::{load_highest, readable_snap, Config, Core, Stats};
+use crate::core::{list_heads, load_highest, read_head, readable_snap, Config, Core, Stats};
 use crate::maint::{FPhase, Forget, Rebuild, SettingsChange};
 use crate::prune::Prune;
 use crate::reader::Reader;
@@ -39,6 +39,15 @@ impl Actor {
             Actor::Reader(a) => a.step(core),
             Actor::Settings(a) => a.step(core),
             Actor::Rebuild(a) => a.step(core),
+        }
+    }
+
+    fn pending_head_r1(&self) -> Option<Gen> {
+        match self {
+            Actor::Prune(a) => a.pending_head_r1(),
+            Actor::Settings(a) => a.pending_head_r1(),
+            Actor::Rebuild(a) => a.pending_head_r1(),
+            Actor::Backup(_) | Actor::Forget(_) | Actor::Reader(_) => None,
         }
     }
 
@@ -122,6 +131,11 @@ pub enum Action {
     Crash {
         pick: u16,
     },
+    /// 當掉一個已寫 head 主體、還沒寫 `.r1` 的寫入者（`Crash` 本來就可能挑到它，這裡只是提高機率，
+    /// 讓 [`Action::LoseLoneHeadBody`] 有對象）。
+    CrashHeadWriter {
+        pick: u16,
+    },
     LoseShard {
         pick: u8,
     },
@@ -133,6 +147,12 @@ pub enum Action {
     FailReadback,
     /// head 的主體遺失（只在有 `.r1` 的 head 上，讀取端改讀 `.r1`）。
     LoseHeadBody {
+        pick: u16,
+    },
+    /// 寫入者寫了 head 主體、還沒寫 `.r1` 就當掉，之後主體遺失：只挑有主體、沒有 `.r1`、也沒有活著的
+    /// 寫入者正要寫它的 `.r1` 的 head。活著的寫入者兩次 PUT 之間只有幾毫秒，模型不讓主體在這段時間
+    /// 遺失；寫入者當掉之後就一直只有一份。主體遺失後，那一代在後端上就像從來沒有寫過。
+    LoseLoneHeadBody {
         pick: u16,
     },
     Mal(Mal),
@@ -498,6 +518,7 @@ impl World {
                         let sid = shards[usize::from(*pick) % shards.len()];
                         self.core.backend.delete(&Key::Shard(sid));
                         self.core.shard_fault = true;
+                        self.core.lost_shards.insert(sid);
                         self.core
                             .note(format!("fault: lost shard {sid:?} of head {}", l.g));
                     }
@@ -514,6 +535,66 @@ impl World {
                 self.core.max_skew_seen = self.core.max_skew_seen.max(skew.abs());
             }
             Action::FailReadback => self.core.fail_next_readback = true,
+            Action::CrashHeadWriter { pick } => {
+                let writers: Vec<ActorId> = self
+                    .actors
+                    .iter()
+                    .filter(|(_, a)| a.pending_head_r1().is_some())
+                    .map(|(id, _)| *id)
+                    .collect();
+                if !writers.is_empty() {
+                    let id = writers[usize::from(*pick) % writers.len()];
+                    let line = format!("crash: {:?}", self.describe(id));
+                    self.core.note(line);
+                    self.remove(id);
+                }
+            }
+            Action::LoseLoneHeadBody { pick } => {
+                let pending: BTreeSet<Gen> = self
+                    .actors
+                    .values()
+                    .filter_map(Actor::pending_head_r1)
+                    .collect();
+                let lone: Vec<Gen> = self
+                    .core
+                    .backend
+                    .keys()
+                    .filter_map(|k| match k {
+                        Key::Head(g)
+                            if !self.core.backend.exists(&Key::HeadR1(*g))
+                                && !pending.contains(g) =>
+                        {
+                            Some(*g)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !lone.is_empty() {
+                    let g = lone[usize::from(*pick) % lone.len()];
+                    self.core.backend.delete(&Key::Head(g));
+                    self.core.stats.lone_head_losses += 1;
+                    self.core.note(format!(
+                        "fault: lost the body of head {g}, which had no .r1 (its writer crashed)"
+                    ));
+                    // 最新的 head 可能又變回一個分片被故障拿掉、靠剛遺失的那一代重建過的 head：故障重新
+                    // 出現，等下一次重建。缺的分片不是故障拿掉的，就照樣讓 check 報出來。
+                    let newest = list_heads(&self.core).last().copied();
+                    if let Some((h, _)) = newest.and_then(|n| read_head(&self.core, n)) {
+                        let missing: Vec<ShardId> = h
+                            .shards
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .filter(|s| !self.core.backend.exists(&Key::Shard(*s)))
+                            .collect();
+                        if !missing.is_empty()
+                            && missing.iter().all(|s| self.core.lost_shards.contains(s))
+                        {
+                            self.core.shard_fault = true;
+                        }
+                    }
+                }
+            }
             Action::LoseHeadBody { pick } => {
                 let both: Vec<Gen> = self
                     .core

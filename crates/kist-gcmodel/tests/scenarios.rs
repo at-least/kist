@@ -776,3 +776,113 @@ fn stale_writer_after_a_lost_head_body(muts: Mutations) -> (World, Option<StepRe
     let _ = w.finish(reader);
     (w, r)
 }
+
+/// 一個 prune 寫了 head 2 的主體、還沒寫 `.r1` 就當掉；改 settings 讀了只有一份的 head 2，在上面寫
+/// head 3；之後 head 2 的主體遺失，世代之間出現空洞。head 3 的分片再遺失時，重建要讀 `g_r+1..g_lost`
+/// 每一代的 head，讀不到 head 2 就永遠拒絕，GC 與所有 backup 都停住（加入「寫入者當掉後主體遺失」的
+/// 故障後隨機測試找到的交錯，手工重寫）。維護角色在一代上面建下一代之前先補寫它的 `.r1`。
+fn a_successor_on_a_lone_head(muts: Mutations) -> (World, Option<StepResult>) {
+    let mut w = World::new(with(muts), 1);
+    backup(&mut w, 1, 1, 0);
+    assert_eq!(prune(&mut w, 0), StepResult::Done);
+    let p = w.start_prune(0, 0).unwrap();
+    assert!(w.run_until(p, "PutHeadR1"));
+    w.apply(&Action::CrashHeadWriter { pick: 0 });
+    assert!(w.core.backend.exists(&Key::Head(2)));
+    assert!(!w.core.backend.exists(&Key::HeadR1(2)));
+    let s = w.start_settings(1, 96 * HOUR).unwrap();
+    assert!(w.run_until(s, "settings h1 PutHead"));
+    // head 2 的主體遺失：補寫過 `.r1` 就是一般的主體遺失，沒有的話那是這一代唯一的一份。
+    if w.core.backend.exists(&Key::HeadR1(2)) {
+        w.apply(&Action::LoseHeadBody { pick: 2 });
+    } else {
+        w.apply(&Action::LoseLoneHeadBody { pick: 0 });
+    }
+    assert!(!w.core.backend.exists(&Key::Head(2)));
+    assert_eq!(w.finish(s), Some(StepResult::Done));
+    w.apply(&Action::LoseShard { pick: 0 });
+    let r = w.start_rebuild(2).and_then(|id| w.finish(id));
+    (w, r)
+}
+
+#[test]
+fn a_maintenance_writer_completes_a_lone_head_before_building_on_it() {
+    let (mut w, r) = a_successor_on_a_lone_head(Mutations::default());
+    assert_eq!(r, Some(StepResult::Done), "log:\n{}", w.core.log.join("\n"));
+    let v = w.settle();
+    assert!(v.is_empty(), "{v:#?}");
+}
+
+#[test]
+fn mutation_no_head_repair_leaves_a_gap_that_stops_rebuilds() {
+    let (w, r) = a_successor_on_a_lone_head(Mutations {
+        no_head_repair: true,
+        ..Mutations::default()
+    });
+    assert!(
+        matches!(&r, Some(StepResult::Abort(m)) if m.contains("head 2 is missing")),
+        "{r:?}\nlog:\n{}",
+        w.core.log.join("\n")
+    );
+}
+
+/// 一個 backup 照只有一份的 head 決定沿用，之後那份遺失、另一個 prune 以舊計畫重新寫出那一代。s1 退役
+/// 後它的 pack 是 condemned、age 已過；兩個 prune 以 head 3 為基礎，W2 先列出 snapshot，被入侵的主機
+/// 接著寫一個引用 s1 那棵樹的 snapshot，W1 看到它而把那些 pack 復活，寫了 head 4 的主體、還沒寫 `.r1`
+/// 就當掉。client 1 的 backup 以只有一份的 head 4 沿用自己寫的那些 pack、通過 B4；head 4 的主體遺失，
+/// W2 的柵欄看不到任何痕跡，以沒看過偽造 snapshot 的計畫寫出 head 4 並刪掉那些 pack；backup 接著
+/// commit（加入「寫入者當掉後主體遺失」的故障後，照模型推出來的交錯）。B1 只從兩份都在的 head 決定沿用。
+fn a_backup_on_a_lone_head(muts: Mutations) -> (World, bool, Option<StepResult>) {
+    let mut w = World::new(with(muts), 1);
+    let s1 = backup(&mut w, 1, 0, 0);
+    let root = match &w.core.backend.get(&Key::Snap(s1)).unwrap().content {
+        Content::Snap(b) => b.root,
+        _ => unreachable!(),
+    };
+    forget(&mut w, s1);
+    age_and_prune(&mut w, 3, 80);
+    w.advance(80 * HOUR);
+    let w2 = w.start_prune(1, 0).unwrap();
+    assert!(w.run_until(w2, "ListDeltas"));
+    w.apply(&Action::Mal(Mal::ForgedSnap {
+        item: u16::try_from(root.0).unwrap(),
+    }));
+    let w1 = w.start_prune(0, 0).unwrap();
+    assert!(w.run_until(w1, "PutHeadR1"));
+    w.apply(&Action::CrashHeadWriter { pick: 0 });
+    let b = w.start_backup(1, 0, 0, 0).unwrap();
+    let past_b4 = w.run_until(b, "PutSnapR1");
+    w.apply(&Action::LoseLoneHeadBody { pick: 0 });
+    assert!(!w.core.backend.exists(&Key::Head(4)));
+    assert_eq!(w.finish(w2), Some(StepResult::Done));
+    let rb = w.finish(b);
+    (w, past_b4, rb)
+}
+
+#[test]
+fn a_backup_plans_only_on_a_head_with_both_copies() {
+    let (mut w, past_b4, _) = a_backup_on_a_lone_head(Mutations::default());
+    assert!(!past_b4);
+    assert!(
+        w.core
+            .log
+            .iter()
+            .any(|l| l.contains("B1: head 4 has no .r1 yet")),
+        "log:\n{}",
+        w.core.log.join("\n")
+    );
+    assert_ok(&w);
+    let v = w.settle();
+    assert!(v.is_empty(), "{v:#?}");
+}
+
+#[test]
+fn mutation_a_backup_on_a_lone_head_loses_data() {
+    let (w, past_b4, rb) = a_backup_on_a_lone_head(Mutations {
+        backup_trusts_lone_head: true,
+        ..Mutations::default()
+    });
+    assert!(past_b4);
+    assert_eq!(rb, Some(StepResult::Done));
+    assert!(violates_r1(&w), "{:#?}", w.check());
+}

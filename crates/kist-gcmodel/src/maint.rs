@@ -41,7 +41,9 @@ impl Forget {
 pub enum SPhase {
     Probe,
     Load,
+    RepairHead,
     PutHead,
+    PutHeadR1,
 }
 
 /// 改 grace：一個不刪任何東西、走柵欄的世代。
@@ -51,16 +53,27 @@ pub struct SettingsChange {
     pub phase: SPhase,
     target: Time,
     loaded_at: Time,
+    base_head: Option<HeadBody>,
     new_head: Option<HeadBody>,
 }
 
 impl SettingsChange {
+    /// 已寫 head 主體、還沒寫 `.r1` 的世代。
+    pub fn pending_head_r1(&self) -> Option<Gen> {
+        match self.phase {
+            SPhase::RepairHead => self.base_head.as_ref().map(|h| h.g),
+            SPhase::PutHeadR1 => self.new_head.as_ref().map(|h| h.g),
+            _ => None,
+        }
+    }
+
     pub fn new(host: u8, target: Time) -> Self {
         SettingsChange {
             host,
             phase: SPhase::Probe,
             target: target.max(MIN_GRACE),
             loaded_at: 0,
+            base_head: None,
             new_head: None,
         }
     }
@@ -109,7 +122,16 @@ impl SettingsChange {
                 }
                 nh.settings.grace = self.target;
                 nh.g = loaded.g + 1;
+                self.base_head = Some(loaded.head);
                 self.new_head = Some(nh);
+                self.phase = SPhase::RepairHead;
+                StepResult::Continue
+            }
+            SPhase::RepairHead => {
+                let Some(h) = &self.base_head else {
+                    return refuse(core, "settings: no head to repair".into());
+                };
+                core.repair_head_r1(&h.clone(), self.loaded_at);
                 self.phase = SPhase::PutHead;
                 StepResult::Continue
             }
@@ -123,9 +145,18 @@ impl SettingsChange {
                     core.stats.fence_losses += 1;
                     return StepResult::Abort(format!("settings: head {g} already exists"));
                 }
-                let _ = core.put_since(Key::HeadR1(g), Content::Head(nh.clone()), self.loaded_at);
                 core.stats.generations += 1;
                 core.note(format!("settings: grace {} at head {g}", nh.settings.grace));
+                self.new_head = Some(nh);
+                self.phase = SPhase::PutHeadR1;
+                StepResult::Continue
+            }
+            SPhase::PutHeadR1 => {
+                let Some(nh) = &self.new_head else {
+                    return refuse(core, "settings: no head to replicate".into());
+                };
+                let _ =
+                    core.put_since(Key::HeadR1(nh.g), Content::Head(nh.clone()), self.loaded_at);
                 StepResult::Done
             }
         }
@@ -136,9 +167,11 @@ impl SettingsChange {
 pub enum RPhase {
     Probe,
     Load,
+    RepairHead,
     Build,
     PutShards,
     PutHead,
+    PutHeadR1,
 }
 
 /// 重建（§11.4）：最新 head 的分片遺失時，以柵欄寫 `g_lost + 1`。
@@ -153,6 +186,8 @@ pub struct Rebuild {
     case_keep: bool,
     age: Time,
     base: Map,
+    /// 讀到的 `g_lost` 的 head，補寫它的 `.r1` 用。
+    base_head: Option<HeadBody>,
     head: Option<HeadBody>,
     newmap: Map,
     new_head: Option<HeadBody>,
@@ -170,6 +205,7 @@ impl Rebuild {
             case_keep: false,
             age: DEFAULT_GRACE,
             base: Map::new(),
+            base_head: None,
             head: None,
             newmap: Map::new(),
             new_head: None,
@@ -187,9 +223,25 @@ impl Rebuild {
                 Err(e) => refuse(core, e),
             },
             RPhase::Load => self.load(core),
+            RPhase::RepairHead => {
+                let Some(h) = &self.base_head else {
+                    return refuse(core, "rebuild: no head to repair".into());
+                };
+                core.repair_head_r1(&h.clone(), self.loaded_at);
+                self.phase = RPhase::Build;
+                StepResult::Continue
+            }
             RPhase::Build => self.build(core),
             RPhase::PutShards => self.put_shards(core),
             RPhase::PutHead => self.put_head(core),
+            RPhase::PutHeadR1 => {
+                let Some(nh) = &self.new_head else {
+                    return refuse(core, "rebuild: no head to replicate".into());
+                };
+                let _ =
+                    core.put_since(Key::HeadR1(nh.g), Content::Head(nh.clone()), self.loaded_at);
+                StepResult::Done
+            }
         }
     }
 
@@ -254,6 +306,7 @@ impl Rebuild {
         self.g_lost = g_lost;
         self.g_r = g_r;
         self.base = loaded_r.map;
+        self.base_head = Some(lost_head.clone());
         let mut nh = lost_head;
         // 案例 B 的 age：drain 還沒結束（兩個時鐘）就用舊的 grace。
         self.age = nh.settings.grace;
@@ -289,7 +342,7 @@ impl Rebuild {
         }
         nh.g = g_lost + 1;
         self.head = Some(nh);
-        self.phase = RPhase::Build;
+        self.phase = RPhase::RepairHead;
         StepResult::Continue
     }
 
@@ -381,7 +434,6 @@ impl Rebuild {
             core.stats.fence_losses += 1;
             return StepResult::Abort(format!("rebuild: head {g} already exists"));
         }
-        let _ = core.put_since(Key::HeadR1(g), Content::Head(nh.clone()), self.loaded_at);
         core.stats.generations += 1;
         core.stats.rebuilds += 1;
         let kept: BTreeSet<PackId> = self.newmap.keys().copied().collect();
@@ -392,6 +444,17 @@ impl Rebuild {
             self.case_keep,
             kept.len()
         ));
-        StepResult::Done
+        self.new_head = Some(nh);
+        self.phase = RPhase::PutHeadR1;
+        StepResult::Continue
+    }
+
+    /// 已寫 head 主體、還沒寫 `.r1` 的世代。
+    pub fn pending_head_r1(&self) -> Option<Gen> {
+        match self.phase {
+            RPhase::RepairHead => self.base_head.as_ref().map(|h| h.g),
+            RPhase::PutHeadR1 => self.new_head.as_ref().map(|h| h.g),
+            _ => None,
+        }
     }
 }

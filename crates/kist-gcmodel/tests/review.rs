@@ -1,5 +1,7 @@
 //! 外部審查（2026-10-10，獨立的 agent，在 8dc76bd 上寫的）原樣搬進來當回歸測試；只改了 m1（見該測試
-//! 的註解）。
+//! 的註解），以及 `drain_with`：改 settings 後來多了補寫 `.r1` 一步、寫 head 也拆成主體與 `.r1` 兩步，
+//! 所以改成跑到寫 head 之前（同樣在誠實的時鐘下），兩步寫入都在同一個時鐘偏差下跑，和原本一步寫完
+//! 相同。
 //!
 //! Adversarial review of the GC model. `f*_break` / `f4_*` / `f5_*` assert what the spec promises
 //! and FAIL on the unmodified protocol (`Mutations::default()`, `quiet()`: eps 0, under 0, so
@@ -94,10 +96,10 @@ fn drain_with(cfg: Config, skew: Time) -> World {
     let b = w.start_backup(2, 0, 0, 0).unwrap();
     assert!(w.run_until(b, "PutSnapR1")); // B4 passed under grace 72 h
     let s = w.start_settings(1, 2 * HOUR).unwrap();
-    assert_eq!(w.step(s), Some(StepResult::Continue)); // P0, honest backend clock
-    assert_eq!(w.step(s), Some(StepResult::Continue)); // P1, plan
+    assert!(w.run_until(s, "settings h1 PutHead")); // P0 and the plan, honest backend clock
     w.core.backend.skew = skew;
-    assert_eq!(w.step(s), Some(StepResult::Done)); // head with drain { old_grace: 72 h }
+    assert_eq!(w.step(s), Some(StepResult::Continue)); // head with drain { old_grace: 72 h }
+    assert_eq!(w.step(s), Some(StepResult::Done)); // its .r1
     w.core.backend.skew = 0;
     w.advance(68 * HOUR); // 148 h; an honest drain lasts until 152 h
     assert_eq!(prune(&mut w, 0), StepResult::Done);

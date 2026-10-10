@@ -13,6 +13,7 @@ use crate::world::StepResult;
 pub enum PPhase {
     Probe,
     Load,
+    RepairHead,
     ListSnaps,
     ListDeltas,
     ListPacks,
@@ -234,6 +235,15 @@ impl Prune {
         format!("{:?}", self.phase)
     }
 
+    /// 已寫 head 主體、還沒寫 `.r1` 的世代。
+    pub fn pending_head_r1(&self) -> Option<Gen> {
+        match self.phase {
+            PPhase::RepairHead => Some(self.g),
+            PPhase::PutHeadR1 => self.new_head.as_ref().map(|h| h.g),
+            _ => None,
+        }
+    }
+
     fn gen_times(&mut self, core: &Core, g: Gen) -> Option<(Time, Time)> {
         if let Some(v) = self.times.get(&g) {
             return Some(*v);
@@ -300,6 +310,14 @@ impl Prune {
                 Err(e) => refuse(core, e),
             },
             PPhase::Load => self.load(core),
+            PPhase::RepairHead => {
+                let Some(h) = &self.head else {
+                    return refuse(core, "P1: no head to repair".into());
+                };
+                core.repair_head_r1(&h.clone(), self.loaded_at);
+                self.phase = PPhase::ListSnaps;
+                StepResult::Continue
+            }
             PPhase::ListSnaps => {
                 let mut keys = BTreeSet::new();
                 for k in core.backend.keys() {
@@ -415,7 +433,7 @@ impl Prune {
         self.base = loaded.map.clone();
         self.map = loaded.map;
         self.head = Some(loaded.head);
-        self.phase = PPhase::ListSnaps;
+        self.phase = PPhase::RepairHead;
         StepResult::Continue
     }
 

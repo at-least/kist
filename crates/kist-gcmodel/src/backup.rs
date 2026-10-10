@@ -125,6 +125,9 @@ impl Backup {
             Ok(l) => l,
             Err(e) => return StepResult::Abort(format!("B1: cannot read the newest head: {e:?}")),
         };
+        if core.lone_head(loaded.g) {
+            return StepResult::Abort(format!("B1: head {} has no .r1 yet", loaded.g));
+        }
         self.g_s = loaded.g;
         self.grace_s = loaded.head.settings.grace;
         self.replicas = loaded.head.settings.replicas;

@@ -46,6 +46,10 @@ pub struct Mutations {
     pub refuse_future_head: bool,
     /// 柵欄只看主體，不看 `.r1`（深度隨機測試之前的規則）。
     pub fence_ignores_r1: bool,
+    /// 維護角色不補寫最新 head 缺少的 `.r1`（加上這條規則之前）。
+    pub no_head_repair: bool,
+    /// backup 在 B1 接受還沒有 `.r1` 的最新 head（加上這條規則之前）。
+    pub backup_trusts_lone_head: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +104,10 @@ pub struct Stats {
     pub packs_deleted: u64,
     pub false_claims_removed: u64,
     pub rebuilds: u64,
+    /// 沒有 `.r1`、寫入者已當掉的 head 主體遺失的次數。
+    pub lone_head_losses: u64,
+    /// 維護角色補寫 head `.r1` 的次數。
+    pub head_repairs: u64,
     pub reads_ok: u64,
 }
 
@@ -120,6 +128,8 @@ pub struct Core {
     pub skew: BTreeMap<u8, Time>,
     /// 最新 head 的分片被故障拿掉、還沒重建。
     pub shard_fault: bool,
+    /// 被故障拿掉的分片。
+    pub lost_shards: BTreeSet<ShardId>,
     pub fail_next_readback: bool,
     pub reader_failures: Vec<String>,
     /// P3 的「資料遺失」拒絕。模型沒有遺失 pack 的故障，所以出現就是誤報。
@@ -146,6 +156,7 @@ impl Core {
             verified: BTreeMap::new(),
             skew: BTreeMap::new(),
             shard_fault: false,
+            lost_shards: BTreeSet::new(),
             fail_next_readback: false,
             reader_failures: Vec::new(),
             alarms: Vec::new(),
@@ -226,6 +237,27 @@ impl Core {
         }
         self.put_since(Key::Head(g), Content::Head(head.clone()), since)
             .is_ok()
+    }
+
+    /// 寫入者在主體與 `.r1` 之間當掉時，那一代只有一份。維護角色在它上面建下一代之前，以只在不存在
+    /// 時建立的方式補寫 `.r1`（內容是讀到的主體）；之後主體遺失才不會在世代之間留下空洞。
+    pub fn repair_head_r1(&mut self, head: &HeadBody, since: Time) {
+        if self.cfg.mutations.no_head_repair || self.backend.exists(&Key::HeadR1(head.g)) {
+            return;
+        }
+        if self
+            .put_since(Key::HeadR1(head.g), Content::Head(head.clone()), since)
+            .is_ok()
+        {
+            self.stats.head_repairs += 1;
+            self.note(format!("repaired the .r1 of head {}", head.g));
+        }
+    }
+
+    /// B1 只從兩份都在的 head 決定沿用：只有一份的 head 遺失之後，那一代可以被別的計畫重新寫出，照它
+    /// 沿用的持有者可能已被刪掉。實作稍候重新列出一次，模型直接停止（較保守的那一邊）。
+    pub fn lone_head(&self, g: Gen) -> bool {
+        !self.cfg.mutations.backup_trusts_lone_head && !self.backend.exists(&Key::HeadR1(g))
     }
 
     /// 小物件、請求立刻完成：修改時間就是後端時鐘（P0 的探針）。

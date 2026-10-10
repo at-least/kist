@@ -68,6 +68,8 @@ fn add(t: &mut Stats, s: &Stats) {
     t.packs_deleted += s.packs_deleted;
     t.false_claims_removed += s.false_claims_removed;
     t.rebuilds += s.rebuilds;
+    t.lone_head_losses += s.lone_head_losses;
+    t.head_repairs += s.head_repairs;
     t.reads_ok += s.reads_ok;
 }
 
@@ -83,6 +85,8 @@ fn assert_covered(stats: &Stats) {
     assert!(stats.false_claims_removed > 0, "no false claim caught");
     assert!(stats.fence_losses > 0, "no prune lost the fence");
     assert!(stats.rebuilds > 0, "no rebuild");
+    assert!(stats.lone_head_losses > 0, "no lone head body lost");
+    assert!(stats.head_repairs > 0, "no head .r1 repaired");
     assert!(stats.reads_ok > 0, "no restore finished");
 }
 
@@ -185,6 +189,8 @@ fn mutation_named(name: &str) -> Mutations {
         "no_superseded_check" => m.no_superseded_check = true,
         "refuse_future_head" => m.refuse_future_head = true,
         "fence_ignores_r1" => m.fence_ignores_r1 = true,
+        "no_head_repair" => m.no_head_repair = true,
+        "backup_trusts_lone_head" => m.backup_trusts_lone_head = true,
         other => panic!("unknown mutation {other}"),
     }
     m
@@ -210,6 +216,8 @@ pub const MUTATIONS: &[&str] = &[
     "no_superseded_check",
     "refuse_future_head",
     "fence_ignores_r1",
+    "no_head_repair",
+    "backup_trusts_lone_head",
 ];
 
 /// 探索用（不在 gate 裡）：每個突變各跑一次固定種子的隨機搜尋，印出有沒有找到反例。
@@ -285,11 +293,13 @@ fn lit(a: &Action) -> String {
         Action::Step { pick } => format!("Action::Step {{ pick: {pick} }}"),
         Action::Finish { pick } => format!("Action::Finish {{ pick: {pick} }}"),
         Action::Crash { pick } => format!("Action::Crash {{ pick: {pick} }}"),
+        Action::CrashHeadWriter { pick } => format!("Action::CrashHeadWriter {{ pick: {pick} }}"),
         Action::LoseShard { pick } => format!("Action::LoseShard {{ pick: {pick} }}"),
         Action::SetSkew { host, skew } => format!("Action::SetSkew {{ host: {host}, skew: {skew} }}"),
         Action::BackendSkew(s) => format!("Action::BackendSkew({s})"),
         Action::FailReadback => "Action::FailReadback".into(),
         Action::LoseHeadBody { pick } => format!("Action::LoseHeadBody {{ pick: {pick} }}"),
+        Action::LoseLoneHeadBody { pick } => format!("Action::LoseLoneHeadBody {{ pick: {pick} }}"),
         Action::Mal(m) => format!(
             "Action::Mal({})",
             match m {
@@ -321,45 +331,54 @@ fn lit(a: &Action) -> String {
 #[test]
 #[ignore]
 fn extract_minimal_traces() {
-    let short = Config {
-        grace: 6 * HOUR,
-        replicas: 0,
-        ..Config::default()
-    };
-    for (name, clock, base, base_name) in [
-        (
-            "no_elapsed_check",
-            Clock::Hosts,
-            Config::default(),
-            "default",
-        ),
-        ("no_fence", Clock::Hosts, Config::default(), "default"),
-        ("trust_all", Clock::Hosts, Config::default(), "default"),
-        ("reuse_condemned", Clock::Hosts, short, "short"),
+    for name in [
+        "no_verify_before_drop",
+        "no_fence",
+        "reuse_condemned",
+        "trust_all",
+        "no_head_repair",
     ] {
         let cfg = Config {
             mutations: mutation_named(name),
-            ..base
+            ..Config::default()
         };
         let mut runner = runner_with(2000, 7, 50_000);
-        let result = runner.run(&input(clock), |(s, actions)| {
-            let out = World::run(cfg.clone(), s, &actions);
+        let result = runner.run(&input(Clock::Hosts), |(s, actions)| {
+            let out = World::run_and_settle(cfg.clone(), s, &actions);
             prop_assert!(out.violations.is_empty());
             Ok(())
         });
-        if let Err(proptest::test_runner::TestError::Fail(_, (s, actions))) = result {
-            println!(
-                "// {name}: seed {s}, {} actions, config {base_name}",
-                actions.len()
-            );
-            println!("const SEED: u64 = {s};");
-            println!("fn actions() -> Vec<Action> {{ vec![");
-            for a in &actions {
-                println!("    {},", lit(a));
-            }
-            println!("] }}");
-        } else {
+        let Err(proptest::test_runner::TestError::Fail(_, (s, actions))) = result else {
             println!("// {name}: no counterexample");
+            continue;
+        };
+        println!(
+            "/// {name}: seed {s}, {} actions, config default",
+            actions.len()
+        );
+        println!("mod {name} {{");
+        println!("    use super::*;");
+        println!("    const SEED: u64 = {s};");
+        println!("    fn actions() -> Vec<Action> {{ vec![");
+        for a in &actions {
+            println!("        {},", lit(a));
         }
+        println!("    ] }}");
+        println!("    #[test]");
+        println!("    fn the_mutation_violates_an_invariant() {{");
+        println!("        let cfg = Config {{");
+        println!("            mutations: Mutations {{ {name}: true, ..Mutations::default() }},");
+        println!("            ..Config::default()");
+        println!("        }};");
+        println!("        let out = World::run_and_settle(cfg, SEED, &actions());");
+        println!("        assert!(!out.violations.is_empty(), \"{{}}\", out.report());");
+        println!("    }}");
+        println!("    #[test]");
+        println!("    fn the_protocol_does_not() {{");
+        println!("        let out = World::run_and_settle(Config::default(), SEED, &actions());");
+        println!("        assert!(out.violations.is_empty(), \"{{}}\", out.report());");
+        println!("    }}");
+        println!("}}");
+        println!();
     }
 }

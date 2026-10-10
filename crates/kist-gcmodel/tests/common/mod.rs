@@ -123,6 +123,8 @@ pub fn action(clock: Clock) -> BoxedStrategy<Action> {
         3 => any::<u16>().prop_map(|pick| Action::Crash { pick }),
         1 => any::<u8>().prop_map(|pick| Action::LoseShard { pick }),
         1 => any::<u16>().prop_map(|pick| Action::LoseHeadBody { pick }),
+        4 => any::<u16>().prop_map(|pick| Action::CrashHeadWriter { pick }),
+        6 => any::<u16>().prop_map(|pick| Action::LoseLoneHeadBody { pick }),
         6 => skew,
         3 => Just(Action::FailReadback),
         6 => mal().prop_map(Action::Mal),

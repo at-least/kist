@@ -304,7 +304,11 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 ### 11.2 backup
 
 - **B1** 記下開始時間（牆鐘與單調時鐘）。讀列出來的最大世代 `g_s`（必須讀得了、版本認得，否則停止），
-  載入它的分片；列 `deltas/` 並讀新的；找 parent（自己最新、roots 相同的 snapshot）。
+  載入它的分片；列 `deltas/` 並讀新的；找 parent（自己最新、roots 相同的 snapshot）。列表裡沒有 `g_s` 的
+  `.r1`（寫它的人還在兩次 PUT 之間，或已經當掉）→ 稍候重新列出一次，仍然沒有就停止：只有一份的 head
+  遺失之後，那一代可以被別的計畫重新寫出，照它決定的沿用可能指向已被刪掉的 pack（GC 模型找到：寫入者
+  當掉、主體遺失、被入侵的主機的偽造 snapshot 與另一個 prune 同時發生時資料遺失）。下一次維護會補齊它
+  （P1）。
 - **B2** 一個 chunk 或 metadata item 只在兩個條件都成立時沿用，否則重新寫：
   - 有種類相符的持有者：`Map(g_s)` 裡 live 的記錄、當下列表中某個 delta 提到而 `Map(g_s)` 沒提到的
     pack、或這次自己寫的 pack；
@@ -330,7 +334,11 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - **P1** 讀列出來的最大世代 g；版本不認得、讀不了、或沒有修改時間 → 拒絕。`T(g)` 比本機時鐘晚超過 `M`
   → 回報，這一輪以「本機時鐘 + M」代替 `T(g)` 當作現在（只會更保守；`T(g)` 當成某個世代的起點時仍用
   原值）。原本在這裡拒絕：一個時間戳錯誤的 head 會讓 GC 停到真實時間追上它，連改 settings 都過不了
-  （GC 模型的收尾活性檢查找到）。較舊的 head 之間的時間異常只警告。
+  （GC 模型的收尾活性檢查找到）。較舊的 head 之間的時間異常只警告。列表裡有 g 的主體、沒有 `<g>.r1`
+  → 以只在不存在時建立的方式補寫 `.r1`（讀到的主體的 bytes），再往下做：寫入者在兩次 PUT 之間當掉時，
+  那一代只有一份；在它上面建 g+1 之前先補齊，之後它的主體遺失才不會在世代之間留下空洞（重建要讀範圍內
+  每一代的 head，讀不到就永遠拒絕，GC 與所有 backup 都停住；GC 模型找到）。改 settings 與重建讀最新
+  head 時同樣補寫。
 - **P2** 依序列出：`snapshots/`、`deltas/`、`packs/` 與 `mpacks/`（含 `.r1`）、`parity/`、`maint/map/`。
   先列的物件寫在它所依賴的物件之後，所以那些物件一定出現在後列的清單裡。
 - **P3** live 或 condemned 的記錄，主體與 `.r1` 都不在 → 先重新列出 `maint/gen/`：已經有比 g 新的 head，
@@ -436,7 +444,7 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 | 可見延遲＋經過時間低估＋snapshot PUT 延遲 < 1 小時 | 猜測 |
 | 備份角色寫不了 `maint/`、`keys/`、`config` | S3 以 bucket policy 強制；本機與 SFTP 與 v3 同樣信任 |
 | 單一 PUT 的大小上限夠放一個 pack | 未查證（UNVERIFIED） |
-| head 的主體遺失時 `.r1` 在（不會一起遺失；也不會在主體寫成、`.r1` 還沒寫時當掉，之後主體才遺失） | 猜測；不成立時，較早讀過 head 的寫入者可以重新建立那一代（P8） |
+| head 的主體與 `.r1` 不會一起遺失 | 猜測；兩份都遺失時，較早讀過 head 的寫入者可以重新建立那一代（P8）。寫入者在兩次 PUT 之間當掉、之後主體才遺失的情況由 P1 的補寫與 B1 處理，GC 模型有這個故障 |
 | 時鐘出錯時，後端時鐘與寫入者的牆鐘不會同時往同一個方向錯 | 猜測；兩個時鐘的規則（§11.1）只保證單一時鐘出錯時延後刪除 |
 
 ### 11.7 對照 v3 的教訓
@@ -460,7 +468,9 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 ## 13. 冗餘
 
-- head 一律寫 `.r1`（不論 replicas，head 只有幾 KiB）：柵欄靠它擋住主體遺失後被重新建立（P8）。
+- head 一律寫 `.r1`（不論 replicas，head 只有幾 KiB）：柵欄靠它擋住主體遺失後被重新建立（P8）。主體
+  在、`.r1` 不在的 head：寫入者還在兩次 PUT 之間，或已經當掉；維護角色讀到時補寫（P1），backup 不拿它
+  決定沿用（B1）。
 - `replicas=1`（本機預設）：mpack、snapshot、map 分片也寫 `.r1`。mpack 與 head 先寫主體再寫 `.r1`
   （head 的主體是柵欄）；snapshot 先寫 `.r1` 再寫主體（主體是 commit）。資料 pack 不寫副本。
 - parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。
