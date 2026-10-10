@@ -562,3 +562,51 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
   三種設定各 512 個輸入：B4 中止 678／735／1604 次、B5 中止 116／123／122 次），但要出事還得在那段時間
   裡剛好有 prune 標記並刪掉它用到的 pack，這種交錯太稀有。第二輪審查的區塊策略找得到這一類（`s1`），
   它在 gate 裡。
+
+## 實作第二段：kist-format（2026-10-10 至 10-11）
+
+負責人：「按你建議」——不做第三輪外部審查，開始第 2 段。
+
+**內容**：`kist_format::v4`（ids、keys、config、pack、meta、snapshot、index）與 `kist_crypto::v4`（KEK、
+槽、八把子金鑰、§5 七種密封），六個 commit（`6a152cd` 到 `fc0ad50`）、一個修正（`1ad49f0`）與這份文件的 commit。v3 的模組
+一行都沒動，兩個 crate 的 lib.rs 只多了 `pub mod v4`。
+
+**與「實作階段」第 2 項的偏離**：那一項寫「`format-v4.md` 取代 `format.md`」。實際上 kist-core、kist-mount、
+kist-cli 在第 3–6 段遷移之前都還是 v3 的程式碼，刪掉 `format.md` 會讓它們沒有規格。所以 `format-v4.md`
+成為 v4 的權威副本，`format.md` 的開頭改成「只描述還沒遷移的 v3 程式碼」，v3 的模組移除時一併刪除。
+
+**向量的做法**：兩種，看預期值能不能由另一份程式獨立算出。
+- 獨立算出：金鑰推導、槽、config 與槽的 CBOR、子金鑰、七種密封、切段條件、目錄與 chunk 清單的切段結果
+  與 ChunkIndex 的 `size`，由 `scripts/v4-vectors` 的 Go 程式（lukechampine.com/blake3、x/crypto 的
+  argon2 與 chacha20poly1305、手寫的最短 CBOR 編碼）算出，Rust 逐 byte 相同。
+- 由程式錄下再核對：trailer、pack 排版、Entry、snapshot、RootSeg、head、分片、記錄、delta。每種都有一份
+  手寫預期 hex 的單元測試（欄位順序與省略照 §4 的表一欄一欄寫），golden 檔再以另寫的 CBOR 解碼器逐欄看過。
+- 每條規則至少一個失敗案例；關鍵的幾處做了反向檢查（改一個派生字串、欄位順序、排序鍵、檢查條件，測試失敗，
+  改回通過）。
+
+**寫進規格的釐清**（實作時發現原文沒寫死或寫錯，照下面寫進 format-v4.md）：
+1. 槽與探針的名稱是 16 bytes＝32 位 hex（原文 `keys/<hex16>`）。
+2. parity 與它的 pack 同名；§2 原本把 parity 列進「名稱＝BLAKE3(bytes)」，與 §1、P9、§13 矛盾。
+3. 切段條件的低 12 位元＝keyed hash 前兩個 byte 以 little-endian 讀成的整數；「至少 1024 項」是加入那一項
+   之前的數目；大小照實算。
+4. trailer 的 `r` 不含 alg byte；`l` 在 41 到上限＋41。壓縮的 1/16 用乘法比較（整數除法讓短原文留下沒省到
+   的壓縮版，測試發現的）。
+5. Dir 的每一項都小於下一段的 `first`（查找靠它）；ChunkList 非空；ChunkIndex 每段 `size` > 0；xattrs 合計
+   含名稱與值；上限在解碼與建構兩處執行。
+6. snapshot：`parent` 沒有就省略；內容的 client 與時間要等於 key。
+7. head：`parent` 是 head g−1 密封後的 bytes 的 hash；明文的 `g` 要等於 key；settings 的範圍（v3 的
+   `chunker.max ≤ pack_target` 不保留，理由寫在 §10）；drain、hold、bad 的定義性約束。
+8. 記錄：分片內依名稱嚴格遞增；`status` 的欄位依 `s` 在場；`by_prune` 只在全零 client 的前綴下；排序裡
+   tombstone 最後、unreadable 與 unknown 不是持有者。
+9. delta：`DeltaPack` 沒有 client，key 由前綴決定；原文「略過不符的項目」不存在這種項目，改成明文 client
+   與前綴不同的 delta 視同解不開。
+10. 格式層刻意不檢查、使用時本來就會出錯的值，列在 §10。
+
+**修正**：第二步把快取目錄名稱實作成 hex(`K_cache`[..16])，漏了 §3 的「換 repo 位置就不共用（同 v3）」，
+commit 訊息還把它當成規格沒寫死。改成 keyed BLAKE3(`K_cache`, 位置) 的前 16 bytes，Go 向量一起改（`1ad49f0`）。
+
+**延到後面的**：zstd 本身與解壓上限（讀寫路徑，第 4、5 段）；目錄巢狀 256 層（backup 與 restore）；快取
+的使用（第 4 段）；parity 的 v4 排版（第一個寫 parity 的段，預定沿用 v3 的排版、`v` 改成 4）；改 settings
+的命令要做哪些跨 config 的檢查（第 6 段）。
+
+**gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 569 增加到 635 個通過，9 個略過。
