@@ -119,6 +119,8 @@ master ─DeriveKey─▶ K_chunk_id "kist/v4/chunk-id"   K_meta_id "kist/v4/met
 | `Dir` | v, k, level, segs |
 | `DirSeg` | first, id |
 | `ChunkList` | v, k, chunks |
+| `ChunkIndex` | v, k, level, parts |
+| `ChunkPart` | size, id |
 | `RootSeg` | v, k, roots |
 | `Entry` | n, t, mk, size, target, ct, chunks, tree, mode, uid, gid, mtime, ctime, dev, ino, nlink, xattrs, etag, vern |
 | `Root` | path, t, tree, entry |
@@ -177,25 +179,31 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 - **Seg**（`k=0`）`{v, k, entries:[Entry]}`：一個目錄的一段，entries 依名稱 bytes 升冪、不重複。
 - **Dir**（`k=1`）`{v, k, level, segs:[{first, id}]}`：目錄有多段時的索引。`level=1` 時 `id` 指向 Seg，
   `level=2` 或 `3` 時指向下一層 Dir。
-- **ChunkList**（`k=2`）`{v, k, chunks:[chunk ID]}`：檔案的 chunk 超過 256 個時的清單。
+- **ChunkList**（`k=2`）`{v, k, chunks:[chunk ID]}`：檔案的 chunk 超過 256 個時的清單，或清單的一段。
+- **ChunkIndex**（`k=4`）`{v, k, level, parts:[{size, id}]}`：chunk 清單有多段時的索引。`size` 是那一段
+  涵蓋的明文 bytes（chunk 明文長度的合計），讓 mount 隨機讀取時可以跳過不需要的段。`level=1` 時 `id`
+  指向 ChunkList，`level=2` 或 `3` 時指向下一層 ChunkIndex。
 - **RootSeg**（`k=3`）`{v, k, roots:[Root]}`：snapshot 的 roots 的一段，依 `path` bytes 升冪、不重複；
   多段時同樣以 Dir 索引。
 
-**切段規則**（目錄與 root 清單都用）：依名稱順序加入；目前這一段已有至少 1024 項之後，遇到某一項的
-keyed BLAKE3(`K_cut`, 名稱) 低 12 位元全為 0，就在這一項之後切；加入下一項會讓這一段的規範 CBOR 超過
-2 MiB 時，也在它之前切。每個 entry 的 xattrs 合計上限 256 KiB。一項超過任一上限時寫不進去：backup
-把它記成這個項目的錯誤、不寫入，結束碼 3。Dir 本身同樣不超過 2 MiB，最多三層。
+**切段規則**（目錄、root 清單、chunk 清單都用）：依順序加入；目前這一段已有至少 1024 項之後，遇到某一
+項的 keyed BLAKE3(`K_cut`, 名稱) 低 12 位元全為 0，就在這一項之後切；加入下一項會讓這一段的規範 CBOR
+超過 2 MiB 時，也在它之前切。chunk 清單沒有名稱，以 chunk ID 的 32 bytes 代替，順序就是檔案內容的順序；
+內容中間改了一段，只有附近的段會變。每個 entry 的 xattrs 合計上限 256 KiB。一項超過任一上限時寫不
+進去：backup 把它記成這個項目的錯誤、不寫入，結束碼 3。Dir 與 ChunkIndex 本身同樣不超過 2 MiB，最多
+三層；一層 ChunkIndex 平均涵蓋約 400 TiB（以平均 2 MiB 的 chunk 計），檔案大小沒有實際上限。
 
 **讀取端驗證**（任何一條不成立都是腐壞，大聲失敗）：Dir 的 `first` 嚴格遞增；每一段非空，而且第一項
 的名稱等於它在 Dir 裡的 `first`；段內依名稱升冪、不重複；`level` 與指向的種類相符；`ct=0` 的 chunks
-不超過 256 個；上面的大小上限。
+不超過 256 個；ChunkIndex 的每一段非空，每一段 chunk 明文長度的合計等於它的 `size`，全部 `size` 的
+合計等於 Entry 的 `size`；上面的大小上限。
 
 ## 8. Entry（metadata 聯集）
 
 與 v3 相同（欄位、per-kind 規則、快速路徑合約、硬連結範圍、深度上限），只差 `tree` 的意義：
 
 - `tree`：子目錄內容的 meta ID，指向一個 Seg（只有一段）或 Dir（多段）。
-- `ct=1`：`chunks` 恰好一個元素，是 ChunkList 的 meta ID。
+- `ct=1`：`chunks` 恰好一個元素，是 ChunkList（只有一段）或 ChunkIndex（多段）的 meta ID。
 
 | mk | 必填 | 選填 | 必須缺席 |
 | --- | --- | --- | --- |
@@ -312,10 +320,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   → 拒絕（prune 不刪看不懂的東西）。
 - **P5** 走訪每一個 snapshot，收集被引用的 ID。只有 `.r1`、沒有主體的 snapshot 一樣當成起點並回報
   （可能是 commit 前中斷，也可能是主體遺失）。主體解不開 → 試 `.r1`；兩份都解不開：在 head 的 `bad`
-  清單裡已滿一個 grace（`T(first) + grace ≤ T(g)`）→ 不再當成起點、回報；否則 → 這一輪不改任何記錄、
-  不刪任何東西，只以柵欄寫 head g+1（分片不變，把它與這一代 g+1 記進 `bad`，已在清單裡的保留原本的
-  世代），回報後停止。解得開但版本不認得 → 拒絕。列表之後兩份都消失 → 視為已 forget，略過。某個 ID
-  沒有任何可讀、非 tombstone、種類相符的持有者 → 拒絕。
+  清單裡已滿一個 grace（`T(first) + grace ≤ T(g)`）→ 不再當成起點、回報；否則這一輪不改任何記錄、不刪
+  任何東西，回報後停止——它還不在 `bad` 裡時，先以柵欄寫 head g+1 把它記進去（`first = g+1`，分片
+  不變）。維護角色可以直接 `forget <key>` 立刻解除，不需要解密。解得開但版本不認得 → 拒絕。列表之後
+  兩份都消失 → 視為已 forget，略過。某個 ID 沒有任何可讀、非 tombstone、種類相符的持有者 → 拒絕。
 - **P6** 一個 ID 的正本＝它可讀、非 tombstone、種類相符的持有者中排序最前的那個。
 - **P7** 建 `Map(g+1)`（`age` 是目前的 grace；正在 drain 時是舊的 grace）：
   - a) condemned 而且是某個 ID 的正本 → live；
@@ -323,7 +331,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
     的修改時間只是為了不去標剛寫入、snapshot 還沒 commit 的 pack，安全性不靠它；
   - c) repack：live、是正本、比 grace 老、有效比例低 → 把它當正本的 item 逐一解密驗證（發現不實的項目
     就從記錄移除並回報），寫進全零 client 前綴下的新 pack，**讀回驗證**後記為 `by_prune` 的 live；舊的
-    → condemned，保留全部項目；
+    → condemned，保留全部項目。讀回驗證失敗：新 pack 記為 unreadable（`since = g+1`），舊的維持 live，
+    回報；
   - d) condemned（`at = c`、`age`）、不是任何 ID 的正本、`T(c) + age ≤ T(g)` **而且** `w(c) + age ≤ w(g)`
     → 刪前驗證：它宣稱持有的每個被引用 ID，正本必須是 `by_prune`，或現在在正本那裡解密、重算 ID 成功；
     驗證失敗就把那個項目從正本的記錄移除並回報，這個 pack 留在 condemned；全部通過 → tombstone
@@ -409,15 +418,15 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 ## 14. 版本
 
-- 每個結構的 `v` 與 pack magic 都是 4。config 不可變，版本演進靠各物件自己的 `v`：讀取端遇到不認得的
-  版本就拒絕；prune 不刪看不懂的東西。
-- 新的格式版本升 head 的 `v`：較舊的 backup 與 prune 讀不懂最大世代就停止（§10）。
+- `config.v` ＝ 4 代表這一代格式，config 不可變。一開始每個結構的 `v` 與 pack magic 都是 4；同一代內
+  各物件的 `v` 可以往上加，讀取端遇到不認得的版本就拒絕，prune 不刪看不懂的東西。
+- 同一代內改格式時升 head 的 `v`：較舊的 backup 與 prune 讀不懂最大世代就停止（§10）。
 - 派生字串、AAD 常數、magic 的改動屬於下一代格式，不在 v4 內做。
 
 ## 15. 向量與 fixture
 
 每條規範性規則至少一個資料檔向量或測試：金鑰推導與槽；CBOR 十條；切段規則與 Dir 驗證；Root 的種類
-規則；pack 的種類、上限與解壓上限；head、分片、記錄的編碼；GC 的情境（重疊的 prune、停住的 prune、
+規則；chunk 清單的切段與 ChunkIndex 的 `size`；pack 的種類、上限與解壓上限；head、分片、記錄的編碼；GC 的情境（重疊的 prune、停住的 prune、
 重建、grace 調低再調高、晚到的 delta、沿用被 forget 的 parent 子樹、不實的 trailer、讀不了的物件）。
 v3 的 fixture 移除，凍結一份 v4 的。
 

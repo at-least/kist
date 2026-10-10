@@ -169,6 +169,9 @@ v4 不讀 v3，也沒有遷移。
   - 切點：段內至少 1024 項之後，名稱的 keyed hash 低 12 位元為 0 就切，平均每段約 5 100 項。以實測的
     每項約 128 bytes 計算，約 650 KB 一段。
   - `Root.t` 修 V19；root 清單本身也照目錄的方式切段，修 V21。Entry 的聯集沒有 bug 歷史，原樣留下。
+  - 大檔案的 chunk 清單也照同樣的規則切段（以 chunk ID 代替名稱），多段時以 ChunkIndex 索引，記下每段
+    涵蓋的 bytes 給 mount 跳著讀。只用一個 2 MiB 的 ChunkList 的話，檔案上限約 120 GiB（平均 2 MiB
+    的 chunk，每個 ID 34 bytes），v3 沒有這個限制（清單本身當資料切 chunk）。
 
 ### 8. Snapshot
 
@@ -262,6 +265,14 @@ v4 不讀 v3，也沒有遷移。
 - unreadable 的記錄在 pack 消失後移除，不讓它變成 condemned 之後觸發 P3 的誤拒。
 - 只有 `.r1` 的 snapshot（可能是 commit 前中斷）照樣當成起點，不自動補主體。
 
+**advisor 審規格時補的**：
+
+- chunk 清單切段、加 ChunkIndex（見上面第 7 層）：原本單一個 2 MiB 的 ChunkList 把檔案上限壓到約
+  120 GiB。
+- repack 讀回驗證失敗：新 pack 記為 unreadable，舊的維持 live。
+- 壞 snapshot 只在第一次看到時寫一個記錄用的世代；維護角色 `forget <key>` 可以立刻解除。
+- `config.v` 代表這一代，同一代內各物件的 `v` 可以往上加。
+
 ## 假設
 
 | 假設 | 狀態 |
@@ -323,6 +334,10 @@ v4 不讀 v3，也沒有遷移。
   別台的 snapshot（負責人決定 1）。
 - backup 在 B4 之後、snapshot PUT 完成之前停住：B5 量兩次 E、E 計入休眠，可以把視窗縮到 PUT 本身的
   延遲，但那個延遲仍然是假設。
+- **以壞 snapshot 讓 GC 停住**：任何能在 `snapshots/` 寫入的角色（不需要金鑰）都能放一個解不開的
+  snapshot，讓所有 prune 停一個 grace；每個 grace 放一個就能讓 GC 一直停。對策：prune 每次都回報，
+  維護角色 `forget <key>` 立刻解除；S3 上依 client 分前綴的憑證讓它追得到是哪一台。資料不會因此遺失，
+  只是空間回收延後。
 - 一顆 mpack 裝很多目錄的段，遺失的影響比 v3 的一個樹物件大。對策是 `.r1`（本機）與 parity。
 - ID 超過 1 000 萬時 map 的大小要再評估。
 - 所有成本數字都是估計（UNVERIFIED）。
