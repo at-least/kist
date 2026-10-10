@@ -1,7 +1,9 @@
 # kist repo 格式（v4）
 
-> **狀態：設計已確認（2026-10-10，見 ADR 026），實作中。** 實作第 2 段（kist-format）完成時，本文件
-> 取代 `docs/format.md`（v3）成為唯一權威副本；在那之前程式碼仍是 v3，`docs/format.md` 仍描述現有程式碼。
+> **狀態：設計已確認（2026-10-10，見 ADR 026），實作中。** 本文件是 v4 的唯一權威副本：`kist_format::v4`
+> 與 `kist_crypto::v4`（實作第 2 段，已完成）照它實作，第 3 段起的程式碼也照它寫；改動格式必須同時改程式碼、
+> 向量與本文件。kist-core、kist-mount、kist-cli 在第 3–6 段遷移之前仍用 v3，`docs/format.md` 繼續描述
+> 它們，v3 的模組移除時一併刪除。
 > v4 不支援 v3：config 的 `v` 不是 4 就拒絕，沒有遷移（負責人：「不需要支援上一代，目前都還在內部開發
 > 階段」）。
 > 第一版草稿（commit `054c7e1`，「v3 加樹進 pack」）已被否決；本版從需求與 bug 歷史重新推導，
@@ -35,7 +37,7 @@ repo 是 key → bytes 的命名空間。**每一次寫入都是一次只在不�
 | key | 誰寫 | 內容 |
 | --- | --- | --- |
 | `config` | init，一次 | 明文 CBOR，不可變（§3） |
-| `keys/<hex16>` | init、維護 | 金鑰槽（§3） |
+| `keys/<s>` | init、維護 | 金鑰槽（§3） |
 | `packs/<c>/<hex>` | backup（client c）、prune | 資料 pack：檔案的 chunk |
 | `mpacks/<c>/<hex>` | backup（client c）、prune | metadata pack：metadata item（§7） |
 | `parity/<c>/<hex>` | backup、prune | 選配的 Reed-Solomon 同位，對應同名的 pack 或 mpack |
@@ -43,11 +45,14 @@ repo 是 key → bytes 的命名空間。**每一次寫入都是一次只在不�
 | `snapshots/<c>/<ts>` | backup（client c） | commit 記錄（§9） |
 | `maint/gen/<g>` | prune、init | 世代 head（§10、§11），永不刪除 |
 | `maint/map/<hex>` | prune | map 分片（§10） |
-| `maint/probe-<hex>` | prune | 時鐘與條件寫入探針，用完即刪 |
+| `maint/probe-<p>` | prune | 時鐘與條件寫入探針，用完即刪 |
 
 - `<c>` 是 client id 的 32 位小寫 hex。維護角色（prune 的 repack 輸出）用全零的 client id。
-- `<hex>` 是物件 bytes 的 BLAKE3（無 key）小寫 hex；`<g>` 是世代號碼的 16 位小寫 hex（字典序＝數值序）；
-  `<ts>` 是 `YYYYMMDDTHHMMSSnnnnnnnnnZ`。
+- `<hex>` 是物件 bytes 的 BLAKE3（無 key）的 64 位小寫 hex；parity 例外，與它對應的 pack 或 mpack 同名
+  （P9 與刪除順序靠這一點找到它）。`<g>` 是世代號碼的 16 位小寫 hex（字典序＝數值序）；`<ts>` 是
+  `YYYYMMDDTHHMMSSnnnnnnnnnZ`，只接受這一種寫法。`<s>` 是槽的名稱（§3），`<p>` 是 OS 亂數，兩者都是
+  16 bytes 的 32 位小寫 hex。其他寫法（大寫、長度不對、多一段或少一段、不該有副本的種類帶 `.r1`、v3 的
+  `trees/` 與 `indexes/`）都不是 v4 的 key。
 - head 一律有一份 `<key>.r1`；`replicas=1` 時，mpack、snapshot、map 分片也各有一份，bytes 與主體相同
   （§13）。
 - 讀取端必須驗證名稱：整份讀取的 delta 與 map 分片重算 hash；pack 以 range read 讀取，讀不到整份，
@@ -63,7 +68,7 @@ repo 是 key → bytes 的命名空間。**每一次寫入都是一次只在不�
 - chunk ID ＝ keyed BLAKE3(`K_chunk_id`, chunk 明文)，32 bytes。
 - meta ID ＝ keyed BLAKE3(`K_meta_id`, metadata item 的規範 CBOR，壓縮之前)，32 bytes。兩把 key
   不同，一個 ID 不會同時是資料與 metadata。
-- pack、mpack、delta、map 分片、parity 的名稱 ＝ BLAKE3(寫進 repo 的 bytes)。
+- pack、mpack、delta、map 分片的名稱 ＝ BLAKE3(寫進 repo 的 bytes)；parity 與它對應的 pack 或 mpack 同名。
 - CBOR 內的 ID 一律 32-byte byte string；路徑裡一律小寫 hex。
 
 ## 3. config 與金鑰
@@ -92,7 +97,8 @@ master ─DeriveKey─▶ K_chunk_id "kist/v4/chunk-id"   K_meta_id "kist/v4/met
 - 換密碼：`key add` 建一個新槽；`key remove`（維護角色）只在同一個程序內另一個槽成功開啟、而且仍在列表
   裡時才刪，最後一個槽刪不掉。
 - 代價：KDF 參數在 init 時決定，之後不能調高；要更強的參數就開新 repo。
-- 本地 index 快取的目錄名稱從 `K_cache` 推導，換 repo 位置就不共用（同 v3）。
+- 本地 index 快取的目錄名稱 ＝ hex(keyed BLAKE3(`K_cache`, repo 位置)[..16])：換 repo 位置就不共用（同 v3，
+  ADR 004：複製到第二個地方的 repo 可能少了東西）。
 
 ## 4. CBOR 規則與欄位表
 
@@ -170,8 +176,11 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 - magic ＝ `"kistpk"` ‖ u16 big-endian `0x0004`，頭尾一致；trailer 的 `v` ＝ 4。
 - trailer `{v, kind, entries}`：`kind` 0 ＝資料 pack（只放 chunk）、1 ＝ mpack（只放 metadata item）；
   命名空間必須與 `kind` 相符。`entries` 每項 `{i, o, l, r}`：ID、在檔內的位移、sealed 長度、明文長度
-  （壓縮前）。一致性檢查：連續排列、完整覆蓋、沒有重複 ID、長度不超過上限。
-- `alg`：0 原文、1 zstd level 3；壓縮省不到 1/16 就存原文。解壓上限：chunk 是 `chunker.max`，metadata
+  （壓縮前，不含 alg byte）。一致性檢查：從位移 8 起連續排列、最後一項結束在 trailer 的起點、沒有重複 ID、
+  每項的 `l` 在 41（nonce＋alg＋tag）到上限＋41 之間、`r` 不超過上限（資料是 `chunker.max`，metadata 是
+  2 MiB）、位移不溢位。寫入端同樣檢查，不一致就不寫。
+- `alg`：0 原文、1 zstd level 3；壓縮省不到 1/16 就存原文：省下的 bytes × 16 ≥ 原文長度才存壓縮版
+  （整數比較，不用 `原文 / 16`：整數除法讓很短的原文留下沒省到的壓縮版）。解壓上限：chunk 是 `chunker.max`，metadata
   item 是 2 MiB——**與 trailer 宣稱的 `r` 無關**，先限制輸出再比對長度。
 - 名稱＝BLAKE3(整檔)。寫滿 `settings.pack_target`（資料，預設 64 MiB）或 `settings.mpack_target`
   （metadata，預設 8 MiB）時寫出，backup 結束時寫出剩下的。
@@ -183,24 +192,28 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 - **Seg**（`k=0`）`{v, k, entries:[Entry]}`：一個目錄的一段，entries 依名稱 bytes 升冪、不重複。
 - **Dir**（`k=1`）`{v, k, level, segs:[{first, id}]}`：目錄有多段時的索引。`level=1` 時 `id` 指向 Seg，
   `level=2` 或 `3` 時指向下一層 Dir。
-- **ChunkList**（`k=2`）`{v, k, chunks:[chunk ID]}`：檔案的 chunk 超過 256 個時的清單，或清單的一段。
+- **ChunkList**（`k=2`）`{v, k, chunks:[chunk ID]}`：檔案的 chunk 超過 256 個時的清單，或清單的一段；非空。
 - **ChunkIndex**（`k=4`）`{v, k, level, parts:[{size, id}]}`：chunk 清單有多段時的索引。`size` 是那一段
   涵蓋的明文 bytes（chunk 明文長度的合計），讓 mount 隨機讀取時可以跳過不需要的段。`level=1` 時 `id`
   指向 ChunkList，`level=2` 或 `3` 時指向下一層 ChunkIndex。
 - **RootSeg**（`k=3`）`{v, k, roots:[Root]}`：snapshot 的 roots 的一段，依 `path` bytes 升冪、不重複；
   多段時同樣以 Dir 索引。
 
-**切段規則**（目錄、root 清單、chunk 清單都用）：依順序加入；目前這一段已有至少 1024 項之後，遇到某一
-項的 keyed BLAKE3(`K_cut`, 名稱) 低 12 位元全為 0，就在這一項之後切；加入下一項會讓這一段的規範 CBOR
-超過 2 MiB 時，也在它之前切。chunk 清單沒有名稱，以 chunk ID 的 32 bytes 代替，順序就是檔案內容的順序；
-內容中間改了一段，只有附近的段會變。每個 entry 的 xattrs 合計上限 256 KiB。一項超過任一上限時寫不
+**切段規則**（目錄、root 清單、chunk 清單都用）：依順序加入；加入某一項之前這一段已有至少 1024 項，
+而且那一項的 keyed BLAKE3(`K_cut`, 名稱) 前兩個 byte 以 little-endian 讀成的整數低 12 位元全為 0，就在
+這一項之後切；加入下一項會讓這一段的規範 CBOR 超過 2 MiB 時，也在它之前切（大小照實算：每項的編碼長度、
+容器的固定部分、陣列標頭）。chunk 清單沒有名稱，以 chunk ID 的 32 bytes 代替，順序就是檔案內容的順序；
+內容中間改了一段，只有附近的段會變。每個 entry 的 xattrs 合計（名稱＋值）上限 256 KiB。一項超過任一上限時寫不
 進去：backup 把它記成這個項目的錯誤、不寫入，結束碼 3。Dir 與 ChunkIndex 本身同樣不超過 2 MiB，最多
 三層；一層 ChunkIndex 平均涵蓋約 400 TiB（以平均 2 MiB 的 chunk 計），檔案大小沒有實際上限。
 
-**讀取端驗證**（任何一條不成立都是腐壞，大聲失敗）：Dir 的 `first` 嚴格遞增；每一段非空，而且第一項
-的名稱等於它在 Dir 裡的 `first`；段內依名稱升冪、不重複；`level` 與指向的種類相符；`ct=0` 的 chunks
-不超過 256 個；ChunkIndex 的每一段非空，每一段 chunk 明文長度的合計等於它的 `size`，全部 `size` 的
-合計等於 Entry 的 `size`；上面的大小上限。
+**讀取端驗證**（任何一條不成立都是腐壞，大聲失敗）：Dir 非空、`first` 嚴格遞增、`level` 在 1 到 3；
+每一段非空，而且第一項的名稱等於它在 Dir 裡的 `first`，每一項都小於下一段的 `first`（查找靠它）；段內
+依名稱升冪、不重複；`level` 與指向的種類相符；`ct=0` 的 chunks
+不超過 256 個；ChunkList 非空；ChunkIndex 非空、每一段的 `size` 大於 0，每一段 chunk 明文長度的合計（或下一層
+`size` 的合計）等於它的 `size`，全部 `size` 的合計等於 Entry 的 `size`；上面的大小上限。上限在兩處執行：
+解碼時拒絕超過上限的內容（item 超過 2 MiB、xattrs 超過 256 KiB、etag 或 vern 超過 1 KiB）；建構時一項
+自己放不進一段就回錯誤，由 backup 記成那個項目的錯誤。
 
 ## 8. Entry（metadata 聯集）
 
@@ -223,7 +236,7 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 
 ```
 Snapshot { v: 4, roots: meta ID（RootSeg 或 Dir）, time: i64 奈秒（backup 開始）, host: text,
-           user: text（省略若空）, client: bytes(16), parent: text | null, stats }
+           user: text（省略若空）, client: bytes(16), parent: text（沒有就省略）, stats }
 Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 或 2） }
 ```
 
@@ -233,7 +246,10 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
   腐壞。`/srv/data` 切成 `srv`、`data`；`s3://bucket/prefix` 切成 `bucket`、`prefix`；`/` 沒有段。
 - restore 映射：`t=1` 的內容放在 `<target>/<所有段>`（沒有段就直接放在 `<target>`）；`t=0` 或 `2` 放在
   `<target>/<去掉最後一段>/<名稱>`。`t≠1` 時定位至少要有一段。不再從內容猜。
-- `parent`：同一個 client、roots 的路徑與 `t` 相同的上一個 snapshot 的 key，只用於加速。
+- `parent`：同一個 client、roots 的路徑與 `t` 相同的上一個 snapshot 主體的 key，只用於加速；沒有就省略，
+  明寫的 null 也視為沒有。
+- 讀取端：內容的 `client` 與 `time` 必須等於 key 的 client 與時間戳（`.r1` 也一樣）；`parent` 必須是同一個
+  client 的 snapshot 主體的 key。
 - stats：`files`、`symlinks` 按名稱計；`dirs` 是目錄節點數，roots 不算；`bytes` 是內容總和，`(dev, ino)`
   只算一次。過程計數不在格式裡。
 - commit：`replicas=1` 時先寫 `.r1`，再寫主體；主體出現＝commit。同名時時間戳 +1 奈秒重試。
@@ -247,18 +263,25 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
 **Head** `maint/gen/<g>`：
 
 ```
-Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head g−1 的 bytes)（g=0 時省略）,
+Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head g−1 寫進 repo 的 bytes)（g=0 時省略）,
        shards: [256 個 hash，空分片為 null], settings: { grace, replicas, pack_target, mpack_target },
        drain: { from: g, old_grace } | 省略, bad: [{ key, first: g }] | 省略,
        hold: { from: g, lost: g, grace: 秒 } | 省略 }
 ```
 
+- `parent` 是 head g−1 寫進 repo 的（密封後的）bytes 的 BLAKE3，主體與 `.r1` 相同；g > 0 必填。
 - `T(g)` ＝ head g 的後端修改時間，截到秒。head 永不刪除，所以每個世代的 `T` 與 `w` 永遠查得到。
 - init 寫 head 0：空的 map、預設 settings（grace 72 小時；replicas 本機 1、S3 與 SFTP 0，同 v3；
   pack_target 64 MiB；mpack_target 8 MiB）。改 settings 是一個不刪任何東西的世代（§11.4）。
+- settings 的範圍：grace 至少 2 小時；replicas 0 或 1；pack_target 與 mpack_target 在 64 KiB 到 4 GiB
+  （同 v3 的 pack_target）。v3 的「`chunker.max` ≤ pack_target」不保留：target 只是寫出的門檻（§6），比它
+  大的 chunk 照樣放得進一個 pack，而且 target 在可以改的 head 裡、chunker 在不可變的 config 裡。
+- 讀取端：明文的 `g` 必須等於 key 的世代；`shards` 恰好 256 個；`drain.old_grace` 大於現在的 grace（drain
+  只在調低時開始，期間新的 condemned 用它當 `age`）；`hold.from ≤ hold.lost`、`hold.grace` 至少 2 小時；
+  `bad` 的 `key` 只能是 snapshot 主體的 key（P9 會刪它的主體與 `.r1`）。
 
 **Map 分片** `maint/map/<hex>`：`Shard {v, index, records}`；分片 i 放名稱第一個 byte 等於 i 的所有 pack
-與 mpack 的記錄。
+與 mpack 的記錄，依名稱嚴格遞增（一個 pack 只有一筆記錄）。`index` 必須等於 head 指向它的位置。
 
 ```
 Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since: g,
@@ -267,15 +290,23 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 ```
 
 - `entries` 取自 prune 自己讀到的 trailer；之後唯一的改變是移除被證明不實的項目（P7c、P7d）。
-- `by_prune`：prune 自己寫出、讀回驗證過的 pack。
+- `by_prune`：prune 自己寫出、讀回驗證過的 pack，所以一定在全零 client 的前綴下；不在就是腐壞（B2 不驗證
+  就信它）。
+- `status` 的欄位依 `s` 在場（§4 第 8 條）：condemned 必須有 `at` 與 `age`（是一個 grace 值，至少 2 小時）；
+  tombstone 必須有 `at`、不得有 `age`；live、unreadable、unknown 兩個都不得有；`s` 不認得就拒絕。
 - `since`：這筆記錄進入 map 的世代。
 - **排序**（選正本、讀取順序）：live 先於 condemned，其次 `since` 小的先，其次名稱小的先。新進的 pack
-  不會取代既有的持有者成為正本。
+  不會取代既有的持有者成為正本。tombstone 排在最後（只在其他都失敗時讀，P6 的正本不選它）；unreadable 與
+  unknown 不是持有者。
+- 格式層不檢查、由 prune 照協定維持的值：`drain.from ≤ g`、`hold.lost < g`、`bad.first ≤ g`（指向還不存在的
+  世代時，讀那一代的 head 就失敗）、記錄項目的位移範圍與重複（讀到的 bytes 解不開或 ID 不符，就換下一個
+  持有者）。
 
 **Delta** `deltas/<c>/<hex>`：`Delta {v, client, packs: [{id, kind, size, entries}]}`，backup 寫，只是
 提示：讓別台在 prune 收錄之前就能去重與還原新 pack 裡的東西。prune 從不依 delta 做決定。delta 只能描述
-同一個 client 前綴下的 pack（`deltas/<c>/` 只列 `packs/<c>/` 與 `mpacks/<c>/`），讀取端略過不符的項目
-並警告：否則一台主機可以替別台的 pack 宣稱它沒有的內容。
+同一個 client 前綴下的 pack：`DeltaPack` 沒有 client 欄位，它的 key 由 delta 所在的前綴與 `kind` 決定
+（`deltas/<c>/` 只指向 `packs/<c>/` 與 `mpacks/<c>/`）；明文的 `client` 與前綴不同的 delta 視同解不開，
+跳過並警告。否則一台主機可以替別台的 pack 宣稱它沒有的內容。
 
 **讀取端**（backup、restore、mount、check）：
 - 列 `maint/gen/`（從上次看過的世代 start-after），取**列出來的最大世代**，讀主體、不行讀 `.r1`。讀不了
@@ -482,7 +513,9 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   讀到時補寫（P1），backup 不拿它決定沿用（B1）。
 - `replicas=1`（本機預設）：mpack、snapshot、map 分片也寫 `.r1`。mpack 與 head 先寫主體再寫 `.r1`
   （head 的主體是柵欄）；snapshot 先寫 `.r1` 再寫主體（主體是 commit）。資料 pack 不寫副本。
-- parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。
+- parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。parity 與它對應的 pack 同名（§1）。
+  **parity 的排版還沒定義**：預定沿用 v3 的明文 header 與 Reed-Solomon 排版、`v` 改成 4，在第一個寫 parity
+  的實作段（第 3 或第 4 段）寫進這裡並加向量。
 - 刪除順序 `.r1` → parity → 主體。
 - `.r1` 在而主體不在：mpack、head、分片是主體遺失（它們先寫主體），讀取端用 `.r1`，`check` 回報，
   `check --repair` 從 `.r1` 重建主體（主體不存在，所以是建立，不是覆寫）。snapshot 先寫 `.r1`，所以也
