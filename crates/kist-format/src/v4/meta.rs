@@ -7,7 +7,7 @@
 //! | 0 | [`Seg`] | 一個目錄的一段，entries 依名稱 bytes 升冪、不重複 |
 //! | 1 | [`Dir`] | 多段時的索引；`level=1` 指向段，`level=2`、`3` 指向下一層 Dir |
 //! | 2 | [`ChunkList`] | 檔案的 chunk 超過 256 個時的清單，或清單的一段 |
-//! | 3 | `RootSeg` | snapshot 的 roots 的一段（[`super::snapshot`]） |
+//! | 3 | [`RootSeg`] | snapshot 的 roots 的一段（[`super::snapshot`]） |
 //! | 4 | [`ChunkIndex`] | chunk 清單多段時的索引，每段帶涵蓋的明文 bytes |
 //!
 //! 切段（[`segment`]）、建構（[`build_dir`]、[`build_chunks`]）與讀取端驗證都在這裡；需要金鑰的兩件事
@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
 use super::ids::{ChunkId, ItemId, MetaId};
+pub use super::snapshot::RootSeg;
 use super::{check_version, corrupt, invalid, Result, VERSION};
 use crate::cbor;
 
@@ -450,6 +451,7 @@ pub enum Item {
     Seg(Seg),
     Dir(Dir),
     ChunkList(ChunkList),
+    RootSeg(RootSeg),
     ChunkIndex(ChunkIndex),
 }
 
@@ -474,6 +476,7 @@ pub fn decode_item(bytes: &[u8]) -> Result<Item> {
         kind::SEG => Item::Seg(cbor::decode(bytes)?),
         kind::DIR => Item::Dir(cbor::decode(bytes)?),
         kind::CHUNK_LIST => Item::ChunkList(cbor::decode(bytes)?),
+        kind::ROOT_SEG => Item::RootSeg(cbor::decode(bytes)?),
         kind::CHUNK_INDEX => Item::ChunkIndex(cbor::decode(bytes)?),
         other => return Err(corrupt("metadata item", format!("unknown kind {other}"))),
     };
@@ -490,6 +493,7 @@ impl Item {
             Item::Seg(x) => cbor::encode(x)?,
             Item::Dir(x) => cbor::encode(x)?,
             Item::ChunkList(x) => cbor::encode(x)?,
+            Item::RootSeg(x) => cbor::encode(x)?,
             Item::ChunkIndex(x) => cbor::encode(x)?,
         };
         if bytes.len() > MAX_ITEM_BYTES {
@@ -506,6 +510,7 @@ impl Item {
             Item::Seg(x) => (x.v, x.k, kind::SEG),
             Item::Dir(x) => (x.v, x.k, kind::DIR),
             Item::ChunkList(x) => (x.v, x.k, kind::CHUNK_LIST),
+            Item::RootSeg(x) => (x.v, x.k, kind::ROOT_SEG),
             Item::ChunkIndex(x) => (x.v, x.k, kind::CHUNK_INDEX),
         };
         check_version("metadata item", v)?;
@@ -519,6 +524,7 @@ impl Item {
             Item::Seg(x) => x.check(),
             Item::Dir(x) => x.check(),
             Item::ChunkList(x) => x.check(),
+            Item::RootSeg(x) => x.check(),
             Item::ChunkIndex(x) => x.check(),
         }
     }
@@ -528,6 +534,7 @@ impl Item {
         match self {
             Item::Seg(x) => Some(x.entries.iter().map(|e| e.n.as_slice()).collect()),
             Item::Dir(x) => Some(x.segs.iter().map(|s| s.first.as_slice()).collect()),
+            Item::RootSeg(x) => Some(x.roots.iter().map(|r| r.path.as_slice()).collect()),
             Item::ChunkList(_) | Item::ChunkIndex(_) => None,
         }
     }
@@ -557,7 +564,7 @@ fn check_ascending<'a>(what: &'static str, names: impl Iterator<Item = &'a [u8]>
 }
 
 /// 讀取端：Dir 底下第 `i` 段載入之後的檢查。`level=1` 時它必須是 `leaf` 種類的段（目錄是
-/// [`kind::SEG`]），`level>1` 時是低一層的 Dir；非空、第一項的名稱等於 Dir 裡的 `first`，而且每一項都小於下一段
+/// [`kind::SEG`]、roots 是 [`kind::ROOT_SEG`]），`level>1` 時是低一層的 Dir；非空、第一項的名稱等於 Dir 裡的 `first`，而且每一項都小於下一段
 /// 的 `first`（目錄依名稱排好之後才切段）。
 pub fn check_dir_child(dir: &Dir, i: usize, child: &Item, leaf: u8) -> Result<()> {
     let bad = |msg: String| Err(corrupt("directory index", msg));
@@ -567,6 +574,7 @@ pub fn check_dir_child(dir: &Dir, i: usize, child: &Item, leaf: u8) -> Result<()
     let kind_ok = match child {
         Item::Dir(d) => dir.level > 1 && d.level == dir.level - 1,
         Item::Seg(_) => dir.level == 1 && leaf == kind::SEG,
+        Item::RootSeg(_) => dir.level == 1 && leaf == kind::ROOT_SEG,
         Item::ChunkList(_) | Item::ChunkIndex(_) => false,
     };
     if !kind_ok {
@@ -772,7 +780,7 @@ pub fn build_dir(
 }
 
 /// 從第一層開始往上建 Dir，直到一個 Dir 放得下；超過三層寫不進去。
-fn build_dir_levels(
+pub(crate) fn build_dir_levels(
     mut segs: Vec<DirSeg>,
     limits: Limits,
     is_cut: &dyn Fn(&[u8]) -> bool,

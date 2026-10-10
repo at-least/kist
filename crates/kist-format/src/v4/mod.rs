@@ -10,12 +10,14 @@
 //! - [`config`]：§3 的 config 與金鑰槽（金鑰推導在 `kist-crypto` 的 `v4`）。
 //! - [`pack`]：§6 的 pack 與 mpack 排版、trailer 與它的一致性檢查。
 //! - [`meta`]：§7、§8 的 metadata item 與 Entry、切段規則、建構與讀取端驗證。
+//! - [`snapshot`]：§9 的 snapshot、Root、定位的切段與 restore 的落點、roots 的清單。
 
 pub mod config;
 pub mod ids;
 pub mod keys;
 pub mod meta;
 pub mod pack;
+pub mod snapshot;
 
 use crate::FormatError;
 

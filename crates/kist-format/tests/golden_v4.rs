@@ -220,3 +220,69 @@ fn chunk_list_segmentation_and_sizes_match_the_independent_vector() {
         ]
     );
 }
+
+/// snapshot：roots 0x02×32、2026-09-04T12:00:00.123456789Z、host "h"、client 0x1f×16、parent 是同一個 client
+/// 的 `snapshots/<c>/20260904T120000000000001Z`、stats {files 3, dirs 1, bytes 10}。
+#[test]
+fn snapshot_matches_the_golden_file() {
+    use kist_format::v4::ids::{ClientId, MetaId};
+    use kist_format::v4::keys::{Key, SnapTs};
+    use kist_format::v4::snapshot::{Snapshot, SnapshotStats};
+    let client = ClientId::from_bytes([0x1f; 16]);
+    let parent = Key::Snapshot {
+        client,
+        ts: SnapTs::from_nanos(CREATED_NS + 1).unwrap(),
+        replica: false,
+    }
+    .path();
+    let s = Snapshot {
+        v: 4,
+        roots: MetaId::from_bytes([2; 32]),
+        time: CREATED_NS + 123_456_789,
+        host: "h".into(),
+        user: String::new(),
+        client,
+        parent: Some(parent),
+        stats: SnapshotStats {
+            files: 3,
+            dirs: 1,
+            symlinks: 0,
+            bytes: 10,
+        },
+    };
+    let bytes = s.encode().unwrap();
+    check("snapshot.cbor", &bytes);
+    assert_eq!(Snapshot::decode(&golden("snapshot.cbor")).unwrap(), s);
+}
+
+/// RootSeg：一個目錄 root（/srv/data）與一個檔案 root（/etc/hosts，posix）。
+#[test]
+fn root_seg_matches_the_golden_file() {
+    use kist_format::v4::ids::MetaId;
+    use kist_format::v4::meta::{decode_item, meta_kind, node_type, Entry, Item};
+    use kist_format::v4::snapshot::{Root, RootSeg};
+    let mut hosts = Entry::new(b"hosts".to_vec(), node_type::FILE, meta_kind::POSIX);
+    hosts.size = 220;
+    hosts.mode = Some(0o100644);
+    hosts.uid = Some(0);
+    hosts.gid = Some(0);
+    hosts.mtime = Some(CREATED_NS);
+    let roots = vec![
+        Root {
+            path: b"/etc/hosts".to_vec(),
+            t: node_type::FILE,
+            tree: None,
+            entry: Some(hosts),
+        },
+        Root {
+            path: b"/srv/data".to_vec(),
+            t: node_type::DIR,
+            tree: Some(MetaId::from_bytes([3; 32])),
+            entry: None,
+        },
+    ];
+    let item = Item::RootSeg(RootSeg::new(roots));
+    let bytes = item.encode().unwrap();
+    check("root_seg.cbor", &bytes);
+    assert_eq!(decode_item(&golden("root_seg.cbor")).unwrap(), item);
+}
