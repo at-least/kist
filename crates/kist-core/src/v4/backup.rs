@@ -1,0 +1,2128 @@
+//! v4 的 backup：§11.2 的 B1–B5。
+//!
+//! - **B1**（[`Repo::backup_prepare`] 開頭）：記下開始時間（牆鐘與含休眠的單調時鐘）；讀列出來的最大世代
+//!   `g_s`（讀得了、版本認得，列表裡要有它的 `.r1`，沒有就稍候重新列出一次），載入它的分片與當下列表裡的
+//!   delta；找 parent：自己的 snapshot 主體裡最新、roots 的路徑與 `t` 都相同的那一份。
+//! - **B2**（走訪）：依名稱排序遞迴走訪。每個 chunk 與 metadata item 只在有種類相符的持有者（`Map(g_s)` 裡
+//!   live 的記錄、delta 提到而 map 沒提到的 pack、這次自己寫的 pack）而且可信（`by_prune`、在自己的前綴下、
+//!   或這台 client 取回驗證過）時沿用；不可信的候選先取回驗證（解密、重算 ID），成功就記進本地快取；都不行
+//!   就重寫。目錄、chunk 清單、roots 依 §7 切段；目錄邊走邊切，記憶體裡只有一段。
+//!   **沿用 parent 的子樹**：同一條路徑上新建出來的目錄（或 chunk 清單）的 meta ID 等於 parent 的，而且它有
+//!   可信的持有者，就只記這一筆（子樹裡的其他 item 不查持有者，靠 parent 一直存在），B4 對 parent 做 HEAD。
+//!   比 GC 模型的規則窄：模型比對 parent 裡任何位置的 item，這裡只比對同一條路徑。
+//! - **B3**：pack 與 mpack 以只在不存在時建立寫入（mpack 在 replicas=1 時先主體、後 `.r1`；parity 選配），每
+//!   寫幾個就寫一份 delta 列出它們（重跑時沿用已上傳的），最後再寫一份。`E ≥ grace − M` 之後不再寫 delta。
+//! - **B4、B5**：[`PreparedBackup::commit`]。
+//!
+//! 走訪的骨架（排除規則、記號檔、不跨檔案系統、深度上限、硬連結、快速路徑）照 v3 的 `crate::backup`，
+//! 改用 v4 的 Entry；v3 移除時這份重複一起消失。
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use kist_backend::source::{LocalSource, Source, SourceItem, SourceItemKind};
+use kist_backend::{Backend, BackendError};
+use kist_crypto::v4::Keys;
+use kist_format::config::ChunkerParams;
+use kist_format::v4::ids::{ChunkId, ClientId, ItemId, MetaId, ObjectId};
+use kist_format::v4::index::{status, Delta, DeltaPack, Settings};
+use kist_format::v4::keys::{Gen, Key, SnapTs, SNAPSHOTS};
+use kist_format::v4::meta::{
+    build_chunks, content_type, meta_kind, node_type, DirBuilder, Entry, Limits,
+};
+use kist_format::v4::pack::Kind;
+use kist_format::v4::snapshot::{build_roots, split_locator, Root, Snapshot, SnapshotStats};
+use tokio::task::JoinSet;
+
+use super::cache::Kind as CacheKind;
+use super::pack::{FinishedPack, PackWriter};
+use super::read::{DirStream, Reader};
+use super::repo::Repo;
+use super::state::{pack_key, Generation, Holder, Source as HolderSource, State};
+use crate::backup::{Exclusions, SourceSpec};
+use crate::filter::FilterState;
+use crate::{blocking, fsmeta, CoreError, Result};
+
+/// §11.1 的 `M`。
+pub const M: Duration = Duration::from_secs(3600);
+
+/// 同時上傳中的 pack 數（每個最多 pack_target 的記憶體，同 v3）。
+const MAX_INFLIGHT_UPLOADS: usize = 1;
+
+/// 一次時鐘讀數：牆鐘與含休眠的單調時鐘（§11.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading {
+    pub wall: time::OffsetDateTime,
+    pub boot: Duration,
+}
+
+/// backup 的時鐘；測試注入假的。
+#[derive(Clone)]
+pub struct Clock(Arc<dyn Fn() -> Reading + Send + Sync>);
+
+impl Clock {
+    pub fn system() -> Self {
+        Self(Arc::new(|| Reading {
+            wall: time::OffsetDateTime::now_utc(),
+            boot: boot_time(),
+        }))
+    }
+
+    pub fn new(f: impl Fn() -> Reading + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn now(&self) -> Reading {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Clock")
+    }
+}
+
+/// Linux：`CLOCK_BOOTTIME`，計入休眠（clock_gettime(2)）。
+#[cfg(target_os = "linux")]
+fn boot_time() -> Duration {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    Duration::new(
+        u64::try_from(t.tv_sec).unwrap_or(0),
+        u32::try_from(t.tv_nsec).unwrap_or(0),
+    )
+}
+
+/// 其他平台：`Instant` 是否計入休眠沒有驗證過（§11.1 的 UNVERIFIED）；E 另外取牆鐘的經過，取大。
+#[cfg(not(target_os = "linux"))]
+fn boot_time() -> Duration {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed()
+}
+
+/// §11.1 的 E：max(牆鐘經過, 含休眠的單調時鐘經過)。
+pub fn elapsed(start: &Reading, now: &Reading) -> Duration {
+    let wall = Duration::try_from(now.wall - start.wall).unwrap_or(Duration::ZERO);
+    wall.max(now.boot.saturating_sub(start.boot))
+}
+
+#[derive(Debug, Clone)]
+pub struct BackupOptions {
+    pub client: ClientId,
+    pub hostname: String,
+    pub username: String,
+    /// 每個 pack 與 mpack 旁的 Reed-Solomon 同位片數（0..=8；0 不寫）。寫失敗只警告：pack 本身已安全。
+    pub parity: u8,
+    pub source: SourceSpec,
+    pub exclude: Exclusions,
+    #[doc(hidden)]
+    pub clock: Clock,
+    /// B1：列表裡沒有最大世代的 `.r1` 時，等這麼久再列一次。
+    #[doc(hidden)]
+    pub lone_head_wait: Duration,
+    /// B3：每寫這麼多個 pack（資料與 mpack 合計）寫一份中間的 delta。
+    #[doc(hidden)]
+    pub delta_every: usize,
+}
+
+impl BackupOptions {
+    pub fn new(client: ClientId, hostname: impl Into<String>, username: impl Into<String>) -> Self {
+        Self {
+            client,
+            hostname: hostname.into(),
+            username: username.into(),
+            parity: 0,
+            source: SourceSpec::default(),
+            exclude: Exclusions::default(),
+            clock: Clock::system(),
+            lone_head_wait: Duration::from_secs(5),
+            delta_every: 16,
+        }
+    }
+}
+
+/// 過程計數（不在格式裡）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BackupReport {
+    /// 這次新寫的 chunk 與 metadata item。
+    pub chunks_new: u64,
+    pub items_new: u64,
+    /// 沿用既有持有者的 chunk 與 metadata item（只算逐一判斷的；沿用的子樹裡面的不算）。
+    pub chunks_reused: u64,
+    pub items_reused: u64,
+    /// 取回驗證之後才沿用的（別台寫的、第一次用）。
+    pub verified: u64,
+    /// 沿用 parent 的子樹的次數（由下往上，巢狀的也算）。
+    pub subtrees: u64,
+    pub packs_new: u64,
+    pub mpacks_new: u64,
+    pub deltas_new: u64,
+    /// 新寫的 chunk 明文 bytes。
+    pub bytes_stored: u64,
+    /// 走快速路徑、沒有重讀內容的檔案。
+    pub files_reused: u64,
+    /// 讀不到或放不進格式而略過的項目（snapshot 照樣寫，CLI 以非 0 結束）。
+    pub errors: u64,
+    /// 被排除規則略過的項目。
+    pub excluded: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackupSummary {
+    /// snapshot 主體的 key。
+    pub snapshot: String,
+    pub parent: Option<String>,
+    /// B4 讀到的世代 `g_c`。
+    pub generation: Gen,
+    pub stats: SnapshotStats,
+    pub report: BackupReport,
+}
+
+/// 一個檔案在 Entry 裡的內容。
+#[derive(Debug, Clone)]
+struct FileContent {
+    size: u64,
+    ct: u8,
+    chunks: Vec<ItemId>,
+}
+
+/// 沿用的 (item, 持有者)：持有者是 [`UsedPacks`] 裡的位置，記憶體裡每筆 36 bytes。
+type Used = Vec<(ItemId, u32)>;
+
+/// 這次去重用到的 pack（B4 逐一檢查）。
+#[derive(Debug, Clone)]
+struct UsedPack {
+    id: ObjectId,
+    client: ClientId,
+    kind: Kind,
+    source: HolderSource,
+}
+
+#[derive(Debug, Default)]
+struct UsedPacks {
+    index: HashMap<ObjectId, u32>,
+    packs: Vec<UsedPack>,
+}
+
+impl UsedPacks {
+    fn intern(&mut self, h: &Holder) -> u32 {
+        if let Some(i) = self.index.get(&h.pack) {
+            return *i;
+        }
+        let i = self.packs.len() as u32;
+        self.packs.push(UsedPack {
+            id: h.pack,
+            client: h.client,
+            kind: h.kind,
+            source: h.source,
+        });
+        self.index.insert(h.pack, i);
+        i
+    }
+}
+
+/// B2 的結果。
+enum Decision {
+    /// 這次已經寫過（在自己這次寫的 pack 裡）。
+    InRun,
+    Reuse(Holder),
+    Write,
+}
+
+/// 一個 metadata item 放進 snapshot 的方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Reused(u32),
+    InRun,
+    Written,
+}
+
+/// B2：判斷沿用或重寫。只在 blocking 執行緒上用：取回驗證要以 `block_on` 等後端。
+struct Dedup {
+    reader: Reader,
+    written: HashSet<ItemId>,
+    handle: tokio::runtime::Handle,
+    verified: u64,
+}
+
+impl Dedup {
+    fn decide(&mut self, id: ItemId, kind: Kind) -> Decision {
+        if self.written.contains(&id) {
+            return Decision::InRun;
+        }
+        for h in self.reader.state.reuse_candidates(&id, kind) {
+            if self.reader.trusted(&id, &h) {
+                return Decision::Reuse(h);
+            }
+            match self.handle.block_on(self.reader.fetch(&h)) {
+                Ok(_) => {
+                    self.reader.note_verified(id, &h);
+                    self.verified += 1;
+                    return Decision::Reuse(h);
+                }
+                Err(e) => tracing::warn!(
+                    "{id}: the copy in pack {} failed verification; not reusing it: {e}",
+                    h.pack
+                ),
+            }
+        }
+        Decision::Write
+    }
+}
+
+/// 一批 item 各自的結果，與因此寫滿的 mpack。
+type Placed = (Vec<(MetaId, Outcome)>, Vec<FinishedPack>);
+
+/// 走訪一個目錄的 future（遞迴，要 boxed；`Send` 讓整個 backup 能在別的 task 上跑）。
+type DirFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(MetaId, Used)>> + Send + 'a>>;
+
+/// 在 blocking 執行緒之間移進移出的可變狀態。
+struct Work {
+    dedup: Dedup,
+    data: PackWriter,
+    meta: PackWriter,
+    packs: UsedPacks,
+}
+
+impl Work {
+    /// 照 B2 放一批 metadata item：沿用的記進 `used`，要寫的加進 mpack。回傳每一項的結果與寫滿的 mpack。
+    fn place(
+        &mut self,
+        items: Vec<(MetaId, Vec<u8>)>,
+        used: &mut Used,
+        report: &mut BackupReport,
+    ) -> Result<Placed> {
+        let mut outcomes = Vec::with_capacity(items.len());
+        let mut full = Vec::new();
+        for (id, cbor) in items {
+            let item: ItemId = id.into();
+            let outcome = match self.dedup.decide(item, Kind::Meta) {
+                Decision::InRun => Outcome::InRun,
+                Decision::Reuse(h) => {
+                    let i = self.packs.intern(&h);
+                    used.push((item, i));
+                    report.items_reused += 1;
+                    Outcome::Reused(i)
+                }
+                Decision::Write => {
+                    self.meta.add(item, &cbor)?;
+                    self.dedup.written.insert(item);
+                    report.items_new += 1;
+                    if self.meta.is_full() {
+                        full.extend(self.meta.finish()?);
+                    }
+                    Outcome::Written
+                }
+            };
+            outcomes.push((id, outcome));
+        }
+        Ok((outcomes, full))
+    }
+}
+
+/// 走訪端看到的檔案事實：快速路徑與硬連結判別用。
+struct FileFacts {
+    size: u64,
+    posix: Option<kist_backend::fsmeta::PosixMeta>,
+    etag: Option<Vec<u8>>,
+}
+
+/// 一個 root 的走訪來源。
+struct SourceCtx {
+    source: Arc<dyn Source>,
+    named: Named,
+}
+
+impl SourceCtx {
+    fn display_path(&self, rel: &[u8]) -> String {
+        match self.source.local_path(rel) {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => String::from_utf8_lossy(rel).into_owned(),
+        }
+    }
+}
+
+/// 一個 root 底下另外被指名的來源（同 v3）。
+#[derive(Default)]
+struct Named {
+    paths: HashSet<Vec<u8>>,
+    toward: HashSet<Vec<u8>>,
+}
+
+impl Named {
+    fn new(paths: Vec<Vec<u8>>) -> Self {
+        let mut toward = HashSet::new();
+        for path in &paths {
+            let mut at = path.as_slice();
+            while let Some(i) = at.iter().rposition(|&b| b == b'/') {
+                at = &at[..i];
+                toward.insert(at.to_vec());
+            }
+        }
+        Self {
+            paths: paths.into_iter().collect(),
+            toward,
+        }
+    }
+}
+
+/// 一個項目在排除規則裡的位置（同 v3）。
+#[derive(Clone)]
+struct Visit {
+    depth: usize,
+    filter: FilterState,
+    dev_bound: Option<u64>,
+    pass_through: bool,
+    named: bool,
+    toward_named: bool,
+}
+
+impl Visit {
+    fn root(filter: FilterState, dev_bound: Option<u64>) -> Self {
+        Self {
+            depth: 1,
+            filter,
+            dev_bound,
+            pass_through: false,
+            named: true,
+            toward_named: false,
+        }
+    }
+}
+
+fn rel_bytes(rel: &Path) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for comp in rel.components() {
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(&fsmeta::name_to_bytes(comp.as_os_str())?);
+    }
+    Ok(out)
+}
+
+fn join_rel(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(dir.len() + name.len() + 1);
+    v.extend_from_slice(dir);
+    if !dir.is_empty() {
+        v.push(b'/');
+    }
+    v.extend_from_slice(name);
+    v
+}
+
+/// posix 欄位（§8）：mode、uid、gid、mtime 必填；ctime 有才記；dev、ino、nlink 只在檔案且 nlink > 1 時記
+/// （硬連結的識別，同 v3）。
+fn fill_posix(entry: &mut Entry, p: &kist_backend::fsmeta::PosixMeta, is_file: bool) {
+    entry.mode = Some(p.mode);
+    entry.uid = Some(p.uid);
+    entry.gid = Some(p.gid);
+    entry.mtime = Some(p.mtime_ns);
+    entry.ctime = Some(p.ctime_ns).filter(|v| *v != 0);
+    if is_file && p.nlink > 1 {
+        entry.dev = Some(p.dev);
+        entry.ino = Some(p.inode);
+        entry.nlink = Some(p.nlink);
+    }
+}
+
+/// parent 的檔案 entry → 快速路徑比較用的 FsMeta（缺席的選填欄位是 0，不拿來比）。
+fn meta_of(e: &Entry) -> fsmeta::FsMeta {
+    fsmeta::FsMeta {
+        mode: e.mode.unwrap_or(0),
+        uid: e.uid.unwrap_or(0),
+        gid: e.gid.unwrap_or(0),
+        mtime_ns: e.mtime.unwrap_or(0),
+        ctime_ns: e.ctime.unwrap_or(0),
+        inode: e.ino.unwrap_or(0),
+        dev: e.dev.unwrap_or(0),
+        nlink: e.nlink.unwrap_or(0),
+    }
+}
+
+/// 本機單一檔案或 symlink 的來源項目：直接 lstat，不列整個父目錄（同 v3）。
+fn local_file_item(path: &Path, name: &[u8]) -> Result<SourceItem> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
+    let posix = kist_backend::fsmeta::capture(&meta);
+    let kind = if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|e| CoreError::io(path, e))?;
+        SourceItemKind::Symlink {
+            target: fsmeta::path_to_bytes(&target)?,
+        }
+    } else if !meta.is_file() {
+        return Err(CoreError::Usage(format!(
+            "{}: not a regular file (fifo/socket/device); cannot back up",
+            path.display()
+        )));
+    } else {
+        SourceItemKind::File {
+            size: meta.len(),
+            mtime_ns: posix.mtime_ns,
+            etag: None,
+            vern: None,
+        }
+    };
+    Ok(SourceItem {
+        name: name.to_vec(),
+        kind,
+    })
+}
+
+/// 一個 root 的規劃：在 B1 之前決定好，parent 的比對要用到 `t`。
+enum RootPlan {
+    LocalDir {
+        path: PathBuf,
+        named: Vec<Vec<u8>>,
+    },
+    LocalFile {
+        path: PathBuf,
+        item: SourceItem,
+    },
+    RemoteDir(Arc<dyn Source>),
+    RemoteFile {
+        source: Arc<dyn Source>,
+        item: SourceItem,
+    },
+}
+
+struct Planned {
+    path: Vec<u8>,
+    t: u8,
+    plan: RootPlan,
+}
+
+fn item_type(item: &SourceItem) -> u8 {
+    match item.kind {
+        SourceItemKind::Dir => node_type::DIR,
+        SourceItemKind::File { .. } => node_type::FILE,
+        SourceItemKind::Symlink { .. } => node_type::SYMLINK,
+    }
+}
+
+fn last_segment(path: &[u8]) -> Result<Vec<u8>> {
+    split_locator(path)?.pop().ok_or_else(|| {
+        CoreError::Usage(format!(
+            "cannot derive a name for source {}",
+            String::from_utf8_lossy(path)
+        ))
+    })
+}
+
+/// 來源規劃（同 v3）：遠端 URL 或注入的來源是單一 root；本機路徑 canonicalize、依 bytes 排序去重、`/a` 蓋過
+/// `/a/b`（b 記成指名的）。
+async fn plan_roots(paths: &[PathBuf], opts: &BackupOptions) -> Result<Vec<Planned>> {
+    let remote = |path: Vec<u8>, source: Arc<dyn Source>| async move {
+        // 遠端 root 的種類：列根，恰好一個檔案而且名稱等於定位的最後一段 → 檔案（同 v3）
+        let probe = Arc::clone(&source);
+        let mut items = blocking(move || probe.list(b"").map_err(CoreError::from)).await?;
+        let last = split_locator(&path)?.pop();
+        let first = items.next_item();
+        let plan = match (first, last) {
+            (Some(Ok(item)), Some(last))
+                if matches!(item.kind, SourceItemKind::File { .. }) && item.name == last =>
+            {
+                Planned {
+                    path,
+                    t: node_type::FILE,
+                    plan: RootPlan::RemoteFile { source, item },
+                }
+            }
+            _ => Planned {
+                path,
+                t: node_type::DIR,
+                plan: RootPlan::RemoteDir(source),
+            },
+        };
+        Ok::<_, CoreError>(plan)
+    };
+    match &opts.source {
+        SourceSpec::LocalPaths => {
+            let mut with_bytes = Vec::new();
+            for p in paths {
+                let abs = std::fs::canonicalize(p).map_err(|e| CoreError::io(p, e))?;
+                with_bytes.push((fsmeta::path_to_bytes(&abs)?, abs));
+            }
+            with_bytes.sort();
+            with_bytes.dedup();
+            let mut kept: Vec<(Vec<u8>, PathBuf, Vec<Vec<u8>>)> = Vec::new();
+            let mut kept_index: HashMap<PathBuf, usize> = HashMap::new();
+            for (bytes, path) in with_bytes {
+                let outer = path
+                    .ancestors()
+                    .skip(1)
+                    .find_map(|a| kept_index.get(a).map(|&i| (a, i)));
+                if let Some((outer, i)) = outer {
+                    let rel = path
+                        .strip_prefix(outer)
+                        .map_err(|e| CoreError::Usage(format!("{}: {e}", path.display())))?;
+                    tracing::info!(
+                        "{}: inside source {}; backed up as part of it",
+                        path.display(),
+                        outer.display()
+                    );
+                    kept[i].2.push(rel_bytes(rel)?);
+                    continue;
+                }
+                kept_index.insert(path.clone(), kept.len());
+                kept.push((bytes, path, Vec::new()));
+            }
+            let mut out = Vec::new();
+            for (bytes, path, named) in kept {
+                let meta = std::fs::symlink_metadata(&path).map_err(|e| CoreError::io(&path, e))?;
+                if meta.is_dir() {
+                    out.push(Planned {
+                        path: bytes,
+                        t: node_type::DIR,
+                        plan: RootPlan::LocalDir { path, named },
+                    });
+                } else {
+                    let item = local_file_item(&path, &last_segment(&bytes)?)?;
+                    out.push(Planned {
+                        path: bytes,
+                        t: item_type(&item),
+                        plan: RootPlan::LocalFile { path, item },
+                    });
+                }
+            }
+            Ok(out)
+        }
+        SourceSpec::Url(url) => {
+            if paths.len() != 1 || paths[0] != Path::new(url.as_str()) {
+                return Err(CoreError::Usage(format!(
+                    "a remote source URL backs up exactly one root: pass only {url:?} as the path"
+                )));
+            }
+            let source: Arc<dyn Source> = kist_backend::source::open_source(url).await?.into();
+            Ok(vec![remote(url.as_bytes().to_vec(), source).await?])
+        }
+        SourceSpec::Injected(source, locator) => {
+            Ok(vec![remote(locator.clone(), Arc::clone(source)).await?])
+        }
+    }
+}
+
+/// parent：自己的一個 snapshot 主體。
+struct Parent {
+    key: String,
+    snapshot: Snapshot,
+    /// path → 那個 root。
+    roots: HashMap<Vec<u8>, Root>,
+}
+
+impl Repo {
+    /// 讀一個 snapshot（`key` 可以是 `.r1`）：`K_snap` 解密（AAD 是主體的 key 路徑）、解碼、內容與 key 核對。
+    pub async fn read_snapshot(&self, key: &Key) -> Result<Snapshot> {
+        let Key::Snapshot { client, ts, .. } = key else {
+            return Err(CoreError::corrupt(key.path(), "not a snapshot key"));
+        };
+        let bytes = self.backend().get(&key.path()).await?;
+        let plain = self
+            .keys()
+            .open_snapshot(client, ts, &bytes)
+            .map_err(|e| CoreError::corrupt(key.path(), e.to_string()))?;
+        let snap = Snapshot::decode(&plain)?;
+        snap.check_key(key)?;
+        Ok(snap)
+    }
+
+    /// B1：列出來的最大世代。列表從看過的世代開始；它不在列表裡就警告、改列全部。最大世代的 `.r1` 不在列表
+    /// 裡（寫入者在兩次 PUT 之間或已經當掉）→ 等 `wait` 再列一次，仍然沒有就停止（§11.2）。
+    async fn newest_for_backup(&self, wait: Duration) -> Result<Generation> {
+        let cached = self.cache().and_then(|c| c.seen_gen());
+        let mut listing = self.list_heads(cached).await?;
+        if let Some(g) = cached {
+            if listing.is_empty() {
+                tracing::warn!(
+                    "generation {g}, the newest this client saw before, is no longer listed; listing all generations"
+                );
+                listing = self.list_heads(None).await?;
+            }
+        }
+        let Some((&g, copies)) = listing.iter().next_back() else {
+            return Err(CoreError::Generation(
+                "no generation head under maint/gen/: not a v4 repository, or its init did not finish"
+                    .to_owned(),
+            ));
+        };
+        let mut g = g;
+        if !copies.replica {
+            tokio::time::sleep(wait).await;
+            let again = self.list_heads(Some(g)).await?;
+            match again.iter().next_back() {
+                Some((&newest, c)) if c.replica => g = newest,
+                _ => {
+                    return Err(CoreError::Generation(format!(
+                        "generation head {g} has no .r1 yet (its writer is between its two writes or crashed); \
+                         run maintenance to repair it, then rerun the backup"
+                    )))
+                }
+            }
+        }
+        let gen = self.read_head(g).await?;
+        if let Some(c) = self.cache() {
+            c.set_seen_gen(g);
+        }
+        Ok(gen)
+    }
+
+    /// B1：parent 是自己的 snapshot 主體裡最新、roots 的路徑與 `t` 都相同的那一份。讀不了的跳過並警告。
+    async fn find_parent(
+        &self,
+        reader: &Reader,
+        client: ClientId,
+        roots: &[(Vec<u8>, u8)],
+    ) -> Result<Option<Parent>> {
+        let prefix = format!("{SNAPSHOTS}{client}");
+        let mut keys: Vec<(SnapTs, Key)> = Vec::new();
+        let mut listed = HashSet::new();
+        for o in self.backend().list(&prefix).await? {
+            match Key::parse(&o.key) {
+                Ok(
+                    key @ Key::Snapshot {
+                        client: c,
+                        replica: false,
+                        ..
+                    },
+                ) if c == client => {
+                    let Key::Snapshot { ts, .. } = &key else {
+                        continue;
+                    };
+                    listed.insert(o.key.clone());
+                    keys.push((ts.clone(), key));
+                }
+                Ok(Key::Snapshot { replica: true, .. }) => {}
+                _ => tracing::warn!("{}: not a v4 snapshot key; ignored", o.key),
+            }
+        }
+        if let Some(last) = self.cache().and_then(|c| c.last_snapshot()) {
+            if !listed.contains(&last) {
+                tracing::warn!(
+                    "{last}, this client's last snapshot, is no longer in the repository"
+                );
+            }
+        }
+        keys.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, key) in keys {
+            let path = key.path();
+            let snap = match self.read_snapshot(&key).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("cannot read {path}: {e}; not using it as the parent");
+                    continue;
+                }
+            };
+            let theirs = match reader.roots(&snap.roots).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "cannot read the roots of {path}: {e}; not using it as the parent"
+                    );
+                    continue;
+                }
+            };
+            let same = theirs.len() == roots.len()
+                && theirs
+                    .iter()
+                    .zip(roots)
+                    .all(|(r, (p, t))| r.path == *p && r.t == *t);
+            if same {
+                return Ok(Some(Parent {
+                    key: path,
+                    snapshot: snap,
+                    roots: theirs.into_iter().map(|r| (r.path.clone(), r)).collect(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// B1 到 B3：除了 snapshot 之外全部寫完。`paths` 是本機來源；遠端來源由 `opts.source` 給。
+    pub async fn backup_prepare(
+        &self,
+        paths: &[PathBuf],
+        opts: BackupOptions,
+    ) -> Result<PreparedBackup> {
+        if usize::from(opts.parity) > kist_format::v4::parity::MAX_PARITY_SHARDS {
+            return Err(CoreError::Usage(format!(
+                "parity must be 0..={}, got {}",
+                kist_format::v4::parity::MAX_PARITY_SHARDS,
+                opts.parity
+            )));
+        }
+        if opts.exclude.one_file_system && !matches!(opts.source, SourceSpec::LocalPaths) {
+            return Err(CoreError::Usage(
+                "one-file-system compares local device numbers; it works on local source paths only"
+                    .to_owned(),
+            ));
+        }
+        if opts.exclude.one_file_system && cfg!(not(unix)) {
+            return Err(CoreError::Usage(
+                "one-file-system is not supported on this platform (no device numbers)".to_owned(),
+            ));
+        }
+        if opts.client == ClientId::MAINT {
+            return Err(CoreError::Usage(
+                "the all-zero client id belongs to the maintenance role".to_owned(),
+            ));
+        }
+
+        // B1
+        let started = opts.clock.now();
+        let planned = plan_roots(paths, &opts).await?;
+        let gen = self.newest_for_backup(opts.lone_head_wait).await?;
+        let map = self.load_map(&gen).await?;
+        let deltas = self.load_deltas(&map).await?;
+        if let Some(c) = self.cache() {
+            let live = |p: &ObjectId| map.record(p).is_some() || deltas.contains(p);
+            let mpacks: HashSet<ObjectId> = map
+                .records()
+                .iter()
+                .filter(|r| r.kind == Kind::Meta)
+                .map(|r| r.id)
+                .chain(
+                    deltas
+                        .packs()
+                        .filter(|(_, p)| p.kind == Kind::Meta)
+                        .map(|(_, p)| p.id),
+                )
+                .collect();
+            c.retain(CacheKind::Mpack, &mpacks);
+            c.compact_verified(live);
+        }
+        let settings = gen.head.settings;
+        let state = Arc::new(State { gen, map, deltas });
+        let known = self.cache().map(|c| c.verified()).unwrap_or_default();
+        let reader =
+            Reader::new(self.clone(), Arc::clone(&state), Some(opts.client)).with_verified(known);
+        let root_types: Vec<(Vec<u8>, u8)> =
+            planned.iter().map(|p| (p.path.clone(), p.t)).collect();
+        let parent = self.find_parent(&reader, opts.client, &root_types).await?;
+
+        let chunker = self.config().chunker;
+        let keys = Arc::clone(self.keys());
+        let mut w = Walk {
+            repo: self.clone(),
+            keys: Arc::clone(&keys),
+            own: opts.client,
+            cdc: kist_chunker::Chunker::new(ChunkerParams {
+                min: chunker.min,
+                avg: chunker.avg,
+                max: chunker.max,
+            }),
+            work: Some(Work {
+                dedup: Dedup {
+                    reader: reader.clone(),
+                    written: HashSet::new(),
+                    handle: tokio::runtime::Handle::current(),
+                    verified: 0,
+                },
+                data: PackWriter::new(
+                    Arc::clone(&keys),
+                    Kind::Data,
+                    settings.pack_target,
+                    chunker.max,
+                ),
+                meta: PackWriter::new(
+                    Arc::clone(&keys),
+                    Kind::Meta,
+                    settings.mpack_target,
+                    chunker.max,
+                ),
+                packs: UsedPacks::default(),
+            }),
+            reader: reader.clone(),
+            uploads: JoinSet::new(),
+            since_delta: Vec::new(),
+            own_packs: Vec::new(),
+            used_subtree: false,
+            stats: SnapshotStats::default(),
+            report: BackupReport::default(),
+            parent_start: parent.as_ref().map_or(0, |p| p.snapshot.time),
+            hardlinks: HashMap::new(),
+            counted: HashSet::new(),
+            chunk_bufs: Vec::new(),
+            exclude: opts.exclude.clone(),
+            settings,
+            parity: opts.parity,
+            started,
+            clock: opts.clock.clone(),
+            delta_every: opts.delta_every.max(1),
+        };
+
+        // B2、B3：走訪每個 root
+        let mut roots = Vec::with_capacity(planned.len());
+        let mut used = Used::new();
+        for p in planned {
+            let parent_root = parent
+                .as_ref()
+                .and_then(|par| par.roots.get(&p.path))
+                .filter(|r| r.t == p.t);
+            let (root, root_used) = w.walk_root(p, parent_root).await?;
+            roots.push(root);
+            used.extend(root_used);
+        }
+        let mut items = Vec::new();
+        let built = build_roots(roots, Limits::V4, &|n| keys.is_cut(n), &|b| keys.meta_id(b))?;
+        items.extend(built.items);
+        let mut roots_used = Used::new();
+        let outcomes = w.place(items, &mut roots_used).await?;
+        used.extend(roots_used);
+        if parent
+            .as_ref()
+            .is_some_and(|p| p.snapshot.roots == built.root)
+        {
+            w.collapse(built.root, &outcomes, &mut used);
+        }
+
+        // B3：剩下的 pack、上傳、最後一份 delta
+        w.flush().await?;
+        let mut work = w
+            .work
+            .take()
+            .ok_or_else(|| CoreError::Join("work missing".into()))?;
+        w.report.verified = work.dedup.verified;
+        let packs = std::mem::take(&mut work.packs);
+        Ok(PreparedBackup {
+            repo: self.clone(),
+            reader,
+            state,
+            client: opts.client,
+            hostname: opts.hostname,
+            username: opts.username,
+            clock: opts.clock,
+            started,
+            roots: built.root,
+            parent: parent.map(|p| p.key),
+            stats: w.stats,
+            report: w.report,
+            used,
+            packs,
+            own_packs: w.own_packs,
+            used_subtree: w.used_subtree,
+            settings,
+        })
+    }
+
+    /// 完整的 backup：[`Self::backup_prepare`] 加 [`PreparedBackup::commit`]。
+    pub async fn backup(&self, paths: &[PathBuf], opts: BackupOptions) -> Result<BackupSummary> {
+        self.backup_prepare(paths, opts).await?.commit().await
+    }
+}
+
+/// 走訪中的 backup。
+struct Walk {
+    repo: Repo,
+    reader: Reader,
+    keys: Arc<Keys>,
+    own: ClientId,
+    cdc: kist_chunker::Chunker,
+    work: Option<Work>,
+    uploads: JoinSet<Result<()>>,
+    /// 上一份 delta 之後寫的 pack。
+    since_delta: Vec<DeltaPack>,
+    /// 這次寫的 pack 與 mpack（B4：不能是 tombstone）。
+    own_packs: Vec<ObjectId>,
+    /// 沿用了 parent 的子樹（B4 對 parent 做 HEAD）。
+    used_subtree: bool,
+    stats: SnapshotStats,
+    report: BackupReport,
+    /// parent 的開始時間（快速路徑的 racy 判斷）。
+    parent_start: i64,
+    hardlinks: HashMap<(u64, u64), FileContent>,
+    counted: HashSet<(u64, u64)>,
+    chunk_bufs: Vec<Vec<u8>>,
+    exclude: Exclusions,
+    settings: Settings,
+    parity: u8,
+    started: Reading,
+    clock: Clock,
+    delta_every: usize,
+}
+
+/// 一個檔案切塊到一半的狀態，在 blocking closure 之間移進移出：一輪最多封一個 pack 就回 async 端上傳。
+struct ChunkState<R: std::io::Read> {
+    chunks: kist_chunker::Chunks<R>,
+    list: Vec<(ChunkId, u64)>,
+    used: Used,
+    bytes_total: u64,
+    bytes_new: u64,
+    chunks_new: u64,
+    chunks_reused: u64,
+}
+
+impl Walk {
+    fn take_work(&mut self) -> Result<Work> {
+        self.work
+            .take()
+            .ok_or_else(|| CoreError::Join("backup state missing".into()))
+    }
+
+    fn skip(&mut self, what: &str, reason: &str) {
+        tracing::warn!("{what}: {reason}; skipped");
+        self.report.errors += 1;
+    }
+
+    /// 照 B2 放一批 metadata item（在 blocking 執行緒上），寫滿的 mpack 交出去上傳。
+    async fn place(
+        &mut self,
+        items: Vec<(MetaId, Vec<u8>)>,
+        used: &mut Used,
+    ) -> Result<Vec<(MetaId, Outcome)>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut work = self.take_work()?;
+        let mut report = self.report;
+        let mut local = Used::new();
+        let (work, result, report) = blocking(move || {
+            let r = work
+                .place(items, &mut local, &mut report)
+                .map(|x| (x, local));
+            Ok((work, r, report))
+        })
+        .await?;
+        self.work = Some(work);
+        self.report = report;
+        let ((outcomes, full), local) = result?;
+        used.extend(local);
+        for p in full {
+            self.handle_finished(p).await?;
+        }
+        Ok(outcomes)
+    }
+
+    /// 沿用 parent 的子樹：新建出來的根等於 parent 同一條路徑上的根，而且根有可信的持有者（或是這次已經寫過）
+    /// → 子樹只記根這一筆。
+    fn collapse(&mut self, root: MetaId, outcomes: &[(MetaId, Outcome)], used: &mut Used) {
+        let Some((_, outcome)) = outcomes.iter().rev().find(|(id, _)| *id == root) else {
+            return;
+        };
+        match outcome {
+            Outcome::Reused(i) => *used = vec![(root.into(), *i)],
+            Outcome::InRun => used.clear(),
+            Outcome::Written => return,
+        }
+        self.used_subtree = true;
+        self.report.subtrees += 1;
+    }
+
+    async fn walk_root(&mut self, p: Planned, parent: Option<&Root>) -> Result<(Root, Used)> {
+        let parent_tree = parent.and_then(|r| r.tree);
+        let parent_entry = parent.and_then(|r| r.entry.clone());
+        match p.plan {
+            RootPlan::LocalDir { path, named } => {
+                let root_dev = if self.exclude.one_file_system {
+                    let meta =
+                        std::fs::symlink_metadata(&path).map_err(|e| CoreError::io(&path, e))?;
+                    Some(kist_backend::fsmeta::capture(&meta).dev)
+                } else {
+                    None
+                };
+                let ctx = SourceCtx {
+                    source: Arc::new(LocalSource::new(path)?),
+                    named: Named::new(named),
+                };
+                let visit = Visit::root(self.root_state(&p.path)?, root_dev);
+                let (tree, used) = self.walk_dir(&ctx, b"", parent_tree, visit).await?;
+                Ok((dir_root(p.path, tree), used))
+            }
+            RootPlan::LocalFile { path, item } => {
+                let dir = path.parent().ok_or_else(|| {
+                    CoreError::Usage(format!(
+                        "cannot derive a parent directory for source path {}",
+                        path.display()
+                    ))
+                })?;
+                let ctx = SourceCtx {
+                    source: Arc::new(LocalSource::new(dir.to_path_buf())?),
+                    named: Named::default(),
+                };
+                let name = item.name.clone();
+                let entry = self
+                    .process_entry(
+                        &ctx,
+                        &name,
+                        item,
+                        parent_entry.as_ref(),
+                        Visit::root(FilterState::default(), None),
+                    )
+                    .await?;
+                file_root(p.path, entry, &path.display().to_string())
+            }
+            RootPlan::RemoteDir(source) => {
+                let ctx = SourceCtx {
+                    source,
+                    named: Named::default(),
+                };
+                let visit = Visit::root(self.root_state(&p.path)?, None);
+                let (tree, used) = self.walk_dir(&ctx, b"", parent_tree, visit).await?;
+                Ok((dir_root(p.path, tree), used))
+            }
+            RootPlan::RemoteFile { source, item } => {
+                let ctx = SourceCtx {
+                    source,
+                    named: Named::default(),
+                };
+                let display = String::from_utf8_lossy(&p.path).into_owned();
+                let entry = self
+                    .process_entry(
+                        &ctx,
+                        b"",
+                        item,
+                        parent_entry.as_ref(),
+                        Visit::root(FilterState::default(), None),
+                    )
+                    .await?;
+                file_root(p.path, entry, &display)
+            }
+        }
+    }
+
+    /// 目錄來源在排除樣式裡的狀態：從頂端沿它的定位切段走下去（§9 的切段）。
+    fn root_state(&self, locator: &[u8]) -> Result<FilterState> {
+        let patterns = &self.exclude.patterns;
+        let mut state = patterns.start();
+        for name in split_locator(locator)? {
+            state = patterns.descend(&state, &name);
+        }
+        Ok(state)
+    }
+
+    async fn markers_in(&self, ctx: &SourceCtx, dir_rel: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let mut found = Vec::new();
+        for marker in &self.exclude.if_present {
+            let rel = join_rel(dir_rel, &marker.name);
+            let source = Arc::clone(&ctx.source);
+            let limit = marker.header.len();
+            let probe = blocking(move || source.probe(&rel, limit).map_err(CoreError::from)).await;
+            match probe {
+                Ok(Some(head)) if head == marker.header => found.push(marker.name.clone()),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "{}: cannot check for {}: {e}; backing the directory up in full",
+                    ctx.display_path(dir_rel),
+                    String::from_utf8_lossy(&marker.name)
+                ),
+            }
+        }
+        (!found.is_empty()).then_some(found)
+    }
+
+    /// 一個空目錄（讀不到的目錄、別的檔案系統上的目錄）。
+    async fn empty_dir(&mut self, used: &mut Used) -> Result<MetaId> {
+        let keys = Arc::clone(&self.keys);
+        let mut items = Vec::new();
+        let root = DirBuilder::new(Limits::V4)?.finish(
+            &|n| keys.is_cut(n),
+            &|b| keys.meta_id(b),
+            &mut items,
+        )?;
+        self.place(items, used).await?;
+        Ok(root)
+    }
+
+    /// 遞迴走訪一個目錄的內容：回傳它的根（Seg 或 Dir）與這棵子樹沿用的 (item, 持有者)。
+    fn walk_dir<'a>(
+        &'a mut self,
+        ctx: &'a SourceCtx,
+        dir_rel: &'a [u8],
+        parent_tree: Option<MetaId>,
+        visit: Visit,
+    ) -> DirFuture<'a> {
+        Box::pin(async move {
+            let mut used = Used::new();
+            let mut parent: Option<DirStream> = match parent_tree {
+                Some(id) => match self.reader.dir(&id).await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!("cannot read the parent's directory {id}: {e}; re-reading this directory");
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let list_source = Arc::clone(&ctx.source);
+            let list_dir = dir_rel.to_vec();
+            let mut listing = match blocking(move || {
+                list_source.list(&list_dir).map_err(CoreError::from)
+            })
+            .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    self.skip(&ctx.display_path(dir_rel), &e.to_string());
+                    let root = self.empty_dir(&mut used).await?;
+                    return Ok((root, used));
+                }
+            };
+            let markers = if self.exclude.if_present.is_empty() || visit.pass_through {
+                None
+            } else {
+                self.markers_in(ctx, dir_rel).await
+            };
+
+            let keys = Arc::clone(&self.keys);
+            let is_cut = |n: &[u8]| keys.is_cut(n);
+            let meta_id = |b: &[u8]| keys.meta_id(b);
+            let mut builder = DirBuilder::new(Limits::V4)?;
+            let mut outcomes = Vec::new();
+            while let Some(item) = listing.next_item() {
+                let item = match item {
+                    Ok(i) => i,
+                    Err(e) => {
+                        self.skip(&ctx.display_path(dir_rel), &e.to_string());
+                        continue;
+                    }
+                };
+                let child_rel = join_rel(dir_rel, &item.name);
+                let named = ctx.named.paths.contains(&child_rel);
+                let toward_named = !named && ctx.named.toward.contains(&child_rel);
+                if visit.pass_through && !named && !toward_named {
+                    self.report.excluded += 1;
+                    continue;
+                }
+                let child_filter = self.exclude.patterns.descend(&visit.filter, &item.name);
+                let too_large = match (self.exclude.larger_than, &item.kind) {
+                    (Some(limit), SourceItemKind::File { size, .. }) => *size > limit,
+                    _ => false,
+                };
+                let beside_marker = markers
+                    .as_ref()
+                    .is_some_and(|names| !names.contains(&item.name));
+                let excluded = !named && (child_filter.is_match() || too_large || beside_marker);
+                if excluded && !toward_named {
+                    tracing::debug!("{}: excluded", ctx.display_path(&child_rel));
+                    self.report.excluded += 1;
+                    continue;
+                }
+                // 深度上限與讀取端同一把尺（同 v3）：寫得出、還原不回就是自造的損壞。
+                if matches!(item.kind, SourceItemKind::Dir) && visit.depth >= crate::MAX_TREE_DEPTH
+                {
+                    self.skip(
+                        &ctx.display_path(&child_rel),
+                        &format!(
+                            "directory nesting deeper than {} levels; the read side refuses deeper trees",
+                            crate::MAX_TREE_DEPTH
+                        ),
+                    );
+                    continue;
+                }
+                let parent_entry = match parent.as_mut() {
+                    Some(s) => match s.take(&self.reader, &item.name).await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(
+                                "cannot read the parent's copy of {}: {e}; re-reading the rest of this directory",
+                                ctx.display_path(dir_rel)
+                            );
+                            parent = None;
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let child = Visit {
+                    depth: visit.depth,
+                    filter: child_filter,
+                    dev_bound: visit.dev_bound,
+                    pass_through: !named && (visit.pass_through || excluded),
+                    named,
+                    toward_named,
+                };
+                let display = ctx.display_path(&child_rel);
+                let Some((entry, child_used)) = self
+                    .process_entry(ctx, &child_rel, item, parent_entry.as_ref(), child)
+                    .await?
+                else {
+                    continue;
+                };
+                let mut items = Vec::new();
+                match builder.push(entry, &is_cut, &meta_id, &mut items) {
+                    Ok(()) => used.extend(child_used),
+                    // §7：放不進格式的項目記成這個項目的錯誤，目錄照樣寫
+                    Err(e) => {
+                        self.skip(&display, &e.to_string());
+                        continue;
+                    }
+                }
+                outcomes.extend(self.place(items, &mut used).await?);
+            }
+            let mut items = Vec::new();
+            let root = builder.finish(&is_cut, &meta_id, &mut items)?;
+            outcomes.extend(self.place(items, &mut used).await?);
+            if parent_tree == Some(root) {
+                self.collapse(root, &outcomes, &mut used);
+            }
+            Ok((root, used))
+        })
+    }
+
+    /// 處理一個目錄項目：回傳它的 Entry 與它沿用的 (item, 持有者)；讀不到的、別的檔案系統上的檔案回 `None`。
+    async fn process_entry(
+        &mut self,
+        ctx: &SourceCtx,
+        rel: &[u8],
+        item: SourceItem,
+        parent: Option<&Entry>,
+        visit: Visit,
+    ) -> Result<Option<(Entry, Used)>> {
+        let mk = ctx.source.meta_kind();
+        let posix = if mk == meta_kind::POSIX {
+            ctx.source
+                .local_path(rel)
+                .and_then(|p| std::fs::symlink_metadata(&p).ok())
+                .map(|m| kist_backend::fsmeta::capture(&m))
+        } else {
+            None
+        };
+        let other_fs = match (visit.dev_bound, &posix) {
+            (Some(bound), Some(p)) => p.dev != bound && !visit.named,
+            _ => false,
+        };
+        let mut entry = Entry::new(item.name.clone(), node_type::FILE, mk);
+        let mut used = Used::new();
+        match item.kind {
+            SourceItemKind::Symlink { target } => {
+                self.stats.symlinks += 1;
+                entry.t = node_type::SYMLINK;
+                entry.target = target;
+                if let Some(p) = &posix {
+                    fill_posix(&mut entry, p, false);
+                }
+            }
+            SourceItemKind::Dir => {
+                let parent_tree = match parent {
+                    Some(e) if e.t == node_type::DIR => e.tree,
+                    _ => None,
+                };
+                let tree = if other_fs && !visit.toward_named {
+                    self.report.excluded += 1;
+                    self.empty_dir(&mut used).await?
+                } else {
+                    let dev_bound = match (visit.named, visit.dev_bound, &posix) {
+                        (true, Some(_), Some(p)) => Some(p.dev),
+                        _ => visit.dev_bound,
+                    };
+                    let inside = Visit {
+                        depth: visit.depth + 1,
+                        filter: visit.filter.clone(),
+                        dev_bound,
+                        pass_through: visit.pass_through || other_fs,
+                        named: false,
+                        toward_named: false,
+                    };
+                    let (tree, sub) = self.walk_dir(ctx, rel, parent_tree, inside).await?;
+                    used = sub;
+                    tree
+                };
+                self.stats.dirs += 1;
+                entry.t = node_type::DIR;
+                entry.tree = Some(tree);
+                match mk {
+                    meta_kind::POSIX => {
+                        if let Some(p) = &posix {
+                            fill_posix(&mut entry, p, false);
+                        }
+                    }
+                    // object_store 的前綴沒有時間：sftp 的目錄改記 generic（同 v3）
+                    meta_kind::SFTP => entry.mk = meta_kind::GENERIC,
+                    _ => {}
+                }
+            }
+            SourceItemKind::File {
+                size,
+                mtime_ns,
+                etag,
+                vern,
+            } => {
+                if other_fs {
+                    self.report.excluded += 1;
+                    return Ok(None);
+                }
+                let facts = FileFacts {
+                    size,
+                    posix,
+                    etag: etag.clone(),
+                };
+                let Some((content, file_used)) =
+                    self.process_file(ctx, rel, &facts, parent).await?
+                else {
+                    return Ok(None);
+                };
+                used = file_used;
+                self.stats.files += 1;
+                entry.t = node_type::FILE;
+                entry.size = content.size;
+                entry.ct = content.ct;
+                entry.chunks = content.chunks;
+                entry.mtime = Some(mtime_ns);
+                if mk == meta_kind::S3 {
+                    entry.etag = etag.map(serde_bytes::ByteBuf::from);
+                    entry.vern = vern.map(serde_bytes::ByteBuf::from);
+                }
+                match mk {
+                    meta_kind::POSIX => match facts.posix {
+                        Some(p) => fill_posix(&mut entry, &p, true),
+                        None => {
+                            self.skip(
+                                &ctx.display_path(rel),
+                                "posix source did not provide metadata",
+                            );
+                            return Ok(None);
+                        }
+                    },
+                    meta_kind::SFTP => {
+                        if let Some(p) = &facts.posix {
+                            entry.mode = Some(p.mode);
+                            entry.uid = Some(p.uid);
+                            entry.gid = Some(p.gid);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if mk == meta_kind::POSIX {
+            if let Some(path) = ctx.source.local_path(rel) {
+                entry.xattrs = fsmeta::read_xattrs(&path);
+            }
+        }
+        Ok(Some((entry, used)))
+    }
+
+    /// 一個檔案：快速路徑 → 硬連結 → 讀檔切塊。`None` 是讀不到、已記錄略過。
+    async fn process_file(
+        &mut self,
+        ctx: &SourceCtx,
+        rel: &[u8],
+        f: &FileFacts,
+        parent: Option<&Entry>,
+    ) -> Result<Option<(FileContent, Used)>> {
+        #[cfg(unix)]
+        if let Some(p) = f.posix {
+            if p.mode & 0o170000 != 0o100000 {
+                self.skip(
+                    &ctx.display_path(rel),
+                    "not a regular file (fifo/socket/device)",
+                );
+                return Ok(None);
+            }
+        }
+        if let Some(reused) = self.try_reuse(f, parent).await? {
+            self.report.files_reused += 1;
+            return Ok(Some(reused));
+        }
+        let hl_key = f.posix.filter(|p| p.nlink > 1).map(|p| (p.dev, p.inode));
+        if let Some(key) = hl_key {
+            if let Some(hit) = self.hardlinks.get(&key) {
+                // 第一個名字已經處理過它的持有者（或它在沿用的子樹裡，靠 parent）
+                return Ok(Some((hit.clone(), Used::new())));
+            }
+        }
+        let reader = match ctx.source.read(rel) {
+            Ok(r) => r,
+            Err(e) => {
+                self.skip(&ctx.display_path(rel), &e.to_string());
+                return Ok(None);
+            }
+        };
+        let display = ctx.display_path(rel);
+        let Some(chunked) = self.chunk_reader(reader, &display).await? else {
+            return Ok(None);
+        };
+        let ChunkState {
+            list,
+            mut used,
+            bytes_total,
+            bytes_new,
+            chunks_new,
+            chunks_reused,
+            ..
+        } = chunked;
+        match hl_key {
+            Some(key) => {
+                if self.counted.insert(key) {
+                    self.stats.bytes += bytes_total;
+                }
+            }
+            None => self.stats.bytes += bytes_total,
+        }
+        self.report.bytes_stored += bytes_new;
+        self.report.chunks_new += chunks_new;
+        self.report.chunks_reused += chunks_reused;
+        let keys = Arc::clone(&self.keys);
+        let built = build_chunks(list, Limits::V4, &|n| keys.is_cut(n), &|b| keys.meta_id(b))?;
+        self.place(built.items, &mut used).await?;
+        let content = FileContent {
+            size: bytes_total,
+            ct: built.ct,
+            chunks: built.chunks,
+        };
+        if let Some(key) = hl_key {
+            self.hardlinks.insert(key, content.clone());
+        }
+        Ok(Some((content, used)))
+    }
+
+    /// 快速路徑（同 v3 的分級）：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 與 generic 一律
+    /// 重讀。內容照 B2 判斷：`ct=0` 每個 chunk 都要有可信的持有者；`ct=1` 的清單是一棵子樹，只判斷它的根
+    /// （沿用 parent 的子樹）。不成立就重讀。
+    async fn try_reuse(
+        &mut self,
+        f: &FileFacts,
+        parent: Option<&Entry>,
+    ) -> Result<Option<(FileContent, Used)>> {
+        let Some(pe) = parent else {
+            return Ok(None);
+        };
+        if pe.t != node_type::FILE {
+            return Ok(None);
+        }
+        let proven = match (f.posix.as_ref(), pe.mk) {
+            (Some(p), meta_kind::POSIX) => {
+                let now = fsmeta::FsMeta {
+                    mode: p.mode,
+                    uid: p.uid,
+                    gid: p.gid,
+                    mtime_ns: p.mtime_ns,
+                    ctime_ns: p.ctime_ns,
+                    inode: p.inode,
+                    dev: p.dev,
+                    nlink: p.nlink,
+                };
+                fsmeta::file_unchanged(&meta_of(pe), pe.size, &now, f.size, self.parent_start)
+            }
+            (None, meta_kind::S3) => match (&f.etag, &pe.etag) {
+                (Some(etag), Some(petag)) => petag.as_ref() == etag.as_slice() && pe.size == f.size,
+                _ => false,
+            },
+            _ => false,
+        };
+        if !proven {
+            return Ok(None);
+        }
+        let content = FileContent {
+            size: pe.size,
+            ct: pe.ct,
+            chunks: pe.chunks.clone(),
+        };
+        let mut work = self.take_work()?;
+        let check = content.clone();
+        let (work, decided) = blocking(move || {
+            let mut used = Used::new();
+            let mut subtree = false;
+            let ok = if check.ct == content_type::DIRECT {
+                check
+                    .chunks
+                    .iter()
+                    .all(|id| match work.dedup.decide(*id, Kind::Data) {
+                        Decision::InRun => true,
+                        Decision::Reuse(h) => {
+                            used.push((*id, work.packs.intern(&h)));
+                            true
+                        }
+                        Decision::Write => false,
+                    })
+            } else {
+                match check
+                    .chunks
+                    .first()
+                    .map(|id| (*id, work.dedup.decide(*id, Kind::Meta)))
+                {
+                    Some((_, Decision::InRun)) => true,
+                    Some((id, Decision::Reuse(h))) => {
+                        used.push((id, work.packs.intern(&h)));
+                        subtree = true;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            Ok((work, ok.then_some((used, subtree))))
+        })
+        .await?;
+        self.work = Some(work);
+        let Some((used, subtree)) = decided else {
+            return Ok(None);
+        };
+        if subtree {
+            self.used_subtree = true;
+            self.report.subtrees += 1;
+        }
+        let count = match f.posix.filter(|p| p.nlink > 1) {
+            Some(p) => self.counted.insert((p.dev, p.inode)),
+            None => true,
+        };
+        if count {
+            self.stats.bytes += pe.size;
+        }
+        Ok(Some((content, used)))
+    }
+
+    /// 切塊、照 B2 去重、打包。一輪 blocking 最多封一個 pack 就回 async 端上傳（同 v3）。讀到一半出錯回
+    /// `None`（已記錄略過；已寫進 pack 的 chunk 留著無害）。
+    async fn chunk_reader<R>(&mut self, reader: R, display: &str) -> Result<Option<ChunkState<R>>>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let buf = self.chunk_bufs.pop().unwrap_or_default();
+        let mut state = ChunkState {
+            chunks: self.cdc.chunks_with_buf(reader, buf),
+            list: Vec::new(),
+            used: Used::new(),
+            bytes_total: 0,
+            bytes_new: 0,
+            chunks_new: 0,
+            chunks_reused: 0,
+        };
+        loop {
+            let mut work = self.take_work()?;
+            let keys = Arc::clone(&self.keys);
+            let (work, state_back, finished, done, read_error, hard_error) = blocking(move || {
+                let mut finished = None;
+                let mut done = false;
+                let mut read_error = None;
+                let mut hard_error = None;
+                loop {
+                    let chunk = match state.chunks.next() {
+                        None => {
+                            done = true;
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            read_error = Some(e.to_string());
+                            done = true;
+                            break;
+                        }
+                        Some(Ok(c)) => c,
+                    };
+                    let id = keys.chunk_id(&chunk);
+                    let item: ItemId = id.into();
+                    state.bytes_total += chunk.len() as u64;
+                    state.list.push((id, chunk.len() as u64));
+                    match work.dedup.decide(item, Kind::Data) {
+                        Decision::InRun => continue,
+                        Decision::Reuse(h) => {
+                            let i = work.packs.intern(&h);
+                            state.used.push((item, i));
+                            state.chunks_reused += 1;
+                            continue;
+                        }
+                        Decision::Write => {}
+                    }
+                    if let Err(e) = work.data.add(item, &chunk) {
+                        hard_error = Some(e);
+                        done = true;
+                        break;
+                    }
+                    work.dedup.written.insert(item);
+                    state.bytes_new += chunk.len() as u64;
+                    state.chunks_new += 1;
+                    if work.data.is_full() {
+                        match work.data.finish() {
+                            Ok(p) => finished = p,
+                            Err(e) => {
+                                hard_error = Some(e);
+                                done = true;
+                            }
+                        }
+                        break;
+                    }
+                }
+                Ok((work, state, finished, done, read_error, hard_error))
+            })
+            .await?;
+            self.work = Some(work);
+            state = state_back;
+            if let Some(p) = finished {
+                self.handle_finished(p).await?;
+            }
+            if let Some(e) = hard_error {
+                self.chunk_bufs.push(state.chunks.take_buf());
+                return Err(e);
+            }
+            if let Some(reason) = read_error {
+                self.chunk_bufs.push(state.chunks.take_buf());
+                self.skip(display, &reason);
+                return Ok(None);
+            }
+            if done {
+                self.chunk_bufs.push(state.chunks.take_buf());
+                return Ok(Some(state));
+            }
+        }
+    }
+
+    /// B3：封好的 pack 或 mpack 交去上傳（只在不存在時建立；mpack 在 replicas=1 時先主體、後 `.r1`；parity
+    /// 選配），記下來給 delta 與 B4。自己寫的 mpack 也放進記憶體與本地快取：下一次 backup 讀 parent 的樹不必
+    /// 下載。
+    async fn handle_finished(&mut self, p: FinishedPack) -> Result<()> {
+        self.wait_uploads(MAX_INFLIGHT_UPLOADS - 1).await?;
+        let FinishedPack {
+            id,
+            kind,
+            bytes,
+            entries,
+        } = p;
+        self.since_delta.push(DeltaPack {
+            id,
+            kind,
+            size: bytes.len() as u64,
+            entries,
+        });
+        self.own_packs.push(id);
+        let replica = match kind {
+            Kind::Data => {
+                self.report.packs_new += 1;
+                false
+            }
+            Kind::Meta => {
+                self.report.mpacks_new += 1;
+                if let Some(c) = self.repo.cache() {
+                    c.put(CacheKind::Mpack, &id, &bytes);
+                }
+                self.reader.mpacks.insert(id, Arc::new(bytes.clone()));
+                self.settings.replicas == 1
+            }
+        };
+        let backend: Backend = self.repo.backend().clone();
+        let key = pack_key(kind, self.own, id);
+        let parity_key = Key::Parity {
+            client: self.own,
+            id,
+        };
+        let m = usize::from(self.parity);
+        let path = key.path();
+        self.uploads.spawn(async move {
+            let (bytes, parity) = if m > 0 {
+                blocking(move || {
+                    let p = match kist_format::v4::parity::encode(&id, &bytes, m) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!("{path} is stored but its parity is not: {e}");
+                            None
+                        }
+                    };
+                    Ok((bytes, p))
+                })
+                .await?
+            } else {
+                (bytes, None)
+            };
+            // 以內容命名：「已存在」就是那份 bytes 已經在了（§12）
+            let create = |k: Key, b: Vec<u8>| {
+                let backend = backend.clone();
+                async move {
+                    match backend.put_if_absent(&k.path(), b).await {
+                        Ok(()) | Err(BackendError::AlreadyExists(_)) => Ok::<_, CoreError>(()),
+                        Err(e) => Err(e.into()),
+                    }
+                }
+            };
+            let replica_bytes = replica.then(|| bytes.clone());
+            create(key.clone(), bytes).await?;
+            if let Some(b) = replica_bytes {
+                let Key::Mpack { client, id, .. } = key else {
+                    return Err(CoreError::Join("mpack key expected".into()));
+                };
+                create(
+                    Key::Mpack {
+                        client,
+                        id,
+                        replica: true,
+                    },
+                    b,
+                )
+                .await?;
+            }
+            if let Some(p) = parity {
+                if let Err(e) = create(parity_key.clone(), p).await {
+                    tracing::warn!("{} is stored but its parity is not: {e}", parity_key.path());
+                }
+            }
+            Ok(())
+        });
+        if self.since_delta.len() >= self.delta_every {
+            self.write_delta().await?;
+        }
+        Ok(())
+    }
+
+    async fn wait_uploads(&mut self, max: usize) -> Result<()> {
+        while self.uploads.len() > max {
+            match self.uploads.join_next().await {
+                Some(Ok(r)) => r?,
+                Some(Err(e)) => return Err(CoreError::Join(e.to_string())),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// B3：等列在 delta 裡的 pack 都上傳完，再寫 delta。`E ≥ grace − M` 之後不再寫（這次 backup 到 B4 也會停）。
+    async fn write_delta(&mut self) -> Result<()> {
+        if self.since_delta.is_empty() {
+            return Ok(());
+        }
+        self.wait_uploads(0).await?;
+        let grace = Duration::from_secs(self.settings.grace);
+        let e = elapsed(&self.started, &self.clock.now());
+        if e + M >= grace {
+            tracing::warn!(
+                "the backup has run for {}s, within an hour of the GC grace ({}s); not writing more deltas",
+                e.as_secs(),
+                grace.as_secs()
+            );
+            self.since_delta.clear();
+            return Ok(());
+        }
+        let packs = std::mem::take(&mut self.since_delta);
+        let plain = Delta::new(self.own, packs).encode()?;
+        let sealed = self.keys.seal_delta(&self.own, &plain)?;
+        let id = ObjectId::of(&sealed);
+        // 下一次 B1 讀 delta 時不必再下載自己剛寫的這一份
+        if let Some(c) = self.repo.cache() {
+            c.put(CacheKind::Delta, &id, &sealed);
+        }
+        let key = Key::Delta {
+            client: self.own,
+            id,
+        };
+        match self.repo.backend().put_if_absent(&key.path(), sealed).await {
+            Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.report.deltas_new += 1;
+        Ok(())
+    }
+
+    /// 走訪結束：剩下的 pack 與 mpack、等上傳完、最後一份 delta。
+    async fn flush(&mut self) -> Result<()> {
+        let mut work = self.take_work()?;
+        let (work, data, meta) = blocking(move || {
+            let data = work.data.finish();
+            let meta = work.meta.finish();
+            Ok((work, data, meta))
+        })
+        .await?;
+        self.work = Some(work);
+        for p in [data?, meta?].into_iter().flatten() {
+            self.handle_finished(p).await?;
+        }
+        self.wait_uploads(0).await?;
+        self.write_delta().await
+    }
+}
+
+fn dir_root(path: Vec<u8>, tree: MetaId) -> Root {
+    Root {
+        path,
+        t: node_type::DIR,
+        tree: Some(tree),
+        entry: None,
+    }
+}
+
+fn file_root(path: Vec<u8>, entry: Option<(Entry, Used)>, display: &str) -> Result<(Root, Used)> {
+    let Some((entry, used)) = entry else {
+        return Err(CoreError::Usage(format!(
+            "{display}: source could not be read"
+        )));
+    };
+    Ok((
+        Root {
+            path,
+            t: entry.t,
+            tree: None,
+            entry: Some(entry),
+        },
+        used,
+    ))
+}
+
+/// 只在不存在時建立的結果。
+enum Created {
+    /// 建立了，或「已存在」而 bytes 相同（自己剛寫進去的，S3 的 5xx 重試，§12）。
+    Ours,
+    /// 已存在而 bytes 不同：撞名。
+    Collision,
+}
+
+async fn create_or_same(
+    backend: &Backend,
+    key: &str,
+    bytes: &[u8],
+) -> std::result::Result<Created, BackendError> {
+    match backend.put_if_absent(key, bytes.to_vec()).await {
+        Ok(()) => Ok(Created::Ours),
+        Err(BackendError::AlreadyExists(_)) => {
+            let existing = backend.get(key).await?;
+            Ok(if existing == bytes {
+                Created::Ours
+            } else {
+                Created::Collision
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 除了 snapshot 之外全部寫完的 backup。拆成兩步讓測試能在中間插入維護角色的動作。
+pub struct PreparedBackup {
+    repo: Repo,
+    reader: Reader,
+    state: Arc<State>,
+    client: ClientId,
+    hostname: String,
+    username: String,
+    clock: Clock,
+    started: Reading,
+    roots: MetaId,
+    parent: Option<String>,
+    stats: SnapshotStats,
+    report: BackupReport,
+    used: Used,
+    packs: UsedPacks,
+    own_packs: Vec<ObjectId>,
+    used_subtree: bool,
+    settings: Settings,
+}
+
+impl PreparedBackup {
+    pub fn report(&self) -> BackupReport {
+        self.report
+    }
+
+    /// B4 與 B5 的「E < min(grace(g_s), grace(g_c)) − M」。
+    fn check_elapsed(&self, grace: Duration, step: &str) -> Result<()> {
+        let e = elapsed(&self.started, &self.clock.now());
+        if e + M >= grace {
+            return Err(CoreError::NotCommitted(format!(
+                "{step}: the backup has run for {}s; it must finish within the GC grace ({}s) minus one hour",
+                e.as_secs(),
+                grace.as_secs()
+            )));
+        }
+        Ok(())
+    }
+
+    /// B4（緊接在寫 snapshot 之前）與 B5：檢查去重用到的每個 pack、沿用子樹時的 parent，然後寫 snapshot。
+    pub async fn commit(self) -> Result<BackupSummary> {
+        // B4
+        let g_s = self.state.gen.g;
+        let listing = self.repo.list_heads(Some(g_s)).await?;
+        let g_c = match listing.keys().next_back() {
+            Some(&g) if g >= g_s => g,
+            _ => {
+                return Err(CoreError::Generation(format!(
+                    "generation {g_s}, which this backup started from, is no longer listed: the newest generation went backwards"
+                )))
+            }
+        };
+        let newer = if g_c == g_s {
+            None
+        } else {
+            let gen = self.repo.read_head(g_c).await?;
+            let map = self.repo.load_map(&gen).await?;
+            Some((gen, map))
+        };
+        let (head_c, map_c) = match &newer {
+            Some((gen, map)) => (&gen.head, map),
+            None => (&self.state.gen.head, &self.state.map),
+        };
+        let grace = Duration::from_secs(self.settings.grace.min(head_c.settings.grace));
+        self.check_elapsed(grace, "B4")?;
+        let mut by_pack: HashMap<u32, Vec<ItemId>> = HashMap::new();
+        for (id, i) in &self.used {
+            by_pack.entry(*i).or_default().push(*id);
+        }
+        for (i, ids) in by_pack {
+            let p = &self.packs.packs[i as usize];
+            match map_c.record(&p.id) {
+                Some(rec) => {
+                    if matches!(
+                        rec.status.s,
+                        status::TOMBSTONE | status::UNREADABLE | status::UNKNOWN
+                    ) {
+                        return Err(CoreError::NotCommitted(format!(
+                            "pack {} that this backup reuses is {} in generation {g_c}",
+                            p.id,
+                            status_name(rec.status.s)
+                        )));
+                    }
+                    if g_c != g_s {
+                        let have: HashSet<ItemId> = rec.entries.iter().map(|e| e.i).collect();
+                        if let Some(missing) = ids.iter().find(|id| !have.contains(id)) {
+                            return Err(CoreError::NotCommitted(format!(
+                                "pack {} no longer holds {missing} in generation {g_c}",
+                                p.id
+                            )));
+                        }
+                    }
+                }
+                None if p.source == HolderSource::Map => {
+                    return Err(CoreError::NotCommitted(format!(
+                        "pack {} that this backup reuses left the map in generation {g_c}",
+                        p.id
+                    )))
+                }
+                None => {
+                    let key = pack_key(p.kind, p.client, p.id);
+                    let trailer = self.reader.trailer(&key).await.map_err(|e| {
+                        CoreError::NotCommitted(format!(
+                            "pack {} (known from a delta) cannot be checked: {e}",
+                            key.path()
+                        ))
+                    })?;
+                    let have: HashSet<ItemId> = trailer.entries.iter().map(|e| e.i).collect();
+                    if let Some(missing) = ids.iter().find(|id| !have.contains(id)) {
+                        return Err(CoreError::NotCommitted(format!(
+                            "pack {} does not hold {missing}, which its delta claims",
+                            key.path()
+                        )));
+                    }
+                }
+            }
+        }
+        for id in &self.own_packs {
+            if map_c
+                .record(id)
+                .is_some_and(|r| r.status.s == status::TOMBSTONE)
+            {
+                return Err(CoreError::NotCommitted(format!(
+                    "pack {id} that this backup wrote is a tombstone in generation {g_c}"
+                )));
+            }
+        }
+        if self.used_subtree {
+            if let Some(parent) = &self.parent {
+                match self.repo.backend().head(parent).await {
+                    Ok(_) => {}
+                    Err(BackendError::NotFound(_)) => {
+                        return Err(CoreError::NotCommitted(format!(
+                            "the parent snapshot {parent} is gone, and this backup reuses its subtrees"
+                        )))
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        // B5
+        let key = self.write_snapshot(grace).await?;
+        if let Some(c) = self.repo.cache() {
+            c.add_verified(&self.reader.take_new_verified());
+            c.set_seen_gen(g_c);
+            c.set_last_snapshot(&key);
+        }
+        Ok(BackupSummary {
+            snapshot: key,
+            parent: self.parent,
+            generation: g_c,
+            stats: self.stats,
+            report: self.report,
+        })
+    }
+
+    /// B5：再檢查一次 E；replicas=1 時寫 `.r1`；再檢查一次 E；寫主體＝commit。「已存在」時讀回比對：bytes
+    /// 相同是自己剛寫進去的；不同就把時間戳 +1 奈秒，重新封、重寫 `.r1`（§9）。
+    async fn write_snapshot(&self, grace: Duration) -> Result<String> {
+        let base = i64::try_from(self.started.wall.unix_timestamp_nanos())
+            .map_err(|_| CoreError::Usage("the clock is out of range".to_owned()))?;
+        let backend = self.repo.backend();
+        for attempt in 0..3i64 {
+            let time = base + attempt;
+            let ts = SnapTs::from_nanos(time)?;
+            let snap = Snapshot {
+                v: kist_format::v4::VERSION,
+                roots: self.roots,
+                time,
+                host: self.hostname.clone(),
+                user: self.username.clone(),
+                client: self.client,
+                parent: self.parent.clone(),
+                stats: self.stats,
+            };
+            let sealed = self
+                .repo
+                .keys()
+                .seal_snapshot(&self.client, &ts, &snap.encode()?)?;
+            let body = Key::Snapshot {
+                client: self.client,
+                ts: ts.clone(),
+                replica: false,
+            }
+            .path();
+            self.check_elapsed(grace, "B5")?;
+            if self.settings.replicas == 1 {
+                let r1 = Key::Snapshot {
+                    client: self.client,
+                    ts,
+                    replica: true,
+                }
+                .path();
+                if let Created::Collision = create_or_same(backend, &r1, &sealed).await? {
+                    continue;
+                }
+                self.check_elapsed(grace, "B5")?;
+            }
+            match create_or_same(backend, &body, &sealed).await {
+                Ok(Created::Ours) => return Ok(body),
+                Ok(Created::Collision) => continue,
+                Err(source) => return Err(CoreError::CommitUnknown { key: body, source }),
+            }
+        }
+        Err(CoreError::NotCommitted(
+            "the snapshot key collided three times".to_owned(),
+        ))
+    }
+}
+
+fn status_name(s: u8) -> &'static str {
+    match s {
+        status::LIVE => "live",
+        status::CONDEMNED => "condemned",
+        status::TOMBSTONE => "a tombstone",
+        status::UNREADABLE => "unreadable",
+        _ => "of an unknown version",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// §11.1：E ＝ max(牆鐘經過, 含休眠的單調時鐘經過)。
+    #[test]
+    fn elapsed_takes_the_larger_of_the_wall_and_boot_clocks() {
+        let h = Duration::from_secs(3600);
+        let t0 = time::OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let start = Reading {
+            wall: t0,
+            boot: Duration::from_secs(10),
+        };
+        let at = |wall: time::OffsetDateTime, boot: Duration| Reading {
+            wall,
+            boot: start.boot + boot,
+        };
+        // 休眠：單調時鐘多算了睡著的時間
+        assert_eq!(elapsed(&start, &at(t0 + h, 3 * h)), 3 * h);
+        // 牆鐘被往回調：單調時鐘照算
+        assert_eq!(elapsed(&start, &at(t0 - 5 * h, 2 * h)), 2 * h);
+        // 牆鐘往前跳（沒有計入休眠的平台上，牆鐘那一半補上）
+        assert_eq!(elapsed(&start, &at(t0 + 4 * h, h)), 4 * h);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_boot_clock_moves_forward() {
+        let a = boot_time();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(boot_time() > a);
+    }
+}

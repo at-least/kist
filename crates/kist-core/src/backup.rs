@@ -172,8 +172,8 @@ fn one_file_system_unsupported() -> CoreError {
 /// 種類、任何內容都算）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Marker {
-    name: Vec<u8>,
-    header: Vec<u8>,
+    pub(crate) name: Vec<u8>,
+    pub(crate) header: Vec<u8>,
 }
 
 impl Marker {
