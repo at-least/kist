@@ -158,3 +158,62 @@ async fn an_unchanged_backup_after_maintenance_needs_no_trailer() {
     let total: usize = counts.values().sum();
     assert!((6..=11).contains(&total), "{total} requests: {counts:?}");
 }
+
+/// B2 的第一種可信：`by_prune` 的持有者（prune 自己寫出、讀回驗證過，在全零 client 的前綴下）不必取回驗證。
+#[tokio::test]
+async fn a_by_prune_holder_is_trusted_without_a_fetch() {
+    use kist_core::v4::pack::PackWriter;
+    use kist_format::v4::ids::ClientId;
+    use kist_format::v4::keys::Key;
+    use kist_format::v4::pack::Kind;
+
+    let h = HookedRepo::new(init_options(0)).await;
+    let repo = h.open_as("c").await;
+    // 小於最小 chunk 的檔案就是一個 chunk
+    let content = data("repacked", 3000);
+    let keys = std::sync::Arc::clone(repo.keys());
+    let mut w = PackWriter::new(
+        std::sync::Arc::clone(&keys),
+        Kind::Data,
+        64 * 1024,
+        64 * 1024,
+    );
+    w.add(keys.chunk_id(&content).into(), &content).unwrap();
+    let p = w.finish().unwrap().unwrap();
+    h.backend
+        .put_if_absent(
+            &Key::Pack {
+                client: ClientId::MAINT,
+                id: p.id,
+            }
+            .path(),
+            p.bytes,
+        )
+        .await
+        .unwrap();
+    let records = index_everything(&repo, &std::collections::BTreeMap::new()).await;
+    assert!(records.iter().any(|r| r.by_prune));
+    write_generation(&repo, records, false).await;
+
+    let src = h.dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), &content).unwrap();
+    h.store.reset();
+    let s = repo.backup(&[src], opts(1)).await.unwrap();
+    assert_eq!(
+        (
+            s.report.chunks_reused,
+            s.report.chunks_new,
+            s.report.verified
+        ),
+        (1, 0, 0),
+        "{:?}",
+        s.report
+    );
+    assert_eq!(
+        h.store.counts().get("range"),
+        None,
+        "{:?}",
+        h.store.counts()
+    );
+}

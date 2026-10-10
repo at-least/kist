@@ -474,3 +474,111 @@ async fn an_entry_that_does_not_fit_is_an_error_of_that_entry_only() {
     );
     assert_eq!(back["c"], Node::File(b"third".to_vec()));
 }
+
+/// §13：parity 選配，資料 pack 與 mpack 都有一份同名的 `parity/<c>/<hex>`（v3 的排版、`v` 是 4），修得回
+/// 壞掉的 bytes。超過 8 片在寫任何東西之前就拒絕。
+#[tokio::test]
+async fn parity_covers_every_pack_and_mpack_and_repairs_them() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    sample_source(&src);
+    let repo = t.open().await;
+    let mut o = opts(1);
+    o.parity = 9;
+    let err = repo
+        .backup(std::slice::from_ref(&src), o)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Usage(_)), "{err}");
+    assert!(t.keys("packs").await.is_empty());
+
+    let mut o = opts(1);
+    o.parity = 2;
+    repo.backup(std::slice::from_ref(&src), o).await.unwrap();
+    let packs = [t.keys("packs").await, t.keys("mpacks").await].concat();
+    let parity = t.keys("parity").await;
+    assert_eq!(parity.len(), packs.len(), "{parity:?}");
+    for k in packs {
+        let (client, id) = match Key::parse(&k).unwrap() {
+            Key::Pack { client, id } | Key::Mpack { client, id, .. } => (client, id),
+            other => panic!("{other:?}"),
+        };
+        let pk = Key::Parity { client, id }.path();
+        let obj = kist_format::v4::parity::parse(&t.backend.get(&pk).await.unwrap()).unwrap();
+        assert_eq!((obj.v, obj.parity_shards()), (4, 2));
+        let bytes = t.backend.get(&k).await.unwrap();
+        assert_eq!(obj.repair(&id, &bytes).unwrap(), bytes);
+        let mut bad = bytes.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0xff;
+        assert_eq!(obj.repair(&id, &bad).unwrap(), bytes, "{k}");
+    }
+}
+
+/// 排除規則、記號檔、大小上限與硬連結（走訪的骨架照 v3，ADR 020、021）：被排除的不進 snapshot、計進
+/// `excluded`；硬連結的內容只算一次 bytes。
+#[tokio::test]
+async fn exclusions_and_hardlinks_follow_the_v3_walk() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("cache")).unwrap();
+    std::fs::create_dir_all(src.join("keep")).unwrap();
+    std::fs::write(src.join("keep/a.txt"), b"keep me").unwrap();
+    std::fs::write(src.join("keep/b.tmp"), b"skip me").unwrap();
+    std::fs::write(src.join("big.bin"), vec![1u8; 5000]).unwrap();
+    std::fs::write(
+        src.join("cache/CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    std::fs::write(src.join("cache/data"), b"cached").unwrap();
+    std::fs::write(src.join("hard1"), b"shared content").unwrap();
+    std::fs::hard_link(src.join("hard1"), src.join("hard2")).unwrap();
+    let repo = t.open().await;
+    let mut o = opts(1);
+    o.exclude = kist_core::Exclusions::new(
+        kist_core::PathFilter::new(&["*.tmp"]).unwrap(),
+        &[],
+        true,
+        Some(1000),
+        false,
+    )
+    .unwrap();
+    let s = repo.backup(std::slice::from_ref(&src), o).await.unwrap();
+    // b.tmp、big.bin、cache/data
+    assert_eq!(s.report.excluded, 3, "{:?}", s.report);
+    let back = read_root_dir(&repo, &s.snapshot).await;
+    assert_eq!(
+        back.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "cache",
+            "cache/CACHEDIR.TAG",
+            "hard1",
+            "hard2",
+            "keep",
+            "keep/a.txt"
+        ]
+    );
+    assert_eq!(back["hard2"], Node::File(b"shared content".to_vec()));
+    // bytes：a.txt、CACHEDIR.TAG、硬連結的內容一次
+    assert_eq!(s.stats.bytes, 7 + 43 + 14);
+    assert_eq!(s.stats.files, 4);
+    // 沒變的第二次走快速路徑：硬連結的兩個名字照樣只算一次
+    let again = repo
+        .backup(std::slice::from_ref(&src), {
+            let mut o = opts(1);
+            o.exclude = kist_core::Exclusions::new(
+                kist_core::PathFilter::new(&["*.tmp"]).unwrap(),
+                &[],
+                true,
+                Some(1000),
+                false,
+            )
+            .unwrap();
+            o
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.report.files_reused, 4, "{:?}", again.report);
+    assert_eq!(again.stats, s.stats);
+}
