@@ -433,15 +433,17 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
   455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
-## M12：v4 格式（2026-10-10 設計草稿，待負責人確認）
+## M12：v4 格式（2026-10-10 重新設計，待負責人確認）
 
-起因：ADR 017 的 v4 草稿，加上 ADR 025 留下要改格式的 V19、V21。負責人同意先修完審查、合進 main、
-再開 `v4` 分支，並說明系統還沒上線、相容性不重要。
+起因：ADR 017 的 v4 草稿，加上 ADR 025 留下要改格式的 V19、V21。負責人說明系統還沒上線、相容性
+不重要、不需要支援上一代。第一版草稿（`054c7e1`，v3 加樹進 pack）負責人要求重新設計。
 
-- 設計：ADR 026（範圍與每個要選的地方）與 `docs/format-v4.md`（規格全文，確認並開始實作時取代
-  `docs/format.md`）。樹進 `mpacks/`、`Root.t`、樹段 8 MiB 上限、`IndexPack.kind`、mpack 的 `.r1`、
-  backup 零覆寫、`kist/v4/*`、GC 補條款；v4 不讀 v3。
-- 程式碼還沒動。七個實作階段見 ADR 026，每段完成照常 commit、回報、等確認。
+- 設計：ADR 026（一頁白話、需求、教訓與對策、每一層的選項與決定、兩輪對抗式審查、假設、待負責人
+  決定的六項）與 `docs/format-v4.md`（規格全文，確認並開始實作時取代 `docs/format.md`）。重點：世代
+  柵欄（只有建立下一個 head 的 prune 能刪）、刪除只看 prune 驗證過的資料、不覆寫任何物件、metadata
+  進 `mpacks/` 並依內容切段、`Root.t`、backup 只沿用信得過的副本。v4 不讀 v3、沒有遷移。
+- 程式碼還沒動。實作七段見 ADR 026：第一段是可執行的 GC 模型、proptest 與外部審查，通過之後才寫正式
+  程式碼。每段完成照常 commit、回報、等確認。
 
 ## 已接受的限制（非待辦）
 
