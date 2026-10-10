@@ -202,16 +202,21 @@ async fn an_unchanged_second_backup_writes_no_pack_and_reuses_the_parent() {
     );
 }
 
-/// §7：大目錄依內容切段，改一個檔只重寫它那一段、目錄的 Dir 與往上的路徑（這裡是 roots）。
+/// §7：大目錄依內容切段，改一個檔只重寫它那一段、目錄的 Dir 與往上的路徑（這裡是 roots）。名稱依這個 repo 的
+/// K_cut 挑，保證至少兩段（固定的兩萬個名稱在亂數的金鑰下約 1% 完全不切）。
 #[tokio::test]
 async fn one_changed_file_in_a_large_directory_rewrites_one_segment() {
     let t = TestRepo::new().await;
+    let repo = t.open().await;
     let src = t.dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    for i in 0..20_000 {
-        std::fs::write(src.join(format!("f{i:05}")), b"").unwrap();
+    let mut names = names_with_cuts(&repo, 2);
+    while names.len() < 20_000 {
+        names.push(format!("f{:06}", names.len()));
     }
-    let repo = t.open().await;
+    for n in &names {
+        std::fs::write(src.join(n), b"").unwrap();
+    }
     let first = repo
         .backup(std::slice::from_ref(&src), opts(1))
         .await
@@ -223,11 +228,15 @@ async fn one_changed_file_in_a_large_directory_rewrites_one_segment() {
         .unwrap();
     let roots = reader.roots(&snap.roots).await.unwrap();
     let Item::Dir(dir) = reader.item(&roots[0].tree.unwrap()).await.unwrap() else {
-        panic!("20 000 entries should need more than one segment");
+        panic!(
+            "{} entries chosen to cut should need more than one segment",
+            names.len()
+        );
     };
     assert!(dir.segs.len() >= 2, "{} segments", dir.segs.len());
 
-    let path = src.join("f12345");
+    let changed = names[names.len() / 2].clone();
+    let path = src.join(&changed);
     std::fs::write(&path, b"changed").unwrap();
     filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
     let second = repo
@@ -238,10 +247,10 @@ async fn one_changed_file_in_a_large_directory_rewrites_one_segment() {
     assert_eq!(r.chunks_new, 1, "{r:?}");
     // 那一段、目錄的 Dir、roots
     assert_eq!(r.items_new, 3, "{r:?}");
-    assert_eq!(r.files_reused, 19_999, "{r:?}");
+    assert_eq!(r.files_reused, names.len() as u64 - 1, "{r:?}");
     let back = read_root_dir(&repo, &second.snapshot).await;
-    assert_eq!(back.len(), 20_000);
-    assert_eq!(back["f12345"], Node::File(b"changed".to_vec()));
+    assert_eq!(back.len(), names.len());
+    assert_eq!(back[&changed], Node::File(b"changed".to_vec()));
 }
 
 /// §9 的 `Root.t`：檔案 root 帶自己的 Entry、目錄 root 帶 tree。本機來源先 canonicalize（ADR 020：symlink
