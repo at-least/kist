@@ -48,9 +48,11 @@ repo 是 key → bytes 的命名空間。**每一次寫入都是一次只在不�
 - `<c>` 是 client id 的 32 位小寫 hex。維護角色（prune 的 repack 輸出）用全零的 client id。
 - `<hex>` 是物件 bytes 的 BLAKE3（無 key）小寫 hex；`<g>` 是世代號碼的 16 位小寫 hex（字典序＝數值序）；
   `<ts>` 是 `YYYYMMDDTHHMMSSnnnnnnnnnZ`。
-- `replicas=1` 時，mpack、snapshot、head、map 分片各有一份 `<key>.r1`，bytes 與主體相同（§13）。
-- 讀取端必須驗證名稱：以 BLAKE3 命名的物件重算 hash；pack 內每一項重算自己的 ID（§2）；head 與
-  snapshot 以 AAD 綁定 key 路徑，delta 綁定所在前綴的 client（§5）。
+- head 一律有一份 `<key>.r1`；`replicas=1` 時，mpack、snapshot、map 分片也各有一份，bytes 與主體相同
+  （§13）。
+- 讀取端必須驗證名稱：整份讀取的 delta 與 map 分片重算 hash；pack 以 range read 讀取，讀不到整份，
+  以每一項重算自己的 ID 驗證（§2），pack 的名稱只是識別；head 與 snapshot 以 AAD 綁定 key 路徑，
+  delta 綁定所在前綴的 client（§5）。
 
 建議的權限（S3）：每台備份主機的憑證只能在自己的 `packs/<c>/`、`mpacks/<c>/`、`parity/<c>/`、
 `deltas/<c>/`、`snapshots/<c>/` 底下建立物件，可以讀全部；`config`、`keys/`、`maint/` 與全零 client
@@ -133,7 +135,7 @@ master ─DeriveKey─▶ K_chunk_id "kist/v4/chunk-id"   K_meta_id "kist/v4/met
 | `Settings` | grace, replicas, pack_target, mpack_target |
 | `Drain` | from, old_grace |
 | `Bad` | key, first |
-| `Hold` | lost, grace |
+| `Hold` | from, lost, grace |
 | `Shard` | v, index, records |
 | `Record` | id, client, kind, size, entries, by_prune, since, status, held |
 | `Status` | s, at, age |
@@ -237,7 +239,7 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
 - commit：`replicas=1` 時先寫 `.r1`，再寫主體；主體出現＝commit。同名時時間戳 +1 奈秒重試。
 - forget：不刪任何 client 在同一組 roots 上最新的那一份 snapshot（那是下一次 backup 的 parent）；刪除時先
   刪 `.r1` 再刪主體。強制刪除那一份等於讓這個 client 的這組 roots 退役，只能在它沒有進行中的 backup 時
-  做：backup 沿用 parent 的子樹時不查子樹裡每個 item 的持有者，靠的是 parent 一直存在（B4 的 HEAD 只能
+  做，刪除完成之前也不能開始新的 backup：backup 沿用 parent 的子樹時不查子樹裡每個 item 的持有者，靠的是 parent 一直存在（B4 的 HEAD 只能
   縮小、不能消除這個空窗）。
 
 ## 10. Index：map 與 delta
@@ -248,7 +250,7 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
 Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head g−1 的 bytes)（g=0 時省略）,
        shards: [256 個 hash，空分片為 null], settings: { grace, replicas, pack_target, mpack_target },
        drain: { from: g, old_grace } | 省略, bad: [{ key, first: g }] | 省略,
-       hold: { lost: g, grace: 秒 } | 省略 }
+       hold: { from: g, lost: g, grace: 秒 } | 省略 }
 ```
 
 - `T(g)` ＝ head g 的後端修改時間，截到秒。head 永不刪除，所以每個世代的 `T` 與 `w` 永遠查得到。
@@ -260,7 +262,7 @@ Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head
 
 ```
 Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since: g,
-         status: { s: 0 live | 1 condemned | 2 tombstone | 3 unreadable, at: g, age: 秒 },
+         status: { s: 0 live | 1 condemned | 2 tombstone | 3 unreadable | 4 unknown, at: g, age: 秒 },
          held: bool（只在重建後的 hold 期間有意義，§11.4） }
 ```
 
@@ -292,6 +294,12 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   對應時鐘未驗證（UNVERIFIED）。
 - prune 的整輪（P0 到 P9 結束）必須在 `grace − M` 內完成，以同樣的時鐘計；超過就停止，不再寫 head、
   不再刪任何東西。
+- **兩個時鐘的規則**：任何「自某個世代起已過一個 grace」的判斷，後端時間 `T` 與寫入者時間 `w` 都要成立
+  ——P7d 的刪除、drain 的結束、重建 hold 的結束、P5 壞 snapshot 的等待。反過來，判斷「不可能已過一個
+  age」時（重建的沿用條件），任一個時鐘上不夠就成立。這個不對稱是刻意的：兩種寫法都讓單一時鐘出錯只能
+  延後刪除。只看一個時鐘的比較只出現在不承擔安全性的地方：P7b 的年輕規則、P7e、P7g、P9 的分片與
+  delta 清理（最壞是多一次重建或多留一些空間）。這條規則的三個違反（drain、hold、重建的沿用條件）是
+  外部審查在 GC 模型上找到的，之前兩輪設計審查都沒發現。
 
 ### 11.2 backup
 
@@ -319,22 +327,30 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 - **P0** 建立 `maint/probe-<亂數>`，再以同名建立一次，必須得到「已存在」；HEAD 它，後端時間與本機牆鐘
   相差超過 5 分鐘 → 拒絕。記下探針的後端時間 `N_P`。結束時刪掉探針。
-- **P1** 讀列出來的最大世代 g；版本不認得、讀不了、或沒有修改時間 → 拒絕；`T(g)` 比本機時鐘晚超過 `M`
-  → 拒絕。較舊的 head 之間的時間異常只警告。
+- **P1** 讀列出來的最大世代 g；版本不認得、讀不了、或沒有修改時間 → 拒絕。`T(g)` 比本機時鐘晚超過 `M`
+  → 回報，這一輪以「本機時鐘 + M」代替 `T(g)` 當作現在（只會更保守；`T(g)` 當成某個世代的起點時仍用
+  原值）。原本在這裡拒絕：一個時間戳錯誤的 head 會讓 GC 停到真實時間追上它，連改 settings 都過不了
+  （GC 模型的收尾活性檢查找到）。較舊的 head 之間的時間異常只警告。
 - **P2** 依序列出：`snapshots/`、`deltas/`、`packs/` 與 `mpacks/`（含 `.r1`）、`parity/`、`maint/map/`。
   先列的物件寫在它所依賴的物件之後，所以那些物件一定出現在後列的清單裡。
-- **P3** live 或 condemned 的記錄，主體與 `.r1` 都不在 → 拒絕（資料遺失，請執行 check 與修復）；只缺
-  主體、`.r1` 在 → 回報、繼續。例外：重建後的 hold 期間，held 的記錄消失時直接移除（§11.4）。
+- **P3** live 或 condemned 的記錄，主體與 `.r1` 都不在 → 先重新列出 `maint/gen/`：已經有比 g 新的 head，
+  就只是輸掉柵欄，停止；沒有才拒絕（資料遺失，請執行 check 與修復）。只缺主體、`.r1` 在 → 回報、
+  繼續。held 的記錄消失時直接移除（§11.4）。重新列出 head 是外部審查找到的：兩個 prune 以同一代為
+  基礎時，贏的那個刪掉了一個在共同基礎裡仍是 condemned 的 pack，輸的那個原本會誤報資料遺失。
 - **P4** 列表裡有、map 裡沒有的 pack 是新進者：讀它的 trailer，讀得了 → live（`since = g+1`）；讀不了
   （解不開、排版不對、種類與命名空間不符）→ unreadable（`since = g+1`），沒人會用它；解得開但版本不認得
-  → 拒絕（prune 不刪看不懂的東西）。
+  → unknown：不使用、不刪除、每一輪回報，也不擋住 prune 與重建（prune 不刪看不懂的東西；要移除由維護
+  命令處理）。原本是拒絕：一個這樣的 pack 就讓 GC 永遠停住，再遇上分片遺失，重建也失敗、所有 backup
+  都停（外部審查）。
 - **P5** 走訪每一個 snapshot，收集被引用的 ID。只有 `.r1`、沒有主體的 snapshot 一樣當成起點並回報
   （可能是 commit 前中斷，也可能是主體遺失）。主體解不開 → 試 `.r1`；兩份都解不開：在 head 的 `bad`
   清單裡已滿一個 grace（`T(first) + grace ≤ N_P`）→ 不再當成起點、回報；否則這一輪不改任何記錄、不刪
   任何東西，回報後停止——它還不在 `bad` 裡時，先以柵欄寫 head g+1 把它記進去（`first = g+1`，分片
-  不變）。這裡比 P0 的 `N_P`、不比 `T(g)`：等待期間每一輪都停在這裡、不寫新的 head，`T(g)` 不會前進
-  （GC 模型找到的死結）。維護角色可以直接 `forget <key>` 立刻解除，不需要解密。解得開但版本不認得 → 拒絕。列表之後
-  兩份都消失 → 視為已 forget，略過。某個 ID 沒有任何可讀、非 tombstone、種類相符的持有者 → 拒絕。
+  不變）。「已滿一個 grace」是 `T(first) + grace ≤ N_P` 而且 `w(first) + grace ≤` P0 時的本機牆鐘：比的是
+  P0 的時間、不是 `T(g)`，因為等待期間每一輪都停在這裡、不寫新的 head，`T(g)` 不會前進（GC 模型找到的
+  死結）。維護角色可以直接 `forget <key>` 立刻解除，不需要解密。解得開但版本不認得 → 拒絕。列表之後
+  兩份都消失 → 視為已 forget，略過。某個 ID 沒有任何可讀、非 tombstone、種類相符的持有者 → 先重新列出
+  `maint/gen/`（同 P3），沒有更新的 head 才拒絕。
 - **P6** 一個 ID 的正本＝它可讀、非 tombstone、種類相符的持有者中排序最前的那個。
 - **P7** 建 `Map(g+1)`（`age` 是目前的 grace；正在 drain 時是舊的 grace；重建後的 hold 期間不做 c 與 d）：
   - a) condemned 而且是某個 ID 的正本 → live（hold 期間 held 的記錄除外）；
@@ -353,12 +369,16 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   - f) tombstone、仍在列表裡 → tombstone（`at = g+1`，刷新）；
   - g) tombstone（`at = d`）、主體與 `.r1` 都不在列表、`T(d) + grace ≤ T(g)`、當下沒有 delta 提到它 →
     移除記錄。
-- **P8** 寫出有變動的分片；確認仍在整輪時限內，再以只在不存在時建立的方式寫 head g+1 的主體——**這一步是
-  柵欄**：得到「已存在」或超過時限就停止，什麼都不刪，也不拿這份計畫重試。成功之後才寫 head 的 `.r1`。
+- **P8** 寫出有變動的分片；確認仍在整輪時限內，HEAD `maint/gen/<g+1>.r1`（存在就是輸了），再以只在不存在
+  時建立的方式寫 head g+1 的主體——**這兩步合起來是柵欄**：`.r1` 已存在、主體得到「已存在」或超過時限就
+  停止，什麼都不刪，也不拿這份計畫重試。成功之後才寫 head 的 `.r1`。先看 `.r1` 是深度隨機測試找到的：
+  主體遺失、`.r1` 還在的世代，原本可以被一個更早讀了 head 的寫入者以不同的內容重新建立。改 settings 與
+  重建寫 head 時用同一個柵欄。
 - **P9**（仍在整輪時限內）刪除：tombstone 而仍在列表的 pack（順序 `.r1`、parity、主體；Object Lock
   拒絕就保留 tombstone 並回報）；所有 pack 都已在 `Map(g+1)` 或已不在列表的 delta；g 與 g+1 都沒引用、
   修改時間 + grace ≤ `T(g)` 的分片（舊世代的，以及輸掉柵欄的 prune 留下的；不需要讀更舊的 head）；
-  pack 已不在、修改時間 + grace ≤ `T(g)` 的 parity；`bad` 清單裡已不再當成起點的
+  pack 已不在、修改時間 + grace ≤ `T(g)` 的 parity；解不開、修改時間 + grace ≤ `T(g)` 的 delta；`bad`
+  清單裡已不再當成起點的
   snapshot 的主體與 `.r1`（兩份都通不過認證，沒有可還原的內容）。head 永不刪除。這是 prune 唯一會刪
   `snapshots/` 底下物件的情況，它依賴 §5 的 snapshot 密封方式在 v4 這一代內不變。
 
@@ -367,21 +387,29 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - **重建**（最新 head 的分片遺失或壞掉）：維護命令。P0 之後以柵欄寫世代 r ＝ `g_lost + 1`，不走訪
   snapshot、不刪任何東西。`g_lost` 是列出來的最大世代；`g_r` 是分片讀得全的最大世代（head 0 沒有分片，
   一定讀得全）。
-  - `T(g_lost) < T(g_r + 1) + a` 時（`a` 是 `g_r+1` 到 `g_lost` 的 head 裡最小的 grace，drain 的舊 grace
-    也算）：沿用 `Map(g_r)`，其中 condemned 的記錄標成 held；列表裡有、`Map(g_r)` 裡沒有的 pack 照 P4
-    收錄。這段時間不夠讓 `Map(g_r)` 裡 live 的 pack 或之後的新進者被標成 tombstone（標成 condemned 之後
-    還要再過一個 age），所以它們不會正被刪除。
-  - 否則：列表裡的每個 pack 都以 condemned（`at = r`）、held 收錄，trailer 照 P4 讀（讀不了 →
-    unreadable）；`Map(g_r)` 的 tombstone 保留。
-  - head r 記下 `hold: { lost: g_lost, grace: g_r 到 g_lost 的 head 裡最大的 grace }`；已有 hold 時取較晚
-    結束的那個。之後的 prune 在 `T(g) < T(lost) + grace` 時（g 是它的基礎世代）：held 的記錄不復活，
-    主體與 `.r1` 都不在就移除記錄；不 repack、不標 tombstone（P7c、P7d）。原因：在遺失的世代裡被標成
-    tombstone 的 pack，可能正被當時的 prune 刪除；那些 prune 的整輪時限在 `T(lost) + grace` 之前結束。
-    backup 本來就不沿用 condemned 的 pack。過了這個時間，prune 清掉 held 與 hold，之後照一般規則。
+  - 遺失的世代 `g_r+1..g_lost` 的 head 裡，`T` 的最大減最小 < `a`，**或** `w` 的最大減最小 < `a` 時
+    （`a` 是 `g_r` 到 `g_lost` 的 head 裡最小的 grace，drain 的舊 grace 也算）：沿用 `Map(g_r)`，其中
+    condemned 的記錄標成 held；列表裡有、`Map(g_r)` 裡沒有的 pack 照 P4 收錄。標成 tombstone 要兩個時鐘
+    都過了一個 age，任一個時鐘上整段遺失的世代都不到一個 age，`Map(g_r)` 裡 live 的 pack 與之後的新進者
+    就不可能已被標成 tombstone。原本只比兩端的 `T`（`T(g_lost) < T(g_r+1) + a`），後端時鐘倒退時不成立
+    （外部審查）。
+  - 否則：列表裡的每個 pack 都以 condemned（`at = r`，age 是目前的 age，drain 中就是舊的 grace）、held
+    收錄，trailer 照 P4 讀（讀不了 → unreadable）；`Map(g_r)` 的 tombstone 保留。
+  - head r 記下 `hold: { from: g_r+1, lost: g_lost, grace: g_r 到 g_lost 的 head 裡最大的 grace }`；已有
+    hold 時合併（`from` 取小、`lost` 與 `grace` 取大）。hold 在兩個時鐘上都過了才結束：`T(g)` ≥ `from..lost`
+    裡最大的 `T` + grace，**而且** `w(g)` ≥ 其中最大的 `w` + grace（g 是 prune 的基礎世代）。原本只比
+    `T(lost)`：遺失世代裡的刪除者以自己的時鐘計整輪時限，後端時鐘偏慢時 hold 會提早結束（外部審查）。
+  - hold 期間：held 的記錄不復活；不 repack、不標 tombstone（P7c、P7d）。原因：在遺失的世代裡被標成
+    tombstone 的 pack，可能正被當時的 prune 刪除。backup 本來就不沿用 condemned 的 pack。
+  - held 的記錄消失時直接移除，不論 hold 是否已過：它可能早在重建之前就被當時的 prune 刪掉了（hold 很短
+    時，第一次 prune 可能已在 hold 之後；GC 模型找到這個誤報）。被引用的 ID 若因此沒有持有者，P5 會
+    拒絕。held 只在記錄被復活時清掉。
 - **改 settings**：維護命令，P0、P1 之後直接以柵欄寫 head g+1（分片不變、settings 改變），不刪任何
   東西。這不是 ADR 017 否決的 `settings/<gen>`：只有維護角色能寫 `maint/`，而且受柵欄保護。
-- **grace**：調高立刻生效。調低開始 drain：持續一個舊的 grace（直到 `T(g) ≥ T(調低的世代) + 舊 grace`），
-  期間新的 condemned 記錄用舊的 `age`，也不接受其他 grace 變更。backup 一律用 `min(grace(g_s), grace(g_c))`。
+- **grace**：調高立刻生效。調低開始 drain：持續一個舊的 grace，在兩個時鐘上都過了才結束（`T(g) ≥
+  T(調低的世代) + 舊 grace` 而且 `w(g) ≥ w(調低的世代) + 舊 grace`；原本只比 `T`，後端時鐘在寫調低的
+  head 時偏慢就提早結束，外部審查），期間新的 condemned 記錄用舊的 `age`，也不接受其他 grace 變更。
+  backup 一律用 `min(grace(g_s), grace(g_c))`。
 
 ### 11.5 不變式與論證（概要）
 
@@ -408,6 +436,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 | 可見延遲＋經過時間低估＋snapshot PUT 延遲 < 1 小時 | 猜測 |
 | 備份角色寫不了 `maint/`、`keys/`、`config` | S3 以 bucket policy 強制；本機與 SFTP 與 v3 同樣信任 |
 | 單一 PUT 的大小上限夠放一個 pack | 未查證（UNVERIFIED） |
+| head 的主體與 `.r1` 不會一起遺失 | 猜測；兩份都遺失時，較早讀過 head 的寫入者可以重新建立那一代（P8） |
+| 時鐘出錯時，後端時鐘與寫入者的牆鐘不會同時往同一個方向錯 | 猜測；兩個時鐘的規則（§11.1）只保證單一時鐘出錯時延後刪除 |
 
 ### 11.7 對照 v3 的教訓
 
@@ -430,7 +460,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 ## 13. 冗餘
 
-- `replicas=1`（本機預設）：mpack、snapshot、head、map 分片寫 `.r1`。mpack 與 head 先寫主體再寫 `.r1`
+- head 一律寫 `.r1`（不論 replicas，head 只有幾 KiB）：柵欄靠它擋住主體遺失後被重新建立（P8）。
+- `replicas=1`（本機預設）：mpack、snapshot、map 分片也寫 `.r1`。mpack 與 head 先寫主體再寫 `.r1`
   （head 的主體是柵欄）；snapshot 先寫 `.r1` 再寫主體（主體是 commit）。資料 pack 不寫副本。
 - parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。
 - 刪除順序 `.r1` → parity → 主體。

@@ -41,7 +41,7 @@ fn run_random_with(
     let total = std::cell::RefCell::new(Stats::default());
     let mut runner = runner_with(cases, seed, shrink);
     let result = runner.run(&input(clock), |(s, actions)| {
-        let out = World::run(cfg.clone(), s, &actions);
+        let out = World::run_and_settle(cfg.clone(), s, &actions);
         add(&mut total.borrow_mut(), &out.stats);
         prop_assert!(
             out.violations.is_empty(),
@@ -181,6 +181,10 @@ fn mutation_named(name: &str) -> Mutations {
             m.no_delta_prefix_rule = true;
             m.no_b4_entries_check = true;
         }
+        "one_clock_windows" => m.one_clock_windows = true,
+        "no_superseded_check" => m.no_superseded_check = true,
+        "refuse_future_head" => m.refuse_future_head = true,
+        "fence_ignores_r1" => m.fence_ignores_r1 = true,
         other => panic!("unknown mutation {other}"),
     }
     m
@@ -202,16 +206,35 @@ pub const MUTATIONS: &[&str] = &[
     "no_run_bound",
     "no_drain",
     "no_prefix_and_no_entries",
+    "one_clock_windows",
+    "no_superseded_check",
+    "refuse_future_head",
+    "fence_ignores_r1",
 ];
 
 /// 探索用（不在 gate 裡）：每個突變各跑一次固定種子的隨機搜尋，印出有沒有找到反例。
 #[test]
 #[ignore]
 fn mutation_search() {
+    search_mutations(Config::default());
+}
+
+/// 同上，grace 6 小時、replicas 0：一個 case 裡有更多輪 GC。
+#[test]
+#[ignore]
+fn mutation_search_short_grace() {
+    search_mutations(Config {
+        grace: 6 * HOUR,
+        replicas: 0,
+        ..Config::default()
+    });
+}
+
+fn search_mutations(base: Config) {
     for name in MUTATIONS {
         let cfg = Config {
             mutations: mutation_named(name),
-            ..Config::default()
+            ..base.clone()
         };
         for clock in [Clock::Hosts, Clock::Backend] {
             let r = run_random_with(cfg.clone(), clock, 2000, 7, 300);
@@ -221,10 +244,16 @@ fn mutation_search() {
                     let first = e
                         .lines()
                         .find(|l| {
-                            l.contains("R1")
-                                || l.contains("findability")
-                                || l.contains("restore")
-                                || l.contains("newest head")
+                            [
+                                "R1",
+                                "findability",
+                                "restore of",
+                                "liveness",
+                                "false data-loss",
+                                "newest head cannot",
+                            ]
+                            .iter()
+                            .any(|p| l.contains(p))
                         })
                         .unwrap_or("?");
                     format!("FOUND: {}", first.trim())
@@ -260,6 +289,7 @@ fn lit(a: &Action) -> String {
         Action::SetSkew { host, skew } => format!("Action::SetSkew {{ host: {host}, skew: {skew} }}"),
         Action::BackendSkew(s) => format!("Action::BackendSkew({s})"),
         Action::FailReadback => "Action::FailReadback".into(),
+        Action::LoseHeadBody { pick } => format!("Action::LoseHeadBody {{ pick: {pick} }}"),
         Action::Mal(m) => format!(
             "Action::Mal({})",
             match m {
@@ -273,6 +303,15 @@ fn lit(a: &Action) -> String {
                 Mal::JunkPack => "Mal::JunkPack".into(),
                 Mal::ForgedSnap { item } => format!("Mal::ForgedSnap {{ item: {item} }}"),
                 Mal::UnknownVersionPack => "Mal::UnknownVersionPack".into(),
+                Mal::GroundPack {
+                    items,
+                    meta,
+                    delta,
+                    genuine,
+                } => format!(
+                    "Mal::GroundPack {{ items: vec!{items:?}, meta: {meta}, delta: {delta}, genuine: {genuine} }}"
+                ),
+                Mal::FutureSnap { item } => format!("Mal::FutureSnap {{ item: {item} }}"),
             }
         ),
     }
@@ -282,14 +321,25 @@ fn lit(a: &Action) -> String {
 #[test]
 #[ignore]
 fn extract_minimal_traces() {
-    for (name, clock) in [
-        ("no_elapsed_check", Clock::Hosts),
-        ("no_fence", Clock::Hosts),
-        ("trust_all", Clock::Hosts),
+    let short = Config {
+        grace: 6 * HOUR,
+        replicas: 0,
+        ..Config::default()
+    };
+    for (name, clock, base, base_name) in [
+        (
+            "no_elapsed_check",
+            Clock::Hosts,
+            Config::default(),
+            "default",
+        ),
+        ("no_fence", Clock::Hosts, Config::default(), "default"),
+        ("trust_all", Clock::Hosts, Config::default(), "default"),
+        ("reuse_condemned", Clock::Hosts, short, "short"),
     ] {
         let cfg = Config {
             mutations: mutation_named(name),
-            ..Config::default()
+            ..base
         };
         let mut runner = runner_with(2000, 7, 50_000);
         let result = runner.run(&input(clock), |(s, actions)| {
@@ -298,7 +348,10 @@ fn extract_minimal_traces() {
             Ok(())
         });
         if let Err(proptest::test_runner::TestError::Fail(_, (s, actions))) = result {
-            println!("// {name}: seed {s}, {} actions", actions.len());
+            println!(
+                "// {name}: seed {s}, {} actions, config {base_name}",
+                actions.len()
+            );
             println!("const SEED: u64 = {s};");
             println!("fn actions() -> Vec<Action> {{ vec![");
             for a in &actions {

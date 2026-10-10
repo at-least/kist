@@ -269,7 +269,7 @@ impl Backup {
         let Some((kind, items)) = self.to_write.get(i).cloned() else {
             return StepResult::Abort("B3: no such pack".into());
         };
-        let id = PackId(core.fresh_id());
+        let id = core.pack_id(false);
         let entries: BTreeSet<ItemId> = items.iter().copied().collect();
         let body = PackBody {
             client: self.client,
@@ -367,7 +367,10 @@ impl Backup {
         for (item, h) in &self.reused {
             match loaded.map.get(&h.pack) {
                 Some(rec) => {
-                    if matches!(rec.status, Status::Tombstone { .. } | Status::Unreadable) {
+                    if matches!(
+                        rec.status,
+                        Status::Tombstone { .. } | Status::Unreadable | Status::Unknown
+                    ) {
                         return StepResult::Abort(format!(
                             "B4: holder {:?} is {:?}",
                             h.pack, rec.status

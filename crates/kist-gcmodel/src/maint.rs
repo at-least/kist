@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::core::{list_heads, load_gen, load_highest, read_head, read_pack, Core};
+use crate::core::{list_heads, load_gen, load_highest, read_head, read_pack, window_passed, Core};
 use crate::prune::{list_packs, newcomer_record, probe_backend, refuse, Listed};
 use crate::types::*;
 use crate::world::StepResult;
@@ -50,6 +50,7 @@ pub struct SettingsChange {
     pub host: u8,
     pub phase: SPhase,
     target: Time,
+    loaded_at: Time,
     new_head: Option<HeadBody>,
 }
 
@@ -59,6 +60,7 @@ impl SettingsChange {
             host,
             phase: SPhase::Probe,
             target: target.max(MIN_GRACE),
+            loaded_at: 0,
             new_head: None,
         }
     }
@@ -77,19 +79,24 @@ impl SettingsChange {
                     Ok(l) => l,
                     Err(e) => return refuse(core, format!("settings: {e:?}")),
                 };
-                if loaded.t > core.host_wall(self.host) + M {
-                    return refuse(core, "settings: newest head is in the future".into());
-                }
+                let now_t = loaded.t.min(core.host_wall(self.host) + M);
+                self.loaded_at = core.now;
                 let mut nh = loaded.head.clone();
                 let cur = nh.settings.grace;
                 if self.target == cur {
                     return StepResult::Done;
                 }
                 if let Some(d) = nh.drain {
-                    let Some((_, t_from)) = read_head(core, d.from) else {
+                    let Some((h_from, t_from)) = read_head(core, d.from) else {
                         return refuse(core, format!("settings: head {} is missing", d.from));
                     };
-                    if loaded.t < t_from + d.old_grace {
+                    let over = window_passed(
+                        core.cfg.mutations,
+                        (t_from, h_from.w),
+                        (now_t, loaded.head.w),
+                        d.old_grace,
+                    );
+                    if !over {
                         return refuse(core, "settings: a grace drain is in progress".into());
                     }
                     nh.drain = None;
@@ -112,13 +119,11 @@ impl SettingsChange {
                 };
                 nh.w = core.host_wall(self.host);
                 let g = nh.g;
-                if core.put(Key::Head(g), Content::Head(nh.clone())).is_err() {
+                if !core.fence_put(g, &nh, self.loaded_at) {
                     core.stats.fence_losses += 1;
                     return StepResult::Abort(format!("settings: head {g} already exists"));
                 }
-                if nh.settings.replicas == 1 {
-                    let _ = core.put(Key::HeadR1(g), Content::Head(nh.clone()));
-                }
+                let _ = core.put_since(Key::HeadR1(g), Content::Head(nh.clone()), self.loaded_at);
                 core.stats.generations += 1;
                 core.note(format!("settings: grace {} at head {g}", nh.settings.grace));
                 StepResult::Done
@@ -142,9 +147,11 @@ pub struct Rebuild {
     pub host: u8,
     pub phase: RPhase,
     start: Time,
+    loaded_at: Time,
     g_lost: Gen,
     g_r: Gen,
     case_keep: bool,
+    age: Time,
     base: Map,
     head: Option<HeadBody>,
     newmap: Map,
@@ -157,9 +164,11 @@ impl Rebuild {
             host,
             phase: RPhase::Probe,
             start: 0,
+            loaded_at: 0,
             g_lost: 0,
             g_r: 0,
             case_keep: false,
+            age: DEFAULT_GRACE,
             base: Map::new(),
             head: None,
             newmap: Map::new(),
@@ -185,6 +194,7 @@ impl Rebuild {
     }
 
     fn load(&mut self, core: &mut Core) -> StepResult {
+        self.loaded_at = core.now;
         let gens = list_heads(core);
         let Some(g_lost) = gens.last().copied() else {
             return refuse(core, "rebuild: no head".into());
@@ -206,19 +216,25 @@ impl Rebuild {
         if lost_head.version != VERSION {
             return refuse(core, "rebuild: unknown head version".into());
         }
-        // a：g_r+1 到 g_lost 的 head 裡最小的 grace（drain 的舊 grace 也算）；hold 的 grace 取最大。
+        // a：g_r 到 g_lost 的 head 裡最小的 grace（drain 的舊 grace 也算，g_r 是第一個標記者的
+        // 基礎世代）；hold 的 grace 取最大。遺失的世代 g_r+1..g_lost 各自的 T 與 w 取最小、最大。
         let mut min_age = Time::MAX;
         let mut max_grace = 0;
+        let (mut t_lo, mut t_hi, mut w_lo, mut w_hi) = (Time::MAX, Time::MIN, Time::MAX, Time::MIN);
         for g in g_r..=g_lost {
-            let Some((h, _)) = read_head(core, g) else {
+            let Some((h, t)) = read_head(core, g) else {
                 return refuse(core, format!("rebuild: head {g} is missing"));
             };
             max_grace = max_grace.max(h.settings.grace);
+            min_age = min_age.min(h.settings.grace);
+            if let Some(d) = h.drain {
+                min_age = min_age.min(d.old_grace);
+            }
             if g > g_r {
-                min_age = min_age.min(h.settings.grace);
-                if let Some(d) = h.drain {
-                    min_age = min_age.min(d.old_grace);
-                }
+                t_lo = t_lo.min(t);
+                t_hi = t_hi.max(t);
+                w_lo = w_lo.min(h.w);
+                w_hi = w_hi.max(h.w);
             }
         }
         let Some((_, t_r1)) = read_head(core, g_r + 1) else {
@@ -228,26 +244,46 @@ impl Rebuild {
             Ok(l) => l,
             Err(e) => return refuse(core, format!("rebuild: {e:?}")),
         };
-        self.case_keep = t_lost < t_r1 + min_age;
+        // 標成 tombstone 要兩個時鐘都過了一個 age；任一個時鐘上整段遺失的世代都不到一個 age，
+        // 就不可能有 Map(g_r) 裡 live 的 pack 被標成 tombstone（外部審查 F3）。
+        self.case_keep = if core.cfg.mutations.one_clock_windows {
+            t_lost < t_r1 + min_age
+        } else {
+            t_hi - t_lo < min_age || w_hi - w_lo < min_age
+        };
         self.g_lost = g_lost;
         self.g_r = g_r;
         self.base = loaded_r.map;
         let mut nh = lost_head;
+        // 案例 B 的 age：drain 還沒結束（兩個時鐘）就用舊的 grace。
+        self.age = nh.settings.grace;
+        if let Some(d) = nh.drain {
+            if let Some((h_from, t_from)) = read_head(core, d.from) {
+                let over = window_passed(
+                    core.cfg.mutations,
+                    (t_from, h_from.w),
+                    (t_lost, nh.w),
+                    d.old_grace,
+                );
+                if !over && !core.cfg.mutations.no_drain {
+                    self.age = d.old_grace;
+                }
+            }
+        }
         let new_hold = Hold {
+            from: g_r + 1,
             lost: g_lost,
             grace: max_grace,
         };
-        nh.hold = match nh.hold {
-            Some(old) => {
-                let old_end = read_head(core, old.lost).map_or(Time::MIN, |(_, t)| t + old.grace);
-                if old_end > t_lost + max_grace {
-                    Some(old)
-                } else {
-                    Some(new_hold)
-                }
-            }
-            None => Some(new_hold),
-        };
+        // 已有 hold 就合併：涵蓋兩段遺失的世代、取較大的 grace。
+        nh.hold = Some(match nh.hold {
+            Some(old) => Hold {
+                from: old.from.min(new_hold.from),
+                lost: old.lost.max(new_hold.lost),
+                grace: old.grace.max(new_hold.grace),
+            },
+            None => new_hold,
+        });
         if core.cfg.mutations.no_hold {
             nh.hold = None;
         }
@@ -260,10 +296,7 @@ impl Rebuild {
     fn build(&mut self, core: &mut Core) -> StepResult {
         let r = self.g_lost + 1;
         let listed: Vec<(PackId, Listed)> = list_packs(core).into_iter().collect();
-        let age = self
-            .head
-            .as_ref()
-            .map_or(DEFAULT_GRACE, |h| h.settings.grace);
+        let age = self.age;
         let mut newmap = Map::new();
         if self.case_keep {
             for (pid, rec) in &self.base {
@@ -287,10 +320,7 @@ impl Rebuild {
             let Some(body) = read_pack(core, l.client, pid) else {
                 continue;
             };
-            let mut rec = match newcomer_record(&body, l.client, r) {
-                Ok(rec) => rec,
-                Err(e) => return refuse(core, format!("rebuild: {e}")),
-            };
+            let mut rec = newcomer_record(&body, l.client, r);
             if !self.case_keep && rec.status == Status::Live {
                 rec.status = Status::Condemned { at: r, age };
                 rec.held = true;
@@ -323,12 +353,13 @@ impl Rebuild {
                 continue;
             }
             let sid = ShardId(core.fresh_id());
-            let _ = core.put(
+            let _ = core.put_since(
                 Key::Shard(sid),
                 Content::Shard(ShardBody {
                     index: s,
                     records: recs,
                 }),
+                self.loaded_at,
             );
             nh.shards[s] = Some(sid);
         }
@@ -346,13 +377,11 @@ impl Rebuild {
         }
         nh.w = core.host_wall(self.host);
         let g = nh.g;
-        if core.put(Key::Head(g), Content::Head(nh.clone())).is_err() {
+        if !core.fence_put(g, &nh, self.loaded_at) {
             core.stats.fence_losses += 1;
             return StepResult::Abort(format!("rebuild: head {g} already exists"));
         }
-        if nh.settings.replicas == 1 {
-            let _ = core.put(Key::HeadR1(g), Content::Head(nh.clone()));
-        }
+        let _ = core.put_since(Key::HeadR1(g), Content::Head(nh.clone()), self.loaded_at);
         core.stats.generations += 1;
         core.stats.rebuilds += 1;
         let kept: BTreeSet<PackId> = self.newmap.keys().copied().collect();

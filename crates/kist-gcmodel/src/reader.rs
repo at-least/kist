@@ -37,7 +37,9 @@ pub fn candidates(
     let mut ranked: Vec<((u8, u32, PackId), ClientId, PackId)> = map
         .iter()
         .filter(|(_, r)| {
-            r.kind == universe_kind && r.entries.contains(&id) && r.status != Status::Unreadable
+            r.kind == universe_kind
+                && r.entries.contains(&id)
+                && !matches!(r.status, Status::Unreadable | Status::Unknown)
         })
         .map(|(p, r)| {
             let mut key = rank(r, *p, newcomer_first);

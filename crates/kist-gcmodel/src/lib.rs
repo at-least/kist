@@ -17,7 +17,8 @@
 //!
 //! 模型刻意省略的（不影響 R1 的論證，或屬於別的實作階段）：parity、Object Lock、Dir 與 ChunkIndex
 //! 的巢狀（目錄只有一段）、snapshot 時間戳的 +1 ns 重試（時間戳一律唯一）、加密與壓縮（以「真／假
-//! 副本」與「讀得了／讀不了」旗標代替）、大小上限、本地 index 快取（只保留沿用前驗證的結果）。
+//! 副本」與「讀得了／讀不了」旗標代替）、大小上限、本地 index 快取（只保留沿用前驗證的結果）、map
+//! 分片的 `.r1`（分片遺失以故障注入代替）。map 分片是 4 個而不是 256 個，增刪規則相同。
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]

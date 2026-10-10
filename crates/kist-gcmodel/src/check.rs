@@ -11,7 +11,8 @@ use crate::types::*;
 /// - 最新的 head 讀得全（故障拿掉分片、還沒重建的期間除外）；
 /// - 找得到：照讀取端的規則（最新 head 的 map 與當下的 delta、依排序、驗證失敗換下一份），每個
 ///   item 都找得到真副本（分片故障期間除外）；
-/// - restore actor 沒有在 snapshot 還在時讀失敗。
+/// - restore actor 沒有在 snapshot 還在時讀失敗；
+/// - 沒有 P3 的「資料遺失」拒絕（模型沒有遺失 pack 的故障，出現就是誤報）。
 pub fn check(core: &Core) -> Vec<String> {
     let mut out = Vec::new();
     let mut genuine: BTreeSet<ItemId> = BTreeSet::new();
@@ -39,6 +40,11 @@ pub fn check(core: &Core) -> Vec<String> {
             }
         }
     }
+    out.extend(
+        core.alarms
+            .iter()
+            .map(|a| format!("false data-loss alarm (no pack was lost by a fault): {a}")),
+    );
     let newest = load_highest(core);
     if core.shard_fault {
         out.extend(core.reader_failures.iter().cloned());

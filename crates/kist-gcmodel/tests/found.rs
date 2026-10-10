@@ -1,19 +1,26 @@
-//! 隨機搜尋（tests/random.rs 的 `mutation_search`）找到的反例，縮到最短後固定下來：同一條交錯，
-//! 打開突變就違反不變式，原協定就不違反。證明隨機交錯本身找得到這幾類錯誤。交錯依賴模型目前的
-//! 行為（包括世界的亂數），模型改了之後若不再重現，用 `extract_minimal_traces` 重新產生。
+//! 隨機搜尋（tests/random.rs 的 `mutation_search` 與 `mutation_search_short_grace`）找到的反例，
+//! 縮到最短後固定下來：同一條交錯，打開突變就違反不變式，原協定就不違反。證明隨機交錯本身找得到
+//! 這幾類錯誤。交錯依賴模型目前的行為（包括世界的亂數），模型改了之後若不再重現，用
+//! `extract_minimal_traces` 重新產生。
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use kist_gcmodel::*;
 
-fn mutated(m: Mutations) -> Config {
+fn default_config() -> Config {
+    Config::default()
+}
+
+/// grace 6 小時、replicas 0。
+fn short_config() -> Config {
     Config {
-        mutations: m,
+        grace: 6 * HOUR,
+        replicas: 0,
         ..Config::default()
     }
 }
 
-/// no_elapsed_check: seed 13419682308134130894, 54 actions
+/// no_elapsed_check: seed 13419682308134130894, 54 actions, config default
 mod no_elapsed_check {
     use super::*;
 
@@ -105,25 +112,25 @@ mod no_elapsed_check {
 
     #[test]
     fn the_mutation_violates_an_invariant() {
-        let out = World::run(
-            mutated(Mutations {
+        let cfg = Config {
+            mutations: Mutations {
                 no_elapsed_check: true,
                 ..Mutations::default()
-            }),
-            SEED,
-            &actions(),
-        );
+            },
+            ..default_config()
+        };
+        let out = World::run(cfg, SEED, &actions());
         assert!(!out.violations.is_empty(), "{}", out.report());
     }
 
     #[test]
     fn the_protocol_does_not() {
-        let out = World::run(Config::default(), SEED, &actions());
+        let out = World::run_and_settle(default_config(), SEED, &actions());
         assert!(out.violations.is_empty(), "{}", out.report());
     }
 }
 
-/// no_fence: seed 0, 29 actions
+/// no_fence: seed 0, 29 actions, config default
 mod no_fence {
     use super::*;
 
@@ -198,25 +205,25 @@ mod no_fence {
 
     #[test]
     fn the_mutation_violates_an_invariant() {
-        let out = World::run(
-            mutated(Mutations {
+        let cfg = Config {
+            mutations: Mutations {
                 no_fence: true,
                 ..Mutations::default()
-            }),
-            SEED,
-            &actions(),
-        );
+            },
+            ..default_config()
+        };
+        let out = World::run(cfg, SEED, &actions());
         assert!(!out.violations.is_empty(), "{}", out.report());
     }
 
     #[test]
     fn the_protocol_does_not() {
-        let out = World::run(Config::default(), SEED, &actions());
+        let out = World::run_and_settle(default_config(), SEED, &actions());
         assert!(out.violations.is_empty(), "{}", out.report());
     }
 }
 
-/// trust_all: seed 0, 24 actions
+/// trust_all: seed 0, 24 actions, config default
 mod trust_all {
     use super::*;
 
@@ -294,20 +301,149 @@ mod trust_all {
 
     #[test]
     fn the_mutation_violates_an_invariant() {
-        let out = World::run(
-            mutated(Mutations {
+        let cfg = Config {
+            mutations: Mutations {
                 trust_all: true,
                 ..Mutations::default()
-            }),
-            SEED,
-            &actions(),
-        );
+            },
+            ..default_config()
+        };
+        let out = World::run(cfg, SEED, &actions());
         assert!(!out.violations.is_empty(), "{}", out.report());
     }
 
     #[test]
     fn the_protocol_does_not() {
-        let out = World::run(Config::default(), SEED, &actions());
+        let out = World::run_and_settle(default_config(), SEED, &actions());
+        assert!(out.violations.is_empty(), "{}", out.report());
+    }
+}
+
+/// reuse_condemned: seed 0, 56 actions, config short
+mod reuse_condemned {
+    use super::*;
+
+    const SEED: u64 = 0;
+    fn actions() -> Vec<Action> {
+        vec![
+            Action::StartBackup {
+                client: 0,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::Finish { pick: 0 },
+            Action::StartForget {
+                pick: 0,
+                force: true,
+            },
+            Action::StartPrune { host: 0, under: 0 },
+            Action::Advance(43200),
+            Action::Finish { pick: 0 },
+            Action::Finish { pick: 0 },
+            Action::SetSkew { host: 142, skew: 0 },
+            Action::StartBackup {
+                client: 0,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::StartBackup {
+                client: 190,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::StartBackup {
+                client: 20,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::StartPrune { host: 0, under: 0 },
+            Action::Advance(18000),
+            Action::Finish { pick: 0 },
+            Action::Finish { pick: 2879 },
+            Action::Step { pick: 24422 },
+            Action::SetSkew { host: 0, skew: 0 },
+            Action::Step { pick: 1615 },
+            Action::StartPrune { host: 0, under: 0 },
+            Action::Advance(0),
+            Action::Advance(3600),
+            Action::Step { pick: 3 },
+            Action::Step { pick: 331 },
+            Action::Step { pick: 45 },
+            Action::Advance(18000),
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::StartBackup {
+                client: 0,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::StartPrune { host: 0, under: 0 },
+            Action::StartBackup {
+                client: 0,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 7417 },
+            Action::Step { pick: 5341 },
+            Action::Step { pick: 17545 },
+            Action::Step { pick: 0 },
+            Action::Step { pick: 0 },
+            Action::StartBackup {
+                client: 0,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::StartBackup {
+                client: 55,
+                job: 0,
+                variant: 0,
+                under: 0,
+            },
+            Action::Finish { pick: 39141 },
+        ]
+    }
+
+    #[test]
+    fn the_mutation_violates_an_invariant() {
+        let cfg = Config {
+            mutations: Mutations {
+                reuse_condemned: true,
+                ..Mutations::default()
+            },
+            ..short_config()
+        };
+        let out = World::run(cfg, SEED, &actions());
+        assert!(!out.violations.is_empty(), "{}", out.report());
+    }
+
+    #[test]
+    fn the_protocol_does_not() {
+        let out = World::run_and_settle(short_config(), SEED, &actions());
         assert!(out.violations.is_empty(), "{}", out.report());
     }
 }

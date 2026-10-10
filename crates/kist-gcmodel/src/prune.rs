@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::core::{fetch, load_highest, read_head, read_pack, read_snap, Copy, Core};
+use crate::core::{
+    fetch, list_heads, load_highest, read_head, read_pack, read_snap, window_passed, Copy, Core,
+};
 use crate::types::*;
 use crate::universe::Universe;
 use crate::world::StepResult;
@@ -49,8 +51,12 @@ pub struct Prune {
     pub phase: PPhase,
     start: Time,
     under: Time,
-    /// P0 探針的後端時間。
+    /// P0 探針的後端時間與本機牆鐘。
     probe_time: Time,
+    probe_wall: Time,
+    drain_over: bool,
+    /// P1 讀到最新 head 的真實時間；之後寫的分片與 head 不會在這之前開始。
+    loaded_at: Time,
     g: Gen,
     head: Option<HeadBody>,
     n_t: Time,
@@ -60,7 +66,7 @@ pub struct Prune {
     age: Time,
     hold_active: bool,
     snaps: Vec<SnapKey>,
-    deltas: Vec<(Key, Option<DeltaBody>)>,
+    deltas: Vec<(Key, Option<DeltaBody>, Time)>,
     listed: BTreeMap<PackId, Listed>,
     shard_list: Vec<(ShardId, Time)>,
     referenced: BTreeSet<ItemId>,
@@ -100,29 +106,26 @@ pub fn probe_backend(core: &mut Core, host: u8) -> Result<Time, String> {
 }
 
 /// P4：新進者的記錄。
-pub fn newcomer_record(body: &PackBody, client: ClientId, since: Gen) -> Result<Record, String> {
-    match &body.trailer {
+/// P4：新進者的記錄。trailer 解得開但版本不認得 → `Unknown`：不使用、不刪除、不擋住 prune
+/// 與重建（外部審查 F4）。
+pub fn newcomer_record(body: &PackBody, client: ClientId, since: Gen) -> Record {
+    let (kind, entries, status) = match &body.trailer {
         Trailer::Readable { version, .. } if *version != VERSION => {
-            Err(format!("P4: pack trailer version {version} is unknown"))
+            (body.kind, BTreeSet::new(), Status::Unknown)
         }
-        Trailer::Readable { kind, entries, .. } if *kind == body.kind => Ok(Record {
-            client,
-            kind: *kind,
-            entries: entries.clone(),
-            by_prune: false,
-            since,
-            status: Status::Live,
-            held: false,
-        }),
-        _ => Ok(Record {
-            client,
-            kind: body.kind,
-            entries: BTreeSet::new(),
-            by_prune: false,
-            since,
-            status: Status::Unreadable,
-            held: false,
-        }),
+        Trailer::Readable { kind, entries, .. } if *kind == body.kind => {
+            (*kind, entries.clone(), Status::Live)
+        }
+        _ => (body.kind, BTreeSet::new(), Status::Unreadable),
+    };
+    Record {
+        client,
+        kind,
+        entries,
+        by_prune: false,
+        since,
+        status,
+        held: false,
     }
 }
 
@@ -201,6 +204,9 @@ impl Prune {
             start: 0,
             under,
             probe_time: 0,
+            probe_wall: 0,
+            drain_over: false,
+            loaded_at: 0,
             g: 0,
             head: None,
             n_t: 0,
@@ -243,6 +249,21 @@ impl Prune {
             .map_or(DEFAULT_GRACE, |h| h.settings.grace)
     }
 
+    /// 拒絕之前重新列出 `maint/gen/`：已經有比基礎世代新的 head，就只是輸掉柵欄（外部審查 F5）。
+    fn superseded(&self, core: &mut Core) -> Option<StepResult> {
+        if core.cfg.mutations.no_superseded_check {
+            return None;
+        }
+        let newest = list_heads(core).last().copied()?;
+        if newest > self.g {
+            core.stats.fence_losses += 1;
+            let msg = format!("superseded: head {newest} exists, base was {}", self.g);
+            core.note(msg.clone());
+            return Some(StepResult::Abort(msg));
+        }
+        None
+    }
+
     fn run_elapsed(&self, core: &Core) -> Time {
         core.now - self.start - self.under
     }
@@ -271,6 +292,7 @@ impl Prune {
             PPhase::Probe => match probe_backend(core, self.host) {
                 Ok(t) => {
                     self.probe_time = t;
+                    self.probe_wall = core.host_wall(self.host);
                     self.start = core.now;
                     self.phase = PPhase::Load;
                     StepResult::Continue
@@ -298,7 +320,7 @@ impl Prune {
                             }
                             _ => None,
                         };
-                        self.deltas.push((*k, body));
+                        self.deltas.push((*k, body, obj.mtime));
                     }
                 }
                 self.phase = PPhase::ListPacks;
@@ -337,33 +359,58 @@ impl Prune {
             Err(e) => return refuse(core, format!("P1: cannot read the newest head: {e:?}")),
         };
         let wall = core.host_wall(self.host);
-        if loaded.t > wall + M {
-            return refuse(
-                core,
-                format!(
-                    "P1: T({}) = {} is ahead of the local clock {wall}",
-                    loaded.g, loaded.t
-                ),
+        // T(g) 比本機時鐘晚超過 M：以本機時鐘 + M 代替（只會讓以 T 判斷的規則更保守）。原本在這裡
+        // 拒絕，一個時間戳錯誤的 head 就讓 GC 停到真實時間追上它（收尾活性檢查找到）。快取裡的
+        // T(g) 保留原值：它當成某個世代的起點時，原值才是保守的那一邊。
+        let mut n_t = loaded.t;
+        if n_t > wall + M && core.cfg.mutations.refuse_future_head {
+            let msg = format!(
+                "P1: T({}) = {} is ahead of the local clock {wall}",
+                loaded.g, n_t
             );
+            return refuse(core, msg);
         }
+        if n_t > wall + M {
+            core.note(format!(
+                "P1: T({}) = {} is ahead of the local clock {wall}; using {}",
+                loaded.g,
+                loaded.t,
+                wall + M
+            ));
+            n_t = wall + M;
+        }
+        self.loaded_at = core.now;
         self.g = loaded.g;
-        self.n_t = loaded.t;
+        self.n_t = n_t;
         self.n_w = loaded.head.w;
         self.times.insert(loaded.g, (loaded.t, loaded.head.w));
         self.age = loaded.head.settings.grace;
+        let muts = core.cfg.mutations;
+        let now = (self.n_t, self.n_w);
         if let Some(d) = loaded.head.drain {
-            let Some((t_from, _)) = self.gen_times(core, d.from) else {
+            let Some(from) = self.gen_times(core, d.from) else {
                 return refuse(core, format!("P1: head {} is missing", d.from));
             };
-            if self.n_t < t_from + d.old_grace && !core.cfg.mutations.no_drain {
+            self.drain_over = window_passed(muts, from, now, d.old_grace);
+            if !self.drain_over && !muts.no_drain {
                 self.age = d.old_grace;
             }
         }
         if let Some(h) = loaded.head.hold {
-            let Some((t_lost, _)) = self.gen_times(core, h.lost) else {
-                return refuse(core, format!("P1: head {} is missing", h.lost));
+            // 遺失的世代裡最晚的 T 與最晚的 w，各自加一個 grace。
+            let mut latest = (Time::MIN, Time::MIN);
+            let first = if muts.one_clock_windows {
+                h.lost
+            } else {
+                h.from
             };
-            self.hold_active = !core.cfg.mutations.no_hold && self.n_t < t_lost + h.grace;
+            for g in first..=h.lost {
+                let Some((t, w)) = self.gen_times(core, g) else {
+                    return refuse(core, format!("P1: head {g} is missing"));
+                };
+                latest = (latest.0.max(t), latest.1.max(w));
+            }
+            self.hold_active = !muts.no_hold && !window_passed(muts, latest, now, h.grace);
         }
         self.base = loaded.map.clone();
         self.map = loaded.map;
@@ -381,14 +428,20 @@ impl Prune {
             }
             match rec.status {
                 Status::Live | Status::Condemned { .. } => {
-                    if self.hold_active && rec.held {
+                    // held：可能在遺失的世代裡被標成 tombstone、已被刪掉；不論 hold 過了沒有，
+                    // 消失就移除記錄（被引用的 ID 若因此沒有持有者，P5 會拒絕）。
+                    if rec.held && !core.cfg.mutations.no_hold {
                         dropped.push(*pid);
                     } else {
                         let msg = format!("P3: pack {pid:?} ({:?}) is missing", rec.status);
+                        if let Some(r) = self.superseded(core) {
+                            return r;
+                        }
+                        core.alarms.push(msg.clone());
                         return refuse(core, msg);
                     }
                 }
-                Status::Unreadable => dropped.push(*pid),
+                Status::Unreadable | Status::Unknown => dropped.push(*pid),
                 Status::Tombstone { .. } => {}
             }
         }
@@ -406,12 +459,13 @@ impl Prune {
             let Some(body) = read_pack(core, l.client, pid) else {
                 continue;
             };
-            match newcomer_record(&body, l.client, next) {
-                Ok(rec) => {
-                    self.map.insert(pid, rec);
-                }
-                Err(e) => return refuse(core, e),
+            let rec = newcomer_record(&body, l.client, next);
+            if rec.status == Status::Unknown {
+                core.note(format!(
+                    "P4: pack {pid:?} has an unknown trailer version; kept, not used"
+                ));
             }
+            self.map.insert(pid, rec);
         }
         self.phase = if self.snaps.is_empty() {
             PPhase::Plan
@@ -445,6 +499,9 @@ impl Prune {
                         );
                     }
                     if let Err(e) = self.walk_dag(core, s.root) {
+                        if let Some(r) = self.superseded(core) {
+                            return r;
+                        }
                         return refuse(core, e);
                     }
                 }
@@ -463,12 +520,18 @@ impl Prune {
             return refuse(core, "P5: no head".into());
         };
         if let Some(b) = head.bad.iter().find(|b| b.key == key).copied() {
-            let Some((t_first, _)) = self.gen_times(core, b.first) else {
+            let Some(first) = self.gen_times(core, b.first) else {
                 return refuse(core, format!("P5: head {} is missing", b.first));
             };
-            // 比 P0 探針的後端時間，不比 T(g)：等待期間每次 prune 都停在這裡、不寫新的 head，
-            // T(g) 不會前進。
-            if t_first + head.settings.grace <= self.probe_time {
+            // 比 P0 探針的後端時間與本機牆鐘，不比 T(g)：等待期間每次 prune 都停在這裡、不寫新的
+            // head，T(g) 不會前進。
+            let waited = window_passed(
+                core.cfg.mutations,
+                first,
+                (self.probe_time, self.probe_wall),
+                head.settings.grace,
+            );
+            if waited {
                 core.note(format!("P5: ignoring undecryptable snapshot {key:?}"));
                 self.bad_ignored.push(key);
                 let i = self.snaps.iter().position(|s| *s == key).unwrap_or(0);
@@ -582,6 +645,8 @@ impl Prune {
 
         // P6 與刪前驗證：驗證時發現不實的項目就移除，再重算正本，直到沒有變動。
         let mut verdicts: BTreeMap<(ItemId, PackId), Copy> = BTreeMap::new();
+        // 刪前驗證時發現正本有不實項目的 condemned pack：這一輪維持 condemned（P7d）。
+        let mut tainted: BTreeSet<PackId> = BTreeSet::new();
         let canon = loop {
             let canon = canonical(
                 &newmap,
@@ -614,6 +679,7 @@ impl Prune {
                         .or_insert_with(|| fetch(core, crec.client, *c, *id));
                     if v == Copy::False {
                         removals.push((*id, *c));
+                        tainted.insert(*pid);
                     }
                 }
             }
@@ -651,15 +717,17 @@ impl Prune {
                         }
                     } else if !self.hold_active && aged_set.contains(&pid) {
                         let ok = muts.no_verify_before_drop
-                            || rec.entries.intersection(&self.referenced).all(|id| {
-                                match canon.get(id) {
-                                    None => false,
-                                    Some(c) => {
-                                        newmap.get(c).is_some_and(|cr| cr.by_prune)
-                                            || verdicts.get(&(*id, *c)) == Some(&Copy::Genuine)
-                                    }
-                                }
-                            });
+                            || !tainted.contains(&pid)
+                                && rec
+                                    .entries
+                                    .intersection(&self.referenced)
+                                    .all(|id| match canon.get(id) {
+                                        None => false,
+                                        Some(c) => {
+                                            newmap.get(c).is_some_and(|cr| cr.by_prune)
+                                                || verdicts.get(&(*id, *c)) == Some(&Copy::Genuine)
+                                        }
+                                    });
                         if ok {
                             core.stats.tombstoned += 1;
                             Some(Status::Tombstone { at: next })
@@ -709,6 +777,8 @@ impl Prune {
                         None
                     }
                 }
+                // 版本不認得的 pack：不使用、不刪除。
+                Status::Unknown => None,
                 Status::Tombstone { at } => {
                     if listed.is_some() {
                         Some(Status::Tombstone { at: next })
@@ -716,7 +786,7 @@ impl Prune {
                         let aged = self
                             .gen_times(core, at)
                             .is_some_and(|(t_d, _)| t_d + grace <= self.n_t);
-                        let named = self.deltas.iter().any(|(_, b)| {
+                        let named = self.deltas.iter().any(|(_, b, _)| {
                             b.as_ref()
                                 .is_some_and(|d| d.packs.iter().any(|dp| dp.pack == pid))
                         });
@@ -729,6 +799,9 @@ impl Prune {
             };
             if let Some(s) = new_status {
                 if let Some(r) = newmap.get_mut(&pid) {
+                    if s == Status::Live {
+                        r.held = false;
+                    }
                     r.status = s;
                 }
             }
@@ -781,19 +854,12 @@ impl Prune {
 
         let mut nh = head;
         nh.g = next;
-        if let Some(d) = nh.drain {
-            if self
-                .gen_times(core, d.from)
-                .is_some_and(|(t_from, _)| self.n_t >= t_from + d.old_grace)
-            {
-                nh.drain = None;
-            }
+        if nh.drain.is_some() && self.drain_over {
+            nh.drain = None;
         }
+        // hold 的時間窗過了就拿掉 hold；記錄的 held 留著，只在被復活時清掉。
         if nh.hold.is_some() && !self.hold_active {
             nh.hold = None;
-            for r in newmap.values_mut() {
-                r.held = false;
-            }
         }
         self.newmap = newmap;
         self.new_head = Some(nh);
@@ -811,7 +877,7 @@ impl Prune {
             self.phase = PPhase::PutShards;
             return StepResult::Continue;
         };
-        let id = PackId(core.fresh_id());
+        let id = core.pack_id(false);
         let body = PackBody {
             client: MAINTENANCE,
             kind: job.kind,
@@ -918,12 +984,13 @@ impl Prune {
                 continue;
             }
             let sid = ShardId(core.fresh_id());
-            let _ = core.put(
+            let _ = core.put_since(
                 Key::Shard(sid),
                 Content::Shard(ShardBody {
                     index: s,
                     records: new_recs,
                 }),
+                self.loaded_at,
             );
             nh.shards[s] = Some(sid);
         }
@@ -942,7 +1009,7 @@ impl Prune {
         };
         nh.w = core.host_wall(self.host);
         let g = nh.g;
-        let won = core.put(Key::Head(g), Content::Head(nh.clone())).is_ok();
+        let won = core.fence_put(g, &nh, self.loaded_at);
         self.new_head = Some(nh);
         if won {
             core.stats.generations += 1;
@@ -963,11 +1030,8 @@ impl Prune {
     }
 
     fn put_head_r1(&mut self, core: &mut Core) -> StepResult {
-        let replicas = self.head.as_ref().map_or(0, |h| h.settings.replicas);
         if let Some(nh) = &self.new_head {
-            if replicas == 1 {
-                let _ = core.put(Key::HeadR1(nh.g), Content::Head(nh.clone()));
-            }
+            let _ = core.put_since(Key::HeadR1(nh.g), Content::Head(nh.clone()), self.loaded_at);
         }
         if self.bad_only {
             return StepResult::Done;
@@ -999,13 +1063,21 @@ impl Prune {
                 }
             }
         }
-        for (k, body) in &self.deltas {
-            if let Some(d) = body {
-                let absorbed = d.packs.iter().all(|dp| {
-                    self.newmap.contains_key(&dp.pack) || !self.listed.contains_key(&dp.pack)
-                });
-                if absorbed {
-                    self.deletions.push(*k);
+        for (k, body, mtime) in &self.deltas {
+            match body {
+                Some(d) => {
+                    let absorbed = d.packs.iter().all(|dp| {
+                        self.newmap.contains_key(&dp.pack) || !self.listed.contains_key(&dp.pack)
+                    });
+                    if absorbed {
+                        self.deletions.push(*k);
+                    }
+                }
+                // 解不開的 delta 沒有人會用；過了一個 grace 就刪。
+                None => {
+                    if mtime + grace <= self.n_t {
+                        self.deletions.push(*k);
+                    }
                 }
             }
         }

@@ -446,7 +446,9 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   prune、S3 上 mpack 預設不寫 `.r1`、grace 72 小時、config 不可變、唯寫金鑰不在 v4、先做 GC 模型、v3 的
   信任缺口不在 main 上另外修。
 - 實作七段（ADR 026），每段完成照常 commit、回報、等確認：
-  1. GC 可執行模型、proptest、外部審查——**進行中**。通過之前不寫正式程式碼。
+  1. GC 可執行模型、proptest、外部審查——**完成**（2026-10-10，`crates/kist-gcmodel`）。找到並修正九個
+     規格錯誤（三個是資料遺失：drain、hold、重建的沿用條件只看一個時鐘），每條規則都有反向對照；見
+     ADR 026「實作第一段」。等負責人確認後開始第 2 段。
   2. kist-format。3. 後端。4. backup。5. 讀取路徑。6. prune 與維護。7. 收尾。
 
 ## 已接受的限制（非待辦）

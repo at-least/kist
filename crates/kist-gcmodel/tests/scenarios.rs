@@ -564,7 +564,12 @@ fn mutation_no_hold_stops_gc_after_a_rebuild() {
         matches!(&r, StepResult::Abort(m) if m.starts_with("P3")),
         "{r:?}"
     );
-    assert_ok(&w);
+    let v = w.check();
+    assert!(
+        v.iter().any(|m| m.starts_with("false data-loss alarm")),
+        "{v:#?}"
+    );
+    assert!(!v.iter().any(|m| m.starts_with("R1")), "{v:#?}");
 }
 
 /// 解不開的 snapshot：第一次看到時以一個不刪任何東西的世代記下來；之後一個 grace 內 prune 都停；
@@ -614,17 +619,21 @@ fn forgetting_an_undecryptable_snapshot_unblocks_gc_at_once() {
     assert_eq!(prune(&mut w, 0), StepResult::Done);
 }
 
-/// trailer 解得開但版本不認得的新進 pack：prune 拒絕，不把它當成壞掉的物件刪掉。
+/// trailer 解得開但版本不認得的新進 pack：記為 unknown，不使用、不刪除，也不擋住 prune 與重建
+/// （外部審查 F4；原本 P4 拒絕，一個這樣的 pack 就讓 GC 永遠停住）。
 #[test]
-fn an_unknown_trailer_version_stops_prune() {
+fn an_unknown_trailer_version_is_kept_and_does_not_block_prune() {
     let mut w = World::new(quiet(), 1);
     let _s1 = backup(&mut w, 1, 0, 0);
     w.apply(&Action::Mal(Mal::UnknownVersionPack));
-    let r = prune(&mut w, 0);
-    assert!(
-        matches!(&r, StepResult::Abort(m) if m.starts_with("P4")),
-        "{r:?}"
-    );
+    let kept = w.packs_of(MALICIOUS);
+    assert_eq!(kept.len(), 1);
+    for _ in 0..5 {
+        w.advance(80 * HOUR);
+        assert_eq!(prune(&mut w, 0), StepResult::Done);
+    }
+    assert_eq!(w.packs_of(MALICIOUS), kept);
+    assert_ok(&w);
 }
 
 /// 寬鬆後端（沒有條件建立）：backup 照常，prune 在 P0 就拒絕。
@@ -687,4 +696,83 @@ fn breaking_the_timing_assumption_loses_data() {
     let (w, r) = undercounted_backup(2 * HOUR);
     assert_eq!(r, Some(StepResult::Done));
     assert!(violates_r1(&w), "{:#?}", w.check());
+}
+
+/// 某次 prune 通過 P0 之後，後端時鐘跳快 74 小時才寫 head：head 的時間在未來。後端時鐘修好之後，
+/// P1 以本機時鐘 + M 代替它，GC 立刻照常；原本 P1 拒絕，GC 要等真實時間追上那個時間戳（收尾活性
+/// 檢查找到的最短交錯）。
+fn prune_after_a_head_from_the_future(muts: Mutations) -> (World, StepResult) {
+    let actions = [
+        Action::StartPrune { host: 0, under: 0 },
+        Action::Step { pick: 0 },
+        Action::BackendSkew(266_401),
+        Action::Finish { pick: 0 },
+        Action::BackendSkew(0),
+    ];
+    let mut w = World::new(with(muts), 1);
+    for a in &actions {
+        w.apply(a);
+    }
+    w.advance(HOUR);
+    let r = prune(&mut w, 0);
+    (w, r)
+}
+
+#[test]
+fn a_head_time_in_the_future_does_not_stop_gc() {
+    let (mut w, r) = prune_after_a_head_from_the_future(Mutations::default());
+    assert_eq!(r, StepResult::Done);
+    let v = w.settle();
+    assert!(v.is_empty(), "{v:#?}");
+}
+
+#[test]
+fn mutation_refusing_a_future_head_stops_gc() {
+    let (_, r) = prune_after_a_head_from_the_future(Mutations {
+        refuse_future_head: true,
+        ..Mutations::default()
+    });
+    assert!(
+        matches!(&r, StepResult::Abort(m) if m.contains("ahead of the local clock")),
+        "{r:?}"
+    );
+}
+
+/// head 1 的主體遺失、`.r1` 還在時，一個在 head 1 出現之前就讀了 head 0 的維護命令（改 settings）
+/// 再寫 head 1。主體不在，「只在不存在時建立」會成功，原本就繞過了柵欄、蓋出一個 map 不同的第 1 代。
+/// 柵欄先看那一代的 `.r1`，存在就算輸（深度隨機測試找到的交錯，手工重寫）。
+#[test]
+fn a_lost_head_body_cannot_be_recreated_by_a_stale_writer() {
+    let (w, r) = stale_writer_after_a_lost_head_body(Mutations::default());
+    assert!(
+        matches!(&r, Some(StepResult::Abort(m)) if m.contains("already exists")),
+        "{r:?}"
+    );
+    assert_ok(&w);
+}
+
+#[test]
+fn mutation_a_fence_that_ignores_the_replica_forks_a_generation() {
+    let (w, r) = stale_writer_after_a_lost_head_body(Mutations {
+        fence_ignores_r1: true,
+        ..Mutations::default()
+    });
+    assert_eq!(r, Some(StepResult::Done));
+    let v = w.check();
+    assert!(v.iter().any(|m| m.starts_with("findability")), "{v:#?}");
+}
+
+fn stale_writer_after_a_lost_head_body(muts: Mutations) -> (World, Option<StepResult>) {
+    let mut w = World::new(with(muts), 1);
+    let s1 = backup(&mut w, 1, 1, 0);
+    let s = w.start_settings(1, 2 * HOUR).unwrap();
+    assert!(w.run_until(s, "settings h1 PutHead"));
+    assert_eq!(prune(&mut w, 0), StepResult::Done);
+    w.apply(&Action::LoseHeadBody { pick: 1 });
+    assert!(!w.core.backend.exists(&Key::Head(1)));
+    assert!(w.core.backend.exists(&Key::HeadR1(1)));
+    let r = w.finish(s);
+    let reader = w.start_reader(s1);
+    let _ = w.finish(reader);
+    (w, r)
 }

@@ -69,9 +69,10 @@ pub struct Bad {
     pub first: Gen,
 }
 
-/// 重建後的 hold（§11.4）。
+/// 重建後的 hold（§11.4）：遺失的世代是 `from..=lost`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hold {
+    pub from: Gen,
     pub lost: Gen,
     pub grace: Time,
 }
@@ -79,9 +80,16 @@ pub struct Hold {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Live,
-    Condemned { at: Gen, age: Time },
-    Tombstone { at: Gen },
+    Condemned {
+        at: Gen,
+        age: Time,
+    },
+    Tombstone {
+        at: Gen,
+    },
     Unreadable,
+    /// trailer 解得開但版本不認得：不使用、不刪除、每一輪回報（P4）。
+    Unknown,
 }
 
 /// map 的一筆記錄（§10）。
@@ -105,7 +113,7 @@ pub fn rank(rec: &Record, id: PackId, newcomer_first: bool) -> (u8, u32, PackId)
         Status::Live => 0,
         Status::Condemned { .. } => 1,
         Status::Tombstone { .. } => 2,
-        Status::Unreadable => 3,
+        Status::Unreadable | Status::Unknown => 3,
     };
     let since = if newcomer_first {
         u32::MAX - rec.since

@@ -37,6 +37,15 @@ pub struct Mutations {
     pub no_run_bound: bool,
     /// grace 調低時不 drain：新的 condemned 記錄直接用新的 grace 當 age。
     pub no_drain: bool,
+    /// 「自某個世代起已過一個 grace」的判斷（drain 結束、hold 結束、壞 snapshot）只看後端時間，
+    /// 重建的沿用條件只看兩端 head 的後端時間（外部審查 F1–F3 之前的規則）。
+    pub one_clock_windows: bool,
+    /// P3、P5 拒絕之前不重新列出 `maint/gen/`（外部審查 F5 之前的規則）。
+    pub no_superseded_check: bool,
+    /// P1 遇到時間在未來的 head 就拒絕（收尾活性檢查之前的規則）。
+    pub refuse_future_head: bool,
+    /// 柵欄只看主體，不看 `.r1`（深度隨機測試之前的規則）。
+    pub fence_ignores_r1: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +111,7 @@ pub struct Core {
     pub universe: Universe,
     rng: u64,
     next_id: u32,
+    low_ids: u32,
     /// 誠實的 backup commit 過的 snapshot（主體 PUT 成功）。
     pub honest: BTreeSet<SnapKey>,
     /// 每台 client 驗證過的（item, 持有者）。
@@ -112,6 +122,10 @@ pub struct Core {
     pub shard_fault: bool,
     pub fail_next_readback: bool,
     pub reader_failures: Vec<String>,
+    /// P3 的「資料遺失」拒絕。模型沒有遺失 pack 的故障，所以出現就是誤報。
+    pub alarms: Vec<String>,
+    /// 出現過的最大時鐘偏差（主機或後端）。單一時鐘出錯會把刪除延後這麼久，收尾階段要等過它。
+    pub max_skew_seen: Time,
     pub log: Vec<String>,
     pub stats: Stats,
 }
@@ -127,12 +141,15 @@ impl Core {
             universe: Universe::default(),
             rng: seed | 1,
             next_id: 1,
+            low_ids: 0,
             honest: BTreeSet::new(),
             verified: BTreeMap::new(),
             skew: BTreeMap::new(),
             shard_fault: false,
             fail_next_readback: false,
             reader_failures: Vec::new(),
+            alarms: Vec::new(),
+            max_skew_seen: 0,
             log: Vec::new(),
             stats: Stats::default(),
         }
@@ -142,6 +159,17 @@ impl Core {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// pack 的名稱。名稱是內容的 BLAKE3，攻擊者可以反覆嘗試、挑一個比別人小的（排序的最後一層）：
+    /// `low` 的名稱一律比一般的小。
+    pub fn pack_id(&mut self, low: bool) -> PackId {
+        if low {
+            self.low_ids += 1;
+            PackId(self.low_ids)
+        } else {
+            PackId(1_000_000 + self.fresh_id())
+        }
     }
 
     pub fn rand(&mut self) -> u64 {
@@ -180,6 +208,26 @@ impl Core {
         self.backend.put(key, content, mtime)
     }
 
+    /// 同 [`Core::put`]，但請求不會在真實時間 `since` 之前開始（寫入者在那時才讀到它所依賴的
+    /// head）：ε 不超過 `now − since`。時鐘偏差照樣套用，所以後端時鐘倒退仍然看得到。
+    pub fn put_since(&mut self, key: Key, content: Content, since: Time) -> Result<(), Exists> {
+        let eps = self.below(self.cfg.eps_max.max(0) as u64 + 1) as Time;
+        let eps = eps.min((self.now - since).max(0));
+        let mtime = self.now + self.backend.skew - eps;
+        self.backend.put(key, content, mtime)
+    }
+
+    /// 柵欄（P8，改 settings 與重建也一樣）：這一代的 `.r1` 已經存在就是輸了——主體遺失、`.r1`
+    /// 還在的世代不能被重新建立；否則以只在不存在時建立的方式寫主體。head 一律寫 `.r1`，由贏的人
+    /// 在主體之後寫。
+    pub fn fence_put(&mut self, g: Gen, head: &HeadBody, since: Time) -> bool {
+        if self.backend.exists(&Key::HeadR1(g)) && !self.cfg.mutations.fence_ignores_r1 {
+            return false;
+        }
+        self.put_since(Key::Head(g), Content::Head(head.clone()), since)
+            .is_ok()
+    }
+
     /// 小物件、請求立刻完成：修改時間就是後端時鐘（P0 的探針）。
     pub fn put_now(&mut self, key: Key, content: Content) -> Result<(), Exists> {
         let mtime = self.backend_now();
@@ -192,6 +240,18 @@ impl Core {
 
     pub fn backend_now(&self) -> Time {
         self.now + self.backend.skew
+    }
+}
+
+/// 「自 `start` 起已過 `span`」：後端時間與寫入者時間都要成立（§11.1）。`start` 與 `now` 都是
+/// （T, w）。
+pub fn window_passed(m: Mutations, start: (Time, Time), now: (Time, Time), span: Time) -> bool {
+    let t = start.0 + span <= now.0;
+    let w = start.1 + span <= now.1;
+    if m.one_clock_windows {
+        t
+    } else {
+        t && w
     }
 }
 

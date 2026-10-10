@@ -81,6 +81,10 @@ pub fn mal() -> impl Strategy<Value = Mal> {
         1 => any::<bool>().prop_map(|r1| Mal::JunkSnap { r1 }),
         1 => Just(Mal::JunkPack),
         1 => any::<u16>().prop_map(|item| Mal::ForgedSnap { item }),
+        1 => Just(Mal::UnknownVersionPack),
+        3 => (vec(any::<u16>(), 1..4), any::<bool>(), any::<bool>(), any::<u8>())
+            .prop_map(|(items, meta, delta, genuine)| Mal::GroundPack { items, meta, delta, genuine }),
+        1 => any::<u16>().prop_map(|item| Mal::FutureSnap { item }),
     ]
 }
 
@@ -88,13 +92,22 @@ pub fn mal() -> impl Strategy<Value = Mal> {
 pub fn action(clock: Clock) -> BoxedStrategy<Action> {
     let skew: BoxedStrategy<Action> = match clock {
         // 後端時鐘誠實，prune 主機的時鐘可以任意出錯（包括 P0 之後才跳）。
-        Clock::Hosts => (any::<u8>(), prop_oneof![-600i32..600, -720_000i32..720_000])
+        // 一半以上的時鐘動作把偏差歸零，否則 P0 的拒絕會蓋過其他一切（外部審查的量測）。
+        Clock::Hosts => (
+            any::<u8>(),
+            prop_oneof![2 => Just(0i32), 2 => -600i32..600, 1 => -720_000i32..720_000],
+        )
             .prop_map(|(host, skew)| Action::SetSkew { host, skew })
             .boxed(),
-        // prune 主機的時鐘誠實，後端時鐘可以出錯。
-        Clock::Backend => prop_oneof![-600i32..600, -7_200i32..7_200]
-            .prop_map(Action::BackendSkew)
-            .boxed(),
+        // prune 主機的時鐘誠實，後端時鐘可以出錯，偶爾差到 100 小時。
+        Clock::Backend => prop_oneof![
+            3 => Just(0i32),
+            2 => -600i32..600,
+            1 => -7_200i32..7_200,
+            1 => -360_000i32..360_000,
+        ]
+        .prop_map(Action::BackendSkew)
+        .boxed(),
     };
     prop_oneof![
         120 => any::<u16>().prop_map(|pick| Action::Step { pick }),
@@ -109,7 +122,8 @@ pub fn action(clock: Clock) -> BoxedStrategy<Action> {
         6 => any::<u8>().prop_map(|host| Action::StartRebuild { host }),
         3 => any::<u16>().prop_map(|pick| Action::Crash { pick }),
         1 => any::<u8>().prop_map(|pick| Action::LoseShard { pick }),
-        3 => skew,
+        1 => any::<u16>().prop_map(|pick| Action::LoseHeadBody { pick }),
+        6 => skew,
         3 => Just(Action::FailReadback),
         6 => mal().prop_map(Action::Mal),
     ]

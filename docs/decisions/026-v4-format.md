@@ -274,6 +274,30 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 - 壞 snapshot 只在第一次看到時寫一個記錄用的世代；維護角色 `forget <key>` 可以立刻解除。
 - `config.v` 代表這一代，同一代內各物件的 `v` 可以往上加。
 
+**外部審查（實作第一段，2026-10-10）**：一個獨立的 agent 在 `8dc76bd` 的模型上對照規格逐條檢查並嘗試
+破壞，寫了 19 個測試，搬進 repo 成為 `crates/kist-gcmodel/tests/review.rs`（m1 與 f4 兩處依修正改了斷言，
+檔頭註明）。五項發現都修了，每一項都先在原碼上失敗、修正後通過，並有恢復舊規則的突變開關證明修正承擔
+安全性：
+
+| # | 問題 | 嚴重度 | 修正 | 紅→綠的測試；反向對照 |
+| --- | --- | --- | --- | --- |
+| F1 | drain 的結束只比 `T`：寫調低 grace 的 head 時後端時鐘慢 4 小時，drain 提早結束，B4 已過的 backup 用到的 pack 以新的 2 小時 age 被刪 | 資料遺失 | 兩個時鐘都要過（age 的選擇、drain 的清除、settings 的檢查三處） | `f1_drain_ends_on_backend_clock_alone_break`；`mutation_one_clock_drain_end_loses_data` |
+| F2 | hold 的結束只比 `T(lost)`：遺失世代的刪除者以自己的時鐘計整輪時限，後端時鐘慢 2 小時時 hold 提早結束 | 資料遺失（配合偽造的 snapshot）；GC 停住 | Hold 加 `from`，兩個時鐘都要過 `from..lost` 的最大值 + grace | `f2_hold_ends_on_backend_clock_alone_data_loss_break`、`…_gc_stuck_break`；`mutation_one_clock_hold_end_loses_data` |
+| F3 | 重建的沿用條件只比兩端 head 的 `T`，後端時鐘倒退 10 分鐘就不成立 | 資料遺失 | 遺失世代的 `T` 或 `w` 任一個的最大減最小不到一個 age | `f3_rebuild_keep_rule_assumes_monotone_t_break`；`mutation_one_clock_keep_rule_loses_data` |
+| F4 | trailer 版本不認得的 pack 讓 P4 永遠拒絕；再遇上分片遺失，重建也失敗、所有 backup 停 | GC 永久停住、backup 全停 | 記為 unknown：不使用、不刪除、不擋 prune 與重建 | `f4_unknown_version_pack_stalls_gc_forever`、`f4_unknown_version_pack_and_a_shard_loss_stop_all_backups` |
+| F5 | 基礎世代已被超越時，P3 誤報資料遺失 | 誤報 | P3、P5 拒絕之前重新列出 `maint/gen/` | `f5_superseded_prune_reports_false_data_loss`；`mutation_no_superseded_check_raises_a_false_alarm` |
+
+- 模型本身與規格不符、一併修正的：強制 forget 的程序規則原本只在開始時檢查（m1，改成刪除完成前那組
+  roots 都不能開始 backup）；物件修改時間的 ε 讓誠實時鐘下較晚的 head 拿到較早的 `T`（m2，改成請求不會
+  早於寫入者讀到 head 的時間，時鐘故障照樣保留）；P7d 原本在同一輪重新驗證後就標 tombstone，改成照規格
+  那一輪維持 condemned；重建案例 B 的 age 照 drain；解不開的 delta 過一個 grace 刪除；規格裡 pack 名稱
+  的驗證改寫成 range read 做得到的方式。
+- 照設計維持、沒有改的：偽造且引用沒有持有者的 item 的 snapshot，以及版本 5 的 snapshot，照樣讓 prune
+  拒絕到有人 `forget`——它們可能代表真的資料遺失，所以大聲失敗（`f4_attacker_snapshots_stall_gc_until_forgotten`
+  釘住這個行為，殘餘風險見下）。
+- F1–F3 是同一類：「自某個世代起已過一個 grace」只看了一個時鐘。兩輪設計審查與 advisor 都沒發現，是
+  模型上的外部審查找到的。規格 §11.1 現在把兩個時鐘的規則寫成一條總則。
+
 ## 假設
 
 | 假設 | 狀態 |
@@ -326,8 +350,13 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 
 ## 殘餘風險
 
-- 安全性的證明是手寫的。實作第一段的可執行模型、proptest 與外部審查是對策；ADR 016 的教訓是「GC
-  鄰接面的每個『顯然』都要過 proptest 與外部審查」。
+- 安全性的證明是手寫的。實作第一段的可執行模型、proptest 與外部審查已經做了，找到並修正了九個規格
+  錯誤（見最後一節）。剩下的風險：模型省略的部分（crate 說明列出）；模型證明的是規格，不是之後的程式碼，
+  後面各段的實作要以模型的情境為驗收。ADR 016 的教訓是「GC 鄰接面的每個『顯然』都要過 proptest 與外部
+  審查」。
+- **「只看一個時鐘」三度漏網**：drain 的結束、hold 的結束、重建的沿用條件都只看了後端時間，兩輪設計審查
+  與 advisor 都沒發現，是模型上的外部審查找到的。§11.1 現在有一條總則，並列出剩下只看一個時鐘的比較
+  與它們不承擔安全性的理由；以後改 GC 規則時，任何只比 `T` 或只比 `w` 的地方都要先對照這一條。
 - 柵欄只和後端的條件寫入一樣可靠。MinIO 在讀取 quorum 錯誤時會略過檢查：這是讀原始碼得到的，沒有
   實測。
 - 被入侵的備份主機仍然可以：讀全部資料（它持有主金鑰）、塞滿空間、寫假的 pack（別台沿用前會驗證，
@@ -336,9 +365,15 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 - backup 在 B4 之後、snapshot PUT 完成之前停住：B5 量兩次 E、E 計入休眠，可以把視窗縮到 PUT 本身的
   延遲，但那個延遲仍然是假設。
 - **以壞 snapshot 讓 GC 停住**：任何能在 `snapshots/` 寫入的角色（不需要金鑰）都能放一個解不開的
-  snapshot，讓所有 prune 停一個 grace；每個 grace 放一個就能讓 GC 一直停。對策：prune 每次都回報，
-  維護角色 `forget <key>` 立刻解除；S3 上依 client 分前綴的憑證讓它追得到是哪一台。資料不會因此遺失，
-  只是空間回收延後。
+  snapshot，讓所有 prune 停一個 grace；每個 grace 放一個就能讓 GC 一直停。持有金鑰的被入侵主機還能放
+  解得開、但引用沒有持有者的 item 的 snapshot，或版本 5 的 snapshot，這兩種會讓 prune 一直拒絕，直到有人
+  處理——它們可能代表真的資料遺失，所以刻意大聲失敗，不自己過期。對策：prune 每次都回報是哪一個
+  snapshot，維護角色 `forget <key>` 立刻解除；S3 上依 client 分前綴的憑證讓它追得到是哪一台。資料不會
+  因此遺失，只是空間回收延後。
+- **版本不認得的 pack 永遠保留**：prune 不刪看不懂的東西，所以這種 pack 只佔空間，要由維護命令移除。
+- **head 的主體與 `.r1` 一起遺失**：柵欄靠 `.r1` 擋住主體遺失後被重新建立；兩份都遺失時，較早讀過 head
+  的寫入者可以重新建立那一代。
+- **兩個時鐘往同一個方向錯**：兩個時鐘的規則只保證單一時鐘出錯時延後刪除。
 - 一顆 mpack 裝很多目錄的段，遺失的影響比 v3 的一個樹物件大。對策是 `.r1`（本機）與 parity。
 - ID 超過 1 000 萬時 map 的大小要再評估。
 - 所有成本數字都是估計（UNVERIFIED）。
@@ -374,3 +409,84 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 6. **唯寫金鑰不在 v4**，因為代價是失去跨主機去重。
 7. **實作第一段先做可執行的 GC 模型、proptest 與外部審查**，通過之後才寫正式程式碼。
 8. **v3 的信任缺口不在 main 上另外修**：v4 取代 v3，系統也還沒上線。
+
+## 實作第一段：GC 可執行模型（2026-10-10）
+
+位置：`crates/kist-gcmodel`。不是正式程式碼：只依賴 std，proptest 是 dev-dependency。
+
+**做法**
+
+- 每個 actor（backup、prune、forget、restore、改 settings、重建）是一個 phase 狀態機，一步一個後端操作。
+  排程器依 proptest 產生的 action 清單推進時間、啟動 actor、推進一步、把某個 actor 一口氣跑完、讓它當掉、
+  注入故障或惡意寫入；proptest 縮小的是這份清單，失敗時得到最短的交錯。
+- 真相與協定狀態分開：item 的 DAG、每個 item 的真副本、誠實 client commit 過的 snapshot 都在模型的世界
+  裡，actor 只能經由後端操作看到 repo。
+- 每一步之後檢查：R1（commit 過、沒有 forget 的 snapshot 引用的每個 item 都有真副本）；照讀取端的規則
+  找得到每個 item 的真副本；最新 head 讀得全（分片故障期間除外）；restore 沒有在 snapshot 還在時讀失敗；
+  沒有 P3 的「資料遺失」拒絕（模型沒有遺失 pack 的故障，出現就是誤報）。
+- 每個隨機 case 結束時做收尾活性檢查：停掉所有 actor、時鐘歸零、最新 head 讀不了就重建、forget 被入侵
+  主機的 snapshot，先等過出現過的最大時鐘偏差，再跑六輪 prune，每輪推進 grace、drain 的舊 grace、hold
+  的 grace 與 condemned 記錄裡最長的 age 之中最大的那個再加一小時。每一輪都要完成；最後誠實前綴下不能
+  留下沒被任何 snapshot 引用的 pack，每個誠實的 snapshot 都要讀得回來。外部審查指出原本沒有活性檢查。
+- 時間以秒計。物件的修改時間 = 後端時鐘 − ε（≤ 20 分鐘，但不早於寫入者讀到它所依賴的 head 的時間）；
+  backup 的經過時間少算 u（0 到 30 分鐘均勻）；兩者合計小於 M，就是規格的時間假設。
+- 時鐘故障：prune 主機的牆鐘與後端時鐘各自可以出錯、可以在 P0 之後才跳，偶爾差到 100 至 200 小時。
+  其他故障：actor 當掉、map 分片遺失、head 主體遺失、repack 讀回失敗。
+- 被入侵的備份主機只能在自己的前綴下建立物件（負責人決定 1 的 S3 部署）：假副本的 pack（可以挑比別人
+  小的名稱、可以混一部分真副本）、替別台的 pack 宣稱內容的 delta、解不開的 snapshot、版本 5 的 snapshot、
+  trailer 解不開或版本不認得的 pack、偽造的 snapshot。
+- 省略的寫在 crate 說明裡：parity、Object Lock、Dir 與 ChunkIndex 的巢狀、+1 ns 重試、加密與壓縮（以
+  真／假副本、讀得了／讀不了代替）、大小上限、本地 index 快取、分片的 `.r1`；分片 4 個而不是 256 個。
+
+**找到並修正的規格錯誤**：每一項都有先紅後綠的測試，並有恢復舊規則的突變開關證明修正承擔安全性或
+活性。
+
+| # | 誰找到的 | 問題 | 嚴重度 | 修正 |
+| --- | --- | --- | --- | --- |
+| 1 | 模型的確定情境 | P5 的壞 snapshot 等「滿一個 grace」比的是 `T(g)`，等待期間每一輪都停住、不寫 head，`T(g)` 不前進 | GC 永久停住 | 比 P0 的探針時間與本機牆鐘 |
+| 2–6 | 外部審查 F1–F5 | 見上面「審查結果」的外部審查一節 | 資料遺失（F1–F3）、GC 停住（F2、F4）、誤報（F5） | 同上 |
+| 7 | 收尾活性檢查 | P1 遇到時間在未來的 head 就拒絕：後端時鐘跳快一次，GC 就停到真實時間追上它，連改 settings 都過不了，沒有任何維護命令能解 | GC 停住，長度等於那次跳動 | 以本機時鐘 + M 代替，只會更保守 |
+| 8 | 處理審查時的隨機測試 | hold 的時間窗一過就清掉 held；重建之前已被刪掉的 pack，在 hold 很短（grace 被調低）時第一次 prune 就誤報資料遺失 | 誤報、GC 停住 | held 留到記錄被復活；held 的記錄消失就移除 |
+| 9 | 深度隨機測試 | head 主體遺失、`.r1` 還在時，一個在那一代出現之前就讀了 head 的寫入者可以重新建立那一代，柵欄被繞過、map 分岔 | restore 找不到資料 | 柵欄先看那一代的 `.r1`；head 一律寫 `.r1` |
+
+**每條規則都承擔安全性**：每一條各有一組情境，照規則通過、把那條規則拿掉（`Mutations`）就違反。
+
+| 規則 | 拿掉之後 | 證據 |
+| --- | --- | --- |
+| B3–B5 的經過時間檢查 | B4 之後停住超過一個 grace 的 backup，commit 了已被刪掉的 pack | 情境；較早的隨機搜尋找到過（tests/found.rs） |
+| P7d 刪前驗證 | repack 之後，假的正本排在前面，真的副本全被刪掉 | 情境；隨機搜尋也找到 |
+| P7d 兩個時鐘都要過期 | 只比 `w`：prune 主機的牆鐘在 P0 之後跳快就提早刪；只比 `T`：後端時鐘在 P0 之後慢了就提早刪 | 兩個情境 |
+| drain、hold、重建沿用條件也看兩個時鐘（第 2–4 項） | 恢復只看 `T`：外部審查的三個情境重新資料遺失 | 三個情境 |
+| P8 的柵欄 | 輸掉柵欄的 prune 刪掉 delta，新 pack 既不在 map、也不在任何 delta 裡 | 情境；隨機搜尋也找到 |
+| 柵欄先看 `.r1`（第 9 項） | 主體遺失後那一代被重新建立，map 分岔 | 情境；隨機搜尋也找到 |
+| B2 只沿用 live 的持有者 | 沿用了已過期的 condemned，下一輪 prune 把它刪掉 | 情境；隨機搜尋也找到 |
+| B2 沿用前驗證 | 沿用了假副本，commit 一個沒有人有的 chunk | 情境；隨機搜尋也找到 |
+| B4 HEAD parent | parent 在 B4 之前被強制 forget，子樹裡的 chunk 被刪掉 | 情境 |
+| grace 調低時的 drain | 在調低之前通過 B4 的 backup，用到的 pack 提早被刪 | 情境 |
+| delta 只描述自己前綴的 pack、B4 確認記錄裡還有沿用的 ID | 各自單獨拿掉都還擋得住；兩個都拿掉才違反（兩層防護） | 四個情境 |
+| P3、P5 拒絕前重新列出 head（第 6 項） | 誤報資料遺失 | 情境；隨機搜尋也找到 |
+| P1 以本機時鐘代替未來的 `T`（第 7 項） | 時鐘修好之後 prune 仍拒絕 | 情境 |
+| 重建的 hold | 慢速刪除完成時下一輪 prune 誤報資料遺失、GC 停住 | 情境；隨機搜尋也找到 |
+
+另外兩項不是協定裡的規則，模型確認它們承擔安全性：**強制 forget 每組 roots 最新的那一份＝讓那組 roots
+退役**（§9 的程序規則；parent 在 B4 之後才被強制 forget 時協定本身擋不住）；**時間假設**（backup 的經過
+時間少算 2 小時、大於 M 時 R1 違反，少算 30 分鐘時 B5 擋下）。
+
+模型裡沒有找到作用的兩條規則都保留：排序上「新進者不取代既有的正本」（假的正本已由刪前驗證擋住，它讓
+正本不會隨著新副本來回換）；prune 的整輪時限（在模型裡它的作用與柵欄重疊，重建 hold 的長度是由它推出
+來的）。
+
+**隨機交錯**
+
+- gate 裡三種設定各 512 個 case，每個都有收尾活性檢查：prune 主機的時鐘出錯；後端時鐘出錯；grace 6 小時
+  且 replicas 0。每一批都要求 condemned、復活、tombstone、刪除、repack、抓到假項目、輸掉柵欄、重建、
+  restore 完成都出現過，避免隨機測試本身空轉。
+- 深度版（不在 gate 裡）三種設定各 5000 個 case，沒有違反。三批合計 commit 76 450、tombstone 170 881、
+  刪除 169 084、復活 14 774、抓到假項目 6 099、輸掉柵欄 4 857、重建 5 159、restore 完成 92 439。
+- 固定種子的突變搜尋（不在 gate 裡；每個突變、兩種時鐘出錯方式各 2000 個 case，預設設定與 grace 6 小時
+  兩批，release 約 200 秒）：刪前驗證、柵欄、只沿用 live、沿用前驗證、重建的 hold、拒絕前重新列出 head
+  在四組裡都找到反例；柵欄先看 `.r1` 只在預設設定、後端時鐘出錯那組找到。其餘由上表的情境證明：兩個時鐘
+  各自單獨、看兩個時鐘的三個時間窗、B4 HEAD parent、drain、delta 前綴與 B4 記錄檢查（兩個都拿掉也沒找
+  到）、P1 以本機時鐘代替未來的 `T`。經過時間檢查在這次修改模型之後，同一個種子沒有再找到；較早的搜尋
+  找到、固定在 tests/found.rs 的四條交錯（經過時間檢查、柵欄、沿用前驗證、只沿用 live）在目前的模型上
+  仍然是「突變違反、原協定不違反」。新進者排序與整輪時限仍然沒有找到反例（見上一段）。
