@@ -11,6 +11,7 @@
 //! - [`live`]：restore、mount、check 的讀取端：退回較舊的世代、持有者全部失敗時重新載入一次（§10）。
 //! - [`backup`]：B1–B5（§11.2）。
 //! - [`snapshots`]：列出、選取與讀取 snapshot（主體不行讀 `.r1`，§9）。
+//! - [`restore`]：restore 與 dry run 的走訪（§9 的落點）；檔案系統那一層與 v3 共用。
 
 pub mod backup;
 pub mod cache;
@@ -18,6 +19,7 @@ pub mod live;
 pub mod pack;
 pub mod read;
 pub mod repo;
+pub mod restore;
 pub mod snapshots;
 pub mod state;
 

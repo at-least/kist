@@ -94,6 +94,15 @@ impl TestRepo {
         self.dir.path().join("repo")
     }
 
+    /// 某個前綴底下的物件數（本機 repo 的檔案數）。
+    pub fn count(&self, prefix: &str) -> usize {
+        let p = self.repo_path().join(prefix);
+        if !p.exists() {
+            return 0;
+        }
+        walk_files(&p).into_iter().filter(|p| p.is_file()).count()
+    }
+
     /// 某個前綴底下的 key，排好。
     pub async fn keys(&self, prefix: &str) -> Vec<String> {
         let mut k: Vec<String> = self
@@ -561,4 +570,211 @@ impl HookedRepo {
         k.sort();
         k
     }
+}
+
+/// v3 測試的 client（`[0x11; 16]`）：從 v3 搬過來的測試照用。
+pub fn backup_options() -> BackupOptions {
+    opts(0x11)
+}
+
+/// snapshot 的 key（測試裡 backup 回傳的是字串）。
+pub fn skey(s: &str) -> Key {
+    Key::parse(s).unwrap()
+}
+
+pub fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    use rand::{RngExt, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut v = vec![0u8; len];
+    rng.fill(&mut v[..]);
+    v
+}
+
+/// 一組有代表性的測試資料（同 v3 的 tests/common）：空檔、小檔、多 chunk 檔、可壓縮檔、子目錄、空目錄。
+pub fn make_source(root: &Path) {
+    std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+    std::fs::create_dir_all(root.join("empty-dir")).unwrap();
+    std::fs::write(root.join("empty.txt"), b"").unwrap();
+    std::fs::write(root.join("small.txt"), b"hello kist\n").unwrap();
+    std::fs::write(root.join("random.bin"), random_bytes(1, 300 * 1024)).unwrap();
+    std::fs::write(root.join("zeros.bin"), vec![0u8; 200 * 1024]).unwrap();
+    std::fs::write(root.join("sub/a.txt"), b"a").unwrap();
+    std::fs::write(root.join("sub/deeper/b.bin"), random_bytes(2, 70 * 1024)).unwrap();
+    std::fs::write(root.join("sub/中文檔名.txt"), "內容").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("small.txt", root.join("link")).unwrap();
+}
+
+/// 遞迴列出所有項目（相對路徑 → 內容），symlink 記錄目標，目錄記錄 `<dir>`。
+pub fn snapshot_dir(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    for p in walk_files(root) {
+        let rel = p.strip_prefix(root).unwrap().to_path_buf();
+        let meta = std::fs::symlink_metadata(&p).unwrap();
+        let content = if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&p).unwrap();
+            format!("symlink -> {}", target.display()).into_bytes()
+        } else if meta.is_dir() {
+            b"<dir>".to_vec()
+        } else {
+            std::fs::read(&p).unwrap()
+        };
+        out.insert(rel, content);
+    }
+    out
+}
+
+/// 所有檔案、目錄、symlink 的路徑（含空目錄），已排序。
+pub fn walk_files(root: &Path) -> Vec<PathBuf> {
+    fn rec(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            out.push(p.clone());
+            if meta.is_dir() {
+                rec(&p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(root, &mut out);
+    out.sort();
+    out
+}
+
+/// 比對兩個目錄：清單、內容、mtime。
+pub fn assert_same_tree(a: &Path, b: &Path) {
+    let sa = snapshot_dir(a);
+    let sb = snapshot_dir(b);
+    let ka: Vec<_> = sa.keys().collect();
+    let kb: Vec<_> = sb.keys().collect();
+    assert_eq!(ka, kb, "檔案清單不同");
+    for (k, va) in &sa {
+        assert_eq!(va, &sb[k], "內容不同：{}", k.display());
+        let ma = std::fs::symlink_metadata(a.join(k)).unwrap();
+        let mb = std::fs::symlink_metadata(b.join(k)).unwrap();
+        if !ma.file_type().is_symlink() {
+            assert_eq!(
+                filetime::FileTime::from_last_modification_time(&ma),
+                filetime::FileTime::from_last_modification_time(&mb),
+                "mtime 不同：{}",
+                k.display()
+            );
+        }
+    }
+}
+
+/// `src` 在 restore 目標底下的位置（本機來源：目標 + 絕對路徑，§9）。
+pub fn landed(target: &Path, src: &Path) -> PathBuf {
+    target.join(src.strip_prefix("/").unwrap_or(src))
+}
+
+/// 一個 Entry 的零值（只有名稱、類型與 metadata 種類）：測試只寫它在乎的欄位。
+pub fn entry(n: &[u8], t: u8, mk: u8) -> Entry {
+    Entry::new(n.to_vec(), t, mk)
+}
+
+/// 手工寫一個 snapshot（測試敵意或腐壞的 repo）：`items` 與 roots 的 RootSeg 寫進 client `c` 前綴下的一個
+/// mpack，記進一份 delta（讀取端從 delta 找到持有者），再以時間 `at`（奈秒，key 的時間戳與內容的 time 一致）
+/// 密封 snapshot。回傳 key。
+pub async fn hand_snapshot(
+    repo: &Repo,
+    c: ClientId,
+    at: i64,
+    roots: Vec<kist_format::v4::snapshot::Root>,
+    items: Vec<kist_format::v4::meta::Item>,
+) -> Key {
+    use kist_core::v4::pack::PackWriter;
+    use kist_format::v4::index::{Delta, DeltaPack};
+    use kist_format::v4::keys::SnapTs;
+    use kist_format::v4::meta::Item;
+    use kist_format::v4::pack::Kind;
+    use kist_format::v4::snapshot::{RootSeg, Snapshot};
+
+    let keys = std::sync::Arc::clone(repo.keys());
+    let mut w = PackWriter::new(
+        std::sync::Arc::clone(&keys),
+        Kind::Meta,
+        u64::MAX,
+        64 * 1024,
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |item: &Item| {
+        let cbor = item.encode().unwrap();
+        let id = keys.meta_id(&cbor);
+        if seen.insert(id) {
+            w.add(id.into(), &cbor).unwrap();
+        }
+        id
+    };
+    for item in &items {
+        add(item);
+    }
+    let roots_id = add(&Item::RootSeg(RootSeg::new(roots)));
+    let p = w.finish().unwrap().unwrap();
+    repo.backend()
+        .put_if_absent(
+            &Key::Mpack {
+                client: c,
+                id: p.id,
+                replica: false,
+            }
+            .path(),
+            p.bytes.clone(),
+        )
+        .await
+        .unwrap();
+    let delta = Delta::new(
+        c,
+        vec![DeltaPack {
+            id: p.id,
+            kind: Kind::Meta,
+            size: p.bytes.len() as u64,
+            entries: p.entries,
+        }],
+    )
+    .encode()
+    .unwrap();
+    let sealed = keys.seal_delta(&c, &delta).unwrap();
+    repo.backend()
+        .put_if_absent(
+            &Key::Delta {
+                client: c,
+                id: ObjectId::of(&sealed),
+            }
+            .path(),
+            sealed,
+        )
+        .await
+        .unwrap();
+    let ts = SnapTs::from_nanos(at).unwrap();
+    let snap = Snapshot {
+        v: kist_format::v4::VERSION,
+        roots: roots_id,
+        time: at,
+        host: "hand".to_owned(),
+        user: String::new(),
+        client: c,
+        parent: None,
+        stats: Default::default(),
+    };
+    let sealed = keys
+        .seal_snapshot(&c, &ts, &snap.encode().unwrap())
+        .unwrap();
+    let key = Key::Snapshot {
+        client: c,
+        ts,
+        replica: false,
+    };
+    repo.backend()
+        .put_if_absent(&key.path(), sealed)
+        .await
+        .unwrap();
+    key
+}
+
+/// 現在之後 `hours` 小時的奈秒時間（手工 snapshot 不與真的撞 key）。
+pub fn hours_from_now(hours: i64) -> i64 {
+    i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap()
+        + hours * 3_600_000_000_000
 }

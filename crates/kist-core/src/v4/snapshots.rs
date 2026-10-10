@@ -7,6 +7,13 @@ use kist_format::v4::snapshot::Snapshot;
 use super::repo::Repo;
 use crate::{CoreError, Result};
 
+fn not_found(e: &CoreError) -> bool {
+    matches!(
+        e,
+        CoreError::Backend(kist_backend::BackendError::NotFound(_))
+    )
+}
+
 /// 一個 snapshot 與它的 key（主體）。
 #[derive(Debug, Clone)]
 pub struct SnapshotInfo {
@@ -42,6 +49,9 @@ impl Repo {
             Ok(s) => {
                 tracing::warn!("{}: {body}; read its .r1 instead", key.path());
                 Ok(s)
+            }
+            Err(e) if not_found(&body) && not_found(&e) => {
+                Err(CoreError::SnapshotNotFound(key.path()))
             }
             Err(e) => Err(CoreError::corrupt(
                 key.path(),
