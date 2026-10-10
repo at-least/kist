@@ -1935,6 +1935,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kist-gcmodel"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "kist-mount"
 version = "0.1.0"
 dependencies = [

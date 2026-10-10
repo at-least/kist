@@ -1,0 +1,13 @@
+[package]
+name = "kist-gcmodel"
+description = "v4 GC 協定的可執行模型（ADR 026 實作第一段），不是正式程式碼"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
