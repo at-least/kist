@@ -318,7 +318,7 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 只在通過條件寫入探針的後端上執行。同一台主機以檔案鎖保證一次一個。
 
 - **P0** 建立 `maint/probe-<亂數>`，再以同名建立一次，必須得到「已存在」；HEAD 它，後端時間與本機牆鐘
-  相差超過 5 分鐘 → 拒絕。結束時刪掉探針。
+  相差超過 5 分鐘 → 拒絕。記下探針的後端時間 `N_P`。結束時刪掉探針。
 - **P1** 讀列出來的最大世代 g；版本不認得、讀不了、或沒有修改時間 → 拒絕；`T(g)` 比本機時鐘晚超過 `M`
   → 拒絕。較舊的 head 之間的時間異常只警告。
 - **P2** 依序列出：`snapshots/`、`deltas/`、`packs/` 與 `mpacks/`（含 `.r1`）、`parity/`、`maint/map/`。
@@ -330,9 +330,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   → 拒絕（prune 不刪看不懂的東西）。
 - **P5** 走訪每一個 snapshot，收集被引用的 ID。只有 `.r1`、沒有主體的 snapshot 一樣當成起點並回報
   （可能是 commit 前中斷，也可能是主體遺失）。主體解不開 → 試 `.r1`；兩份都解不開：在 head 的 `bad`
-  清單裡已滿一個 grace（`T(first) + grace ≤ T(g)`）→ 不再當成起點、回報；否則這一輪不改任何記錄、不刪
+  清單裡已滿一個 grace（`T(first) + grace ≤ N_P`）→ 不再當成起點、回報；否則這一輪不改任何記錄、不刪
   任何東西，回報後停止——它還不在 `bad` 裡時，先以柵欄寫 head g+1 把它記進去（`first = g+1`，分片
-  不變）。維護角色可以直接 `forget <key>` 立刻解除，不需要解密。解得開但版本不認得 → 拒絕。列表之後
+  不變）。這裡比 P0 的 `N_P`、不比 `T(g)`：等待期間每一輪都停在這裡、不寫新的 head，`T(g)` 不會前進
+  （GC 模型找到的死結）。維護角色可以直接 `forget <key>` 立刻解除，不需要解密。解得開但版本不認得 → 拒絕。列表之後
   兩份都消失 → 視為已 forget，略過。某個 ID 沒有任何可讀、非 tombstone、種類相符的持有者 → 拒絕。
 - **P6** 一個 ID 的正本＝它可讀、非 tombstone、種類相符的持有者中排序最前的那個。
 - **P7** 建 `Map(g+1)`（`age` 是目前的 grace；正在 drain 時是舊的 grace；重建後的 hold 期間不做 c 與 d）：
