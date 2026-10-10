@@ -64,8 +64,9 @@ walkdir = "2"
 zeroize = { version = "1", features = ["derive"] }
 # restore 以目錄 fd 為錨的 *at 系列（mkdirat、openat、renameat、linkat、symlinkat；
 # ADR 019 A4）：safe 封裝，所有 crate 維持 forbid(unsafe_code)。xattr、tempfile 已經
-# 間接帶進同一份 1.1。"process" 給 A43 的 geteuid。
-rustix = { version = "1.1", features = ["fs", "process"] }
+# 間接帶進同一份 1.1。"process" 給 A43 的 geteuid。"time" 給 v4 backup 的 CLOCK_BOOTTIME
+# （§11.1：經過時間計入休眠）。
+rustix = { version = "1.1", features = ["fs", "process", "time"] }
 zstd = "0.13"
 
 # The profile that 'dist' will build with

@@ -19,6 +19,7 @@
 
 pub mod corefs;
 pub mod offsets;
+pub mod v4;
 pub mod vpath;
 
 use std::path::{Path, PathBuf};

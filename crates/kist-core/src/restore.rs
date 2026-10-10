@@ -60,13 +60,13 @@ pub fn subtree_components(path: &str) -> Result<Vec<Vec<u8>>> {
 }
 
 /// [`RestoreOptions::subtree`] 的顯示字串（錯誤訊息用）。
-fn subtree_display(subtree: &[Vec<u8>]) -> String {
+pub(crate) fn subtree_display(subtree: &[Vec<u8>]) -> String {
     let parts: Vec<_> = subtree.iter().map(|c| String::from_utf8_lossy(c)).collect();
     format!("/{}", parts.join("/"))
 }
 
 /// SNAPSHOT:PATH 指到的不是目錄。
-fn not_a_directory(subtree: &[Vec<u8>]) -> CoreError {
+pub(crate) fn not_a_directory(subtree: &[Vec<u8>]) -> CoreError {
     CoreError::Usage(format!(
         "{} is not a directory in this snapshot",
         subtree_display(subtree)
@@ -160,7 +160,60 @@ pub struct RestoreSummary {
 /// 記路徑、不記目錄 handle（ADR 019 A4）：大樹裡硬連結多，每筆開著一個 fd
 /// 會把 fd 用光；後續名字到時再從目標的 handle 沿路徑逐層重新開
 /// （[`link_to_first`]）。
-type HardLinks = std::collections::HashMap<(u64, u64), Vec<OsString>>;
+pub(crate) type HardLinks = std::collections::HashMap<(u64, u64), Vec<OsString>>;
+
+/// restore 套 metadata 與選取需要的 Entry 欄位。v3 與 v4 的 Entry 欄位相同、名稱不同（docs/format-v4.md §8）；
+/// 兩邊的走訪共用這一層的檔案系統操作（ADR 019 的強化），v3 移除時拿掉 v3 的實作。
+pub(crate) trait RestoreEntry {
+    fn name(&self) -> &[u8];
+    fn is_dir(&self) -> bool;
+    fn target(&self) -> &[u8];
+    fn mode(&self) -> Option<u32>;
+    fn mtime_ns(&self) -> Option<i64>;
+    fn xattrs(
+        &self,
+    ) -> Option<&std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>>;
+    /// 記錄的擁有者（[`fsmeta::owner_of_entry`] 的規則：uid 與 gid 都有才算）。
+    fn owner(&self) -> Option<(u32, u32)>;
+    /// 套用用的 metadata（[`fsmeta::meta_of_entry`] 的規則：缺席的是 0）。
+    fn fs_meta(&self) -> fsmeta::FsMeta;
+}
+
+impl RestoreEntry for Entry {
+    fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    fn is_dir(&self) -> bool {
+        self.kind == node_type::DIR
+    }
+
+    fn target(&self) -> &[u8] {
+        &self.target
+    }
+
+    fn mode(&self) -> Option<u32> {
+        self.mode
+    }
+
+    fn mtime_ns(&self) -> Option<i64> {
+        self.mtime_ns
+    }
+
+    fn xattrs(
+        &self,
+    ) -> Option<&std::collections::BTreeMap<serde_bytes::ByteBuf, serde_bytes::ByteBuf>> {
+        self.xattrs.as_ref()
+    }
+
+    fn owner(&self) -> Option<(u32, u32)> {
+        fsmeta::owner_of_entry(self)
+    }
+
+    fn fs_meta(&self) -> fsmeta::FsMeta {
+        fsmeta::meta_of_entry(self)
+    }
+}
 
 /// 套用 metadata，一律經已開的 `file`（ADR 019 A3；`path` 只用在錯誤訊息）。
 /// 順序：xattr → 擁有者 → 時間 → mode。xattr 在 mode 之前：記錄的 mode 可能是
@@ -176,17 +229,21 @@ type HardLinks = std::collections::HashMap<(u64, u64), Vec<OsString>>;
 /// 回傳兩個結果：(xattr／時間／mode, 擁有者)。分開交回是因為 restore_dir 只在
 /// 前者失敗（記錄的 mode 沒套上）時放回暫時加的寫入權；擁有者設不回去時 mode
 /// 已經套上，不能再被蓋掉。
-fn apply_meta(file: &std::fs::File, path: &Path, node: &Entry) -> (Result<()>, Result<()>) {
-    if let Err(e) = fsmeta::apply_xattrs(file, path, node.xattrs.as_ref()) {
+pub(crate) fn apply_meta(
+    file: &std::fs::File,
+    path: &Path,
+    node: &impl RestoreEntry,
+) -> (Result<()>, Result<()>) {
+    if let Err(e) = fsmeta::apply_xattrs(file, path, node.xattrs()) {
         return (Err(e), Ok(()));
     }
     let as_root = fsmeta::running_as_root();
-    let owner = fsmeta::apply_owner(file, path, fsmeta::owner_of_entry(node), as_root);
+    let owner = fsmeta::apply_owner(file, path, node.owner(), as_root);
     let owner_restored = matches!(owner, Ok(true));
-    let applied = if node.mtime_ns.is_none() {
+    let applied = if node.mtime_ns().is_none() {
         Ok(())
     } else {
-        let mut meta = fsmeta::meta_of_entry(node);
+        let mut meta = node.fs_meta();
         meta.mode = fsmeta::mode_to_apply(meta.mode, as_root, owner_restored);
         fsmeta::apply(file, path, &meta)
     };
@@ -197,14 +254,18 @@ fn apply_meta(file: &std::fs::File, path: &Path, node: &Entry) -> (Result<()>, R
 /// （ADR 019 A4）：擁有者（只有 root，ADR 019 A43）→ mtime；symlink 沒有 mode
 /// 可套。mtime 沒記錄就不動，理由同 [`apply_meta`]；設不了 mtime 不算錯（有些
 /// 平台不支援），擁有者設不回去算這個節點的錯。
-fn apply_symlink_meta(dir: &DirHandle, name: &OsStr, node: &Entry) -> Result<()> {
-    let owner = match fsmeta::owner_of_entry(node) {
+pub(crate) fn apply_symlink_meta(
+    dir: &DirHandle,
+    name: &OsStr,
+    node: &impl RestoreEntry,
+) -> Result<()> {
+    let owner = match node.owner() {
         Some((uid, gid)) if fsmeta::running_as_root() => dir
             .chown_symlink(name, uid, gid)
             .map_err(|e| fsmeta::owner_error(&dir.child_path(name), uid, gid, e)),
         _ => Ok(()),
     };
-    if let Some(mtime_ns) = node.mtime_ns {
+    if let Some(mtime_ns) = node.mtime_ns() {
         dir.set_symlink_mtime(name, mtime_ns);
     }
     owner
@@ -215,10 +276,10 @@ fn apply_symlink_meta(dir: &DirHandle, name: &OsStr, node: &Entry) -> Result<()>
 /// 失敗，drop 就把暫存名刪掉——正式名底下使用者原有的檔從頭到尾沒被碰過。
 /// SIGINT 不會跑 drop，會留下 `.kist-restore-*`（README 有寫）。rename 與
 /// 刪除都經那一層目錄的 handle（ADR 019 A4）。
-struct TempPath {
-    dir: DirHandle,
-    name: OsString,
-    committed: bool,
+pub(crate) struct TempPath {
+    pub(crate) dir: DirHandle,
+    pub(crate) name: OsString,
+    pub(crate) committed: bool,
 }
 
 impl TempPath {
@@ -226,7 +287,7 @@ impl TempPath {
     /// （[`refuse_in_the_way`]）：擋路的 symlink 照舊拒絕；一般檔被取代（「既有
     /// 檔案會被覆寫」）。這次檢查與 rename 之間仍有視窗，輸掉的後果只是 rename
     /// 取代了那個 symlink 目錄項本身——rename 不跟隨 symlink，寫不到目標之外。
-    fn commit(mut self, dest: &OsStr) -> Result<()> {
+    pub(crate) fn commit(mut self, dest: &OsStr) -> Result<()> {
         refuse_in_the_way(&self.dir, dest)?;
         self.dir
             .rename(&self.name, dest)
@@ -252,23 +313,23 @@ impl Drop for TempPath {
 
 /// 新的隱藏暫存名 `.kist-restore-<16 位 hex>`（亂數直接向作業系統要，與
 /// repo id 同一個來源）。只產生名字，不建檔。
-fn temp_name() -> Result<OsString> {
+pub(crate) fn temp_name() -> Result<OsString> {
     let random = hex::encode(kist_crypto::random_bytes::<8>()?);
     Ok(OsString::from(format!(".kist-restore-{random}")))
 }
 
 /// 寫著內容的暫存檔：寫入用的 handle 加上負責刪檔的 [`TempPath`]。`file`
 /// 放在前面：drop 時先關檔、再刪暫存名。
-struct TempFile {
-    file: std::fs::File,
-    temp: TempPath,
+pub(crate) struct TempFile {
+    pub(crate) file: std::fs::File,
+    pub(crate) temp: TempPath,
 }
 
 impl TempFile {
     /// 在 `dir` 這一層建一個新的暫存檔（[`DirHandle::create_new_file`]：
     /// O_CREAT|O_EXCL，unix 另加 O_NOFOLLOW——名字已被佔用就失敗，不會打開
     /// 別人放的東西），建檔權限 `mode`（[`temp_file_mode`]）。
-    fn create_in(dir: &DirHandle, mode: u32) -> Result<Self> {
+    pub(crate) fn create_in(dir: &DirHandle, mode: u32) -> Result<Self> {
         let name = temp_name()?;
         // 開檔成功才交給 TempPath：失敗時那個名字不是我們的，drop 不能去刪它。
         let file = dir
@@ -286,8 +347,8 @@ impl TempFile {
 }
 
 /// 記錄的 mode 會不會被套上：與 [`apply_meta`] 同條件（有 mtime、mode 不是 0）。
-fn mode_will_be_applied(node: &Entry) -> bool {
-    node.mtime_ns.is_some() && node.mode.is_some_and(|m| m != 0)
+pub(crate) fn mode_will_be_applied(node: &impl RestoreEntry) -> bool {
+    node.mtime_ns().is_some() && node.mode().is_some_and(|m| m != 0)
 }
 
 /// 暫存檔的建檔權限（unix 再經 umask；非 unix 沒有 mode，不看）。內容寫進
@@ -299,7 +360,11 @@ fn mode_will_be_applied(node: &Entry) -> bool {
 ///   不以記錄的 mode 建檔：唯讀的 mode 會讓之後的 user.* xattr 設不進去。
 /// - 不會套 mode（s3／generic 來源）→ 正式名處原有一般檔的權限（以前原地寫時
 ///   就是保留它），沒有就是 0o666（與 std 新建的檔相同）。
-fn temp_file_mode(dir: &DirHandle, name: &OsStr, node: &Entry) -> Result<u32> {
+pub(crate) fn temp_file_mode(
+    dir: &DirHandle,
+    name: &OsStr,
+    node: &impl RestoreEntry,
+) -> Result<u32> {
     if mode_will_be_applied(node) {
         return Ok(0o600);
     }
@@ -318,7 +383,7 @@ fn chunk_ids_of(list: &[u8]) -> Result<Vec<ChunkId>> {
 /// 不起來，呼叫端退回複製），再 linkat 到 `dir` 的 `name`（ADR 019 A4）。
 /// 正式名處已經有東西時 linkat 回 EEXIST（最常見：同一個 snapshot 再還原
 /// 一次），改走 [`link_over`]。
-fn link_to_first(
+pub(crate) fn link_to_first(
     target_dir: &DirHandle,
     first: &[OsString],
     dir: &DirHandle,
@@ -372,7 +437,7 @@ fn link_over(
 /// symlink、目錄、特殊檔（FIFO、socket、裝置）→ 拒絕，而且不刪它、不跟隨
 /// （ADR 019 A2 裁定：擋路的 symlink 維持拒絕）。擋路的是本機的東西，不是
 /// repo 損壞（ADR 019 A30）。
-fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
+pub(crate) fn refuse_in_the_way(dir: &DirHandle, name: &OsStr) -> Result<()> {
     let what = match dir.kind_of(name)? {
         None | Some(Kind::File) => return Ok(()),
         Some(Kind::Symlink) => "a symlink",
@@ -423,7 +488,7 @@ fn make_owner_writable(_: &DirHandle) -> Result<Option<std::fs::Permissions>> {
 /// 還原路徑上的一層目錄，第一次要往裡面寫東西時才建立。還原目標本身一開始就開著
 /// （[`DirHandle`] 直接實作）；其他層是 [`PendingDir`]，沿 `parent` 一路接到目標。
 /// 每層只開著自己的一個 handle，同時開著的數目仍是遞迴深度（ADR 019 A4）。
-trait OpenDir {
+pub(crate) trait OpenDir {
     /// 這一層的 handle，準備好往裡面寫：還沒建就先建（缺的上層一起建）；第一次寫入
     /// 之前，既有的唯讀目錄暫時加上擁有者寫入權（[`make_owner_writable`]）。
     fn open(&mut self) -> Result<&DirHandle>;
@@ -442,21 +507,21 @@ impl OpenDir for DirHandle {
 }
 
 /// 目標底下還沒建（或還沒開）的一層：root 的落點，或 snapshot 裡的一個目錄。
-struct PendingDir<'p> {
+pub(crate) struct PendingDir<'p> {
     parent: &'p mut dyn OpenDir,
     make: Make,
     path: PathBuf,
     /// 這一層最後會套回記錄的 mode（[`mode_will_be_applied`]），所以既有的唯讀目錄
     /// 可以先暫時加寫入權。root 的落點沒有 metadata，不加。
     loosen: bool,
-    handle: Option<DirHandle>,
+    pub(crate) handle: Option<DirHandle>,
     /// [`make_owner_writable`] 做過了（第一次往這層寫東西之前做一次）。
     prepared: bool,
     /// 暫時加上寫入權之前的權限：套 metadata 失敗時放回去。
-    loosened: Option<std::fs::Permissions>,
+    pub(crate) loosened: Option<std::fs::Permissions>,
     /// 上一次建立這一層失敗了（之後建起來就清掉）：root 的落點用它判斷整個 restore 要不要
     /// 回錯（[`Repository::restore`]）。
-    create_failed: bool,
+    pub(crate) create_failed: bool,
 }
 
 enum Make {
@@ -469,13 +534,17 @@ enum Make {
 
 impl<'p> PendingDir<'p> {
     /// root 的落點 `rel`（目標底下）。
-    fn base(parent: &'p mut dyn OpenDir, rel: &Path) -> Self {
+    pub(crate) fn base(parent: &'p mut dyn OpenDir, rel: &Path) -> Self {
         let path = parent.location().join(rel);
         Self::new(parent, Make::Base(rel.to_path_buf()), path, false)
     }
 
     /// snapshot 裡的目錄節點 `node`，名字 `name`。
-    fn child(parent: &'p mut dyn OpenDir, name: &OsStr, node: &Entry) -> Self {
+    pub(crate) fn child(
+        parent: &'p mut dyn OpenDir,
+        name: &OsStr,
+        node: &impl RestoreEntry,
+    ) -> Self {
         let path = parent.location().join(name);
         let loosen = mode_will_be_applied(node);
         Self::new(parent, Make::Child(name.to_os_string()), path, loosen)
@@ -495,7 +564,7 @@ impl<'p> PendingDir<'p> {
     }
 
     /// 建立這一層（建過就沿用），不做寫入前的準備。
-    fn create(&mut self) -> Result<()> {
+    pub(crate) fn create(&mut self) -> Result<()> {
         self.ensure(false).map(|_| ())
     }
 
@@ -555,7 +624,7 @@ struct Walk<'w> {
 }
 
 /// 部分還原的選取（[`RestoreOptions`]）：每個節點的 [`Pos`] 從上一層往下走一步。
-struct Select<'o> {
+pub(crate) struct Select<'o> {
     include: &'o PathFilter,
     exclude: &'o PathFilter,
     /// 每條 include 樣式有沒有選到東西：涵蓋（比對到它或它的上層）某個被還原的節點
@@ -565,11 +634,11 @@ struct Select<'o> {
 
 /// 一個節點在兩組樣式裡的位置。
 #[derive(Clone)]
-struct Pos {
+pub(crate) struct Pos {
     include: FilterState,
     exclude: FilterState,
     /// 自己或某個上層被 include 比對到（沒有 include 時一律是）：要還原。
-    selected: bool,
+    pub(crate) selected: bool,
     /// 比對到自己或某個上層、還沒算成選到東西的正向 include 樣式。這個節點被還原時它們都
     /// 選到了東西（[`Select::credit`]）。
     pending: Vec<usize>,
@@ -578,7 +647,7 @@ struct Pos {
 impl<'o> Select<'o> {
     /// 只有反向樣式的 include 什麼都選不到：反向樣式只取消前面的 include 選到的（ADR
     /// 023）。直接報錯，不以「還原 0 個檔案」成功結束（審查修正）。
-    fn new(opts: &'o RestoreOptions) -> Result<Self> {
+    pub(crate) fn new(opts: &'o RestoreOptions) -> Result<Self> {
         let include = &opts.include;
         if !include.is_empty() && (0..include.len()).all(|p| include.is_negated(p)) {
             return Err(CoreError::Usage(
@@ -595,7 +664,7 @@ impl<'o> Select<'o> {
     }
 
     /// 路徑頂端（還沒走過任何元件）。
-    fn start(&self) -> Pos {
+    pub(crate) fn start(&self) -> Pos {
         Pos {
             include: self.include.start(),
             exclude: self.exclude.start(),
@@ -605,7 +674,7 @@ impl<'o> Select<'o> {
     }
 
     /// `parent` 底下的 `name`；被 exclude 比對到 → `None`。
-    fn child(&self, parent: &Pos, name: &[u8]) -> Option<Pos> {
+    pub(crate) fn child(&self, parent: &Pos, name: &[u8]) -> Option<Pos> {
         let exclude = self.exclude.descend(&parent.exclude, name);
         if exclude.is_match() {
             return None;
@@ -636,7 +705,7 @@ impl<'o> Select<'o> {
     /// `pos` 被還原：比對到它或它上層的 include 樣式都選到了東西。只在這裡記，不在比對到
     /// 的時候記——比對到、但被後面的反向樣式取消，或比對到的上層底下全被排除，都不算
     /// （審查修正）。
-    fn credit(&mut self, pos: &Pos) {
+    pub(crate) fn credit(&mut self, pos: &Pos) {
         if pos.selected {
             for &p in &pos.pending {
                 self.hit[p] = true;
@@ -645,7 +714,7 @@ impl<'o> Select<'o> {
     }
 
     /// 從頂端沿 `names` 走到底；途中被 exclude 比對到 → `None`（那底下全部不還原）。
-    fn walk<'n>(&self, names: impl IntoIterator<Item = &'n [u8]>) -> Option<Pos> {
+    pub(crate) fn walk<'n>(&self, names: impl IntoIterator<Item = &'n [u8]>) -> Option<Pos> {
         let mut pos = self.start();
         for name in names {
             pos = self.child(&pos, name)?;
@@ -655,20 +724,19 @@ impl<'o> Select<'o> {
 
     /// `parent` 底下的 `entry` 要不要走：被排除、或沒被選到而且底下也不可能有東西被
     /// 選到 → `None`。
-    fn visit(&mut self, parent: &Pos, entry: &Entry) -> Option<Pos> {
-        let pos = self.child(parent, &entry.name)?;
+    pub(crate) fn visit(&mut self, parent: &Pos, entry: &impl RestoreEntry) -> Option<Pos> {
+        let pos = self.child(parent, entry.name())?;
         self.credit(&pos);
-        (pos.selected || (entry.kind == node_type::DIR && pos.include.may_match_below()))
-            .then_some(pos)
+        (pos.selected || (entry.is_dir() && pos.include.may_match_below())).then_some(pos)
     }
 
     /// 這個節點底下還值得走嗎：自己被選到，或底下還可能有東西被選到。
-    fn worth_walking(pos: &Pos) -> bool {
+    pub(crate) fn worth_walking(pos: &Pos) -> bool {
         pos.selected || pos.include.may_match_below()
     }
 
     /// 沒選到東西的 include 樣式。反向樣式不算：它們本來就只會取消。
-    fn unmatched(&self) -> Vec<String> {
+    pub(crate) fn unmatched(&self) -> Vec<String> {
         (0..self.include.len())
             .filter(|&p| !self.hit[p] && !self.include.is_negated(p))
             .map(|p| self.include.pattern(p).to_owned())
@@ -707,25 +775,25 @@ enum Placed {
 }
 
 /// dry run（[`Repository::plan_restore`]）的走訪狀態。
-struct Plan<'p, 'o> {
-    select: Select<'o>,
-    summary: RestoreSummary,
-    on_node: &'p mut dyn FnMut(&Path, Planned),
+pub(crate) struct Plan<'p, 'o> {
+    pub(crate) select: Select<'o>,
+    pub(crate) summary: RestoreSummary,
+    pub(crate) on_node: &'p mut dyn FnMut(&Path, Planned),
     /// 目前路徑上的每一層，對應真的還原的 [`PendingDir`]。
-    levels: Vec<PlanLevel>,
+    pub(crate) levels: Vec<PlanLevel>,
 }
 
-struct PlanLevel {
-    path: PathBuf,
+pub(crate) struct PlanLevel {
+    pub(crate) path: PathBuf,
     /// snapshot 裡的目錄（root 的落點不是：真的還原不計數、這裡也不回報）。
-    snapshot_dir: bool,
-    created: bool,
+    pub(crate) snapshot_dir: bool,
+    pub(crate) created: bool,
 }
 
 impl Plan<'_, '_> {
     /// 要往最深一層寫東西：沿路還沒建的層算是建了，snapshot 裡的目錄依序回報（上層先）。
     /// 計數等那一層走完（[`Repository::plan_dir`]），與真的還原同一個時機。
-    fn open(&mut self) {
+    pub(crate) fn open(&mut self) {
         let Plan {
             levels, on_node, ..
         } = self;
@@ -1417,16 +1485,16 @@ impl Repository {
 }
 
 /// 還原 symlink 條目：建連結（[`replace_with_symlink`]），再套它本身的 metadata。
-fn restore_symlink(
+pub(crate) fn restore_symlink(
     dir: &DirHandle,
     name: &OsStr,
-    node: &Entry,
+    node: &impl RestoreEntry,
     summary: &mut RestoreSummary,
 ) -> Result<()> {
-    let link_target = fsmeta::bytes_to_name(&node.target)?;
+    let link_target = fsmeta::bytes_to_name(node.target())?;
     replace_with_symlink(dir, name, Path::new(&link_target))?;
     summary.symlinks += 1;
-    if node.xattrs.is_some() {
+    if node.xattrs().is_some() {
         tracing::warn!(
             "{}: snapshot has extended attributes for this symlink; \
              Linux cannot set user.* on a symlink and following it \

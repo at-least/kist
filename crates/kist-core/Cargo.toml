@@ -33,7 +33,11 @@ rustix.workspace = true
 xattr.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+bytes.workspace = true
 filetime.workspace = true
+futures.workspace = true
+object_store.workspace = true
 proptest.workspace = true
 serde.workspace = true
 rand.workspace = true

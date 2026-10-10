@@ -29,6 +29,7 @@ pub mod rebuild;
 pub mod repo;
 pub mod restore;
 pub mod snapshots;
+pub mod v4;
 
 pub use backup::{
     BackupOptions, BackupProgress, BackupSummary, Exclusions, Marker, PreparedBackup,
@@ -107,6 +108,27 @@ pub enum CoreError {
     Format(#[from] kist_format::FormatError),
     #[error(transparent)]
     Chunker(#[from] kist_chunker::ChunkerError),
+    #[error(transparent)]
+    FormatV4(#[from] kist_format::v4::Error),
+    /// v4 的 B1、B4：最大世代的 head 用不了（讀不了、版本不認得、沒有 `.r1`、世代變小）。
+    #[error("{0}")]
+    Generation(String),
+    /// v4 的 B4、B5：沿用或時間的條件不成立，不寫 snapshot。
+    #[error("not committing this backup: {0}; rerun it")]
+    NotCommitted(String),
+    /// v4 的 B5：寫 snapshot 主體失敗，commit 與否不明（逾時的 PUT 可能已經寫進去，§12）。
+    #[error(
+        "writing snapshot {key} failed, so whether this backup was committed is unknown: {source}"
+    )]
+    CommitUnknown {
+        key: String,
+        #[source]
+        source: kist_backend::BackendError,
+    },
+    /// v4 的讀取（§10）：一項沒有持有者，或每一份都驗證失敗。restore、mount 與 check 在這時重新載入一次世代
+    /// 再試（[`v4::live`]）。
+    #[error("no usable copy of {what}: {reasons}")]
+    Unavailable { what: String, reasons: String },
 }
 
 impl CoreError {
