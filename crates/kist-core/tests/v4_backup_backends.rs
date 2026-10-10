@@ -1,11 +1,13 @@
-//! v4 backup 在真的後端上：init、backup、讀回、沒變的第二次 backup 不寫新東西。MinIO、SFTP、rclone 有環境
-//! 變數才跑（tests/README.md）；本機與記憶體後端的規則測試在 `v4_backup*.rs`。
+//! v4 在真的後端上：init、backup、讀回、沒變的第二次 backup 不寫新東西、另一台 client 取回驗證後沿用、
+//! restore、check --read-data。MinIO、SFTP、rclone 有環境變數才跑（tests/README.md）；本機與記憶體後端的規則
+//! 測試在 `v4_backup*.rs`、`v4_restore*.rs`、`v4_check.rs`。
 
 #[path = "v4_common/mod.rs"]
 mod v4_common;
 
 use kist_backend::Backend;
 use kist_core::v4::Repo;
+use kist_format::v4::keys::Key;
 use v4_common::*;
 
 async fn round_trip(backend: Backend) {
@@ -35,7 +37,10 @@ async fn round_trip(backend: Backend) {
         expected.insert(format!("{}/{p}", segs.join("/")), n);
     }
     assert_eq!(read_tree(&repo, &first.snapshot).await, expected);
-    let second = repo.backup(&[src], opts(1)).await.unwrap();
+    let second = repo
+        .backup(std::slice::from_ref(&src), opts(1))
+        .await
+        .unwrap();
     assert_eq!(second.parent.as_deref(), Some(first.snapshot.as_str()));
     assert_eq!(
         second.report.packs_new + second.report.mpacks_new + second.report.deltas_new,
@@ -57,6 +62,31 @@ async fn round_trip(backend: Backend) {
         .await
         .values()
         .any(|n| *n == Node::File(data("big", 300 * 1024))));
+    // restore（第 5 段）：落點是目標加上定位的各段，內容與來源相同
+    let target = dir.path().join("restored");
+    let restored = repo
+        .restore(
+            &Key::parse(&first.snapshot).unwrap(),
+            &target,
+            kist_core::RestoreOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(restored.errors.is_empty(), "{restored:?}");
+    assert_eq!(source_tree(&target.join(segs.join("/"))), source_tree(&src));
+    // check --read-data：每個 pack 與 mpack 整份下載驗證，沒有錯誤與警告
+    let report = repo
+        .check(kist_core::v4::check::CheckOptions {
+            read_data: true,
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        report.errors.is_empty() && report.warnings.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(report.snapshots, 3);
     // 清掉（只有測試用的前綴）
     for prefix in ["keys", "packs", "mpacks", "deltas", "snapshots", "maint"] {
         for o in backend.list(prefix).await.unwrap() {
