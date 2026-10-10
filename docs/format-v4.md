@@ -129,12 +129,13 @@ master ─DeriveKey─▶ K_chunk_id "kist/v4/chunk-id"   K_meta_id "kist/v4/met
 | `SnapshotStats` | files, dirs, symlinks, bytes |
 | `Delta` | v, client, packs |
 | `DeltaPack` | id, kind, size, entries |
-| `Head` | v, g, w, parent, shards, settings, drain, bad |
+| `Head` | v, g, w, parent, shards, settings, drain, bad, hold |
 | `Settings` | grace, replicas, pack_target, mpack_target |
 | `Drain` | from, old_grace |
 | `Bad` | key, first |
+| `Hold` | lost, grace |
 | `Shard` | v, index, records |
-| `Record` | id, client, kind, size, entries, by_prune, since, status |
+| `Record` | id, client, kind, size, entries, by_prune, since, status, held |
 | `Status` | s, at, age |
 
 ## 5. Sealed 物件
@@ -234,7 +235,10 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
 - stats：`files`、`symlinks` 按名稱計；`dirs` 是目錄節點數，roots 不算；`bytes` 是內容總和，`(dev, ino)`
   只算一次。過程計數不在格式裡。
 - commit：`replicas=1` 時先寫 `.r1`，再寫主體；主體出現＝commit。同名時時間戳 +1 奈秒重試。
-- forget：不刪任何 client 最新的那一份 snapshot（除非明確強制）；刪除時先刪 `.r1` 再刪主體。
+- forget：不刪任何 client 在同一組 roots 上最新的那一份 snapshot（那是下一次 backup 的 parent）；刪除時先
+  刪 `.r1` 再刪主體。強制刪除那一份等於讓這個 client 的這組 roots 退役，只能在它沒有進行中的 backup 時
+  做：backup 沿用 parent 的子樹時不查子樹裡每個 item 的持有者，靠的是 parent 一直存在（B4 的 HEAD 只能
+  縮小、不能消除這個空窗）。
 
 ## 10. Index：map 與 delta
 
@@ -243,7 +247,8 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
 ```
 Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head g−1 的 bytes)（g=0 時省略）,
        shards: [256 個 hash，空分片為 null], settings: { grace, replicas, pack_target, mpack_target },
-       drain: { from: g, old_grace } | 省略, bad: [{ key, first: g }] | 省略 }
+       drain: { from: g, old_grace } | 省略, bad: [{ key, first: g }] | 省略,
+       hold: { lost: g, grace: 秒 } | 省略 }
 ```
 
 - `T(g)` ＝ head g 的後端修改時間，截到秒。head 永不刪除，所以每個世代的 `T` 與 `w` 永遠查得到。
@@ -255,7 +260,8 @@ Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head
 
 ```
 Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since: g,
-         status: { s: 0 live | 1 condemned | 2 tombstone | 3 unreadable, at: g, age: 秒 } }
+         status: { s: 0 live | 1 condemned | 2 tombstone | 3 unreadable, at: g, age: 秒 },
+         held: bool（只在重建後的 hold 期間有意義，§11.4） }
 ```
 
 - `entries` 取自 prune 自己讀到的 trailer；之後唯一的改變是移除被證明不實的項目（P7c、P7d）。
@@ -265,7 +271,9 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   不會取代既有的持有者成為正本。
 
 **Delta** `deltas/<c>/<hex>`：`Delta {v, client, packs: [{id, kind, size, entries}]}`，backup 寫，只是
-提示：讓別台在 prune 收錄之前就能去重與還原新 pack 裡的東西。prune 從不依 delta 做決定。
+提示：讓別台在 prune 收錄之前就能去重與還原新 pack 裡的東西。prune 從不依 delta 做決定。delta 只能描述
+同一個 client 前綴下的 pack（`deltas/<c>/` 只列 `packs/<c>/` 與 `mpacks/<c>/`），讀取端略過不符的項目
+並警告：否則一台主機可以替別台的 pack 宣稱它沒有的內容。
 
 **讀取端**（backup、restore、mount、check）：
 - 列 `maint/gen/`（從上次看過的世代 start-after），取**列出來的最大世代**，讀主體、不行讀 `.r1`。讀不了
@@ -282,7 +290,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   2 小時）。`M` ＝ 1 小時。
 - backup 的經過時間 `E` ＝ max(牆鐘經過, 含休眠的單調時鐘經過)。Linux 用 `CLOCK_BOOTTIME`；其他平台的
   對應時鐘未驗證（UNVERIFIED）。
-- prune 的整輪（P0 到 P9 結束）必須在 `grace − M` 內完成，以同樣的時鐘計；超過就停止，不再刪任何東西。
+- prune 的整輪（P0 到 P9 結束）必須在 `grace − M` 內完成，以同樣的時鐘計；超過就停止，不再寫 head、
+  不再刪任何東西。
 
 ### 11.2 backup
 
@@ -298,10 +307,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - **B3** 以只在不存在時建立的方式寫 pack（mpack 連同 `.r1`，選配 parity），再寫 delta 列出它們；可以寫
   中間的 delta，重跑時沿用已上傳的 pack。`E ≥ grace − M` 之後不再寫 delta。
 - **B4**（緊接在寫 snapshot 之前）讀列出來的最大世代 `g_c`（必須讀得了；`g_c < g_s` 是錯誤）。要求
-  `E < min(grace(g_s), grace(g_c)) − M`。`g_c > g_s` 時載入 `Map(g_c)`：去重用到的每個 pack 都在、不是
-  tombstone 或 unreadable，自己寫的 pack 沒有被 tombstone。來自 delta 的每個 pack：HEAD 它；不在
-  `Map(g_c)` 裡就讀它的 trailer，確認沿用的 ID 在裡面。沿用了 parent 的子樹時 HEAD parent，不在就停止。
-  任何一項不成立：不 commit，以錯誤結束。
+  `E < min(grace(g_s), grace(g_c)) − M`。去重用到的每個 pack：在 `Map(g_c)` 裡 → 不是 tombstone 或
+  unreadable，而且沿用的 ID 都還在它的記錄裡（`g_c = g_s` 時 B2 已經查過）；不在 `Map(g_c)` 裡（來自
+  delta 的）→ HEAD 它，再讀它的 trailer 確認沿用的 ID 在裡面。自己這次寫的 pack 不能是 tombstone。沿用了
+  parent 的子樹時 HEAD parent，不在就停止。任何一項不成立：不 commit，以錯誤結束。
 - **B5** 再檢查一次 `E`；`replicas=1` 時寫 snapshot 的 `.r1`；再檢查一次 `E`；寫 snapshot 主體。commit。
 
 ### 11.3 prune
@@ -312,10 +321,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   相差超過 5 分鐘 → 拒絕。結束時刪掉探針。
 - **P1** 讀列出來的最大世代 g；版本不認得、讀不了、或沒有修改時間 → 拒絕；`T(g)` 比本機時鐘晚超過 `M`
   → 拒絕。較舊的 head 之間的時間異常只警告。
-- **P2** 依序列出：`snapshots/`、`deltas/`、`packs/` 與 `mpacks/`（含 `.r1`）、`parity/`。先列的物件寫在
-  它所依賴的物件之後，所以那些物件一定出現在後列的清單裡。
+- **P2** 依序列出：`snapshots/`、`deltas/`、`packs/` 與 `mpacks/`（含 `.r1`）、`parity/`、`maint/map/`。
+  先列的物件寫在它所依賴的物件之後，所以那些物件一定出現在後列的清單裡。
 - **P3** live 或 condemned 的記錄，主體與 `.r1` 都不在 → 拒絕（資料遺失，請執行 check 與修復）；只缺
-  主體、`.r1` 在 → 回報、繼續。
+  主體、`.r1` 在 → 回報、繼續。例外：重建後的 hold 期間，held 的記錄消失時直接移除（§11.4）。
 - **P4** 列表裡有、map 裡沒有的 pack 是新進者：讀它的 trailer，讀得了 → live（`since = g+1`）；讀不了
   （解不開、排版不對、種類與命名空間不符）→ unreadable（`since = g+1`），沒人會用它；解得開但版本不認得
   → 拒絕（prune 不刪看不懂的東西）。
@@ -326,8 +335,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   不變）。維護角色可以直接 `forget <key>` 立刻解除，不需要解密。解得開但版本不認得 → 拒絕。列表之後
   兩份都消失 → 視為已 forget，略過。某個 ID 沒有任何可讀、非 tombstone、種類相符的持有者 → 拒絕。
 - **P6** 一個 ID 的正本＝它可讀、非 tombstone、種類相符的持有者中排序最前的那個。
-- **P7** 建 `Map(g+1)`（`age` 是目前的 grace；正在 drain 時是舊的 grace）：
-  - a) condemned 而且是某個 ID 的正本 → live；
+- **P7** 建 `Map(g+1)`（`age` 是目前的 grace；正在 drain 時是舊的 grace；重建後的 hold 期間不做 c 與 d）：
+  - a) condemned 而且是某個 ID 的正本 → live（hold 期間 held 的記錄除外）；
   - b) live、不是任何 ID 的正本、pack 修改時間 + grace ≤ `T(g)` → condemned（`at = g+1`）。比對 pack
     的修改時間只是為了不去標剛寫入、snapshot 還沒 commit 的 pack，安全性不靠它；
   - c) repack：live、是正本、比 grace 老、有效比例低 → 把它當正本的 item 逐一解密驗證（發現不實的項目
@@ -343,19 +352,31 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   - f) tombstone、仍在列表裡 → tombstone（`at = g+1`，刷新）；
   - g) tombstone（`at = d`）、主體與 `.r1` 都不在列表、`T(d) + grace ≤ T(g)`、當下沒有 delta 提到它 →
     移除記錄。
-- **P8** 寫出有變動的分片，再以只在不存在時建立的方式寫 head g+1 的主體——**這一步是柵欄**：得到「已
-  存在」就停止，什麼都不刪，也不拿這份計畫重試。成功之後才寫 head 的 `.r1`。
+- **P8** 寫出有變動的分片；確認仍在整輪時限內，再以只在不存在時建立的方式寫 head g+1 的主體——**這一步是
+  柵欄**：得到「已存在」或超過時限就停止，什麼都不刪，也不拿這份計畫重試。成功之後才寫 head 的 `.r1`。
 - **P9**（仍在整輪時限內）刪除：tombstone 而仍在列表的 pack（順序 `.r1`、parity、主體；Object Lock
-  拒絕就保留 tombstone 並回報）；所有 pack 都已在 `Map(g+1)` 或已不在列表的 delta；只被比 g 舊的 head
-  引用、而 g 與 g+1 都沒引用的分片；沒有任何 head 引用、修改時間 + grace ≤ `T(g)` 的分片（輸掉柵欄的
-  prune 留下的）；pack 已不在、修改時間 + grace ≤ `T(g)` 的 parity；`bad` 清單裡已不再當成起點的
+  拒絕就保留 tombstone 並回報）；所有 pack 都已在 `Map(g+1)` 或已不在列表的 delta；g 與 g+1 都沒引用、
+  修改時間 + grace ≤ `T(g)` 的分片（舊世代的，以及輸掉柵欄的 prune 留下的；不需要讀更舊的 head）；
+  pack 已不在、修改時間 + grace ≤ `T(g)` 的 parity；`bad` 清單裡已不再當成起點的
   snapshot 的主體與 `.r1`（兩份都通不過認證，沒有可還原的內容）。head 永不刪除。這是 prune 唯一會刪
   `snapshots/` 底下物件的情況，它依賴 §5 的 snapshot 密封方式在 v4 這一代內不變。
 
 ### 11.4 重建、settings、grace
 
-- **重建**（map 分片遺失或壞掉）：也是一個走柵欄的世代。不在最新可讀 map 裡是 live 的 pack 以
-  condemned 進入；在 `T(分片遺失的最新 head) + grace` 之前，不復活、也不給 backup 沿用。
+- **重建**（最新 head 的分片遺失或壞掉）：維護命令。P0 之後以柵欄寫世代 r ＝ `g_lost + 1`，不走訪
+  snapshot、不刪任何東西。`g_lost` 是列出來的最大世代；`g_r` 是分片讀得全的最大世代（head 0 沒有分片，
+  一定讀得全）。
+  - `T(g_lost) < T(g_r + 1) + a` 時（`a` 是 `g_r+1` 到 `g_lost` 的 head 裡最小的 grace，drain 的舊 grace
+    也算）：沿用 `Map(g_r)`，其中 condemned 的記錄標成 held；列表裡有、`Map(g_r)` 裡沒有的 pack 照 P4
+    收錄。這段時間不夠讓 `Map(g_r)` 裡 live 的 pack 或之後的新進者被標成 tombstone（標成 condemned 之後
+    還要再過一個 age），所以它們不會正被刪除。
+  - 否則：列表裡的每個 pack 都以 condemned（`at = r`）、held 收錄，trailer 照 P4 讀（讀不了 →
+    unreadable）；`Map(g_r)` 的 tombstone 保留。
+  - head r 記下 `hold: { lost: g_lost, grace: g_r 到 g_lost 的 head 裡最大的 grace }`；已有 hold 時取較晚
+    結束的那個。之後的 prune 在 `T(g) < T(lost) + grace` 時（g 是它的基礎世代）：held 的記錄不復活，
+    主體與 `.r1` 都不在就移除記錄；不 repack、不標 tombstone（P7c、P7d）。原因：在遺失的世代裡被標成
+    tombstone 的 pack，可能正被當時的 prune 刪除；那些 prune 的整輪時限在 `T(lost) + grace` 之前結束。
+    backup 本來就不沿用 condemned 的 pack。過了這個時間，prune 清掉 held 與 hold，之後照一般規則。
 - **改 settings**：維護命令，P0、P1 之後直接以柵欄寫 head g+1（分片不變、settings 改變），不刪任何
   東西。這不是 ADR 017 否決的 `settings/<gen>`：只有維護角色能寫 `maint/`，而且受柵欄保護。
 - **grace**：調高立刻生效。調低開始 drain：持續一個舊的 grace（直到 `T(g) ≥ T(調低的世代) + 舊 grace`），
