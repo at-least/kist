@@ -693,33 +693,76 @@ pub fn segment<T>(
     name: impl Fn(&T) -> &[u8],
     is_cut: &dyn Fn(&[u8]) -> bool,
 ) -> Result<Vec<Vec<T>>> {
+    let mut seg = Segmenter::new(base, limits);
     let mut out = Vec::new();
-    let mut cur: Vec<T> = Vec::new();
-    let mut sum = 0usize;
     for item in items {
         let len = encoded_len(&item)?;
-        if base + array_head_len(1) + len > limits.max_bytes {
+        out.extend(seg.push(item, len, |t| is_cut(name(t)))?);
+    }
+    out.extend(seg.finish());
+    Ok(out)
+}
+
+/// 邊加邊切的 [`segment`]（`segment` 就是用它實作的）：一次只放一段在記憶體，backup 走訪一百萬項的目錄時
+/// 不必先收齊全部 entry。
+#[derive(Debug)]
+pub struct Segmenter<T> {
+    base: usize,
+    limits: Limits,
+    cur: Vec<T>,
+    sum: usize,
+    emitted: usize,
+}
+
+impl<T> Segmenter<T> {
+    pub fn new(base: usize, limits: Limits) -> Self {
+        Self {
+            base,
+            limits,
+            cur: Vec::new(),
+            sum: 0,
+            emitted: 0,
+        }
+    }
+
+    /// 加入一項：`len` 是它的規範 CBOR 長度，`cut` 算它的名稱的切段條件（這一段已有至少 `min_items` 項時才
+    /// 呼叫）。回傳因此完成的段，依序（最多兩段：加入之前因大小切的、加入之後因切點切的）。一項自己放不進
+    /// 任何一段時回錯誤，狀態不變，呼叫端可以略過它繼續。
+    pub fn push(
+        &mut self,
+        item: T,
+        len: usize,
+        cut: impl FnOnce(&T) -> bool,
+    ) -> Result<Vec<Vec<T>>> {
+        if self.base + array_head_len(1) + len > self.limits.max_bytes {
             return Err(invalid(
                 "metadata item",
                 format!("one element is {len} bytes, too large for any segment"),
             ));
         }
-        if !cur.is_empty() && base + array_head_len(cur.len() + 1) + sum + len > limits.max_bytes {
-            out.push(std::mem::take(&mut cur));
-            sum = 0;
+        let mut done = Vec::new();
+        if !self.cur.is_empty()
+            && self.base + array_head_len(self.cur.len() + 1) + self.sum + len
+                > self.limits.max_bytes
+        {
+            done.push(std::mem::take(&mut self.cur));
+            self.sum = 0;
         }
-        let cut = cur.len() >= limits.min_items && is_cut(name(&item));
-        cur.push(item);
-        sum += len;
+        let cut = self.cur.len() >= self.limits.min_items && cut(&item);
+        self.cur.push(item);
+        self.sum += len;
         if cut {
-            out.push(std::mem::take(&mut cur));
-            sum = 0;
+            done.push(std::mem::take(&mut self.cur));
+            self.sum = 0;
         }
+        self.emitted += done.len();
+        Ok(done)
     }
-    if !cur.is_empty() || out.is_empty() {
-        out.push(cur);
+
+    /// 最後一段；整個都沒有項目時是一個空段，最後一項剛好切在段尾時沒有。
+    pub fn finish(self) -> Option<Vec<T>> {
+        (!self.cur.is_empty() || self.emitted == 0).then_some(self.cur)
     }
-    Ok(out)
 }
 
 /// 建好的 metadata：根的 meta ID，以及要寫進 mpack 的 item（meta ID、規範 CBOR），子 item 在前。
@@ -749,34 +792,89 @@ pub fn build_dir(
     is_cut: &dyn Fn(&[u8]) -> bool,
     meta_id: &dyn Fn(&[u8]) -> MetaId,
 ) -> Result<Built> {
-    for e in &entries {
+    let mut b = DirBuilder::new(limits)?;
+    let mut items = Vec::new();
+    for e in entries {
+        b.push(e, is_cut, meta_id, &mut items)?;
+    }
+    let root = b.finish(is_cut, meta_id, &mut items)?;
+    Ok(Built { root, items })
+}
+
+/// 邊加邊建的 [`build_dir`]（`build_dir` 就是用它實作的）：entry 依名稱升冪一個一個加入，切出來的段當場
+/// 編碼交出，記憶體裡只有目前這一段與各段的 `first`。
+#[derive(Debug)]
+pub struct DirBuilder {
+    seg: Segmenter<Entry>,
+    segs: Vec<DirSeg>,
+    last: Option<Vec<u8>>,
+    limits: Limits,
+}
+
+impl DirBuilder {
+    pub fn new(limits: Limits) -> Result<Self> {
+        Ok(Self {
+            seg: Segmenter::new(base_len(&Seg::new(Vec::new()))?, limits),
+            segs: Vec::new(),
+            last: None,
+            limits,
+        })
+    }
+
+    /// 加入一個 entry。§8 的驗證不過、名稱不大於上一個、或自己放不進一段，就回錯誤、不加入（backup 把它
+    /// 記成這個項目的錯誤，繼續加下一個）。切出來的段編碼成 Seg item，連同 meta ID 接在 `out` 後面。
+    pub fn push(
+        &mut self,
+        e: Entry,
+        is_cut: &dyn Fn(&[u8]) -> bool,
+        meta_id: &dyn Fn(&[u8]) -> MetaId,
+        out: &mut Vec<(MetaId, Vec<u8>)>,
+    ) -> Result<()> {
         e.validate()
             .map_err(|err| invalid("directory", err.to_string()))?;
-    }
-    check_ascending("directory", entries.iter().map(|e| e.n.as_slice()))
-        .map_err(|err| invalid("directory", err.to_string()))?;
-    let base = base_len(&Seg::new(Vec::new()))?;
-    let segs = segment(
-        entries,
-        base,
-        limits,
-        |e| Ok(cbor::encode(e)?.len()),
-        |e| e.n.as_slice(),
-        is_cut,
-    )?;
-    let mut items = Vec::new();
-    let mut level_segs = Vec::with_capacity(segs.len());
-    let single = segs.len() == 1;
-    for s in segs {
-        let first = s.first().map(|e| e.n.clone()).unwrap_or_default();
-        let id = push(&mut items, &Item::Seg(Seg::new(s)), meta_id)?;
-        if single {
-            return Ok(Built { root: id, items });
+        if self.last.as_deref().is_some_and(|l| l >= e.n.as_slice()) {
+            return Err(invalid(
+                "directory",
+                "names must be ascending with no duplicates",
+            ));
         }
-        level_segs.push(DirSeg { first, id });
+        let name = e.n.clone();
+        let len = cbor::encode(&e)?.len();
+        for s in self.seg.push(e, len, |e| is_cut(&e.n))? {
+            self.emit(s, meta_id, out)?;
+        }
+        self.last = Some(name);
+        Ok(())
     }
-    let root = build_dir_levels(level_segs, limits, is_cut, meta_id, &mut items)?;
-    Ok(Built { root, items })
+
+    fn emit(
+        &mut self,
+        s: Vec<Entry>,
+        meta_id: &dyn Fn(&[u8]) -> MetaId,
+        out: &mut Vec<(MetaId, Vec<u8>)>,
+    ) -> Result<()> {
+        let first = s.first().map(|e| e.n.clone()).unwrap_or_default();
+        let id = push(out, &Item::Seg(Seg::new(s)), meta_id)?;
+        self.segs.push(DirSeg { first, id });
+        Ok(())
+    }
+
+    /// 收尾：最後一段，多段時再建 Dir。回傳目錄的根（只有一段時就是那個 Seg）。
+    pub fn finish(
+        mut self,
+        is_cut: &dyn Fn(&[u8]) -> bool,
+        meta_id: &dyn Fn(&[u8]) -> MetaId,
+        out: &mut Vec<(MetaId, Vec<u8>)>,
+    ) -> Result<MetaId> {
+        let rest = std::mem::replace(&mut self.seg, Segmenter::new(0, self.limits)).finish();
+        if let Some(s) = rest {
+            self.emit(s, meta_id, out)?;
+        }
+        if let [only] = self.segs.as_slice() {
+            return Ok(only.id);
+        }
+        build_dir_levels(self.segs, self.limits, is_cut, meta_id, out)
+    }
 }
 
 /// 從第一層開始往上建 Dir，直到一個 Dir 放得下；超過三層寫不進去。
@@ -1337,6 +1435,48 @@ mod tests {
         let inserted = build_dir(ins, limits, &cut, &fake_id).unwrap();
         let changed = ids(&inserted).difference(&b).count();
         assert!(changed <= 3, "{changed} items changed after one insert");
+    }
+
+    /// 邊加邊建：加不進去的 entry（太大、沒排好、驗證不過）回錯誤而不改變狀態，略過它繼續加，結果等於整批
+    /// 建一個沒有它的目錄（§7：記成那個項目的錯誤、目錄照樣寫）。
+    #[test]
+    fn a_refused_entry_leaves_the_streaming_builder_intact() {
+        let limits = Limits {
+            min_items: 1_000_000,
+            max_bytes: 600,
+        };
+        let good = names(40);
+        let mut big = generic("e000020a");
+        big.target = vec![b'x'; 700];
+        big.t = node_type::SYMLINK;
+        let mut b = DirBuilder::new(limits).unwrap();
+        let mut items = Vec::new();
+        for (i, e) in good.iter().enumerate() {
+            if i == 21 {
+                assert!(
+                    b.push(big.clone(), &never, &fake_id, &mut items).is_err(),
+                    "too large"
+                );
+                assert!(
+                    b.push(good[3].clone(), &never, &fake_id, &mut items)
+                        .is_err(),
+                    "out of order"
+                );
+                let mut bad = generic("e000020b");
+                bad.mk = 9;
+                assert!(
+                    b.push(bad, &never, &fake_id, &mut items).is_err(),
+                    "invalid"
+                );
+            }
+            b.push(e.clone(), &never, &fake_id, &mut items).unwrap();
+        }
+        let root = b.finish(&never, &fake_id, &mut items).unwrap();
+        let whole = build_dir(good.clone(), limits, &never, &fake_id).unwrap();
+        assert_eq!(root, whole.root);
+        assert_eq!(items, whole.items);
+        assert!(items.len() > 2, "the limit makes several segments");
+        assert_eq!(read_dir(root, &decode_all(&items)), good);
     }
 
     fn chunks(n: usize) -> Vec<(ChunkId, u64)> {
