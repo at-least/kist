@@ -292,10 +292,16 @@ pub async fn write_generation(repo: &Repo, records: Vec<Record>, lone: bool) -> 
         let plain = Shard::new(i, rs).encode().unwrap();
         let sealed = repo.keys().seal_shard(&plain).unwrap();
         let id = ObjectId::of(&sealed);
-        repo.backend()
-            .put_if_absent(&Key::Shard { id, replica: false }.path(), sealed)
-            .await
-            .unwrap();
+        // §13：replicas=1 時分片也寫 .r1（先主體）
+        for replica in [false, true] {
+            if replica && base.head.settings.replicas == 0 {
+                continue;
+            }
+            repo.backend()
+                .put_if_absent(&Key::Shard { id, replica }.path(), sealed.clone())
+                .await
+                .unwrap();
+        }
         shards[i as usize] = Some(id);
     }
     let head = Head {

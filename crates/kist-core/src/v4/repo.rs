@@ -36,6 +36,16 @@ pub struct Repo {
     cache: Option<Cache>,
 }
 
+impl Repo {
+    /// 同一個 repo、不用本地快取：check 要驗證的是後端的物件，不是快取裡的那一份。
+    pub fn uncached(&self) -> Self {
+        Self {
+            cache: None,
+            ..self.clone()
+        }
+    }
+}
+
 impl std::fmt::Debug for Repo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Repo({})", self.backend.location())

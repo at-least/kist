@@ -95,6 +95,8 @@ pub struct Reader {
     pub mpacks: Arc<Mpacks>,
     own: Option<ClientId>,
     verified: Arc<Mutex<Verified>>,
+    /// check 用：每一份驗證失敗的副本與只剩 tombstone 讀得到的項目都記下來（[`Reader::with_failure_log`]）。
+    failures: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 #[derive(Default)]
@@ -111,6 +113,27 @@ impl Reader {
             mpacks: Arc::new(Mpacks::new(MPACK_MEMORY)),
             own,
             verified: Arc::new(Mutex::new(Verified::default())),
+            failures: None,
+        }
+    }
+
+    /// 記下每一份驗證失敗的副本（check 回報它們；一般的讀取只警告、換下一份）。
+    pub fn with_failure_log(mut self) -> Self {
+        self.failures = Some(Arc::new(Mutex::new(Vec::new())));
+        self
+    }
+
+    /// 記下的失敗，取走。
+    pub fn take_failures(&self) -> Vec<String> {
+        self.failures
+            .as_ref()
+            .map(|f| std::mem::take(&mut *f.lock().unwrap_or_else(|e| e.into_inner())))
+            .unwrap_or_default()
+    }
+
+    fn note_failure(&self, what: String) {
+        if let Some(f) = &self.failures {
+            f.lock().unwrap_or_else(|e| e.into_inner()).push(what);
         }
     }
 
@@ -245,6 +268,10 @@ impl Reader {
                     "{id}: every other holder failed; reading tombstoned pack {}",
                     h.pack
                 );
+                self.note_failure(format!(
+                    "{id}: only tombstoned pack {} had a usable copy",
+                    h.key().path()
+                ));
             }
             match self.fetch(h).await {
                 Ok(plain) => {
@@ -253,6 +280,10 @@ impl Reader {
                 }
                 Err(e) => {
                     tracing::warn!("{id}: holder {} failed verification: {e}", h.pack);
+                    self.note_failure(format!(
+                        "{id}: the copy in {} failed verification: {e}",
+                        h.key().path()
+                    ));
                     reasons.push(format!("{}: {e}", h.pack));
                 }
             }
@@ -391,6 +422,16 @@ impl Reader {
     /// 檔案的 chunk 清單（依內容順序），連同 §7 的大小檢查：每一段的 `size` 等於它涵蓋的 chunk 明文長度
     /// （取自持有者的 `r`）、全部等於 Entry 的 `size`。
     pub async fn file_chunks(&self, entry: &Entry) -> Result<Vec<ChunkId>> {
+        self.file_chunks_visit(entry, &mut |_| {}).await
+    }
+
+    /// [`Reader::file_chunks`]，每讀一個清單的 item（ChunkList、ChunkIndex）就把它的 ID 交給 `visit`（check 查
+    /// 它們的持有者）。
+    pub async fn file_chunks_visit(
+        &self,
+        entry: &Entry,
+        visit: &mut dyn FnMut(MetaId),
+    ) -> Result<Vec<ChunkId>> {
         let chunk_len = |id: &ChunkId| self.chunk_len(id);
         let ids: Vec<ChunkId> = if entry.ct == content_type::DIRECT {
             entry.chunks.iter().map(|c| c.to_chunk()).collect()
@@ -403,6 +444,7 @@ impl Reader {
             let mut out = Vec::new();
             // (索引, 第 i 段) 的堆疊；ChunkList 直接收下
             let mut stack: Vec<(Arc<kist_format::v4::meta::ChunkIndex>, usize)> = Vec::new();
+            visit(root);
             match self.item(&root).await? {
                 Item::ChunkList(l) => out = l.chunks,
                 Item::ChunkIndex(x) => stack.push((Arc::new(x), 0)),
@@ -418,6 +460,7 @@ impl Reader {
                     continue;
                 }
                 stack.push((Arc::clone(&index), i + 1));
+                visit(index.parts[i].id);
                 let child = self.item(&index.parts[i].id).await?;
                 match &child {
                     Item::ChunkList(l) => {

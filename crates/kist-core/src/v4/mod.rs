@@ -12,9 +12,11 @@
 //! - [`backup`]：B1–B5（§11.2）。
 //! - [`snapshots`]：列出、選取與讀取 snapshot（主體不行讀 `.r1`，§9）。
 //! - [`restore`]：restore 與 dry run 的走訪（§9 的落點）；檔案系統那一層與 v3 共用。
+//! - [`check`]：check、`--read-data` 與只在不存在時建立的 `--repair`（§13.1）。
 
 pub mod backup;
 pub mod cache;
+pub mod check;
 pub mod live;
 pub mod pack;
 pub mod read;
