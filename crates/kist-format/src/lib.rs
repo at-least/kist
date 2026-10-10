@@ -11,6 +11,7 @@
 //! - [`pack`]：pack 檔的位元組排版與 trailer 結構。
 //! - [`config`]、[`tree`]、[`snapshot`]、[`index`]：各種明文結構。
 //! - [`keys`]：repo 內物件的 key（路徑）命名規則。
+//! - [`v4`]：v4 格式（`docs/format-v4.md`），與 v3 並存到所有使用者遷移完。
 //!
 //! sealed 物件沒有 envelope header（v1 的舊設計已淘汰）：形式就是
 //! `nonce(24) ‖ ciphertext ‖ tag(16)`，AAD 依角色由 [`AAD_*`] 常數或
@@ -28,6 +29,7 @@ pub mod pack;
 pub mod parity;
 pub mod snapshot;
 pub mod tree;
+pub mod v4;
 
 pub use ids::{ChunkId, ObjectId, TreeId};
 
