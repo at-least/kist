@@ -8,9 +8,9 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::path::{Path, PathBuf};
-
-use kist_format::tree::Entry;
+use std::path::Path;
+#[cfg(not(unix))]
+use std::path::PathBuf;
 
 use crate::{CoreError, Result};
 
@@ -74,16 +74,6 @@ pub fn locator_components(bytes: &[u8]) -> Result<Vec<&[u8]>> {
         .collect()
 }
 
-/// [`locator_components`] → restore 目標底下的相對路徑。本機絕對路徑
-/// `/srv/data` → `srv/data`；遠端定位 `s3://bucket/prefix` → `bucket/prefix`、
-/// `sftp://host/path` → `host/path`。
-pub fn locator_to_relative(bytes: &[u8]) -> Result<PathBuf> {
-    locator_components(bytes)?
-        .into_iter()
-        .map(bytes_to_name)
-        .collect()
-}
-
 /// restore 用：tree 裡的子節點名稱來自 repo 內容，必須是「單一路徑元件」。
 /// 空字串、`.`、`..`、含分隔符或 NUL 的名稱都可能讓 restore 寫到目標目錄之外。
 pub fn validate_child_name(name: &[u8]) -> Result<()> {
@@ -125,30 +115,6 @@ pub struct FsMeta {
     /// 硬連結識別（nlink > 1 才有意義）。
     pub dev: u64,
     pub nlink: u64,
-}
-
-/// parent tree 裡的檔案 entry → FsMeta（快速路徑的比較用）。
-/// v3 的 Entry 欄位是 Option：posix 來源必填 mode/uid/gid/mtime，缺席的
-/// 選填欄位以 0 呈現（與「平台沒有」同一語意，不拿來比對）。
-pub fn meta_of_entry(entry: &Entry) -> FsMeta {
-    FsMeta {
-        mode: entry.mode.unwrap_or(0),
-        uid: entry.uid.unwrap_or(0),
-        gid: entry.gid.unwrap_or(0),
-        mtime_ns: entry.mtime_ns.unwrap_or(0),
-        ctime_ns: entry.ctime_ns.unwrap_or(0),
-        inode: entry.inode.unwrap_or(0),
-        dev: entry.dev.unwrap_or(0),
-        nlink: entry.nlink.unwrap_or(0),
-    }
-}
-
-/// entry 記錄的擁有者 (uid, gid)，restore 用（ADR 019 A43）。不走
-/// [`meta_of_entry`]：那裡把缺席當 0，而 0 是 root。uid 與 gid 都有才算——
-/// 只有一個（sftp 的選填欄位）當成沒記錄：只改 uid 會留下 root 的 gid，
-/// setgid 指向 gid 0 一樣是提權。
-pub fn owner_of_entry(entry: &Entry) -> Option<(u32, u32)> {
-    entry.uid.zip(entry.gid)
 }
 
 /// backup 快速路徑的完整判斷：size 相同，且 [`unchanged`] 成立。

@@ -1,6 +1,6 @@
-//! v4（`docs/format-v4.md`）：與 v3 的模組並存。實作第 4 段是 init、open 與 backup（B1–B5），讀取路徑
-//! （restore、mount、check）在第 5 段、prune 與維護命令在第 6 段；CLI、kist-app、kist-mount 在 v3 移除時
-//! 一起換過來。章節號碼（§n）指 `docs/format-v4.md`。
+//! v4（`docs/format-v4.md`）：唯一的格式（v3 在實作第 6 段移除）。實作第 4 段是 init、open 與 backup（B1–B5），
+//! 讀取路徑（restore、mount、check）在第 5 段、prune 與維護命令在第 6 段；CLI、kist-app、kist-mount 在第 6 段換過來。
+//! 章節號碼（§n）指 `docs/format-v4.md`。
 //!
 //! 模組一覽：
 //! - [`pack`]：pack 與 mpack 的寫入、讀取一項並驗證、trailer（§6）。
@@ -35,12 +35,14 @@ pub mod state;
 
 pub use backup::{
     BackupOptions, BackupProgress, BackupReport, BackupSummary, Clock, PreparedBackup,
-    ProgressCallback, Reading,
+    ProgressCallback, Reading, RootSummary,
 };
 pub use forget::{ForgetOptions, ForgetSummary};
+/// backup 的 client id（kist-app 不直接依賴 kist-format，從這裡轉出去）。
+pub use kist_format::v4::ids::ClientId;
 pub use live::Live;
-pub use maint::{MaintOptions, SettingsChange, SettingsReport, UnknownReport};
+pub use maint::{MaintOptions, SettingsChange, SettingsReport, SettingsView, UnknownReport};
 pub use prune::{PruneOptions, PruneReport};
 pub use rebuild::RebuildReport;
 pub use repo::{InitOptions, Repo, SlotInfo};
-pub use snapshots::SnapshotInfo;
+pub use snapshots::{SnapshotInfo, SnapshotListing};

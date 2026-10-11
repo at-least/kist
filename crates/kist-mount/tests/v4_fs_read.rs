@@ -8,8 +8,8 @@ mod v4_common;
 use kist_format::v4::ids::ItemId;
 use kist_format::v4::meta::{meta_kind, node_type, Entry, Item, Seg};
 use kist_format::v4::snapshot::Root;
-use kist_mount::corefs::Kind;
 use kist_mount::v4::FsCore;
+use kist_mount::Kind;
 use v4_common::*;
 
 /// src/ 下有小檔、跨多 chunk 的大檔、子目錄、symlink。回傳 big.bin 的 bytes。
@@ -282,7 +282,7 @@ async fn repeated_lookup_returns_same_inode() {
 
     let client_again = core.lookup(1, CLIENT.as_bytes()).await.unwrap();
     assert_eq!(client_again.ino, client.ino);
-    assert_eq!(client_again.ttl, kist_mount::corefs::VOLATILE_TTL);
+    assert_eq!(client_again.ttl, kist_mount::v4::VOLATILE_TTL);
     assert_eq!(
         core.lookup(client.ino, ts.as_bytes()).await.unwrap().ino,
         snap.ino

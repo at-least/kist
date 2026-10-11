@@ -178,6 +178,30 @@ async fn the_r1_is_deleted_before_the_body() {
     assert_eq!(t.store.deleted(), vec![format!("{old}.r1"), old]);
 }
 
+/// `.r1` 刪不掉（不是 NotFound）時 forget 回錯、主體原封不動：先刪主體會留下 check 當成「主體遺失」回報的
+/// `.r1`。搬自 v3 的 `forget.rs`（v3 以目錄擋住刪除；這裡以後端拒絕刪除）。
+#[tokio::test]
+async fn a_failed_r1_delete_keeps_the_body() {
+    let (t, repo) = setup().await;
+    let old = snap(&repo, 1, 1, &["/a"]).await;
+    snap(&repo, 1, 2, &["/a"]).await;
+    let bytes = repo.backend().get(&old).await.unwrap();
+    let r1 = format!("{old}.r1");
+    repo.backend().put_if_absent(&r1, bytes).await.unwrap();
+    t.store.fail_delete.lock().unwrap().push(r1.clone());
+    let err = repo
+        .forget(ForgetOptions {
+            snapshots: vec![old.clone()],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Object Lock"), "{err}");
+    assert!(t.store.deleted().is_empty(), "{:?}", t.store.deleted());
+    repo.backend().get(&old).await.unwrap();
+    repo.backend().get(&r1).await.unwrap();
+}
+
 /// 短的寫法：`<client>/<時間戳>` 與時間戳的前綴。
 #[tokio::test]
 async fn short_specs_resolve_to_one_snapshot() {

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use kist_core::{BackupProgress, ProgressCallback};
+use kist_core::v4::{BackupProgress, ProgressCallback};
 use serde::Serialize;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, watch};

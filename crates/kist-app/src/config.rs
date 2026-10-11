@@ -4,13 +4,12 @@
 //! repo = "s3://bucket/prefix"          # 或本機目錄、sftp://…（M4-c）
 //! password_file = "/etc/kist/password"  # 只能用檔案，不能把密碼寫在設定裡
 //! client_id_file = "/var/lib/kist/client-id"   # 選填
-//! cache_dir = "/var/cache/kist"                # 選填
+//! cache_dir = "/var/cache/kist"                # 選填；預設是使用者的快取目錄（同 CLI）
 //! timezone = "local"                           # 或 "utc"；排程用哪個時區
 //!
 //! [backup]
 //! paths = ["/home", "/etc"]
 //! schedule = "0 2 * * *"      # 5 或 6 欄（秒選填）cron；省略 = 只在 `run --once` 時跑
-//! gc_grace = "72h"            # 選填；沒寫取同檔的 [prune] grace，不得比它長
 //! exclude = ["*.tmp", "node_modules", "/home/me/.cache"]   # 選填；同 CLI 的 --exclude（ADR 020）
 //! iexclude = ["*.bak"]                  # 選填；同 --iexclude（不分大小寫，排在 exclude 之後）
 //! exclude_if_present = [".nobackup"]    # 選填；同 --exclude-if-present（NAME 或 NAME:HEADER）
@@ -23,9 +22,7 @@
 //! keep_weekly = 4
 //! schedule = "0 4 * * *"
 //!
-//! [prune]                      # 選填；同上
-//! grace = "72h"
-//! inactive_after = "30d"
+//! [prune]                      # 選填；同上（grace 存在 repo 裡，以 `kist settings --grace` 改）
 //! repack_below = 50
 //! schedule = "0 5 * * *"
 //!
@@ -77,8 +74,6 @@ pub struct BackupSection {
     pub paths: Vec<PathBuf>,
     #[serde(default)]
     pub schedule: Option<String>,
-    #[serde(default, with = "crate::duration::serde_opt")]
-    pub gc_grace: Option<std::time::Duration>,
     /// 每個 pack 旁存幾片 Reed-Solomon 同位（0..=8；0 = 不存，預設）。
     #[serde(default)]
     pub parity: u8,
@@ -139,16 +134,8 @@ pub struct ForgetSection {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PruneSection {
-    #[serde(default, with = "crate::duration::serde_opt")]
-    pub grace: Option<std::time::Duration>,
-    /// Tolerated client/prune clock difference. Unset takes the 1 h default;
-    /// an explicit 0 is honored literally (zero tolerance): zero is a real
-    /// setting.
-
-    #[serde(default, with = "crate::duration::serde_opt")]
-    pub clock_skew: Option<std::time::Duration>,
-    #[serde(default, with = "crate::duration::serde_opt")]
-    pub inactive_after: Option<std::time::Duration>,
+    /// v4 的 grace 在 repo 的 head 裡（`kist settings --grace`），v3 的 grace、clock_skew、inactive_after
+    /// 都不再是設定：寫了就是 deny_unknown_fields 的錯誤，不默默忽略。
     pub repack_below: Option<u8>,
     #[serde(default)]
     pub schedule: Option<String>,
@@ -237,23 +224,6 @@ impl Config {
             }
             self.schedule_of(p.schedule.as_deref(), "[prune]")?;
         }
-        // grace 的交叉檢查只看一個方向（ADR 019 A5）：backup 以為的 grace 比 prune 給的長，
-        // prune 就可能刪掉 backup 還在用的資料，屬「壞 snapshot」那一邊。反方向（backup
-        // 較短）只會讓 backup 早一點以 BackupTooLong 失敗，是安全的，不擋。
-        // 沒有 [prune] 的設定（prune 放在另一台主機）無從比較。
-        if let (Some(b), Some(p)) = (&self.backup, &self.prune) {
-            if let Some(backup_grace) = b.gc_grace {
-                let prune_grace = p.options().grace;
-                if backup_grace > prune_grace {
-                    return Err(AppError::Config(format!(
-                        "[backup] gc_grace ({}s) must not be longer than [prune] grace ({}s); \
-                         remove [backup] gc_grace to use [prune] grace",
-                        backup_grace.as_secs(),
-                        prune_grace.as_secs()
-                    )));
-                }
-            }
-        }
         if let Some(n) = &self.notify {
             for ev in &n.on {
                 if !matches!(ev.as_str(), "success" | "incomplete" | "failure") {
@@ -276,17 +246,6 @@ impl Config {
             ));
         }
         Ok(())
-    }
-
-    /// backup 閘門用的 grace，唯一的解析點（ADR 019 A5）：`[backup] gc_grace` 優先，
-    /// 沒寫就取同一份設定的 `[prune] grace`，兩個都沒寫才用預設 72h。
-    /// 只把 `[prune] grace` 設短時若閘門仍用 72h，prune 可能刪掉 backup 還在用的資料。
-    pub fn gc_grace(&self) -> std::time::Duration {
-        self.backup
-            .as_ref()
-            .and_then(|b| b.gc_grace)
-            .or_else(|| self.prune.as_ref().and_then(|p| p.grace))
-            .unwrap_or(kist_core::DEFAULT_GC_GRACE)
     }
 
     /// 某一節的排程（解析過的）；沒寫 schedule 就 `None`。
@@ -333,8 +292,8 @@ pub fn read_password_file(path: &Path) -> Result<zeroize::Zeroizing<String>> {
 }
 
 impl ForgetSection {
-    pub fn policy(&self) -> kist_core::RetentionPolicy {
-        kist_core::RetentionPolicy {
+    pub fn policy(&self) -> kist_core::retention::RetentionPolicy {
+        kist_core::retention::RetentionPolicy {
             keep_last: self.keep_last,
             keep_hourly: self.keep_hourly,
             keep_daily: self.keep_daily,
@@ -347,15 +306,11 @@ impl ForgetSection {
 }
 
 impl PruneSection {
-    pub fn options(&self) -> kist_core::PruneOptions {
-        let d = kist_core::PruneOptions::default();
-        kist_core::PruneOptions {
-            grace: self.grace.unwrap_or(d.grace),
-            inactive_after: self.inactive_after.unwrap_or(d.inactive_after),
-            clock_skew: self.clock_skew.unwrap_or(d.clock_skew),
-            repack_below_percent: self.repack_below.unwrap_or(d.repack_below_percent),
-            dry_run: false,
-            now: None,
+    pub fn options(&self) -> kist_core::v4::PruneOptions {
+        let d = kist_core::v4::PruneOptions::default();
+        kist_core::v4::PruneOptions {
+            repack_below: self.repack_below.unwrap_or(d.repack_below),
+            ..d
         }
     }
 }
@@ -374,57 +329,35 @@ mod scheme_case_tests {
         .unwrap();
         assert!(cfg.validate().is_ok(), "大寫 scheme 是合法的 webhook URL");
     }
-
-    /// `[prune] clock_skew` 與 grace／inactive_after 同一形式：
-    /// `<number><unit>` 字串（文件寫的就是這種）。
-    #[test]
-    fn prune_clock_skew_accepts_string_duration() {
-        let cfg = Config::parse(
-            "repo = \"x\"\npassword_file = \"/etc/kist/pw\"\n[prune]\ngrace = \"72h\"\nclock_skew = \"30m\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.prune.as_ref().unwrap().clock_skew,
-            Some(std::time::Duration::from_secs(30 * 60))
-        );
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod gc_grace_tests {
+mod v3_keys_tests {
     use super::*;
 
-    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
-
-    fn cfg(sections: &str) -> Config {
-        Config::parse(&format!(
-            "repo = \"x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n{sections}"
-        ))
-        .unwrap()
+    /// v4 的 grace 在 repo 裡：v3 的 `[backup] gc_grace` 與 `[prune] grace`、`clock_skew`、
+    /// `inactive_after` 寫了就是錯誤，不默默忽略（以為設了其實沒有）。
+    #[test]
+    fn removed_grace_keys_are_errors() {
+        for (section, key) in [
+            ("[backup]\npaths = [\"/e\"]", "gc_grace = \"72h\""),
+            ("[prune]", "grace = \"72h\""),
+            ("[prune]", "clock_skew = \"1h\""),
+            ("[prune]", "inactive_after = \"30d\""),
+        ] {
+            let text = format!("repo = \"x\"\npassword_file = \"/p\"\n{section}\n{key}\n");
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(err.contains("unknown field"), "{key}: {err}");
+        }
     }
 
-    /// 只寫 `[prune] grace`：backup 閘門取它（ADR 019 A5）。
     #[test]
-    fn falls_back_to_prune_grace() {
-        assert_eq!(cfg("[prune]\ngrace = \"1h\"\n").gc_grace(), HOUR);
-    }
-
-    /// `[backup] gc_grace` 有寫就用它（較短是安全方向）。
-    #[test]
-    fn backup_gc_grace_wins() {
-        let c = cfg("gc_grace = \"1h\"\n[prune]\ngrace = \"72h\"\n");
-        assert_eq!(c.gc_grace(), HOUR);
-    }
-
-    /// 兩個都沒寫（或沒有 `[prune]`）：預設 72h，與 prune 的預設相同。
-    #[test]
-    fn defaults_to_72h() {
-        assert_eq!(cfg("").gc_grace(), kist_core::DEFAULT_GC_GRACE);
-        assert_eq!(
-            cfg("[prune]\nrepack_below = 40\n").gc_grace(),
-            kist_core::PruneOptions::default().grace
-        );
+    fn prune_repack_below_maps_to_the_options() {
+        let cfg =
+            Config::parse("repo = \"x\"\npassword_file = \"/p\"\n[prune]\nrepack_below = 30\n")
+                .unwrap();
+        assert_eq!(cfg.prune.unwrap().options().repack_below, 30);
     }
 }
 

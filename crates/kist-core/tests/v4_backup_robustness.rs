@@ -1,11 +1,22 @@
-//! backup 在「不乖」的輸入下的行為：讀不到的檔、備份中變動的檔、index 遺失後的大檔快速路徑。
+//! v4 backup 在「不乖」的輸入下的行為：讀不到的檔、備份中變動的檔、快速路徑的時間與大小判斷、parity 的範圍。
+//! 搬自 v3 的 `backup_robustness.rs`（v4 的走訪是 v3 的複製）；快速路徑的兩個純函式測試原樣搬過來。v3 的兩個
+//! 大檔快速路徑測試不搬：v4 沿用 chunk 清單時把它當成沿用的子樹（B4 檢查子樹的 parent，見 v4_backup_gc），
+//! 沒有 v3 的 index blob 與 `chunks_read`。
 
-mod common;
+#[path = "v4_common/mod.rs"]
+mod v4_common;
 
-use common::*;
 #[cfg(unix)]
-use kist_core::CheckOptions;
+use kist_core::v4::check::CheckOptions;
+#[cfg(unix)]
 use kist_core::RestoreOptions;
+use v4_common::*;
+
+#[cfg(unix)]
+const PLAIN: CheckOptions = CheckOptions {
+    read_data: false,
+    repair: false,
+};
 
 /// 讀不到的檔案：跳過、計數、snapshot 照寫（restic 的做法），其他檔案都在。
 #[cfg(unix)]
@@ -38,24 +49,18 @@ async fn unreadable_file_is_skipped_and_counted() {
 
     assert_eq!(s.report.errors, 2, "{:?}", s.report);
     assert!(
-        t.repo_path().join(&s.snapshot_key).is_file(),
+        t.repo_path().join(&s.snapshot).is_file(),
         "snapshot 仍然要寫出"
     );
     let target = t.dir.path().join("out");
-    repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
+    repo.restore(&skey(&s.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
-    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
+    let restored = landed(&target, &src);
     assert!(restored.join("small.txt").is_file());
     assert!(!restored.join("secret.txt").exists());
     assert!(restored.join("locked").is_dir(), "讀不到的目錄以空目錄記錄");
-    let report = repo
-        .check(CheckOptions {
-            read_data: false,
-            repair: false,
-        })
-        .await
-        .unwrap();
+    let report = repo.check(PLAIN).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 }
 
@@ -83,91 +88,13 @@ async fn file_whose_size_changes_while_reading_restores_correctly() {
         .unwrap();
     assert!(s.stats.bytes > 0, "{:?}", s.stats);
     let target = t.dir.path().join("out");
-    repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
+    repo.restore(&skey(&s.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     let restored = std::fs::read(target.join("proc/version")).unwrap();
     assert_eq!(restored.len() as u64, s.stats.bytes);
-    let report = repo
-        .check(CheckOptions {
-            read_data: false,
-            repair: false,
-        })
-        .await
-        .unwrap();
+    let report = repo.check(PLAIN).await.unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-}
-
-/// 大檔（Indirect）：資料 chunk 從 index 消失、清單 chunk 還在時，快速路徑不能沿用。
-#[tokio::test]
-async fn indirect_fast_path_verifies_data_chunks_not_just_the_list() {
-    let t = TestRepo::new().await;
-    let src = t.dir.path().join("src");
-    std::fs::create_dir_all(&src).unwrap();
-    let big = src.join("big.bin");
-    let mut data = random_bytes(21, 8 * 1024 * 1024);
-    std::fs::write(&big, &data).unwrap();
-    let repo = t.open().await;
-    let s1 = repo
-        .backup(std::slice::from_ref(&src), backup_options())
-        .await
-        .unwrap();
-    assert!(s1.report.chunks_new > 256, "要是 Indirect：{:?}", s1.report);
-
-    // append 1 byte：資料 chunk 幾乎全部重用（在 index blob 1），新清單 chunk 在 blob 2
-    data.push(7);
-    std::fs::write(&big, &data).unwrap();
-    repo.backup(std::slice::from_ref(&src), backup_options())
-        .await
-        .unwrap();
-    let mut blobs = walk_files(&t.repo_path().join("indexes"));
-    blobs.sort_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap());
-    assert_eq!(blobs.len(), 2);
-    std::fs::remove_file(&blobs[0]).unwrap(); // 舊 blob（含資料 chunk）遺失
-
-    let s3 = repo
-        .backup(std::slice::from_ref(&src), backup_options())
-        .await
-        .unwrap();
-    assert!(
-        s3.report.chunks_new > 100,
-        "資料 chunk 不在 index 裡，必須重讀重傳：{:?}",
-        s3.report
-    );
-    let target = t.dir.path().join("out");
-    repo.restore(&s3.snapshot_key, &target, RestoreOptions::default())
-        .await
-        .unwrap();
-    let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
-    assert_eq!(std::fs::read(restored.join("big.bin")).unwrap(), data);
-}
-
-/// 大檔的快速路徑要算**資料** chunk 的數量（`chunks_read`），不是只算清單 chunk。
-#[tokio::test]
-async fn indirect_fast_path_counts_data_chunks() {
-    let t = TestRepo::new().await;
-    let src = t.dir.path().join("src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("big.bin"), random_bytes(22, 8 * 1024 * 1024)).unwrap();
-    let repo = t.open().await;
-    let s1 = repo
-        .backup(std::slice::from_ref(&src), backup_options())
-        .await
-        .unwrap();
-    assert!(s1.report.chunks_new > 256, "要是 Indirect：{:?}", s1.report);
-    let s2 = repo
-        .backup(std::slice::from_ref(&src), backup_options())
-        .await
-        .unwrap();
-    // 沿用時 `chunks_read` 數的是解開清單後的資料 chunk（> 256 個），
-    // 不是樹裡那 1-2 個清單 chunk
-    assert!(
-        s2.report.chunks_read > 256,
-        "{:?} vs {:?}",
-        s1.report,
-        s2.report
-    );
-    assert_eq!(s2.report.chunks_new, 0, "{:?}", s2.report);
 }
 
 /// 「racily clean」：ctime 不早於上一次 backup 開始時間的檔案不能走快速路徑。
@@ -206,16 +133,25 @@ fn fast_path_rejects_files_changed_at_or_after_parent_start() {
     );
 }
 
-/// snapshot 的時間必須是 backup 的**開始**時間：快速路徑用它判斷「檔案早於上次備份就沒再動過」。
-/// 把一個檔案的 mtime 設成剛好等於上一個 snapshot 的時間 → 不能沿用。
+/// 快速路徑的「racily clean」守門用 parent 的**開始**時間（snapshot 的 time）：記錄的 ctime 不早於它的檔案，
+/// stat 一樣也要重讀。第一個 backup 的時鐘撥早一小時，每個檔案記錄的 ctime 都不早於它的開始時間 → 第二個
+/// backup 一個都不能沿用；第三個（parent 的開始時間晚於 ctime）全部沿用。接著把一個檔案的 mtime 設成剛好
+/// 等於上一個 snapshot 的時間 → 那一個不能沿用（v3 的原測試；它單獨抓不到守門用錯時間：設 mtime 本身就讓
+/// stat 不同，所以加上前半）。
 #[tokio::test]
 async fn fast_path_uses_parent_start_time_and_reports_reused_files() {
     let t = TestRepo::new().await;
     let src = t.dir.path().join("src");
     make_source(&src);
     let repo = t.open().await;
+    let base = std::time::Instant::now();
+    let mut early = backup_options();
+    early.clock = kist_core::v4::Clock::new(move || kist_core::v4::Reading {
+        wall: time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+        boot: base.elapsed(),
+    });
     let s1 = repo
-        .backup(std::slice::from_ref(&src), backup_options())
+        .backup(std::slice::from_ref(&src), early)
         .await
         .unwrap();
     assert_eq!(s1.report.files_reused, 0);
@@ -223,24 +159,35 @@ async fn fast_path_uses_parent_start_time_and_reports_reused_files() {
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
-    assert_eq!(s2.report.files_reused, s2.stats.files, "{:?}", s2.report);
-
-    let snap2 = repo.read_snapshot_by_key(&s2.snapshot_key).await.unwrap();
-    let start = time::OffsetDateTime::from_unix_timestamp_nanos(snap2.time_ns as i128).unwrap();
-    let at_start = filetime::FileTime::from_unix_time(start.unix_timestamp(), start.nanosecond());
-    filetime::set_file_mtime(src.join("random.bin"), at_start).unwrap();
-
+    assert_eq!(s2.parent.as_deref(), Some(s1.snapshot.as_str()));
+    assert_eq!(
+        s2.report.files_reused, 0,
+        "ctime 不早於 parent 的開始時間：stat 一樣也要重讀：{:?}",
+        s2.report
+    );
+    assert_eq!(s2.report.chunks_new, 0, "內容沒變，重讀也不寫新 chunk");
     let s3 = repo
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
+    assert_eq!(s3.report.files_reused, s3.stats.files, "{:?}", s3.report);
+
+    let snap3 = repo.read_snapshot(&skey(&s3.snapshot)).await.unwrap();
+    let start = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(snap3.time)).unwrap();
+    let at_start = filetime::FileTime::from_unix_time(start.unix_timestamp(), start.nanosecond());
+    filetime::set_file_mtime(src.join("random.bin"), at_start).unwrap();
+
+    let s4 = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
     assert_eq!(
-        s3.report.files_reused,
-        s3.stats.files - 1,
+        s4.report.files_reused,
+        s4.stats.files - 1,
         "mtime == parent 開始時間的檔案必須重讀：{:?}",
-        s3.report
+        s4.report
     );
-    assert_eq!(s3.report.chunks_new, 0, "內容沒變，重讀也不寫新 chunk");
+    assert_eq!(s4.report.chunks_new, 0, "內容沒變，重讀也不寫新 chunk");
 }
 
 /// snapshot 內容的 `time` 與 key 裡的時間戳必須來自同一個瞬間（開始時間）。
@@ -256,12 +203,14 @@ async fn snapshot_time_is_backup_start_and_matches_key() {
         .await
         .unwrap();
     let after = time::OffsetDateTime::now_utc();
-    let snap = repo.read_snapshot_by_key(&s.snapshot_key).await.unwrap();
-    let time = time::OffsetDateTime::from_unix_timestamp_nanos(snap.time_ns as i128).unwrap();
+    let snap = repo.read_snapshot(&skey(&s.snapshot)).await.unwrap();
+    let time = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(snap.time)).unwrap();
     assert!(before <= time && time <= after);
-    let ts = s.snapshot_key.rsplit('/').next().unwrap();
+    let ts = s.snapshot.rsplit('/').next().unwrap();
     assert_eq!(
-        kist_format::snapshot::format_key_timestamp(time).unwrap(),
+        kist_format::v4::keys::SnapTs::from_nanos(snap.time)
+            .unwrap()
+            .as_str(),
         ts
     );
 }
@@ -287,41 +236,39 @@ fn fast_path_compares_size_even_without_ctime() {
     );
 }
 
-/// report.bytes_stored 必須涵蓋**全部**新寫的 chunk——間接內容的清單
-/// chunk 也是這次存的 bytes。對帳基準：fresh repo 的第一個 backup，
-/// 所有 pack trailer 的 entry 長度總和 == bytes_stored（無去重、無殘留）。
+/// report.bytes_stored 必須涵蓋**全部**新寫的 chunk。對帳基準：新 repo 的第一個 backup，資料 pack 的
+/// trailer 裡每一項的明文長度（`r`）總和 == bytes_stored（無去重、無殘留）。v4 的 chunk 清單是 metadata
+/// item（在 mpack 裡），不算 chunk（v3 的這個測試抓的是清單 chunk 漏算）。
 #[tokio::test]
-async fn bytes_stored_counts_the_indirect_chunk_list_too() {
+async fn bytes_stored_counts_every_new_chunk() {
     let t = TestRepo::new().await;
     let src = t.dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    // >256 chunks（avg 16 KiB）：清單必須走間接。
+    // 多到要 chunk 清單
     std::fs::write(src.join("big.bin"), random_bytes(77, 10 * 1024 * 1024)).unwrap();
     let repo = t.open().await;
     let s = repo
         .backup(std::slice::from_ref(&src), backup_options())
         .await
         .unwrap();
+    assert!(s.report.chunks_new > 256, "{:?}", s.report);
 
-    let keys = repo.keys().clone();
-    // bytes_stored 的語義是**明文** bytes 新存（chunk.len() 的累加），
-    // 對帳基準用 trailer 的 raw_len。
+    let chunk_max = repo.config().chunker.max;
     let mut trailer_raw = 0u64;
-    for pack in walk_files(&t.repo_path().join("packs")) {
-        let bytes = std::fs::read(&pack).unwrap();
-        let key = kist_format::keys::pack(&kist_format::ObjectId::of(&bytes));
-        let trailer = kist_core::pack::read_trailer(&keys, &key, &bytes).unwrap();
-        trailer_raw += trailer.entries.iter().map(|e| e.raw_len).sum::<u64>();
+    for key in t.keys("packs").await {
+        let bytes = repo.backend().get(&key).await.unwrap();
+        let trailer =
+            kist_core::v4::pack::trailer_of(repo.keys(), &skey(&key), &bytes, chunk_max).unwrap();
+        trailer_raw += trailer.entries.iter().map(|e| e.r).sum::<u64>();
     }
     assert_eq!(
         s.report.bytes_stored, trailer_raw,
-        "bytes_stored 要等於 pack 裡實存 chunk 的明文 bytes（含間接清單 chunk）"
+        "bytes_stored 要等於資料 pack 裡實存 chunk 的明文 bytes"
     );
 }
 
-/// ADR 019 A12：parity 份數超出 0..=MAX_PARITY_SHARDS 時，backup 在入口就回 Usage，
-/// repo 裡一個物件都不多。過去是照常備份成功、parity::encode 失敗只記 warn，
-/// 靜默變成沒有冗餘。對照組：上限 8 仍然寫出 sidecar。
+/// ADR 019 A12：parity 份數超出 0..=MAX_PARITY_SHARDS 時，backup 在入口就回 Usage，repo 裡一個物件都不多。
+/// 對照組：上限 8 仍然寫出 parity。
 #[tokio::test]
 async fn parity_out_of_range_is_rejected_before_writing_anything() {
     let t = TestRepo::new().await;
@@ -348,5 +295,5 @@ async fn parity_out_of_range_is_rejected_before_writing_anything() {
     let mut opts = backup_options();
     opts.parity = 8;
     repo.backup(std::slice::from_ref(&src), opts).await.unwrap();
-    assert!(t.count("parity") > 0, "parity 8 應該寫出 sidecar");
+    assert!(t.count("parity") > 0, "parity 8 應該寫出 parity");
 }

@@ -2,7 +2,7 @@
 //! 中斷，或主體遺失）不列出，由 check 回報（§13）。
 
 use kist_format::v4::keys::{Key, SNAPSHOTS};
-use kist_format::v4::snapshot::Snapshot;
+use kist_format::v4::snapshot::{Root, Snapshot};
 
 use super::repo::Repo;
 use crate::{CoreError, Result};
@@ -19,6 +19,14 @@ fn not_found(e: &CoreError) -> bool {
 pub struct SnapshotInfo {
     pub key: Key,
     pub snapshot: Snapshot,
+}
+
+/// 列出用（CLI 的 `snapshots`、kist-app 的網頁）：snapshot 與它的 roots。
+#[derive(Debug, Clone)]
+pub struct SnapshotListing {
+    pub key: Key,
+    pub snapshot: Snapshot,
+    pub roots: Vec<Root>,
 }
 
 impl Repo {
@@ -108,6 +116,34 @@ impl Repo {
             out.push(SnapshotInfo { key, snapshot });
         }
         Ok(out)
+    }
+
+    /// 所有 snapshot 與它們的 roots，依時間。snapshot 或它的 roots 讀不了的不中斷列表，原因在第二個值。
+    /// 讀 roots 用 [`super::live::Live::run_send`]：kist-app 的網頁要 `Send` 的 future。
+    pub async fn list_snapshots_with_roots(&self) -> Result<(Vec<SnapshotListing>, Vec<String>)> {
+        let live = self.live().await?;
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for key in self.list_snapshot_keys().await? {
+            let read = async {
+                let snapshot = self.read_snapshot(&key).await?;
+                let tree = snapshot.roots;
+                let roots = live
+                    .run_send(|r| async move { r.roots(&tree).await })
+                    .await?;
+                Ok::<_, CoreError>((snapshot, roots))
+            }
+            .await;
+            match read {
+                Ok((snapshot, roots)) => out.push(SnapshotListing {
+                    key,
+                    snapshot,
+                    roots,
+                }),
+                Err(e) => errors.push(format!("{}: {e}", key.path())),
+            }
+        }
+        Ok((out, errors))
     }
 
     /// 使用者給的 snapshot 指定 → key。接受 `latest`、完整的 key、`<client>/<時間戳>`、`<時間戳>` 或它的前綴

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use kist_app::server::{serve_http, ui_config, ServeState};
 use kist_app::{Config, Daemon, DaemonHandle};
-use kist_core::{InitOptions, Repository};
+use kist_core::v4::{InitOptions, Repo};
 use tokio::sync::watch;
 
 const PASSWORD: &str = "ui http test password";
@@ -24,14 +24,14 @@ async fn init_repo(dir: &Path) -> std::path::PathBuf {
     let repo = dir.join("repo");
     let backend = kist_backend::Backend::local(&repo).unwrap();
     let opts = InitOptions {
-        kdf_cost: kist_crypto::KdfCost {
+        kdf: kist_crypto::KdfCost {
             m_cost_kib: 8,
             t_cost: 1,
             p_cost: 1,
         },
         ..InitOptions::default()
     };
-    Repository::init(backend, PASSWORD.as_bytes(), opts)
+    Repo::init(backend, PASSWORD.as_bytes(), opts)
         .await
         .unwrap();
     repo

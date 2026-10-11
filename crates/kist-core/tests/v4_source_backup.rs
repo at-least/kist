@@ -1,19 +1,22 @@
-//! 以注入的記憶體來源（Source 抽象）測「直接遠端備份」：metadata 依來源種類
-//! 記錄（§8 聯集）、快速路徑依 §8.2 分級（s3 的 etag 可沿用、sftp 一律重讀）、
-//! 遠端檔案 root 的還原映射與本機檔案 root 對稱（§9）。
+//! v4 backup 的「直接遠端備份」，以注入的記憶體來源（Source 抽象）測：metadata 依來源種類記錄、快速路徑依
+//! 來源分級（s3 的 etag 可沿用、sftp 一律重讀）、遠端檔案 root 的還原映射與本機檔案 root 對稱（§9）。搬自
+//! v3 的 `source_backup.rs`（v4 的走訪是 v3 的複製）。
 
-mod common;
+#[path = "v4_common/mod.rs"]
+mod v4_common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::*;
 use kist_backend::source::{Source, SourceItem, SourceItemKind};
 use kist_backend::BackendError;
-use kist_core::{BackupOptions, RestoreOptions, SourceSpec};
-use kist_format::tree::meta_kind;
+use kist_core::v4::BackupOptions;
+use kist_core::{RestoreOptions, SourceSpec};
+use kist_format::v4::meta::meta_kind;
+use kist_format::v4::snapshot::Root;
+use v4_common::*;
 
 /// 記憶體來源：檔案放在 rel（`/` 分隔）→ 內容的 map，**目錄由檔案路徑推導**
 /// （與 object_store 的 common prefix 同一形狀，所以空目錄不存在）。
@@ -163,6 +166,13 @@ fn set_mtime(path: &Path, mtime_ns: i64) {
     filetime::set_file_times(path, ft, ft).unwrap();
 }
 
+/// 一個 snapshot 的 roots（v4 的 roots 在一個 metadata item 裡）。
+async fn roots_of(repo: &kist_core::v4::Repo, snapshot: &str) -> Vec<Root> {
+    let snap = repo.read_snapshot(&skey(snapshot)).await.unwrap();
+    let reader = repo.reader(None).await.unwrap();
+    reader.roots(&snap.roots).await.unwrap()
+}
+
 /// 比對兩棵樹的檔案清單、內容與**檔案**的 mtime。目錄的時間不比：遠端來源
 /// 沒有目錄時間（缺席＝未知），restore 也不該假造一個。
 fn assert_files_match(a: &Path, b: &Path) {
@@ -214,16 +224,13 @@ async fn backup_from_memory_source_restores() {
     assert_eq!(summary.report.errors, 0, "{:?}", summary.report);
 
     // Root.path = locator bytes（§9：遠端來源是不透明定位）。
-    let snap = repo
-        .read_snapshot_by_key(&summary.snapshot_key)
-        .await
-        .unwrap();
-    assert_eq!(snap.roots.len(), 1);
-    assert_eq!(snap.roots[0].path.as_slice(), b"mem://bucket/data");
+    let roots = roots_of(&repo, &summary.snapshot).await;
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].path.as_slice(), b"mem://bucket/data");
 
     // 還原映射：目錄來源的內容落在 `target/<locator 去掉 scheme>/` 底下。
     let target = t.dir.path().join("out");
-    repo.restore(&summary.snapshot_key, &target, RestoreOptions::default())
+    repo.restore(&skey(&summary.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     let restored = target.join("bucket/data");
@@ -275,7 +282,7 @@ async fn etag_fast_path_reuses_chunks_without_rereading() {
     assert_eq!(second.report.packs_new, 0, "{:?}", second.report);
     assert_eq!(
         second.parent.as_deref(),
-        Some(first.snapshot_key.as_str()),
+        Some(first.snapshot.as_str()),
         "同 locator 的 snapshot 要被當 parent"
     );
 }
@@ -308,7 +315,7 @@ async fn sftp_semantics_never_reuse() {
     assert_eq!(second.report.packs_new, 0, "{:?}", second.report);
 
     let target = t.dir.path().join("out");
-    repo.restore(&second.snapshot_key, &target, RestoreOptions::default())
+    repo.restore(&skey(&second.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     assert_eq!(
@@ -335,7 +342,7 @@ async fn remote_file_root_backup_restores_to_locator_parent() {
     assert_eq!(summary.stats.dirs, 0, "{:?}", summary.stats);
 
     let target = t.dir.path().join("out");
-    repo.restore(&summary.snapshot_key, &target, RestoreOptions::default())
+    repo.restore(&skey(&summary.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     let restored = target.join("bucket/data/only.bin");
@@ -411,19 +418,16 @@ async fn url_source_works_for_a_local_path() {
         .await
         .unwrap();
 
-    let snap = repo
-        .read_snapshot_by_key(&summary.snapshot_key)
-        .await
-        .unwrap();
+    let roots = roots_of(&repo, &summary.snapshot).await;
     let expected = std::fs::canonicalize(&src).unwrap();
     assert_eq!(
-        snap.roots[0].path.as_slice(),
+        roots[0].path.as_slice(),
         kist_core::fsmeta::path_to_bytes(&expected).unwrap(),
         "Root.path = canonicalized locator"
     );
 
     let target = t.dir.path().join("out");
-    repo.restore(&summary.snapshot_key, &target, RestoreOptions::default())
+    repo.restore(&skey(&summary.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     let restored = target.join(src.strip_prefix("/").unwrap_or(&src));
@@ -463,7 +467,7 @@ async fn excludes_match_a_remote_root_by_its_restore_path() {
 
     let target = t.dir.path().join("out");
     let r = repo
-        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .restore(&skey(&s.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);

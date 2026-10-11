@@ -100,6 +100,17 @@ impl Live {
     /// 以現在的讀取端執行 `op`；它回 [`CoreError::Unavailable`] 時重新載入一次再執行（§10）。重新載入被限流
     /// 擋下（距離上次因失敗而載入不到 interval、也沒有別人在這之後載入過）就回原本的錯誤。
     pub async fn run<T>(&self, op: impl AsyncFn(Reader) -> Result<T>) -> Result<T> {
+        let op = &op;
+        self.run_send(move |r| op(r)).await
+    }
+
+    /// [`Live::run`]，`op` 是一般的 closure：拿到 reader、回傳自己持有所需資料的 future。這樣整個 future 是
+    /// `Send`（async closure 借用的生命週期讓 tokio::spawn 不接受），kist-app 跑得了（forget、列出 snapshot）。
+    pub async fn run_send<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: Fn(Reader) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         let (epoch, reader) = self.current();
         match op(reader).await {
             Err(e @ CoreError::Unavailable { .. }) => {

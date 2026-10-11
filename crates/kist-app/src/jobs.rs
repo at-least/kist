@@ -1,7 +1,7 @@
 //! 一件工作 = 對設定檔描述的 repo 做一次 backup / forget / prune，回傳結果（給通知、metrics、UI 用）。
 
 use kist_backend::Backend;
-use kist_core::{BackupOptions, ForgetOptions, ProgressCallback, Repository};
+use kist_core::v4::{BackupOptions, ForgetOptions, ProgressCallback, Repo};
 use serde::Serialize;
 use time::OffsetDateTime;
 
@@ -101,10 +101,14 @@ pub async fn run_job(
 
 /// 依設定開 repo（讀密碼檔、解 key）。每次呼叫都重新做 Argon2，故意不把 key 留在記憶體裡；
 /// Web UI 的 snapshots 頁也用這個。
-pub async fn open_repo(cfg: &Config) -> Result<Repository> {
+pub async fn open_repo(cfg: &Config) -> Result<Repo> {
     let backend = Backend::from_url(&cfg.repo).await?;
     let password = cfg.read_password()?;
-    Ok(Repository::open_with_cache(backend, password.as_bytes(), cfg.cache_dir.clone()).await?)
+    let cache = cfg
+        .cache_dir
+        .clone()
+        .or_else(|| dirs::cache_dir().map(|d| d.join("kist")));
+    Ok(Repo::open(backend, password.as_bytes(), cache.as_deref()).await?)
 }
 
 /// 回傳 (是否不完整, 摘要)。
@@ -125,17 +129,14 @@ async fn run_job_inner(
             // 後寫贏，輸家帶著沒人認得的 id 完成 snapshot。
             let _lock = client_id::lock(cfg.client_id_file.as_deref())?;
             let id = client_id::load_or_create(cfg.client_id_file.as_deref())?;
-            let opts = BackupOptions {
-                client_id: id,
-                hostname: client_id::hostname(),
-                username: client_id::username(),
-                now: None,
-                gc_grace: cfg.gc_grace(),
-                parity: b.parity,
-                progress,
-                source: kist_core::SourceSpec::default(),
-                exclude: b.exclusions()?,
-            };
+            let mut opts = BackupOptions::new(
+                kist_core::v4::ClientId::from_bytes(id),
+                client_id::hostname(),
+                client_id::username(),
+            );
+            opts.parity = b.parity;
+            opts.progress = progress;
+            opts.exclude = b.exclusions()?;
             let summary = repo.backup(&b.paths, opts).await?;
             let incomplete = summary.report.errors > 0;
             Ok((
@@ -151,9 +152,8 @@ async fn run_job_inner(
             let repo = open_repo(cfg).await?;
             let summary = repo
                 .forget(ForgetOptions {
-                    snapshots: vec![],
                     policy: f.policy(),
-                    dry_run: false,
+                    ..ForgetOptions::default()
                 })
                 .await?;
             Ok((false, serde_json::to_value(&summary).unwrap_or_default()))
@@ -165,7 +165,7 @@ async fn run_job_inner(
                 .ok_or_else(|| AppError::Config("no [prune] section".to_owned()))?;
             let repo = open_repo(cfg).await?;
             let report = repo.prune(p.options()).await?;
-            let incomplete = !report.skipped.is_empty();
+            let incomplete = !report.undeleted.is_empty() || report.unfinished.is_some();
             Ok((
                 incomplete,
                 serde_json::to_value(&report).unwrap_or_default(),

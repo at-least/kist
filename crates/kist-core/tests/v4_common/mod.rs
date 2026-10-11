@@ -966,6 +966,18 @@ pub async fn hand_snapshot(
     roots: Vec<kist_format::v4::snapshot::Root>,
     items: Vec<kist_format::v4::meta::Item>,
 ) -> Key {
+    let raw = items.iter().map(|i| i.encode().unwrap()).collect();
+    hand_snapshot_raw(repo, c, at, roots, raw).await
+}
+
+/// [`hand_snapshot`]，item 是已經編碼的明文（測 `Item::encode` 不肯寫的東西，例如版本不認得的 item）。
+pub async fn hand_snapshot_raw(
+    repo: &Repo,
+    c: ClientId,
+    at: i64,
+    roots: Vec<kist_format::v4::snapshot::Root>,
+    items: Vec<Vec<u8>>,
+) -> Key {
     use kist_core::v4::pack::PackWriter;
     use kist_format::v4::index::{Delta, DeltaPack};
     use kist_format::v4::keys::SnapTs;
@@ -981,18 +993,17 @@ pub async fn hand_snapshot(
         64 * 1024,
     );
     let mut seen = std::collections::HashSet::new();
-    let mut add = |item: &Item| {
-        let cbor = item.encode().unwrap();
-        let id = keys.meta_id(&cbor);
+    let mut add = |cbor: &[u8]| {
+        let id = keys.meta_id(cbor);
         if seen.insert(id) {
-            w.add(id.into(), &cbor).unwrap();
+            w.add(id.into(), cbor).unwrap();
         }
         id
     };
     for item in &items {
         add(item);
     }
-    let roots_id = add(&Item::RootSeg(RootSeg::new(roots)));
+    let roots_id = add(&Item::RootSeg(RootSeg::new(roots)).encode().unwrap());
     let p = w.finish().unwrap().unwrap();
     repo.backend()
         .put_if_absent(

@@ -22,12 +22,14 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use kist_backend::{Backend, RepoLocation};
-use kist_core::{
-    BackupOptions, CheckOptions, Exclusions, ForgetOptions, ForgetSummary, InitOptions, PathFilter,
-    Planned, PruneOptions, PruneReport, Repository, RestoreOptions, RestoreSummary,
-    RetentionPolicy, SourceSpec,
+use kist_backend::Backend;
+use kist_core::retention::RetentionPolicy;
+use kist_core::v4::check::CheckOptions;
+use kist_core::v4::{
+    BackupOptions, ForgetOptions, ForgetSummary, InitOptions, MaintOptions, PruneOptions,
+    PruneReport, Repo, SettingsChange,
 };
+use kist_core::{Exclusions, PathFilter, Planned, RestoreOptions, RestoreSummary, SourceSpec};
 
 /// 結束碼（沿用 restic 的慣例）：0 成功；1 失敗；3 backup / restore 完成但有項目被略過或還原失敗。
 const EXIT_FAILURE: i32 = 1;
@@ -60,30 +62,17 @@ struct Cli {
 
 #[derive(Debug, Args)]
 struct PruneArgs {
-    /// Minimum time between marking an object and deleting it. Must be longer than your longest
-    /// backup, and match `backup --gc-grace`.
-    #[arg(long, value_name = "DURATION", default_value = "72h", value_parser = parse_duration)]
-    grace: std::time::Duration,
-    /// Clients without a snapshot for this long no longer hold back deletion.
-    #[arg(long, value_name = "DURATION", default_value = "30d", value_parser = parse_duration)]
-    inactive_after: std::time::Duration,
-    /// Tolerated clock difference between clients and the prune host.
-    #[arg(long, value_name = "DURATION", default_value = "1h", value_parser = parse_duration)]
-    clock_skew: std::time::Duration,
-    /// Repack packs whose live data is below this percentage (0 disables repacking).
-    #[arg(long, value_name = "PERCENT", default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
+    /// Repack old packs whose live data is below this percentage (0 disables ratio repacks;
+    /// damaged packs that their parity repairs are always repacked).
+    #[arg(long, value_name = "PERCENT", default_value_t = kist_core::v4::prune::DEFAULT_REPACK_BELOW, value_parser = clap::value_parser!(u8).range(0..=100))]
     repack_below: u8,
 }
 
 impl PruneArgs {
-    fn options(&self, dry_run: bool) -> PruneOptions {
+    fn options(&self) -> PruneOptions {
         PruneOptions {
-            grace: self.grace,
-            inactive_after: self.inactive_after,
-            clock_skew: self.clock_skew,
-            repack_below_percent: self.repack_below,
-            dry_run,
-            now: None,
+            repack_below: self.repack_below,
+            ..PruneOptions::default()
         }
     }
 }
@@ -161,10 +150,6 @@ enum Command {
         /// File holding this machine's client id (created on first use).
         #[arg(long, env = "KIST_CLIENT_ID_FILE")]
         client_id_file: Option<PathBuf>,
-        /// Packs marked for deletion longer ago than this are treated as already gone.
-        /// Must match the `--grace` used by `prune`.
-        #[arg(long, value_name = "DURATION", default_value = "72h", value_parser = parse_duration)]
-        gc_grace: std::time::Duration,
         /// Reed-Solomon parity shards per pack, out of 16 data shards
         /// (0 = none; 2 = 12.5% overhead, repairs up to 2 damaged sixteenths).
         #[arg(long, value_name = "0..=8", default_value = "0")]
@@ -269,15 +254,17 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Verify the repository's integrity.
+    /// Verify the repository's integrity (always reads the repository, never the local cache).
     Check {
         #[command(flatten)]
         repo: RepoArgs,
         /// Also download every pack and verify every chunk (slow).
         #[arg(long)]
         read_data: bool,
-        /// Rewrite damaged packs from their parity objects (implies --read-data).
-        /// Needs Put access; objects under S3 Object Lock cannot be repaired.
+        /// Create missing copies (a head's or a map shard's or an mpack's body from its verified
+        /// `.r1`, or the `.r1` from the body) (implies --read-data). Never overwrites: damaged
+        /// objects that parity or a `.r1` can repair are reported, and prune rewrites what it
+        /// reads. Maintenance role; refused on rclone://.
         #[arg(long)]
         repair: bool,
     },
@@ -311,25 +298,61 @@ enum Command {
         /// Show what would be removed without removing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Run `prune` afterwards (the prune options below apply).
+        /// Also remove a snapshot named on the command line that is the newest of its client and
+        /// paths. That retires those paths for that client: do it only while that client has no
+        /// backup running (its next backup reuses the newest snapshot as its parent).
         #[arg(long)]
+        retire: bool,
+        /// Run `prune` afterwards (the prune options below apply; not with --dry-run).
+        #[arg(long, conflicts_with = "dry_run")]
         prune: bool,
         #[command(flatten)]
         prune_args: PruneArgs,
     },
-    /// Reclaim space: mark unreferenced data, delete what was marked longer ago than the
-    /// grace period, and repack mostly-unused packs. Safe to run while backups are running.
+    /// Reclaim space (format-v4.md §11.3): mark unreferenced packs, delete what was marked more
+    /// than a grace ago on both the backend and the writer clock, and repack mostly-unused
+    /// packs. Safe to run while backups are running. Maintenance role; refused on rclone://.
     Prune {
         #[command(flatten)]
         repo: RepoArgs,
         #[command(flatten)]
         prune: PruneArgs,
-        /// Report what would happen without writing anything.
-        #[arg(long)]
-        dry_run: bool,
     },
-    /// Rebuild the index from the pack files (after index objects were lost or corrupted).
-    RebuildIndex {
+    /// Rebuild the map after the newest generation's map shards were lost (format-v4.md §11.4).
+    /// Deletes nothing; holds back deletion for a while afterwards.
+    Rebuild {
+        #[command(flatten)]
+        repo: RepoArgs,
+    },
+    /// Show the repository settings, or change them (a new generation; nothing is deleted).
+    Settings {
+        #[command(flatten)]
+        repo: RepoArgs,
+        /// Time between marking a pack and deleting it (at least 2h). Raising takes effect at
+        /// once; lowering drains for one old grace. Every backup must finish within it minus an
+        /// hour.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        grace: Option<std::time::Duration>,
+        /// 1 also writes a `.r1` copy of every mpack, snapshot and map shard (0 or 1).
+        #[arg(long, value_name = "0|1", value_parser = clap::value_parser!(u8).range(0..=1))]
+        replicas: Option<u8>,
+        /// Size at which a data pack is written out (64k to 4g).
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        pack_target: Option<u64>,
+        /// Size at which a metadata pack is written out (64k to 4g).
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        mpack_target: Option<u64>,
+    },
+    /// Manage the password slots: every slot opens the repository with its own password.
+    Key {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+    /// Mark packs written by a newer kist (unknown trailer version) for deletion by later
+    /// prunes. Use only when no newer kist uses this repository.
+    RemoveUnknownPacks {
         #[command(flatten)]
         repo: RepoArgs,
     },
@@ -355,6 +378,24 @@ enum Command {
     },
     /// Print version information.
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyAction {
+    /// Add a slot for a new password (prompted twice, or read from --new-password-file).
+    Add {
+        /// Read the new password from this file (first line).
+        #[arg(long)]
+        new_password_file: Option<PathBuf>,
+    },
+    /// List the slots; `*` marks the one this command opened the repository with.
+    List,
+    /// Remove a slot (maintenance role). The slot used to open the repository cannot be removed,
+    /// so the last slot always stays.
+    Remove {
+        /// Slot name, as `key list` shows it.
+        slot: String,
+    },
 }
 
 /// `--files-from*` 的三種切法（ADR 024，名稱同 restic；都不展開萬用字元）。文字的兩種：開頭的
@@ -679,25 +720,21 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let backend = open_backend(&repo).await?;
             let password = password::obtain(&repo.password_file, true)?;
-            // config 是唯一可覆寫的物件；被蓋掉就打不開 repo。kist 自己驗不了 bucket 設定，只能提醒。
-            // （rclone:// 的 config 讀回驗證只擋同時 init，保護 config 還是要靠遠端本身的版本能力。）
-            let show_versioning_note = matches!(backend.location(), RepoLocation::S3 { .. });
             let opts = InitOptions {
-                chunker: kist_format::config::ChunkerParams {
+                chunker: kist_format::v4::config::Chunker {
                     min: chunker_min,
                     avg: chunker_avg,
                     max: chunker_max,
                 },
                 ..InitOptions::default()
             };
-            Repository::init(backend, password.as_bytes(), opts).await?;
+            Repo::init(backend, password.as_bytes(), opts).await?;
             println!("repository initialized at {}", repo_url(&repo)?);
-            if show_versioning_note {
-                eprintln!(
-                    "note: enable bucket versioning or Object Lock so that `config` cannot be \
-                     overwritten or deleted, and keep a copy of the `config` object somewhere safe"
-                );
-            }
+            // config 與金鑰槽不可覆寫、也不會被 kist 刪：遺失 config 就開不了 repo，密碼忘了也一樣。
+            eprintln!(
+                "note: keep a copy of the `config` object and of your password somewhere safe; \
+                 without either the repository cannot be opened"
+            );
             Ok(())
         }
         Command::Backup {
@@ -707,7 +744,6 @@ async fn run(cli: Cli) -> Result<()> {
             files_from_verbatim,
             files_from_raw,
             client_id_file,
-            gc_grace,
             parity,
             exclude,
             exclude_file,
@@ -766,24 +802,21 @@ async fn run(cli: Cli) -> Result<()> {
             // 先鎖再載入：同 jobs.rs——首建並發各自 mint 不同 id 的視窗。
             let _lock = client_id::lock(client_id_file.as_deref())?;
             let client_id = client_id::load_or_create(client_id_file.as_deref())?;
-            let opts = BackupOptions {
-                client_id,
-                hostname: client_id::hostname(),
-                username: client_id::username(),
-                now: None,
-                gc_grace,
-                parity,
-                progress: None,
-                source,
-                exclude,
-            };
+            let mut opts = BackupOptions::new(
+                kist_format::v4::ids::ClientId::from_bytes(client_id),
+                client_id::hostname(),
+                client_id::username(),
+            );
+            opts.parity = parity;
+            opts.source = source;
+            opts.exclude = exclude;
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;
             let rep = summary.report;
             if json {
                 print_json(&summary)?;
             } else {
-                println!("snapshot {}", short_snapshot_id(&summary.snapshot_key));
+                println!("snapshot {}", short_snapshot_id(&summary.snapshot));
                 println!(
                     "  {} files, {} dirs, {} symlinks, {} total",
                     s.files,
@@ -792,10 +825,11 @@ async fn run(cli: Cli) -> Result<()> {
                     human_bytes(s.bytes)
                 );
                 println!(
-                    "  new: {} in {} chunks, {} packs written",
+                    "  new: {} in {} chunks, {} packs and {} metadata packs written",
                     human_bytes(rep.bytes_stored),
                     rep.chunks_new,
-                    rep.packs_new
+                    rep.packs_new,
+                    rep.mpacks_new
                 );
                 if rep.excluded > 0 {
                     println!(
@@ -816,7 +850,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Snapshots { repo } => {
             let r = open_repo(&repo).await?;
-            let snaps = r.list_snapshots().await?;
+            let (snaps, errors) = r.list_snapshots_with_roots().await?;
+            for e in &errors {
+                eprintln!("warning: cannot read snapshot {e}");
+            }
             if json {
                 let items: Vec<SnapshotJson> = snaps.iter().map(SnapshotJson::new).collect();
                 print_json(&items)?;
@@ -831,17 +868,17 @@ async fn run(cli: Cli) -> Result<()> {
                 "CLIENT", "TIMESTAMP", "TIME (UTC)", "HOST", "FILES", "SIZE"
             );
             for s in snaps {
+                let (client, ts) = snapshot_parts(&s.key);
                 let paths: Vec<String> = s
-                    .snapshot
                     .roots
                     .iter()
-                    .map(|r| String::from_utf8_lossy(r.path.as_slice()).into_owned())
+                    .map(|r| String::from_utf8_lossy(&r.path).into_owned())
                     .collect();
                 println!(
                     "{:<8} {:<25} {:<19} {:<12} {:>8} {:>10}  {}",
-                    &s.client_hex()[..8.min(s.client_hex().len())],
-                    s.timestamp(),
-                    display_time_ns(s.snapshot.time_ns),
+                    &client[..8],
+                    ts,
+                    display_time_ns(s.snapshot.time),
                     s.snapshot.host,
                     s.snapshot.stats.files,
                     human_bytes(s.snapshot.stats.bytes),
@@ -936,7 +973,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!(
                     "{} {} to {}: {} files, {} dirs, {} symlinks",
                     if dry_run { "would restore" } else { "restored" },
-                    short_snapshot_id(&key),
+                    short_snapshot_id(&key.path()),
                     target.display(),
                     summary.files,
                     summary.dirs,
@@ -985,14 +1022,11 @@ async fn run(cli: Cli) -> Result<()> {
             keep_yearly,
             keep_within,
             dry_run,
+            retire,
             prune,
             prune_args,
         } => {
             let r = open_repo(&repo).await?;
-            let mut keys = Vec::new();
-            for spec in &snapshots {
-                keys.push(r.resolve_snapshot(spec).await?);
-            }
             let policy = RetentionPolicy {
                 keep_last,
                 keep_hourly,
@@ -1004,11 +1038,18 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let summary = r
                 .forget(ForgetOptions {
-                    snapshots: keys,
+                    snapshots,
                     policy,
+                    retire,
                     dry_run,
                 })
                 .await?;
+            for u in &summary.unreadable {
+                eprintln!(
+                    "warning: {u}: its roots cannot be read, so the policy leaves it alone; \
+                     forget it by its full key"
+                );
+            }
             if json {
                 // --prune 時 forget 的結果併進下面的合併 JSON，這裡不先印
                 if !prune {
@@ -1033,23 +1074,19 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
             if prune {
-                let prune_result = r.prune(prune_args.options(dry_run)).await;
+                let prune_result = r.prune(prune_args.options()).await;
                 if json {
                     // stdout 只能有一個 JSON 值：forget 與 prune 包在一起。
                     // prune 失敗時 snapshot 已經刪了，仍要把 forget 的結果印出來
                     //（prune 為 null、結束碼 1、錯誤在 stderr），消費者才知道刪了哪些。
-                    let prune_json = prune_result
-                        .as_ref()
-                        .ok()
-                        .map(|report| PruneJson { dry_run, report });
                     print_json(&serde_json::json!({
                         "forget": ForgetJson::new(dry_run, &summary),
-                        "prune": prune_json,
+                        "prune": prune_result.as_ref().ok(),
                     }))?;
                 }
                 let report = prune_result?;
                 if !json {
-                    output_prune(&report, dry_run);
+                    output_prune(&report);
                 }
                 prune_warnings_and_exit(&report)
             } else {
@@ -1059,32 +1096,160 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Command::Prune {
-            repo,
-            prune,
-            dry_run,
-        } => {
+        Command::Prune { repo, prune } => {
             let r = open_repo(&repo).await?;
-            let report = r.prune(prune.options(dry_run)).await?;
+            let report = r.prune(prune.options()).await?;
             if json {
-                print_json(&PruneJson {
-                    dry_run,
-                    report: &report,
-                })?;
+                print_json(&report)?;
             } else {
-                output_prune(&report, dry_run);
+                output_prune(&report);
             }
             prune_warnings_and_exit(&report)
         }
-        Command::RebuildIndex { repo } => {
+        Command::Rebuild { repo } => {
             let r = open_repo(&repo).await?;
-            let s = r.rebuild_index().await?;
+            let report = r.rebuild(MaintOptions::default()).await?;
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
             if json {
-                print_json(&s)?;
+                print_json(&report)?;
             } else {
+                match report.generation {
+                    None => println!(
+                        "the map of generation {} is intact; nothing to rebuild",
+                        report.lost
+                    ),
+                    Some(g) => println!(
+                        "rebuilt the map as generation {g} from generation {} ({}): {} records, \
+                         {} held until the hold passes",
+                        report.readable,
+                        if report.kept_map {
+                            "kept its map"
+                        } else {
+                            "every pack held as condemned"
+                        },
+                        report.records,
+                        report.held
+                    ),
+                }
+            }
+            Ok(())
+        }
+        Command::Settings {
+            repo,
+            grace,
+            replicas,
+            pack_target,
+            mpack_target,
+        } => {
+            let r = open_repo(&repo).await?;
+            if grace.is_none()
+                && replicas.is_none()
+                && pack_target.is_none()
+                && mpack_target.is_none()
+            {
+                let v = r.settings().await?;
+                if json {
+                    print_json(&v)?;
+                } else {
+                    println!("generation {}", v.generation);
+                    print_settings(&v.settings);
+                    if let Some(d) = v.drain {
+                        println!(
+                            "drain: lowered at generation {} from {}; new marks age by the old \
+                             grace until it ends",
+                            d.from,
+                            human_duration(d.old_grace)
+                        );
+                    }
+                    if let Some(h) = v.hold {
+                        println!(
+                            "hold: after a rebuild that lost generations {}..={}; no deletion \
+                             until it passes",
+                            h.from, h.lost
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            let report = r
+                .change_settings(
+                    SettingsChange {
+                        grace: grace.map(|d| d.as_secs()),
+                        replicas,
+                        pack_target,
+                        mpack_target,
+                    },
+                    MaintOptions::default(),
+                )
+                .await?;
+            if json {
+                print_json(&report)?;
+            } else {
+                match report.generation {
+                    None => println!("no change"),
+                    Some(g) => println!("settings written as generation {g}"),
+                }
+                print_settings(&report.settings);
+                if let Some(d) = report.drain {
+                    println!(
+                        "drain: the grace was lowered from {}; marks made until it ends still age \
+                         by the old grace",
+                        human_duration(d.old_grace)
+                    );
+                }
+            }
+            Ok(())
+        }
+        Command::Key { repo, action } => {
+            let r = open_repo(&repo).await?;
+            match action {
+                KeyAction::Add { new_password_file } => {
+                    let new = password::obtain_new(&new_password_file)?;
+                    let name = r.key_add(new.as_bytes()).await?;
+                    if json {
+                        print_json(&serde_json::json!({ "added": name }))?;
+                    } else {
+                        println!("added key slot {name}");
+                    }
+                }
+                KeyAction::List => {
+                    let slots = r.key_list().await?;
+                    if json {
+                        print_json(&slots)?;
+                    } else {
+                        for s in slots {
+                            println!("{} {}", if s.current { "*" } else { " " }, s.name);
+                        }
+                    }
+                }
+                KeyAction::Remove { slot } => {
+                    r.key_remove(&slot).await?;
+                    if json {
+                        print_json(&serde_json::json!({ "removed": slot }))?;
+                    } else {
+                        println!("removed key slot {slot}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::RemoveUnknownPacks { repo } => {
+            let r = open_repo(&repo).await?;
+            let report = r.condemn_unknown(MaintOptions::default()).await?;
+            if json {
+                print_json(&report)?;
+            } else if report.packs.is_empty() {
+                println!("no pack with an unknown version");
+            } else {
+                for p in &report.packs {
+                    println!("marked for deletion: {p}");
+                }
                 println!(
-                    "rebuilt index from {} packs ({} chunks); {} old index object(s) superseded",
-                    s.packs, s.chunks, s.superseded
+                    "{} pack(s) marked in generation {}; prune deletes them once a grace has passed",
+                    report.packs.len(),
+                    report.generation.unwrap_or_default()
                 );
             }
             Ok(())
@@ -1099,18 +1264,25 @@ async fn run(cli: Cli) -> Result<()> {
             if json {
                 print_json(&report)?;
             } else {
-                // 人類可讀的輸出（含修復了哪些 pack）只在非 --json 模式印：
-                // --json 的 stdout 必須整份是 JSON（README 的契約）。
-                for id in &report.repaired {
-                    println!("repaired pack {id} from parity");
+                // 人類可讀的輸出只在非 --json 模式印：--json 的 stdout 必須整份是 JSON（README 的契約）。
+                for k in &report.repaired {
+                    println!("created {k}");
+                }
+                for k in &report.repairable {
+                    println!("repairable (not rewritten): {k}");
                 }
                 println!(
-                    "checked {} snapshots, {} trees, {} packs, {} chunks{}",
+                    "checked generation {}: {} snapshots, {} metadata items, {} chunks, {} packs{}",
+                    report.generation,
                     report.snapshots,
-                    report.trees,
-                    report.packs,
+                    report.items,
                     report.chunks,
-                    if read_data { " (data read)" } else { "" }
+                    report.packs,
+                    if read_data || repair {
+                        " (data read)"
+                    } else {
+                        ""
+                    }
                 );
             }
             for w in &report.warnings {
@@ -1131,47 +1303,73 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn output_prune(p: &PruneReport, dry_run: bool) {
-    let would = if dry_run { "would " } else { "" };
+fn output_prune(p: &PruneReport) {
+    for w in &p.warnings {
+        eprintln!("warning: {w}");
+    }
     println!(
-        "{} snapshots, {} live trees, {} live packs",
-        p.snapshots, p.live_trees, p.live_packs
+        "generation {} written (from {}): {} snapshots, {} metadata items, {} chunks",
+        p.generation, p.base, p.snapshots, p.items, p.chunks
     );
     println!(
-        "{would}marked {} object(s) ({}) for deletion; {} marker(s) revived, {} stale",
-        p.marked,
-        human_bytes(p.marked_bytes),
-        p.revived,
-        p.stale_marks
+        "{} new pack(s) recorded; {} marked, {} revived, {} to delete",
+        p.newcomers, p.condemned, p.revived, p.tombstoned
     );
+    if p.repacked > 0 || p.repaired > 0 {
+        println!(
+            "repacked {} pack(s) ({} repaired from parity first)",
+            p.repacked, p.repaired
+        );
+    }
     println!(
-        "{would}deleted {} object(s) ({}); {} waiting for the grace period, {} held back by active clients",
-        p.deleted,
+        "deleted {} pack(s) ({}), {} delta(s), {} map shard(s), {} parity object(s), {} snapshot(s)",
+        p.deleted_packs,
         human_bytes(p.deleted_bytes),
-        p.waiting,
-        p.blocked
-    );
-    println!(
-        "{would}repacked {} pack(s) ({} of live data moved into {} new pack(s))",
-        p.repacked_packs,
-        human_bytes(p.repacked_bytes),
-        p.new_packs
+        p.deleted_deltas,
+        p.deleted_shards,
+        p.deleted_parity,
+        p.deleted_snapshots
     );
 }
 
-/// 刪不掉的物件走 stderr + 結束碼 3，兩種輸出模式都一樣。
+/// 刪不掉的物件、沒做完的刪除走 stderr + 結束碼 3，兩種輸出模式都一樣。
 fn prune_warnings_and_exit(p: &PruneReport) -> Result<()> {
-    for s in &p.skipped {
-        eprintln!("warning: {s}");
+    for s in &p.undeleted {
+        eprintln!("warning: cannot delete {s}");
     }
-    if !p.skipped.is_empty() {
+    if let Some(u) = &p.unfinished {
+        eprintln!("warning: {u}");
+    }
+    if !p.undeleted.is_empty() || p.unfinished.is_some() {
         return Err(Incomplete(format!(
-            "{} object(s) could not be deleted (object lock or permissions); their markers were kept",
-            p.skipped.len()
+            "{} object(s) could not be deleted{}; they are retried by the next prune",
+            p.undeleted.len(),
+            if p.unfinished.is_some() {
+                " and the deletions did not finish"
+            } else {
+                ""
+            }
         ))
         .into());
     }
     Ok(())
+}
+
+fn print_settings(s: &kist_format::v4::index::Settings) {
+    println!("grace         {}", human_duration(s.grace));
+    println!("replicas      {}", s.replicas);
+    println!("pack_target   {}", human_bytes(s.pack_target));
+    println!("mpack_target  {}", human_bytes(s.mpack_target));
+}
+
+/// 秒 → `72h`、`90m`、`45s` 這種寫法（能整除的最大單位）。
+fn human_duration(secs: u64) -> String {
+    match secs {
+        s if s > 0 && s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s > 0 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s > 0 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 /// 結果序列化成 pretty JSON（`--json`）。錯誤照舊走 stderr。
@@ -1253,8 +1451,8 @@ fn print_next_runs(daemon: &kist_app::Daemon) {
     }
 }
 
-/// `snapshots --json` 的輸出形狀：key 拆出 client 與 timestamp，路徑從 OS bytes
-/// 轉成 UTF-8（非法位元組以 U+FFFD 取代）；root 等 id 在 JSON 是 hex 字串。
+/// `snapshots --json` 的輸出形狀：key 拆出 client 與 timestamp，路徑從 bytes 轉成 UTF-8（非法位元組以
+/// U+FFFD 取代）。
 #[derive(serde::Serialize)]
 struct SnapshotJson {
     key: String,
@@ -1264,30 +1462,60 @@ struct SnapshotJson {
     time: String,
     hostname: String,
     username: String,
-    /// v3：roots 的定位字串（lossy UTF-8）。
+    /// roots 的定位（lossy UTF-8）。
     paths: Vec<String>,
-    roots: Vec<kist_format::snapshot::Root>,
-    stats: kist_format::snapshot::SnapshotStats,
+    roots: Vec<RootJson>,
+    parent: Option<String>,
+    stats: kist_format::v4::snapshot::SnapshotStats,
+}
+
+#[derive(serde::Serialize)]
+struct RootJson {
+    path: String,
+    /// "file" | "dir" | "symlink"
+    r#type: &'static str,
 }
 
 impl SnapshotJson {
-    fn new(s: &kist_core::SnapshotInfo) -> Self {
+    fn new(s: &kist_core::v4::SnapshotListing) -> Self {
+        let (client, timestamp) = snapshot_parts(&s.key);
         Self {
-            key: s.key.clone(),
-            client: s.client_hex().to_owned(),
-            timestamp: s.timestamp().to_owned(),
-            time: display_time_ns(s.snapshot.time_ns),
+            key: s.key.path(),
+            client,
+            timestamp,
+            time: rfc3339_ns(s.snapshot.time),
             hostname: s.snapshot.host.clone(),
             username: s.snapshot.user.clone(),
             paths: s
-                .snapshot
                 .roots
                 .iter()
-                .map(|r| String::from_utf8_lossy(r.path.as_slice()).into_owned())
+                .map(|r| String::from_utf8_lossy(&r.path).into_owned())
                 .collect(),
-            roots: s.snapshot.roots.clone(),
+            roots: s
+                .roots
+                .iter()
+                .map(|r| RootJson {
+                    path: String::from_utf8_lossy(&r.path).into_owned(),
+                    r#type: match r.t {
+                        kist_format::v4::meta::node_type::DIR => "dir",
+                        kist_format::v4::meta::node_type::SYMLINK => "symlink",
+                        _ => "file",
+                    },
+                })
+                .collect(),
+            parent: s.snapshot.parent.clone(),
             stats: s.snapshot.stats,
         }
+    }
+}
+
+/// snapshot 的 key → (client 的 32 位 hex, 時間戳)。
+fn snapshot_parts(key: &kist_format::v4::keys::Key) -> (String, String) {
+    match key {
+        kist_format::v4::keys::Key::Snapshot { client, ts, .. } => {
+            (client.to_string(), ts.as_str().to_owned())
+        }
+        other => (other.path(), String::new()),
     }
 }
 
@@ -1298,6 +1526,7 @@ struct ForgetJson {
     dry_run: bool,
     removed: Vec<String>,
     kept: Vec<ForgetKept>,
+    unreadable: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1319,6 +1548,7 @@ impl ForgetJson {
                     reasons: reasons.iter().map(|r| (*r).to_owned()).collect(),
                 })
                 .collect(),
+            unreadable: s.unreadable.clone(),
         }
     }
 }
@@ -1331,14 +1561,6 @@ struct RestoreJson<'a> {
     summary: &'a RestoreSummary,
 }
 
-/// `prune --json`：加上 dry_run（report 本身不帶，但消費者需要知道刪了沒）。
-#[derive(serde::Serialize)]
-struct PruneJson<'a> {
-    dry_run: bool,
-    #[serde(flatten)]
-    report: &'a PruneReport,
-}
-
 fn repo_url(args: &RepoArgs) -> Result<&str> {
     args.repo
         .as_deref()
@@ -1349,7 +1571,7 @@ async fn open_backend(args: &RepoArgs) -> Result<Backend> {
     Ok(Backend::from_url(repo_url(args)?).await?)
 }
 
-async fn open_repo(args: &RepoArgs) -> Result<Repository> {
+async fn open_repo(args: &RepoArgs) -> Result<Repo> {
     let backend = open_backend(args).await?;
     let password = password::obtain(&args.password_file, false)?;
     let cache_root = if args.no_cache {
@@ -1366,7 +1588,7 @@ async fn open_repo(args: &RepoArgs) -> Result<Repository> {
         }
         root
     };
-    Ok(Repository::open_with_cache(backend, password.as_bytes(), cache_root).await?)
+    Ok(Repo::open(backend, password.as_bytes(), cache_root.as_deref()).await?)
 }
 
 /// `snapshots/<client>/<ts>` → `<client 前 8 碼>/<ts>`，給人看的簡短 id。
@@ -1375,6 +1597,17 @@ fn short_snapshot_id(key: &str) -> String {
     let ts = parts.next().unwrap_or(key);
     let client = parts.next().unwrap_or("");
     format!("{}/{ts}", &client[..8.min(client.len())])
+}
+
+/// snapshot 的 i64 奈秒 → RFC 3339。
+fn rfc3339_ns(ns: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns))
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_default()
 }
 
 /// snapshot 的 i64 奈秒 → 列表用的時間字串（顯示到秒）。

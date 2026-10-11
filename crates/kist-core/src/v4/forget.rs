@@ -113,7 +113,8 @@ impl Repo {
             let key = Key::parse(path)?;
             let roots = async {
                 let snap = self.read_snapshot(&key).await?;
-                live.run(async |r| r.roots(&snap.roots).await).await
+                let tree = snap.roots;
+                live.run_send(|r| async move { r.roots(&tree).await }).await
             }
             .await;
             let Some((client, nanos)) = snapshot_parts(&key) else {

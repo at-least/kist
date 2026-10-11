@@ -85,6 +85,24 @@ impl Env {
     }
 }
 
+/// `dir` 底下所有的檔案（遞迴），排好。
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn make_source(root: &Path) {
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     let mut big = vec![0u8; 3 * 1024 * 1024];
@@ -152,13 +170,7 @@ fn check_fails_on_corrupted_pack() {
     env.ok(&["init"]);
     env.ok(&["backup", src.to_str().unwrap()]);
 
-    let packs_dir = env.repo().join("packs");
-    let pack = std::fs::read_dir(&packs_dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let pack = files_under(&env.repo().join("packs"))[0].clone();
     let mut bytes = std::fs::read(&pack).unwrap();
     bytes[200] ^= 0xff;
     std::fs::write(&pack, bytes).unwrap();
@@ -430,20 +442,26 @@ fn s3_repo_url_works_end_to_end() {
     assert_eq!(code, Some(0), "{stdout}\n{stderr}");
 }
 
+/// `rebuild`：最新一代的 map 分片遺失 → check 回報、rebuild 從讀得全的一代重建，之後 check 乾淨。
 #[test]
-fn rebuild_index_command() {
+fn rebuild_command() {
     let env = Env::new();
     let src = env.dir.path().join("src");
     make_source(&src);
     env.ok(&["init"]);
     env.ok(&["backup", src.to_str().unwrap()]);
-    for e in std::fs::read_dir(env.repo().join("indexes")).unwrap() {
-        std::fs::remove_file(e.unwrap().path()).unwrap();
+    env.ok(&["prune"]);
+    let out = env.ok(&["rebuild"]);
+    assert!(out.contains("intact"), "{out}");
+    for f in files_under(&env.repo().join("maint/map")) {
+        std::fs::remove_file(f).unwrap();
     }
     env.fails(&["check"]);
-    let out = env.ok(&["rebuild-index"]);
-    assert!(out.contains("pack"), "{out}");
+    let out = env.ok(&["rebuild"]);
+    assert!(out.contains("rebuilt the map as generation 2"), "{out}");
     env.ok(&["check", "--read-data"]);
+    let out = env.ok(&["settings"]);
+    assert!(out.contains("hold:"), "{out}");
 }
 
 #[test]
@@ -471,7 +489,10 @@ fn forget_by_policy_and_by_id() {
     assert!(out.contains("keep ") && out.contains("(last)"), "{out}");
     assert_eq!(env.ok(&["snapshots"]).lines().count(), 2);
 
-    let out = env.ok(&["forget", "latest"]);
+    // 每個 client 與 paths 最新的一份是下一次 backup 的 parent：要明說 --retire
+    let err = env.fails(&["forget", "latest"]);
+    assert!(err.contains("--retire"), "{err}");
+    let out = env.ok(&["forget", "latest", "--retire"]);
     assert!(out.contains("removed 1 snapshot(s)"), "{out}");
     assert!(env.ok(&["snapshots"]).contains("no snapshots"));
 
@@ -504,23 +525,17 @@ fn concurrent_backup_with_the_same_client_id_is_refused() {
     env.ok(&["backup", src.to_str().unwrap()]);
 }
 
+/// prune 走真的時間：刪除要等兩個 grace（至少 2 小時），這裡只驗每一輪寫出新的一代、收錄新的 pack、什麼都
+/// 不刪、之後 check 乾淨；刪除的路徑在 kist-core 以虛擬時鐘測（tests/v4_prune.rs）。v3 的選項不再接受。
 #[test]
-fn prune_marks_then_deletes() {
-    fn packs(env: &Env) -> std::collections::BTreeSet<String> {
-        std::fs::read_dir(env.repo().join("packs"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect()
-    }
+fn prune_writes_a_generation_per_run() {
     let env = Env::new();
     let src = env.dir.path().join("src");
     make_source(&src);
     env.ok(&["init"]);
     env.ok(&["backup", src.to_str().unwrap()]);
-    let original = packs(&env);
     std::fs::remove_file(src.join("big.bin")).unwrap();
     env.ok(&["backup", src.to_str().unwrap()]);
-    // 拿掉第一個 snapshot：big.bin 的 chunk 沒人引用（跟小檔同一個 pack → 部分死亡 → repack）
     let out = env.ok(&["snapshots"]);
     let first_ts = out
         .lines()
@@ -531,48 +546,22 @@ fn prune_marks_then_deletes() {
         .unwrap()
         .to_owned();
     env.ok(&["forget", &first_ts]);
-
-    // grace 0：立刻標記；repack 產生新 pack，舊 pack 還在（要等下一輪）。
-    // 修改時間是整秒，標記不能跟物件同一秒：每次 prune 前等一下
-    let settle = || std::thread::sleep(std::time::Duration::from_millis(1100));
-    settle();
-    let out = env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s"]);
-    assert!(out.contains("deleted 0 object"), "{out}");
-    assert!(out.contains("repacked 1 pack"), "{out}");
-    assert!(original.is_subset(&packs(&env)), "第一階段不能刪 pack");
-    // 活躍 client 在標記後要有新 snapshot 才會刪
-    settle();
-    let out = env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s"]);
-    assert!(out.contains("deleted 0 object"), "{out}");
-    assert!(!out.contains(", 0 held back"), "{out}");
-    assert!(env.repo().join("gc").is_dir());
-    env.ok(&["backup", src.to_str().unwrap()]);
-    settle();
-    let out = env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s"]);
-    assert!(!out.contains("deleted 0 object"), "{out}");
-    assert!(
-        original.is_disjoint(&packs(&env)),
-        "被 repack 的舊 pack 應該刪掉了"
-    );
+    let out = env.ok(&["prune"]);
+    assert!(out.contains("generation 1 written (from 0)"), "{out}");
+    assert!(out.contains("new pack(s) recorded"), "{out}");
+    assert!(out.contains("deleted 0 pack(s)"), "{out}");
+    let out = env.ok(&["prune", "--repack-below", "0"]);
+    assert!(out.contains("generation 2 written (from 1)"), "{out}");
     env.ok(&["check", "--read-data"]);
-
-    // dry-run 不動任何東西
-    let before: Vec<_> = std::fs::read_dir(env.repo().join("indexes"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    env.ok(&["prune", "--grace", "0s", "--clock-skew", "0s", "--dry-run"]);
-    let after: Vec<_> = std::fs::read_dir(env.repo().join("indexes"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(before, after);
-
+    for old in [["prune", "--grace", "0s"], ["prune", "--dry-run", ""]] {
+        let args: Vec<&str> = old.iter().copied().filter(|a| !a.is_empty()).collect();
+        let err = env.fails(&args);
+        assert!(err.contains("unexpected argument"), "{err}");
+    }
     // forget --prune 一次做完
-    settle();
     let out = env.ok(&["forget", "--keep-last", "1", "--prune"]);
     assert!(
-        out.contains("removed 1 snapshot(s)") && out.contains("live packs"),
+        out.contains("kept 1") && out.contains("generation 3 written"),
         "{out}"
     );
     env.ok(&["check", "--read-data"]);
@@ -591,20 +580,13 @@ fn json_flag_outputs_parseable_results() {
 
     let v: Value =
         serde_json::from_str(&env.ok(&["backup", "--json", src.to_str().unwrap()])).unwrap();
-    assert!(v["snapshot_key"]
-        .as_str()
-        .unwrap()
-        .starts_with("snapshots/"));
+    assert!(v["snapshot"].as_str().unwrap().starts_with("snapshots/"));
     assert_eq!(v["stats"]["files"], 3);
-    // v3：roots 取代 root——每個 root 帶 path 與 64 字元 hex 的 tree ID
     assert_eq!(v["roots"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        v["roots"][0]["tree"].as_str().unwrap().len(),
-        64,
-        "roots[0].tree 是 64 字元 hex"
-    );
     assert_eq!(v["roots"][0]["path"], src.to_str().unwrap());
+    assert_eq!(v["roots"][0]["type"], "dir");
     assert!(v["parent"].is_null());
+    assert_eq!(v["generation"], 0);
 
     let v: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 1);
@@ -612,6 +594,7 @@ fn json_flag_outputs_parseable_results() {
     assert_eq!(v[0]["paths"][0], src.to_str().unwrap());
     assert_eq!(v[0]["stats"]["files"], 3);
     assert!(v[0]["key"].as_str().unwrap().contains('/'));
+    assert_eq!(v[0]["roots"][0]["type"], "dir");
 
     let target = env.dir.path().join("out");
     let v: Value =
@@ -640,16 +623,29 @@ fn json_flag_outputs_parseable_results() {
             .unwrap();
     assert_eq!(v["forget"]["dry_run"], false);
     assert_eq!(v["forget"]["kept"].as_array().unwrap().len(), 1);
-    assert_eq!(v["prune"]["dry_run"], false);
-    assert_eq!(v["prune"]["skipped"], Value::Array(vec![]));
+    assert_eq!(v["prune"]["generation"], 1);
+    assert_eq!(v["prune"]["undeleted"], Value::Array(vec![]));
     assert!(v.get("removed").is_none(), "top-level 要是空物件以外的組合");
 
     let v: Value = serde_json::from_str(&env.ok(&["prune", "--json"])).unwrap();
-    assert_eq!(v["dry_run"], false);
-    assert_eq!(v["skipped"], Value::Array(vec![]));
+    assert_eq!(v["generation"], 2);
+    assert_eq!(v["undeleted"], Value::Array(vec![]));
 
-    let v: Value = serde_json::from_str(&env.ok(&["rebuild-index", "--json"])).unwrap();
-    assert!(v["packs"].as_u64().unwrap() >= 1);
+    let v: Value = serde_json::from_str(&env.ok(&["rebuild", "--json"])).unwrap();
+    assert!(v["generation"].is_null(), "the map is intact: {v}");
+    assert_eq!(v["lost"], 2);
+
+    let v: Value = serde_json::from_str(&env.ok(&["settings", "--json"])).unwrap();
+    assert_eq!(v["generation"], 2);
+    assert_eq!(v["settings"]["grace"], 72 * 3600);
+    let v: Value =
+        serde_json::from_str(&env.ok(&["settings", "--json", "--grace", "100h"])).unwrap();
+    assert_eq!(v["generation"], 3);
+    assert_eq!(v["settings"]["grace"], 100 * 3600);
+
+    let v: Value = serde_json::from_str(&env.ok(&["key", "list", "--json"])).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["current"], true);
 
     // run --once --json：JobOutcome 陣列
     let pw = env.dir.path().join("pw.txt");
@@ -698,15 +694,16 @@ fn forget_prune_json_still_reports_forget_when_prune_fails() {
     make_source(&src);
     env.ok(&["init"]);
     env.ok(&["backup", src.to_str().unwrap()]);
-    // snapshot key 的時間是秒級，第二個 backup 要換一秒
-    std::thread::sleep(std::time::Duration::from_millis(1100));
     env.ok(&["backup", src.to_str().unwrap()]);
 
-    // trees/ 讀不到 → forget 照常刪 snapshot，接著的 prune 在規劃階段失敗
-    let trees = env.repo().join("trees");
-    std::fs::set_permissions(&trees, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // packs/ 讀不到 → forget 照常刪 snapshot（它只讀 snapshot 與 roots），接著的 prune 列 packs/ 時失敗
+    if nix_is_root() {
+        return; // root 讀得到 0o000 的目錄
+    }
+    let packs = env.repo().join("packs");
+    std::fs::set_permissions(&packs, std::fs::Permissions::from_mode(0o000)).unwrap();
     let (ok, stdout, stderr) = env.kist(&["forget", "--json", "--keep-last", "1", "--prune"]);
-    std::fs::set_permissions(&trees, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&packs, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(!ok, "prune should have failed\nstdout: {stdout}");
     assert!(
@@ -919,26 +916,12 @@ fn check_json_repair_output_is_pure_json() {
     env.ok(&["init"]);
     env.ok(&["backup", "--parity", "2", src.to_str().unwrap()]);
 
-    // 弄壞一個 pack（中間一個 byte）：hash 一定不符，parity 修得回來
-    let packs = env.repo().join("packs");
-    let mut pack_files: Vec<_> = std::fs::read_dir(&packs)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.is_file())
-        .collect();
-    pack_files.sort();
-    assert!(!pack_files.is_empty(), "backup 後應該有 pack");
-    let victim_id = pack_files[0]
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let mut data = std::fs::read(&pack_files[0]).unwrap();
-    let mid = data.len() / 2;
-    data[mid] ^= 0x01;
-    std::fs::write(&pack_files[0], &data).unwrap();
-
+    // 本機的 replicas=1：mpack 有 .r1。拿掉一份 → check --repair 從主體建立（只在不存在時建立）
+    let r1 = files_under(&env.repo().join("mpacks"))
+        .into_iter()
+        .find(|p| p.to_str().unwrap().ends_with(".r1"))
+        .expect("an mpack .r1");
+    std::fs::remove_file(&r1).unwrap();
     let (ok, stdout, stderr) = env.kist(&["check", "--json", "--repair"]);
     assert!(
         ok,
@@ -946,12 +929,34 @@ fn check_json_repair_output_is_pure_json() {
     );
     let report: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout 不是純 JSON（{e}）：\n{stdout}"));
-    let repaired = report["repaired"].as_array().expect("repaired 欄位");
+    let name = r1.file_name().unwrap().to_str().unwrap();
     assert!(
-        repaired
+        report["repaired"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|v| v.as_str().is_some_and(|s| s.ends_with(&victim_id))),
-        "壞掉的 pack {victim_id} 應該被修復：{report}"
+            .any(|v| v.as_str().is_some_and(|s| s.contains(name))),
+        "{report}"
+    );
+    assert!(r1.is_file(), "recreated");
+
+    // 弄壞一個資料 pack：v4 不覆寫，check 回報錯誤，parity 修得回就列在 repairable
+    let pack = files_under(&env.repo().join("packs"))[0].clone();
+    let mut data = std::fs::read(&pack).unwrap();
+    let mid = data.len() / 2;
+    data[mid] ^= 0x01;
+    std::fs::write(&pack, &data).unwrap();
+    let (ok, stdout, _) = env.kist(&["check", "--json", "--read-data"]);
+    assert!(!ok);
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let id = pack.file_name().unwrap().to_str().unwrap();
+    assert!(
+        report["repairable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains(id))),
+        "{report}"
     );
 }
 

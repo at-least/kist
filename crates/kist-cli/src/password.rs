@@ -34,3 +34,22 @@ pub fn obtain(password_file: &Option<PathBuf>, confirm: bool) -> Result<Zeroizin
     }
     Ok(pw)
 }
+
+/// `key add` 的新密碼：`--new-password-file`（同樣取第一行），不然在終端機輸入兩次。
+pub fn obtain_new(password_file: &Option<PathBuf>) -> Result<Zeroizing<String>> {
+    if let Some(path) = password_file {
+        return Ok(kist_app::config::read_password_file(path)?);
+    }
+    let pw = Zeroizing::new(
+        rpassword::prompt_password("new password: ")
+            .context("cannot read the new password from the terminal (use --new-password-file)")?,
+    );
+    if pw.is_empty() {
+        bail!("password must not be empty");
+    }
+    let again = Zeroizing::new(rpassword::prompt_password("confirm new password: ")?);
+    if *again != *pw {
+        bail!("passwords do not match");
+    }
+    Ok(pw)
+}

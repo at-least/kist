@@ -1,14 +1,16 @@
-//! backup 的排除規則（`BackupOptions::exclude`，ADR 020）：被排除的檔案與目錄不進
-//! snapshot、計進 `report.excluded`；指名的來源本身不會被排除；樣式比對的是節點在
-//! snapshot 裡的路徑（本機來源＝canonical 絕對路徑）。
+//! v4 backup 的排除規則（`BackupOptions::exclude`，ADR 020）：被排除的檔案與目錄不進 snapshot、計進
+//! `report.excluded`；指名的來源本身不會被排除；樣式比對的是節點在 snapshot 裡的路徑（本機來源＝canonical
+//! 絕對路徑）。搬自 v3 的 `backup_exclude.rs`（v4 的走訪是 v3 的複製）；不碰 repo 的幾個原樣搬過來。
 
-mod common;
+#[path = "v4_common/mod.rs"]
+mod v4_common;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use common::*;
-use kist_core::{BackupOptions, Exclusions, Marker, PathFilter, RestoreOptions};
+use kist_core::v4::BackupOptions;
+use kist_core::{Exclusions, Marker, PathFilter, RestoreOptions};
+use v4_common::*;
 
 fn excluding(patterns: &[&str]) -> BackupOptions {
     with(Exclusions {
@@ -31,7 +33,7 @@ async fn round_trip(t: &TestRepo, src: &Path, opts: BackupOptions) -> (BTreeSet<
     assert_eq!(s.report.errors, 0, "{:?}", s.report);
     let target = tempfile::tempdir_in(t.dir.path()).unwrap().keep();
     let r = repo
-        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .restore(&skey(&s.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -110,7 +112,7 @@ async fn excluded_paths_are_left_out_and_counted() {
 
     let target = t.dir.path().join("out");
     let r = repo
-        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .restore(&skey(&s.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -171,11 +173,20 @@ async fn a_second_backup_with_the_same_excludes_reuses_everything() {
         .backup(std::slice::from_ref(&src), excluding(&patterns))
         .await
         .unwrap();
-    assert_eq!(second.parent.as_deref(), Some(first.snapshot_key.as_str()));
+    assert_eq!(second.parent.as_deref(), Some(first.snapshot.as_str()));
     assert_eq!(second.report.chunks_new, 0, "{:?}", second.report);
     assert_eq!(second.report.files_reused, first.stats.files);
     assert_eq!(second.report.excluded, first.report.excluded);
-    assert_eq!(second.roots, first.roots, "內容沒變：同一組 root tree");
+    let roots = |s: &str| {
+        let key = skey(s);
+        let repo = &repo;
+        async move { repo.read_snapshot(&key).await.unwrap().roots }
+    };
+    assert_eq!(
+        roots(&second.snapshot).await,
+        roots(&first.snapshot).await,
+        "內容沒變：同一組 root"
+    );
 }
 
 /// README／ADR 020 的例子：遠端 root 只剝掉 `scheme://`，URL 裡的 `[user@]host[:port]` 原樣是
@@ -406,7 +417,7 @@ async fn a_named_source_inside_another_is_never_excluded() {
     assert_eq!(s.roots.len(), 1, "巢狀的指名來源仍併進外層的 root");
     let target = tempfile::tempdir_in(t.dir.path()).unwrap().keep();
     let r = repo
-        .restore(&s.snapshot_key, &target, RestoreOptions::default())
+        .restore(&skey(&s.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -461,7 +472,7 @@ async fn an_unreadable_marker_without_a_header_still_counts() {
     )
     .unwrap();
     let target = tempfile::tempdir_in(t.dir.path()).unwrap().keep();
-    repo.restore(&s.snapshot_key, &target, RestoreOptions::default())
+    repo.restore(&skey(&s.snapshot), &target, RestoreOptions::default())
         .await
         .unwrap();
     let abs = std::fs::canonicalize(&src).unwrap();

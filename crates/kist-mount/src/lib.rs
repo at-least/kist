@@ -1,10 +1,10 @@
 //! kist-mount：把 repo 的 snapshots 掛成**唯讀**檔案系統（FUSE）。
 //!
 //! 佈局：`<client id hex>/<timestamp>/<備份的樹>`。備份來源是絕對路徑
-//! （`/tmp/x/src`），根目錄會展開成虛擬的中介層級讓你一路瀏覽下去
-//! （見 [`vpath`]）。頂兩層 volatile（TTL 1 秒，重複 ls 看得到新 snapshot）、
-//! snapshot 內容 immutable（TTL 24 小時）。檔案讀取走 index 的
-//! `raw_len` 直接定位 chunk（隨機讀不用先解前面的資料），解密後的 chunk
+//! （`/tmp/x/src`），snapshot 的頂層照 roots 的定位展開成中介層級讓你一路瀏覽下去
+//! （見 [`v4`]）。頂兩層 volatile（TTL 1 秒，重複 ls 看得到新 snapshot）、
+//! snapshot 內容 immutable（TTL 24 小時）。檔案讀取以持有者記錄的 chunk 長度
+//! 直接定位 chunk（隨機讀不用先解前面的資料），解密後的 chunk
 //! 有小 LRU（預設 8 顆 = 8 MiB chunk 時 64 MiB 上限）。
 //!
 //! 執行模型：fuser 0.18 的 callback 是同步 `&self`，非同步工作用共用的
@@ -17,19 +17,17 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-pub mod corefs;
 pub mod offsets;
 pub mod v4;
-pub mod vpath;
 
 use std::path::{Path, PathBuf};
 
-use kist_core::Repository;
+use kist_core::v4::Repo;
 
 #[cfg(unix)]
 mod fuse;
 
-pub use corefs::{Attr, DirEntryData, FsCore, FsError, Kind, Lookup, MountConfig};
+pub use v4::{Attr, DirEntryData, FsCore, FsError, Kind, Lookup, MountConfig};
 
 #[cfg(unix)]
 pub use fuse::KistFs;
@@ -76,18 +74,14 @@ impl Drop for Mounted {
 }
 
 /// 把 `repo` 掛到 `mountpoint`（必須已存在、最好是空目錄）。回傳時掛載已生效。
-/// **async**：`FsCore::new` 要先載 index——在呼叫端的 runtime 上做（絕不能在
+/// **async**：`FsCore::new` 要先列出 snapshot、載入世代——在呼叫端的 runtime 上做（絕不能在
 /// 另一個 runtime 的 context 裡 `block_on`，tokio 會直接 panic）。
 ///
 /// fuser event loop 在 Linux 上開 4 條；本函式另建的 tokio runtime worker 開
 /// `4 × 2` 條（advisor 的 deadlock 鐵律：block_on park 住的 fuser 執行緒不算
 /// 勞動力，worker 必須足夠）。macOS 的 fuser 只支援單一 event loop。
 #[cfg(unix)]
-pub async fn mount(
-    repo: Repository,
-    mountpoint: &Path,
-    config: MountConfig,
-) -> std::io::Result<Mounted> {
+pub async fn mount(repo: Repo, mountpoint: &Path, config: MountConfig) -> std::io::Result<Mounted> {
     #[cfg(target_os = "linux")]
     let event_loops = 4usize;
     #[cfg(not(target_os = "linux"))]

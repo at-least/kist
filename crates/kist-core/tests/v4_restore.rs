@@ -1,6 +1,6 @@
 //! v4 的 restore：backup → restore 的往返、§9 依 `Root.t` 的落點、§7 的 chunk 索引，以及從 v3 的
 //! `restore_hardening.rs` 搬過來的走訪層強化（重複還原、擋路的東西、壞掉的 chunk、過深的目錄、唯讀目錄、
-//! 硬連結、metadata 的順序；ADR 019）。檔案系統那一層的單元行為由 v3 的測試覆蓋（共用 `crate::restore`）。
+//! 硬連結、metadata 的順序；ADR 019）。metadata 經寫入時的 handle 套用的測試（ADR 019 A2、A3）是 `crate::v4::restore` 的單元測試。
 
 #[path = "v4_common/mod.rs"]
 mod v4_common;
@@ -10,7 +10,7 @@ use kist_core::{CoreError, RestoreOptions};
 use kist_format::v4::ids::{ChunkId, ItemId, MetaId};
 use kist_format::v4::keys::Key;
 use kist_format::v4::meta::{
-    content_type, meta_kind, node_type, ChunkIndex, ChunkList, ChunkPart, Entry, Item, Seg,
+    content_type, kind, meta_kind, node_type, ChunkIndex, ChunkList, ChunkPart, Entry, Item, Seg,
 };
 use kist_format::v4::snapshot::Root;
 use v4_common::*;
@@ -461,6 +461,87 @@ async fn corrupt_chunk_fails_only_that_file() {
         s.stats.files,
         "還原成功 + 失敗 = 全部檔案；{summary:?}"
     );
+}
+
+/// 間接內容的 chunk 清單同樣要比 `v`（v3 的 ADR 019 A10）：版本不認得的清單是那個檔案的錯誤，restore 不寫
+/// 那個檔、其餘照常還原；check（不讀資料也會解開清單）回報。解碼端的版本檢查在 kist-format 測（meta.rs），這裡
+/// 測它在 restore 與 check 裡浮上來。
+#[tokio::test]
+async fn a_chunk_list_of_an_unknown_version_fails_only_that_file() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let chunks = small_chunks(&t, &repo, 2).await;
+    let (listed, listed_id) = &chunks[0];
+    let (plain, plain_id) = &chunks[1];
+    let list = kist_format::cbor::encode(&ChunkList {
+        v: kist_format::v4::VERSION + 1,
+        k: kind::CHUNK_LIST,
+        chunks: vec![*listed_id],
+    })
+    .unwrap();
+    let mut f = entry(b"listed.bin", node_type::FILE, meta_kind::GENERIC);
+    f.size = listed.len() as u64;
+    f.ct = content_type::INDIRECT;
+    f.chunks = vec![ItemId::from(repo.keys().meta_id(&list))];
+    let (root, seg) = dir_root(
+        &repo,
+        b"/evil",
+        vec![f, file(b"plain.bin", &[*plain_id], plain.len() as u64)],
+    );
+    let key = hand_snapshot_raw(
+        &repo,
+        client(0x11),
+        hours_from_now(1),
+        vec![root],
+        vec![seg.encode().unwrap(), list],
+    )
+    .await;
+
+    let target = t.dir.path().join("out");
+    let summary = repo
+        .restore(&key, &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.errors.len(), 1, "{summary:?}");
+    assert!(summary.errors[0].contains("listed.bin"), "{summary:?}");
+    assert!(!target.join("evil/listed.bin").exists());
+    assert_eq!(
+        std::fs::read(target.join("evil/plain.bin")).unwrap(),
+        *plain
+    );
+    let report = repo
+        .check(kist_core::v4::check::CheckOptions {
+            read_data: false,
+            repair: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        report.errors.iter().any(|e| e.contains("version")),
+        "{:?}",
+        report.errors
+    );
+}
+
+/// tree 裡的子節點名稱由 repo 內容決定；含分隔符或 `..` 的名稱不能讓 restore 逃出目標目錄。搬自 v3 的
+/// `restore_hardening.rs`（`fsmeta::validate_child_name` 共用；v4 的解碼也拒絕這些名稱，見 kist-format）。
+#[test]
+fn child_names_that_escape_are_rejected() {
+    use kist_core::fsmeta::validate_child_name;
+    for bad in [&b""[..], b".", b"..", b"a/b", b"a\0b", b"/etc/passwd"] {
+        assert!(validate_child_name(bad).is_err(), "{bad:?} 應該被拒絕");
+    }
+    // 反斜線在 Unix 是合法檔名，在 Windows 是分隔符
+    assert_eq!(validate_child_name(b"a\\b").is_err(), cfg!(windows));
+    for good in [
+        &b"a"[..],
+        b"..a",
+        b"a..",
+        "中文.txt".as_bytes(),
+        b"weird name with spaces",
+    ] {
+        assert!(validate_child_name(good).is_ok(), "{good:?} 應該可以");
+    }
 }
 
 /// snapshot 可以帶一個 symlink，另一個 root 的定位穿過它。restore 不得透過那個 symlink 寫到目標之外：目錄路徑
