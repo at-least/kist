@@ -98,7 +98,7 @@ pub struct PruneReport {
 
 /// P2 列出來的一個 pack 或 mpack：主體與 `.r1` 各自的 (大小, 修改時間)。
 #[derive(Debug, Clone, Copy)]
-struct Listed {
+pub(crate) struct Listed {
     client: ClientId,
     kind: Kind,
     body: Option<(u64, i64)>,
@@ -107,7 +107,7 @@ struct Listed {
 
 impl Listed {
     /// 主體的大小與修改時間；只有 `.r1` 時用它的。
-    fn first(&self) -> (u64, i64) {
+    pub(crate) fn first(&self) -> (u64, i64) {
         self.body.or(self.r1).unwrap_or_default()
     }
 }
@@ -129,6 +129,137 @@ enum Copy {
     False(String),
     /// pack 不在了。
     Missing,
+}
+
+/// P2 的 `packs/` 與 `mpacks/`（含 `.r1`）：名稱 → 列表裡的主體與 `.r1`。不是 v4 的 key、同一個名稱又出現在
+/// 別的前綴下的略過並回報（第二個回傳值）。
+pub(crate) async fn list_packs(
+    backend: &kist_backend::Backend,
+) -> Result<(BTreeMap<ObjectId, Listed>, Vec<String>)> {
+    let mut packs: BTreeMap<ObjectId, Listed> = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for prefix in [PACKS, MPACKS] {
+        for o in backend.list(prefix.trim_end_matches('/')).await? {
+            let (client, id, kind, replica) = match Key::parse(&o.key) {
+                Ok(Key::Pack { client, id }) => (client, id, Kind::Data, false),
+                Ok(Key::Mpack {
+                    client,
+                    id,
+                    replica,
+                }) => (client, id, Kind::Meta, replica),
+                _ => {
+                    warnings.push(format!("{}: not a v4 pack key; ignored", o.key));
+                    continue;
+                }
+            };
+            let e = packs.entry(id).or_insert(Listed {
+                client,
+                kind,
+                body: None,
+                r1: None,
+            });
+            if e.client != client || e.kind != kind {
+                warnings.push(format!(
+                    "{}: the same pack name is also listed under another prefix; ignored",
+                    o.key
+                ));
+                continue;
+            }
+            let at = Some((o.size, unix_ns(o.modified)));
+            if replica {
+                e.r1 = at;
+            } else {
+                e.body = at;
+            }
+        }
+    }
+    Ok((packs, warnings))
+}
+
+/// P4（重建也用）：讀新進者的 trailer（主體，mpack 不行再讀 `.r1`）。讀得了 → live；內容讀不了 → unreadable；
+/// 版本不認得 → unknown（不使用、不刪除，兩份之中有一份是就算）。讀的時候後端的錯誤（不是「不存在」）回錯誤：
+/// 一次逾時不能讓好的 pack 變成 unreadable。列表之後就不見了回 `None`。第二個值是要回報的話。
+pub(crate) async fn newcomer(
+    repo: &Repo,
+    id: ObjectId,
+    l: &Listed,
+    since: Gen,
+) -> Result<Option<(Record, Option<String>)>> {
+    let mut copies = Vec::new();
+    if let Some((size, _)) = l.body {
+        copies.push((pack_key(l.kind, l.client, id), size));
+    }
+    if let (Some((size, _)), Kind::Meta) = (l.r1, l.kind) {
+        copies.push((
+            Key::Mpack {
+                client: l.client,
+                id,
+                replica: true,
+            },
+            size,
+        ));
+    }
+    let mut status_ = None;
+    let mut entries = Vec::new();
+    let mut reasons = Vec::new();
+    for (key, size) in copies {
+        match repo.trailer_sized(&key, size).await {
+            Ok(t) => {
+                entries = t.entries;
+                status_ = Some(Status::LIVE);
+                break;
+            }
+            Err(CoreError::FormatV4(e @ kist_format::v4::Error::Version { .. })) => {
+                reasons.push(e.to_string());
+                status_ = Some(Status {
+                    s: status::UNKNOWN,
+                    at: 0,
+                    age: 0,
+                });
+            }
+            Err(e) if not_found(&e) => {}
+            Err(e @ CoreError::Backend(_)) => return Err(e),
+            Err(e) => {
+                reasons.push(e.to_string());
+                if status_.is_none() {
+                    status_ = Some(Status {
+                        s: status::UNREADABLE,
+                        at: 0,
+                        age: 0,
+                    });
+                }
+            }
+        }
+    }
+    let Some(st) = status_ else {
+        return Ok(None);
+    };
+    let key = pack_key(l.kind, l.client, id).path();
+    let warning = match st.s {
+        status::UNKNOWN => Some(format!(
+            "{key}: unknown trailer version ({}); kept, not used, not deleted",
+            reasons.join("; ")
+        )),
+        status::UNREADABLE => Some(format!(
+            "{key}: unreadable ({}); nobody uses it, a later prune deletes it",
+            reasons.join("; ")
+        )),
+        _ => None,
+    };
+    Ok(Some((
+        Record {
+            id,
+            client: l.client,
+            kind: l.kind,
+            size: l.first().0,
+            entries,
+            by_prune: false,
+            since,
+            status: st,
+            held: false,
+        },
+        warning,
+    )))
 }
 
 fn not_found(e: &CoreError) -> bool {
@@ -411,41 +542,10 @@ impl Prune {
                 delta,
             ));
         }
-        for prefix in [PACKS, MPACKS] {
-            for o in backend.list(prefix.trim_end_matches('/')).await? {
-                let (client, id, kind, replica) = match Key::parse(&o.key) {
-                    Ok(Key::Pack { client, id }) => (client, id, Kind::Data, false),
-                    Ok(Key::Mpack {
-                        client,
-                        id,
-                        replica,
-                    }) => (client, id, Kind::Meta, replica),
-                    _ => {
-                        self.warn(format!("{}: not a v4 pack key; ignored", o.key));
-                        continue;
-                    }
-                };
-                let e = self.packs.entry(id).or_insert(Listed {
-                    client,
-                    kind,
-                    body: None,
-                    r1: None,
-                });
-                if e.client != client || e.kind != kind {
-                    let msg = format!(
-                        "{}: the same pack name is also listed under another prefix; ignored",
-                        o.key
-                    );
-                    self.warn(msg);
-                    continue;
-                }
-                let at = Some((o.size, unix_ns(o.modified)));
-                if replica {
-                    e.r1 = at;
-                } else {
-                    e.body = at;
-                }
-            }
+        let (packs, warnings) = list_packs(&backend).await?;
+        self.packs = packs;
+        for w in warnings {
+            self.warn(w);
         }
         for o in backend.list(PARITY.trim_end_matches('/')).await? {
             match Key::parse(&o.key) {
@@ -520,80 +620,13 @@ impl Prune {
             .map(|(id, l)| (*id, *l))
             .collect();
         for (id, l) in fresh {
-            let mut copies = Vec::new();
-            if let Some((size, _)) = l.body {
-                copies.push((pack_key(l.kind, l.client, id), size));
+            let Some((rec, warning)) = newcomer(&self.session.repo, id, &l, next).await? else {
+                continue;
+            };
+            if let Some(w) = warning {
+                self.warn(w);
             }
-            if let (Some((size, _)), Kind::Meta) = (l.r1, l.kind) {
-                copies.push((
-                    Key::Mpack {
-                        client: l.client,
-                        id,
-                        replica: true,
-                    },
-                    size,
-                ));
-            }
-            let mut status_ = None;
-            let mut entries = Vec::new();
-            let mut reasons = Vec::new();
-            for (key, size) in copies {
-                match self.session.repo.trailer_sized(&key, size).await {
-                    Ok(t) => {
-                        entries = t.entries;
-                        status_ = Some(Status::LIVE);
-                        break;
-                    }
-                    Err(CoreError::FormatV4(e @ kist_format::v4::Error::Version { .. })) => {
-                        reasons.push(e.to_string());
-                        status_ = Some(Status {
-                            s: status::UNKNOWN,
-                            at: 0,
-                            age: 0,
-                        });
-                    }
-                    Err(e) if not_found(&e) => {}
-                    Err(e @ CoreError::Backend(_)) => return Err(e),
-                    Err(e) => {
-                        reasons.push(e.to_string());
-                        if status_.is_none() {
-                            status_ = Some(Status {
-                                s: status::UNREADABLE,
-                                at: 0,
-                                age: 0,
-                            });
-                        }
-                    }
-                }
-            }
-            // 列表之後就不見了：下一輪再看
-            let Some(st) = status_ else { continue };
-            let key = pack_key(l.kind, l.client, id).path();
-            match st.s {
-                status::UNKNOWN => self.warn(format!(
-                    "{key}: unknown trailer version ({}); kept, not used, not deleted",
-                    reasons.join("; ")
-                )),
-                status::UNREADABLE => self.warn(format!(
-                    "{key}: unreadable ({}); nobody uses it, a later prune deletes it",
-                    reasons.join("; ")
-                )),
-                _ => {}
-            }
-            self.map.insert(
-                id,
-                Record {
-                    id,
-                    client: l.client,
-                    kind: l.kind,
-                    size: l.first().0,
-                    entries,
-                    by_prune: false,
-                    since: next,
-                    status: st,
-                    held: false,
-                },
-            );
+            self.map.insert(id, rec);
             self.report.newcomers += 1;
         }
         Ok(())

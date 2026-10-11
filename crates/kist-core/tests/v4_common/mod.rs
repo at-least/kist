@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod harness;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
