@@ -29,8 +29,12 @@ struct T {
 }
 
 async fn setup() -> T {
+    setup_with(1).await
+}
+
+async fn setup_with(replicas: u8) -> T {
     let clock = VClock::new();
-    let hooked = HookedRepo::with_clock(init_options(1), Some(Arc::clone(&clock))).await;
+    let hooked = HookedRepo::with_clock(init_options(replicas), Some(Arc::clone(&clock))).await;
     let repo = hooked.open_uncached().await;
     T {
         clock,
@@ -60,8 +64,14 @@ impl T {
     }
 
     async fn try_prune(&self) -> kist_core::Result<PruneReport> {
+        self.prune_with(kist_core::v4::prune::DEFAULT_REPACK_BELOW)
+            .await
+    }
+
+    async fn prune_with(&self, repack_below: u8) -> kist_core::Result<PruneReport> {
         self.repo
             .prune(PruneOptions {
+                repack_below,
                 clock: self.clock.clock(),
             })
             .await
@@ -139,6 +149,17 @@ impl T {
         kind: Kind,
         items: &[(ItemId, Vec<u8>)],
     ) -> (ObjectId, Vec<PackEntry>) {
+        self.hand_pack_with_parity(c, kind, items, 0).await
+    }
+
+    /// 同 [`T::hand_pack`]，另寫 `m` 片 parity（0 不寫）。
+    async fn hand_pack_with_parity(
+        &self,
+        c: u8,
+        kind: Kind,
+        items: &[(ItemId, Vec<u8>)],
+        m: usize,
+    ) -> (ObjectId, Vec<PackEntry>) {
         let mut w = PackWriter::new(Arc::clone(self.repo.keys()), kind, u64::MAX, 64 * 1024);
         for (id, plain) in items {
             w.add(*id, plain).unwrap();
@@ -155,6 +176,21 @@ impl T {
                 replica: false,
             },
         };
+        if m > 0 {
+            let parity = kist_format::v4::parity::encode(&p.id, &p.bytes, m).unwrap();
+            self.repo
+                .backend()
+                .put_if_absent(
+                    &Key::Parity {
+                        client: client(c),
+                        id: p.id,
+                    }
+                    .path(),
+                    parity,
+                )
+                .await
+                .unwrap();
+        }
         self.repo
             .backend()
             .put_if_absent(&key.path(), p.bytes)
@@ -1546,4 +1582,259 @@ async fn p5_a_chunk_held_only_by_a_tombstone_is_refused() {
         matches!(&err, CoreError::Unsafe(m) if m.contains("chunk") && m.contains("no readable holder")),
         "{err}"
     );
+}
+
+/// 同一個目錄先有小的 a 與大的 b、再只剩 a：forget 第一份之後，a 與 b 同一個資料 pack，當正本的只有 a（約兩成）。
+/// 回傳 (那個 pack, 第二份 snapshot)。
+async fn sparse_pack(t: &T) -> (ObjectId, String) {
+    t.write("d", "a", &data("a", 10 * 1024));
+    t.write("d", "b", &data("b", 40 * 1024));
+    let first = t.backup(1, "d").await;
+    let packs = t.pack_ids("packs").await;
+    assert_eq!(packs.len(), 1, "a and b share one data pack");
+    std::fs::remove_file(t.src.path().join("d/b")).unwrap();
+    let second = t.backup(1, "d").await;
+    assert_eq!(t.pack_ids("packs").await, packs, "a is reused, nothing new");
+    t.forget(&first).await;
+    (packs[0], second)
+}
+
+/// 還原 `snapshot` 到暫存目錄，回傳 d 底下的檔案。
+async fn restored(t: &T, snapshot: &str) -> BTreeMap<String, Node> {
+    let target = tempfile::tempdir().unwrap();
+    let r = t
+        .repo
+        .restore(
+            &Key::parse(snapshot).unwrap(),
+            target.path(),
+            kist_core::RestoreOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(r.errors.is_empty(), "{r:?}");
+    let segs = kist_format::v4::snapshot::split_locator(
+        t.src.path().join("d").to_str().unwrap().as_bytes(),
+    )
+    .unwrap();
+    let mut dir = target.path().to_path_buf();
+    for s in segs {
+        dir.push(String::from_utf8(s).unwrap());
+    }
+    source_tree(&dir)
+}
+
+fn only_a() -> BTreeMap<String, Node> {
+    [("a".to_owned(), Node::File(data("a", 10 * 1024)))].into()
+}
+
+const MAINT: kist_format::v4::ids::ClientId = kist_format::v4::ids::ClientId::MAINT;
+
+/// P7c：live、是正本、比 grace 老、有效比例低的 pack 被 repack：當正本的項目寫進全零 client 前綴下的新 pack
+/// （by_prune、讀回驗證過），舊的 condemned、保留全部項目，之後照常刪除；snapshot 一路還原得出來。
+#[tokio::test]
+async fn p7c_a_sparse_old_pack_is_repacked_and_the_snapshot_still_restores() {
+    let t = setup().await;
+    let (p, second) = sparse_pack(&t).await;
+    t.prune().await; // g1
+    let entries = t.records().await[&p].entries.len();
+    let r = t.prune_after(73).await; // g2：還不夠老
+    assert_eq!(r.repacked, 0);
+    let r = t.prune_after(73).await; // g3：repack
+    assert_eq!(r.repacked, 1);
+    let recs = t.records().await;
+    let old = &recs[&p];
+    assert_eq!((old.status.s, old.status.at), (status::CONDEMNED, 3));
+    assert_eq!(old.entries.len(), entries, "the old pack keeps every entry");
+    let new: Vec<&Record> = recs.values().filter(|r| r.by_prune).collect();
+    assert_eq!(new.len(), 1);
+    let n = new[0];
+    assert_eq!((n.client, n.status.s, n.since), (MAINT, status::LIVE, 3));
+    assert!(n.entries.len() < entries);
+    assert!(t.hooked.keys(&format!("packs/{MAINT}")).await.contains(
+        &Key::Pack {
+            client: MAINT,
+            id: n.id
+        }
+        .path()
+    ));
+    assert_eq!(restored(&t, &second).await, only_a());
+    t.prune_after(73).await;
+    t.prune_after(73).await; // 舊的 tombstone、刪除
+    assert!(!t.pack_ids("packs").await.contains(&p));
+    assert_eq!(
+        restored(&t, &second).await,
+        only_a(),
+        "read from the new pack"
+    );
+}
+
+/// P7c 的比例：當正本的項目不低於 `repack_below` 就不 repack；0 不依比例 repack。
+#[tokio::test]
+async fn p7c_a_dense_pack_or_repack_below_zero_is_not_repacked() {
+    let t = setup().await;
+    let (p, _) = sparse_pack(&t).await;
+    t.prune().await;
+    t.prune_after(73).await;
+    t.clock.advance_hours(73);
+    let r = t.prune_with(0).await.unwrap();
+    assert_eq!(r.repacked, 0, "0 disables ratio repacks");
+    let r = t.prune_with(15).await.unwrap();
+    assert_eq!(r.repacked, 0, "about a fifth is live, not under 15%");
+    let r = t.prune_with(50).await.unwrap();
+    assert_eq!(r.repacked, 1);
+    assert_eq!(t.records().await[&p].status.s, status::CONDEMNED);
+}
+
+/// P7c：新 pack 讀回驗證失敗 → 新的記為 unreadable、舊的維持 live、回報。
+#[tokio::test]
+async fn p7c_a_new_pack_that_does_not_read_back_leaves_the_old_one_live() {
+    let t = setup().await;
+    let (p, second) = sparse_pack(&t).await;
+    t.prune().await;
+    t.prune_after(73).await;
+    *t.hooked.store.corrupt_puts_under.lock().unwrap() = Some(format!("packs/{MAINT}"));
+    let r = t.prune_after(73).await;
+    assert_eq!(r.repacked, 0);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("does not read back")),
+        "{:?}",
+        r.warnings
+    );
+    let recs = t.records().await;
+    assert_eq!(recs[&p].status.s, status::LIVE);
+    let bad: Vec<&Record> = recs.values().filter(|r| r.client == MAINT).collect();
+    assert_eq!(bad.len(), 1);
+    assert_eq!(bad[0].status.s, status::UNREADABLE);
+    assert!(!bad[0].by_prune);
+    *t.hooked.store.corrupt_puts_under.lock().unwrap() = None;
+    assert_eq!(restored(&t, &second).await, only_a());
+}
+
+/// hold 期間不 repack（§11.4）。
+#[tokio::test]
+async fn p7c_no_repack_during_a_hold() {
+    let t = setup().await;
+    sparse_pack(&t).await;
+    t.prune().await;
+    t.prune_after(73).await;
+    t.clock.advance_hours(73);
+    t.hand_generation(|_, h| {
+        h.hold = Some(kist_format::v4::index::Hold {
+            from: h.g,
+            lost: h.g,
+            grace: 72 * HOUR,
+        });
+    })
+    .await;
+    let r = t.prune().await;
+    assert_eq!(r.repacked, 0);
+}
+
+/// 規格錯誤第 17 項的修法 D：唯一持有 metadata item 的 mpack 位元損壞，有 parity → P5 在記憶體裡修復、照樣走訪；
+/// P7c 把它當正本的項目寫進 by_prune 的新 mpack（不論新舊、比例），損壞的那個 condemned、之後照常刪除。沒有 D
+/// 的話這一項從記錄移除、沒有持有者，prune 一直拒絕到有人 forget。
+#[tokio::test]
+async fn d_a_damaged_sole_metadata_holder_with_parity_is_repaired_and_repacked() {
+    let t = setup_with(0).await;
+    t.write("d", "a", &data("a", 10 * 1024));
+    let mut o = opts(1);
+    o.clock = t.clock.clock();
+    o.parity = 2;
+    let snap = t
+        .repo
+        .backup(&[t.src.path().join("d")], o)
+        .await
+        .unwrap()
+        .snapshot;
+    t.prune().await; // g1
+    let mpacks = t.pack_ids("mpacks").await;
+    assert_eq!(mpacks.len(), 1);
+    let m = mpacks[0];
+    let rec = t.records().await[&m].clone();
+    damage(
+        &t,
+        &Key::Mpack {
+            client: client(1),
+            id: m,
+            replica: false,
+        },
+        &rec.entries[0],
+    )
+    .await;
+    let r = t.prune().await; // g2
+    assert_eq!((r.repaired, r.repacked, r.false_entries), (1, 1, 0));
+    let recs = t.records().await;
+    assert_eq!(recs[&m].status.s, status::CONDEMNED);
+    let n: Vec<&Record> = recs.values().filter(|r| r.by_prune).collect();
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0].kind, Kind::Meta);
+    assert_eq!(restored(&t, &snap).await, only_a());
+    t.prune_after(73).await;
+    t.prune_after(73).await;
+    assert!(
+        !t.pack_ids("mpacks").await.contains(&m),
+        "the damaged mpack is deleted"
+    );
+    assert_eq!(restored(&t, &snap).await, only_a());
+}
+
+/// 修法 D 在 P7d：正本 C 的副本位元損壞、有 parity → 不移除；這一輪不憑修好的副本把 condemned 的 X 標成
+/// tombstone，C 由 repack 寫進 by_prune 的新 pack；下一輪以那一份驗證，X 才 tombstone。
+#[tokio::test]
+async fn d_a_damaged_canonical_copy_is_repaired_and_the_condemned_holder_waits_a_round() {
+    let t = setup().await;
+    let plain = data("chunk", 3000);
+    let k = t.repo.keys().chunk_id(&plain);
+    let (a, ea) = t
+        .hand_pack_with_parity(1, Kind::Data, &[(k.into(), plain.clone())], 2)
+        .await;
+    let (b, eb) = t
+        .hand_pack_with_parity(2, Kind::Data, &[(k.into(), plain.clone())], 2)
+        .await;
+    hand_snapshot(
+        &t.repo,
+        client(3),
+        hours_from_now(-1),
+        vec![file_root("f", k, plain.len() as u64)],
+        vec![],
+    )
+    .await;
+    let (c, cc, ce, x) = if a < b {
+        (a, 1, ea[0], b)
+    } else {
+        (b, 2, eb[0], a)
+    };
+    condemn(&t, &[x]).await;
+    t.prune_after(73).await; // g4
+    damage(
+        &t,
+        &Key::Pack {
+            client: client(cc),
+            id: c,
+        },
+        &ce,
+    )
+    .await;
+    let r = t.prune_after(73).await; // g5
+    assert_eq!(
+        (r.repaired, r.repacked, r.false_entries, r.tombstoned),
+        (1, 1, 0, 0)
+    );
+    let recs = t.records().await;
+    assert_eq!(
+        recs[&x].status.s,
+        status::CONDEMNED,
+        "X waits for the new copy"
+    );
+    assert_eq!(recs[&c].status.s, status::CONDEMNED, "C is repacked");
+    assert!(
+        recs[&c].entries.iter().any(|e| e.i == k.into()),
+        "not removed"
+    );
+    let n: Vec<&Record> = recs.values().filter(|r| r.by_prune).collect();
+    assert_eq!(n.len(), 1);
+    assert!(n[0].entries.iter().any(|e| e.i == k.into()));
+    let r = t.prune().await; // g6：正本是 by_prune 的新 pack
+    assert!(r.tombstoned >= 1);
+    assert_eq!(t.records().await[&x].status.s, status::TOMBSTONE);
 }

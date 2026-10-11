@@ -26,12 +26,12 @@ use kist_format::v4::ids::{ClientId, ItemId, MetaId, ObjectId};
 use kist_format::v4::index::{shard_of, status, Bad, Delta, Head, Record, Shard, Status, SHARDS};
 use kist_format::v4::keys::{Gen, Key, DELTAS, MAP, MPACKS, PACKS, PARITY, SNAPSHOTS};
 use kist_format::v4::meta::{content_type, decode_item, node_type, Entry, Item};
-use kist_format::v4::pack::Kind;
+use kist_format::v4::pack::{Kind, PackEntry};
 use kist_format::v4::snapshot::Snapshot;
 
 use super::backup::Clock;
 use super::maint::{secs, unix_ns, window_passed, Newest, Pair, Session};
-use super::pack::{open_chunk, open_meta};
+use super::pack::{open_chunk, open_meta, PackWriter};
 use super::repo::Repo;
 use super::state::{pack_key, Holder, MapView};
 use crate::{CoreError, Result};
@@ -39,14 +39,21 @@ use crate::{CoreError, Result};
 /// prune 的選項。
 #[derive(Debug, Clone)]
 pub struct PruneOptions {
+    /// P7c：live、是正本、比 grace 老的 pack，當正本的項目（sealed bytes）不到這個百分比就 repack；0 不依比例
+    /// repack。以 parity 修復過的 pack 一律 repack（規格錯誤第 17 項的修法 D）。
+    pub repack_below: u8,
     /// 牆鐘與含休眠的單調時鐘（P0 的本機讀數、head 的 `w`、整輪時限）。測試注入假的。
     #[doc(hidden)]
     pub clock: Clock,
 }
 
+/// [`PruneOptions::repack_below`] 的預設（同 v3 的 prune）。
+pub const DEFAULT_REPACK_BELOW: u8 = 50;
+
 impl Default for PruneOptions {
     fn default() -> Self {
         Self {
+            repack_below: DEFAULT_REPACK_BELOW,
             clock: Clock::system(),
         }
     }
@@ -71,6 +78,10 @@ pub struct PruneReport {
     pub removed_records: u64,
     /// 從記錄移除的不實項目。
     pub false_entries: u64,
+    /// repack 寫出、讀回驗證過的新 pack（P7c）。
+    pub repacked: u64,
+    /// 損壞、以 parity 在記憶體裡修復的 pack（它當正本的項目由 repack 寫進新的 pack）。
+    pub repaired: u64,
     pub deleted_packs: u64,
     pub deleted_bytes: u64,
     pub deleted_deltas: u64,
@@ -112,6 +123,8 @@ struct Object {
 enum Copy {
     /// 解得開、ID 相符；metadata item 帶著規範 CBOR。
     Genuine(Vec<u8>),
+    /// 存著的副本壞了，但 pack 以 parity 修得回（重算 BLAKE3 等於名稱），修好的 bytes 裡這一項解得開。
+    Repaired(Vec<u8>),
     /// pack 在，但這一項解不開、ID 不符，或位移超出範圍。
     False(String),
     /// pack 不在了。
@@ -213,6 +226,12 @@ struct Prune {
     false_claims: HashSet<(ItemId, ObjectId)>,
     bad_ignored: Vec<String>,
     mpacks: MpackCache,
+    repack_below: u8,
+    /// 以 parity 修復過的 pack 的完整 bytes（P7c 從它 repack）與修不回的 pack。
+    repaired: HashMap<ObjectId, Arc<Vec<u8>>>,
+    unrepairable: HashSet<ObjectId>,
+    /// P6 的正本（P7c 用）。
+    canon: HashMap<ItemId, ObjectId>,
     report: PruneReport,
 }
 
@@ -277,6 +296,10 @@ impl Repo {
             false_claims: HashSet::new(),
             bad_ignored: Vec::new(),
             mpacks: MpackCache::new(super::read::MPACK_MEMORY),
+            repack_below: opts.repack_below,
+            repaired: HashMap::new(),
+            unrepairable: HashSet::new(),
+            canon: HashMap::new(),
             report: PruneReport {
                 base: g,
                 ..Default::default()
@@ -290,6 +313,7 @@ impl Repo {
         p.newcomers().await?;
         p.walk_all().await?;
         let mut new_head = p.plan().await?;
+        p.repack().await?;
         p.put_shards(&mut new_head).await?;
         if p.session.out_of_time(p.grace) {
             return Err(CoreError::Unsafe(format!(
@@ -697,7 +721,7 @@ impl Prune {
             let mut cbor = None;
             for h in &holders {
                 match self.fetch(h).await? {
-                    Copy::Genuine(c) => {
+                    Copy::Genuine(c) | Copy::Repaired(c) => {
                         cbor = Some(c);
                         break;
                     }
@@ -775,32 +799,61 @@ impl Prune {
         ));
     }
 
-    /// 取回一個持有者裡的 item 並驗證（解密、解壓、長度、重算 ID）。mpack 先試主體、再試 `.r1`。
+    /// 從一份 pack 的完整 bytes 打開一項（解密、解壓、長度、重算 ID）：chunk 回明文，metadata item 回規範 CBOR。
+    fn open_in(
+        &self,
+        kind: Kind,
+        e: &PackEntry,
+        bytes: &[u8],
+    ) -> std::result::Result<Vec<u8>, String> {
+        let sealed =
+            e.o.checked_add(e.l)
+                .and_then(|end| usize::try_from(e.o).ok().zip(usize::try_from(end).ok()))
+                .and_then(|(s, t)| bytes.get(s..t))
+                .ok_or_else(|| format!("entry {}+{} is outside the pack", e.o, e.l))?;
+        self.open_sealed(kind, e, sealed)
+    }
+
+    fn open_sealed(
+        &self,
+        kind: Kind,
+        e: &PackEntry,
+        sealed: &[u8],
+    ) -> std::result::Result<Vec<u8>, String> {
+        let repo = &self.session.repo;
+        match kind {
+            Kind::Data => {
+                let max = u64::from(repo.config().chunker.max);
+                open_chunk(repo.keys(), &e.i.to_chunk(), sealed, e.r, max)
+            }
+            Kind::Meta => open_meta(repo.keys(), &e.i.to_meta(), sealed, e.r),
+        }
+        .map_err(|err| err.to_string())
+    }
+
+    /// 取回一個持有者裡的 item 並驗證。資料 pack 以 range 讀那一項；mpack 整份讀（先主體、再 `.r1`）。每一份都
+    /// 驗證失敗時，以 parity 在記憶體裡修復整個 pack 再試（[`Prune::repair`]）。
     async fn fetch(&mut self, h: &Holder) -> Result<Copy> {
         let e = h.entry;
         let Some(end) = e.o.checked_add(e.l) else {
             return Ok(Copy::False(format!("entry {}+{} overflows", e.o, e.l)));
         };
         let repo = self.session.repo.clone();
+        let mut reasons = Vec::new();
         match h.kind {
             Kind::Data => {
                 let key = h.key().path();
-                let sealed = match repo.backend().get_range(&key, e.o..end).await {
-                    Ok(b) => b,
+                match repo.backend().get_range(&key, e.o..end).await {
+                    Ok(sealed) => match self.open_sealed(Kind::Data, &e, &sealed) {
+                        Ok(plain) => return Ok(Copy::Genuine(plain)),
+                        Err(why) => reasons.push(why),
+                    },
                     Err(BackendError::NotFound(_)) => return Ok(Copy::Missing),
                     Err(err) => return Err(err.into()),
-                };
-                let max = u64::from(repo.config().chunker.max);
-                Ok(
-                    match open_chunk(repo.keys(), &e.i.to_chunk(), &sealed, e.r, max) {
-                        Ok(plain) => Copy::Genuine(plain),
-                        Err(err) => Copy::False(err.to_string()),
-                    },
-                )
+                }
             }
             Kind::Meta => {
                 let listed = self.packs.get(&h.pack).copied();
-                let mut reasons = Vec::new();
                 for replica in [false, true] {
                     let present = listed.is_some_and(|l| {
                         if replica {
@@ -831,24 +884,114 @@ impl Prune {
                             }
                         }
                     };
-                    let slice = usize::try_from(e.o)
-                        .ok()
-                        .zip(usize::try_from(end).ok())
-                        .and_then(|(s, t)| bytes.get(s..t));
-                    let Some(sealed) = slice else {
-                        reasons.push(format!("entry {}..{end} is outside the mpack", e.o));
-                        continue;
-                    };
-                    match open_meta(repo.keys(), &e.i.to_meta(), sealed, e.r) {
+                    match self.open_in(Kind::Meta, &e, &bytes) {
                         Ok(cbor) => return Ok(Copy::Genuine(cbor)),
-                        Err(err) => reasons.push(err.to_string()),
+                        Err(why) => reasons.push(why),
                     }
                 }
-                Ok(if reasons.is_empty() {
-                    Copy::Missing
+                if reasons.is_empty() {
+                    return Ok(Copy::Missing);
+                }
+            }
+        }
+        if let Some(bytes) = self.repair(h.pack, h.client, h.kind).await? {
+            if let Ok(plain) = self.open_in(h.kind, &e, &bytes) {
+                return Ok(Copy::Repaired(plain));
+            }
+        }
+        Ok(Copy::False(reasons.join("; ")))
+    }
+
+    /// 整份讀一個 pack：主體，不在就 `.r1`（mpack）。不驗證名稱；都不在就是 `None`。
+    async fn whole(&self, id: ObjectId, client: ClientId, kind: Kind) -> Result<Option<Vec<u8>>> {
+        let listed = self.packs.get(&id).copied();
+        for replica in [false, true] {
+            let present = listed.is_some_and(|l| {
+                if replica {
+                    l.r1.is_some()
                 } else {
-                    Copy::False(reasons.join("; "))
-                })
+                    l.body.is_some()
+                }
+            });
+            if !present || (replica && kind == Kind::Data) {
+                continue;
+            }
+            let key = match (kind, replica) {
+                (Kind::Meta, _) => Key::Mpack {
+                    client,
+                    id,
+                    replica,
+                },
+                (Kind::Data, _) => Key::Pack { client, id },
+            };
+            match self.session.repo.backend().get(&key.path()).await {
+                Ok(b) => return Ok(Some(b)),
+                Err(BackendError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(None)
+    }
+
+    /// 規格錯誤第 17 項的修法 D：存著的 pack 名稱與內容不符（位元損壞）而有 parity → 在記憶體裡修復，重算
+    /// BLAKE3 等於名稱才算數。修好的 bytes 留給 P7c，它當正本的項目寫進 by_prune 的新 pack，損壞的 pack 走
+    /// 一般的兩階段刪除；不覆寫任何東西。名稱相符的 pack（某一項本來就是假的）parity 救不了。
+    async fn repair(
+        &mut self,
+        id: ObjectId,
+        client: ClientId,
+        kind: Kind,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
+        if let Some(b) = self.repaired.get(&id) {
+            return Ok(Some(Arc::clone(b)));
+        }
+        if self.unrepairable.contains(&id) {
+            return Ok(None);
+        }
+        let parity = Key::Parity { client, id };
+        if !self.parity.iter().any(|o| o.key == parity) {
+            self.unrepairable.insert(id);
+            return Ok(None);
+        }
+        let Some(damaged) = self.whole(id, client, kind).await? else {
+            self.unrepairable.insert(id);
+            return Ok(None);
+        };
+        if ObjectId::of(&damaged) == id {
+            self.unrepairable.insert(id);
+            return Ok(None);
+        }
+        let raw = match self.session.repo.backend().get(&parity.path()).await {
+            Ok(r) => r,
+            Err(BackendError::NotFound(_)) => {
+                self.unrepairable.insert(id);
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let key = pack_key(kind, client, id).path();
+        match crate::blocking(move || {
+            let obj = kist_format::v4::parity::parse(&raw)?;
+            Ok(obj.repair(&id, &damaged)?)
+        })
+        .await
+        {
+            Ok(bytes) => {
+                let bytes = Arc::new(bytes);
+                self.warn(format!(
+                    "{key} is damaged; repaired from its parity in memory, its live items are \
+                     rewritten into a new pack by this prune"
+                ));
+                self.report.repaired += 1;
+                self.repaired.insert(id, Arc::clone(&bytes));
+                Ok(Some(bytes))
+            }
+            Err(e) => {
+                self.warn(format!(
+                    "{key} is damaged and its parity cannot repair it: {e}"
+                ));
+                self.unrepairable.insert(id);
+                Ok(None)
             }
         }
     }
@@ -939,13 +1082,15 @@ impl Prune {
                                 by_prune: false,
                                 status: crec.status.s,
                             };
+                            // 修得回的副本：不移除，但這一輪不憑它標 tombstone——repack 把它寫進
+                            // by_prune 的新 pack 之後，下一輪以那一份驗證（規格錯誤第 17 項的修法 D）
                             let v = match self.fetch(&h).await? {
                                 Copy::Genuine(_) => true,
                                 Copy::False(why) => {
                                     removals.push((id, c, why));
                                     false
                                 }
-                                Copy::Missing => false,
+                                Copy::Repaired(_) | Copy::Missing => false,
                             };
                             verdicts.insert((id, c), v);
                             v
@@ -1088,7 +1233,243 @@ impl Prune {
             head.hold = None;
         }
         self.map = newmap;
+        self.canon = canon;
         Ok(head)
+    }
+
+    /// P7c：repack（hold 期間不做）。候選是 live、是正本的 pack：以 parity 修復過的一律做；其他的要比 grace 老、
+    /// 當正本的項目（sealed bytes）不到 `repack_below` 百分比。把它當正本的項目逐一解密驗證（不實的從記錄移除並
+    /// 回報；整份讀到的 bytes 名稱不符時先以 parity 修復），寫進全零 client 前綴下的新 pack（一個舊的對一個新的，
+    /// 同 GC 模型），讀回驗證後記為 by_prune 的 live、舊的 → condemned（保留全部項目）。讀回驗證失敗：新的記為
+    /// unreadable，舊的維持 live，回報。
+    async fn repack(&mut self) -> Result<()> {
+        if self.hold_active {
+            return Ok(());
+        }
+        let mut canon_of: HashMap<ObjectId, HashSet<ItemId>> = HashMap::new();
+        for (id, p) in &self.canon {
+            canon_of.entry(*p).or_default().insert(*id);
+        }
+        let mut jobs = Vec::new();
+        for r in self.map.values() {
+            if r.status.s != status::LIVE {
+                continue;
+            }
+            let Some(items) = canon_of.get(&r.id) else {
+                continue;
+            };
+            if !self.repaired.contains_key(&r.id) {
+                let old = self
+                    .packs
+                    .get(&r.id)
+                    .is_some_and(|l| l.first().1.saturating_add(secs(self.grace)) <= self.n_t);
+                let total: u64 = r.entries.iter().map(|e| e.l).sum();
+                let live: u64 = r
+                    .entries
+                    .iter()
+                    .filter(|e| items.contains(&e.i))
+                    .map(|e| e.l)
+                    .sum();
+                let sparse =
+                    live.saturating_mul(100) < total.saturating_mul(u64::from(self.repack_below));
+                if !(old && sparse) {
+                    continue;
+                }
+            }
+            jobs.push((r.id, items.clone()));
+        }
+        for (id, items) in jobs {
+            self.repack_one(id, &items).await?;
+        }
+        Ok(())
+    }
+
+    async fn repack_one(&mut self, id: ObjectId, items: &HashSet<ItemId>) -> Result<()> {
+        let next = self.g + 1;
+        let Some(rec) = self.map.get(&id).cloned() else {
+            return Ok(());
+        };
+        let entries: Vec<PackEntry> = rec
+            .entries
+            .iter()
+            .filter(|e| items.contains(&e.i))
+            .copied()
+            .collect();
+        let mut bytes = match self.repaired.get(&id) {
+            Some(b) => Arc::clone(b),
+            None => match self.whole(id, rec.client, rec.kind).await? {
+                Some(b) => Arc::new(b),
+                // 列表之後就不見了：P3 下一輪處理
+                None => return Ok(()),
+            },
+        };
+        let mut opened: Vec<std::result::Result<Vec<u8>, String>> = entries
+            .iter()
+            .map(|e| self.open_in(rec.kind, e, &bytes))
+            .collect();
+        if opened.iter().any(|o| o.is_err()) && !self.repaired.contains_key(&id) {
+            if let Some(b) = self.repair(id, rec.client, rec.kind).await? {
+                bytes = b;
+                opened = entries
+                    .iter()
+                    .map(|e| self.open_in(rec.kind, e, &bytes))
+                    .collect();
+            }
+        }
+        let path = pack_key(rec.kind, rec.client, id).path();
+        let mut good = Vec::new();
+        for (e, o) in entries.iter().zip(opened) {
+            match o {
+                Ok(plain) => good.push((e.i, plain)),
+                Err(why) => {
+                    if let Some(r) = self.map.get_mut(&id) {
+                        r.entries.retain(|x| x.i != e.i);
+                    }
+                    self.report.false_entries += 1;
+                    self.warn(format!(
+                        "{path} claims {} but its copy is false ({why}); removed from the record (P7c)",
+                        e.i
+                    ));
+                }
+            }
+        }
+        if good.is_empty() {
+            return Ok(());
+        }
+        let repo = self.session.repo.clone();
+        let chunk_max = repo.config().chunker.max;
+        let mut w = PackWriter::new(Arc::clone(repo.keys()), rec.kind, u64::MAX, chunk_max);
+        for (i, plain) in &good {
+            w.add(*i, plain)?;
+        }
+        let Some(p) = w.finish()? else {
+            return Ok(());
+        };
+        let key = pack_key(rec.kind, ClientId::MAINT, p.id);
+        let backend = repo.backend().clone();
+        let mut copies = vec![key.clone()];
+        if rec.kind == Kind::Meta && self.head.settings.replicas == 1 {
+            copies.push(Key::Mpack {
+                client: ClientId::MAINT,
+                id: p.id,
+                replica: true,
+            });
+        }
+        for k in &copies {
+            match backend.put_if_absent(&k.path(), p.bytes.clone()).await {
+                Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+                Err(e) => {
+                    self.warn(format!(
+                        "repacking {path}: writing {} failed: {e}; it stays live",
+                        k.path()
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        // repack 為新 pack 寫 parity（§13）：片數同舊的 parity，沒有就不寫；寫失敗只回報
+        let old_parity = Key::Parity {
+            client: rec.client,
+            id,
+        };
+        if self.parity.iter().any(|o| o.key == old_parity) {
+            let written = async {
+                let raw = backend.get(&old_parity.path()).await?;
+                let m = kist_format::v4::parity::parse(&raw)?.parity_shards();
+                let (pid, bytes) = (p.id, p.bytes.clone());
+                let parity =
+                    crate::blocking(move || Ok(kist_format::v4::parity::encode(&pid, &bytes, m)?))
+                        .await?;
+                match backend
+                    .put_if_absent(
+                        &Key::Parity {
+                            client: ClientId::MAINT,
+                            id: p.id,
+                        }
+                        .path(),
+                        parity,
+                    )
+                    .await
+                {
+                    Ok(()) | Err(BackendError::AlreadyExists(_)) => Ok::<_, CoreError>(()),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            .await;
+            if let Err(e) = written {
+                self.warn(format!("{}: its parity is not written: {e}", key.path()));
+            }
+        }
+        // 讀回驗證：名稱、trailer、每一項
+        let verified = async {
+            let back = backend.get(&key.path()).await?;
+            if ObjectId::of(&back) != p.id {
+                return Err(CoreError::corrupt(
+                    key.path(),
+                    "read back with different bytes",
+                ));
+            }
+            let t = super::pack::trailer_of(repo.keys(), &key, &back, chunk_max)?;
+            if t.entries != p.entries {
+                return Err(CoreError::corrupt(
+                    key.path(),
+                    "read back with a different trailer",
+                ));
+            }
+            for e in &t.entries {
+                self.open_in(rec.kind, e, &back)
+                    .map_err(|why| CoreError::corrupt(key.path(), why))?;
+            }
+            Ok(())
+        }
+        .await;
+        match verified {
+            Ok(()) => {
+                self.map.insert(
+                    p.id,
+                    Record {
+                        id: p.id,
+                        client: ClientId::MAINT,
+                        kind: rec.kind,
+                        size: p.bytes.len() as u64,
+                        entries: p.entries,
+                        by_prune: true,
+                        since: next,
+                        status: Status::LIVE,
+                        held: false,
+                    },
+                );
+                if let Some(r) = self.map.get_mut(&id) {
+                    r.status = condemned(next, self.age);
+                }
+                self.report.repacked += 1;
+            }
+            Err(e) => {
+                self.map.insert(
+                    p.id,
+                    Record {
+                        id: p.id,
+                        client: ClientId::MAINT,
+                        kind: rec.kind,
+                        size: p.bytes.len() as u64,
+                        entries: Vec::new(),
+                        by_prune: false,
+                        since: next,
+                        status: Status {
+                            s: status::UNREADABLE,
+                            at: 0,
+                            age: 0,
+                        },
+                        held: false,
+                    },
+                );
+                self.warn(format!(
+                    "repacking {path}: the new pack does not read back ({e}); recorded as \
+                     unreadable, {path} stays live"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// P8：寫出有變動的分片（`replicas=1` 時先主體、再 `.r1`），把名稱填進 head。

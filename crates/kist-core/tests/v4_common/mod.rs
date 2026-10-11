@@ -440,6 +440,8 @@ pub mod hooked {
         pub after_get: Mutex<Vec<(String, String, Vec<u8>)>>,
         /// 刪除過的 key，依順序。
         deleted: Arc<Mutex<Vec<String>>>,
+        /// key 以它開頭的寫入，寫進去的 bytes 被改掉一個 byte（寫入路徑上的損壞；讀回驗證抓得到）。
+        pub corrupt_puts_under: Mutex<Option<String>>,
         /// 這些 key 的下一次讀取（GET、HEAD、range）失敗（暫時的錯誤，例如逾時）。
         pub fail_get: Mutex<Vec<String>>,
         /// 這些 key 的下一次刪除被拒絕（Object Lock、權限）。
@@ -531,6 +533,20 @@ pub mod hooked {
                     });
                 }
             }
+            let corrupt = self
+                .corrupt_puts_under
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p| location.as_ref().starts_with(p.as_str()));
+            let payload = if corrupt {
+                let mut b: Vec<u8> = payload.into_iter().flat_map(|c| c.to_vec()).collect();
+                let mid = b.len() / 2;
+                b[mid] ^= 0x55;
+                PutPayload::from(b)
+            } else {
+                payload
+            };
             let r = self.inner.put_opts(location, payload, opts).await?;
             if let Some(c) = &self.clock {
                 let t = c.backend_now();
