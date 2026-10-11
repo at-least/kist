@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use kist_backend::BackendError;
-use kist_format::v4::index::{Drain, Head, Settings};
+use kist_format::v4::index::{status, Drain, Head, Settings, Status};
 use kist_format::v4::keys::{Gen, Key};
 
 use super::backup::{elapsed, Clock, Reading, M};
@@ -426,5 +426,65 @@ impl Repo {
             settings,
             drain,
         })
+    }
+}
+
+/// 移除版本不認得的 pack 的結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct UnknownReport {
+    /// 寫出的世代；map 裡沒有 unknown 的記錄時是 `None`（不寫 head）。
+    pub generation: Option<Gen>,
+    /// 改成 condemned 的 pack（key）。
+    pub packs: Vec<String>,
+}
+
+impl Repo {
+    /// 移除版本不認得的 pack（ADR 026 負責人決定 10）：prune 把它們記成 unknown、不使用也不刪除；這個命令由維護
+    /// 角色明確下令，以柵欄寫一代把它們改成 condemned（`at` 是新的世代，age 是目前的 age，drain 中是舊的 grace），
+    /// 其他不變。之後照一般的兩階段刪除：過了 age 的 prune 標成 tombstone、P9 刪除——不另外多一個刪除者。unknown
+    /// 的記錄沒有項目，不會是任何 ID 的正本；較新的 kist 的 snapshot 若引用它們，prune 在 P5 就停住（版本不認得、
+    /// 或沒有可讀的持有者），走不到刪除。
+    pub async fn condemn_unknown(&self, opts: MaintOptions) -> Result<UnknownReport> {
+        let mut session = Session::begin(self, opts.clock).await?;
+        let newest = session.newest().await?;
+        let base: std::collections::BTreeMap<_, _> = session
+            .repo
+            .load_map(&newest.copy.gen)
+            .await?
+            .records()
+            .iter()
+            .map(|r| (r.id, r.clone()))
+            .collect();
+        let g = newest.g() + 1;
+        let head = newest.head().clone();
+        let mut age = head.settings.grace;
+        if let Some(d) = head.drain {
+            let from = session.times(d.from).await?;
+            if !window_passed(from, session.now(&newest), d.old_grace) {
+                age = d.old_grace;
+            }
+        }
+        let mut map = base.clone();
+        let mut report = UnknownReport::default();
+        for r in map.values_mut() {
+            if r.status.s == status::UNKNOWN {
+                r.status = Status {
+                    s: status::CONDEMNED,
+                    at: g,
+                    age,
+                };
+                report
+                    .packs
+                    .push(super::state::pack_key(r.kind, r.client, r.id).path());
+            }
+        }
+        if report.packs.is_empty() {
+            return Ok(report);
+        }
+        session.repair_r1(&newest).await?;
+        let mut head = head;
+        super::prune::put_changed_shards(&session.repo, &base, &map, &mut head).await?;
+        report.generation = Some(session.fence(&newest, head).await?);
+        Ok(report)
     }
 }

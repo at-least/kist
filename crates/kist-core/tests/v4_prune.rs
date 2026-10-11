@@ -1500,3 +1500,93 @@ async fn d_a_damaged_canonical_copy_is_repaired_and_the_condemned_holder_waits_a
     assert!(r.tombstoned >= 1);
     assert_eq!(t.records().await[&x].status.s, status::TOMBSTONE);
 }
+
+/// 移除版本不認得的 pack（負責人決定 10）：以柵欄寫一代把 unknown 改成 condemned，之後由 prune 照兩階段刪除。
+#[tokio::test]
+async fn condemned_unknown_packs_are_deleted_by_later_prunes() {
+    let t = setup().await;
+    let id = t.odd_pack(1, Some(5)).await;
+    t.prune().await; // g1：unknown
+    let r = t.repo.condemn_unknown(t.clock.maint()).await.unwrap();
+    assert_eq!(r.generation, Some(2));
+    assert_eq!(
+        r.packs,
+        vec![Key::Pack {
+            client: client(1),
+            id
+        }
+        .path()]
+    );
+    let rec = t.records().await[&id].clone();
+    assert_eq!(
+        (rec.status.s, rec.status.at, rec.status.age),
+        (status::CONDEMNED, 2, 72 * 3600)
+    );
+    t.prune_after(73).await; // g3：基礎世代 g2 還不到 age
+    assert!(t.pack_ids("packs").await.contains(&id));
+    let p = t.prune_after(73).await; // g4
+    assert_eq!(p.deleted_packs, 1);
+    assert!(!t.pack_ids("packs").await.contains(&id));
+}
+
+#[tokio::test]
+async fn without_unknown_packs_nothing_is_written() {
+    let t = setup().await;
+    t.write("a", "f", &data("a", 10 * 1024));
+    t.backup(1, "a").await;
+    t.prune().await;
+    let r = t.repo.condemn_unknown(t.clock.maint()).await.unwrap();
+    assert_eq!(r.generation, None);
+    assert!(r.packs.is_empty());
+    assert_eq!(t.newest().await, 1);
+}
+
+/// 較新的 kist 寫的 snapshot 還在時，prune 在 P5 就停住：condemned 的 unknown pack 不會被刪。
+#[tokio::test]
+async fn a_newer_snapshot_keeps_condemned_unknown_packs_from_being_deleted() {
+    let t = setup().await;
+    let id = t.odd_pack(1, Some(5)).await;
+    t.prune().await;
+    t.repo.condemn_unknown(t.clock.maint()).await.unwrap();
+    #[derive(serde::Serialize)]
+    struct Snap {
+        v: u32,
+        roots: MetaId,
+        time: i64,
+        host: String,
+        client: kist_format::v4::ids::ClientId,
+    }
+    let at = hours_from_now(-1);
+    let ts = SnapTs::from_nanos(at).unwrap();
+    let plain = kist_format::cbor::encode(&Snap {
+        v: 5,
+        roots: MetaId::from_bytes([1; 32]),
+        time: at,
+        host: "future".into(),
+        client: client(2),
+    })
+    .unwrap();
+    let sealed = t
+        .repo
+        .keys()
+        .seal_snapshot(&client(2), &ts, &plain)
+        .unwrap();
+    t.repo
+        .backend()
+        .put_if_absent(
+            &Key::Snapshot {
+                client: client(2),
+                ts,
+                replica: false,
+            }
+            .path(),
+            sealed,
+        )
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        t.clock.advance_hours(73);
+        assert!(t.try_prune().await.is_err());
+    }
+    assert!(t.pack_ids("packs").await.contains(&id));
+}

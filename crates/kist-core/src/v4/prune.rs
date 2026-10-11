@@ -262,6 +262,51 @@ pub(crate) async fn newcomer(
     )))
 }
 
+/// P8：`new` 與 `base` 有差別的分片才寫（`replicas=1` 時先主體、再 `.r1`），名稱填進 `head`；變空的分片是 null。
+pub(crate) async fn put_changed_shards(
+    repo: &Repo,
+    base: &BTreeMap<ObjectId, Record>,
+    new: &BTreeMap<ObjectId, Record>,
+    head: &mut Head,
+) -> Result<()> {
+    let group = |m: &BTreeMap<ObjectId, Record>| {
+        let mut out: BTreeMap<u8, Vec<Record>> = BTreeMap::new();
+        for r in m.values() {
+            out.entry(shard_of(&r.id)).or_default().push(r.clone());
+        }
+        out
+    };
+    let (mut new, old) = (group(new), group(base));
+    for i in 0..SHARDS {
+        let i = i as u8;
+        let recs = new.remove(&i).unwrap_or_default();
+        if old.get(&i).map_or(recs.is_empty(), |o| *o == recs) {
+            continue;
+        }
+        if recs.is_empty() {
+            head.shards[i as usize] = None;
+            continue;
+        }
+        let sealed = repo.keys().seal_shard(&Shard::new(i, recs).encode()?)?;
+        let id = ObjectId::of(&sealed);
+        for replica in [false, true] {
+            if replica && head.settings.replicas == 0 {
+                continue;
+            }
+            match repo
+                .backend()
+                .put_if_absent(&Key::Shard { id, replica }.path(), sealed.clone())
+                .await
+            {
+                Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        head.shards[i as usize] = Some(id);
+    }
+    Ok(())
+}
+
 fn not_found(e: &CoreError) -> bool {
     matches!(e, CoreError::Backend(BackendError::NotFound(_)))
 }
@@ -1507,43 +1552,7 @@ impl Prune {
 
     /// P8：寫出有變動的分片（`replicas=1` 時先主體、再 `.r1`），把名稱填進 head。
     async fn put_shards(&mut self, head: &mut Head) -> Result<()> {
-        let mut new: BTreeMap<u8, Vec<Record>> = BTreeMap::new();
-        for r in self.map.values() {
-            new.entry(shard_of(&r.id)).or_default().push(r.clone());
-        }
-        let mut old: BTreeMap<u8, Vec<Record>> = BTreeMap::new();
-        for r in self.base.values() {
-            old.entry(shard_of(&r.id)).or_default().push(r.clone());
-        }
-        let backend = self.session.repo.backend().clone();
-        for i in 0..SHARDS {
-            let i = i as u8;
-            let recs = new.remove(&i).unwrap_or_default();
-            if old.get(&i).map_or(recs.is_empty(), |o| *o == recs) {
-                continue;
-            }
-            if recs.is_empty() {
-                head.shards[i as usize] = None;
-                continue;
-            }
-            let plain = Shard::new(i, recs).encode()?;
-            let sealed = self.session.repo.keys().seal_shard(&plain)?;
-            let id = ObjectId::of(&sealed);
-            for replica in [false, true] {
-                if replica && self.head.settings.replicas == 0 {
-                    continue;
-                }
-                match backend
-                    .put_if_absent(&Key::Shard { id, replica }.path(), sealed.clone())
-                    .await
-                {
-                    Ok(()) | Err(BackendError::AlreadyExists(_)) => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            head.shards[i as usize] = Some(id);
-        }
-        Ok(())
+        put_changed_shards(&self.session.repo, &self.base, &self.map, head).await
     }
 
     /// 刪一個物件；Object Lock 或權限擋下時回報。整輪時限過了就停止、回 false。

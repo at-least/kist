@@ -36,7 +36,7 @@ pub mod state;
 pub use backup::{BackupOptions, BackupReport, BackupSummary, Clock, PreparedBackup, Reading};
 pub use forget::{ForgetOptions, ForgetSummary};
 pub use live::Live;
-pub use maint::{MaintOptions, SettingsChange, SettingsReport};
+pub use maint::{MaintOptions, SettingsChange, SettingsReport, UnknownReport};
 pub use prune::{PruneOptions, PruneReport};
 pub use rebuild::RebuildReport;
 pub use repo::{InitOptions, Repo, SlotInfo};
