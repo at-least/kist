@@ -327,6 +327,40 @@ pub async fn write_generation(repo: &Repo, records: Vec<Record>, lone: bool) -> 
     g + 1
 }
 
+/// Unix 奈秒（head 的 `w`）。
+pub fn ns(t: time::OffsetDateTime) -> i64 {
+    i64::try_from(t.unix_timestamp_nanos()).unwrap()
+}
+
+/// 扮演維護角色：在最大世代之上寫 head `g+1`（主體與 `.r1`，分片照舊、`w` 是真的時間），`edit` 改內容。
+/// `lone` 是只寫主體。回傳新的世代。
+pub async fn write_head_with(repo: &Repo, lone: bool, edit: impl FnOnce(&mut Head)) -> Gen {
+    let listing = repo.list_heads(None).await.unwrap();
+    let g = *listing.keys().next_back().unwrap();
+    let base = repo.read_head(g).await.unwrap();
+    let mut head = Head {
+        g: g + 1,
+        w: ns(time::OffsetDateTime::now_utc()),
+        parent: Some(base.hash),
+        ..base.head
+    };
+    edit(&mut head);
+    let sealed = repo
+        .keys()
+        .seal_head(g + 1, &head.encode().unwrap())
+        .unwrap();
+    for replica in [false, true] {
+        if replica && lone {
+            continue;
+        }
+        repo.backend()
+            .put_if_absent(&Key::Head { g: g + 1, replica }.path(), sealed.clone())
+            .await
+            .unwrap();
+    }
+    g + 1
+}
+
 /// 扮演 prune 的 P4：列表裡的每個 pack 與 mpack 讀 trailer，記成 live（`since` 是新世代）。`status` 改寫
 /// 指定 pack 的狀態。
 pub async fn index_everything(
@@ -378,12 +412,13 @@ pub async fn index_everything(
 /// 包住 `InMemory` 的 store：數每一種請求、記下 PUT 的順序，也能讓指定的 key 在寫入成功之後回「已存在」
 /// 一次（S3 回 5xx、client 重試、第一次其實已寫入，§12）。
 pub mod hooked {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream::BoxStream;
+    use futures::StreamExt as _;
     use object_store::memory::InMemory;
     use object_store::path::Path as StorePath;
     use object_store::{
@@ -399,6 +434,13 @@ pub mod hooked {
         ranged: Mutex<Vec<String>>,
         /// 這些 key 第一次寫入成功之後回「已存在」。
         pub echo: Mutex<Vec<String>>,
+        /// 這些 key 的下一次寫入失敗（沒有寫進去，回錯誤）。
+        pub fail: Mutex<Vec<String>>,
+        /// (A, B, bytes)：A 被讀（GET，不含 HEAD 與 range）之後建立 B——在一個命令的兩步之間插入別人的寫入。
+        pub after_get: Mutex<Vec<(String, String, Vec<u8>)>>,
+        /// 有虛擬時鐘時，修改時間是寫入當下的虛擬後端時間（[`super::VClock`]），不是真的時間。
+        clock: Option<Arc<super::VClock>>,
+        stamps: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     }
 
     impl std::fmt::Display for Hooked {
@@ -435,6 +477,13 @@ pub mod hooked {
         pub fn puts(&self) -> Vec<String> {
             self.puts.lock().unwrap().clone()
         }
+
+        fn stamp(&self, mut meta: ObjectMeta) -> ObjectMeta {
+            if let Some(t) = self.stamps.lock().unwrap().get(meta.location.as_ref()) {
+                meta.last_modified = *t;
+            }
+            meta
+        }
     }
 
     #[async_trait]
@@ -447,7 +496,23 @@ pub mod hooked {
         ) -> object_store::Result<PutResult> {
             self.bump("put");
             self.puts.lock().unwrap().push(location.to_string());
+            {
+                let mut fail = self.fail.lock().unwrap();
+                if let Some(i) = fail.iter().position(|k| k == location.as_ref()) {
+                    fail.remove(i);
+                    return Err(object_store::Error::Generic {
+                        store: "Hooked",
+                        source: "simulated write failure".into(),
+                    });
+                }
+            }
             let r = self.inner.put_opts(location, payload, opts).await?;
+            if let Some(c) = &self.clock {
+                let t = c.backend_now();
+                let t =
+                    chrono::DateTime::from_timestamp(t.unix_timestamp(), t.nanosecond()).unwrap();
+                self.stamps.lock().unwrap().insert(location.to_string(), t);
+            }
             let mut echo = self.echo.lock().unwrap();
             if let Some(i) = echo.iter().position(|k| k == location.as_ref()) {
                 echo.remove(i);
@@ -480,7 +545,27 @@ pub mod hooked {
             } else {
                 "get"
             });
-            self.inner.get_opts(location, options).await
+            let plain = !options.head && options.range.is_none();
+            let mut r = self.inner.get_opts(location, options).await?;
+            r.meta = self.stamp(r.meta);
+            if plain {
+                let hook = {
+                    let mut hooks = self.after_get.lock().unwrap();
+                    hooks
+                        .iter()
+                        .position(|(a, _, _)| a == location.as_ref())
+                        .map(|i| hooks.remove(i))
+                };
+                if let Some((_, b, bytes)) = hook {
+                    self.put_opts(
+                        &StorePath::from(b.as_str()),
+                        bytes.into(),
+                        PutOptions::default(),
+                    )
+                    .await?;
+                }
+            }
+            Ok(r)
         }
 
         async fn get_ranges(
@@ -506,7 +591,18 @@ pub mod hooked {
             prefix: Option<&StorePath>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.bump("list");
-            self.inner.list(prefix)
+            let stamps = self.stamps.lock().unwrap().clone();
+            self.inner
+                .list(prefix)
+                .map(move |m| {
+                    m.map(|mut m| {
+                        if let Some(t) = stamps.get(m.location.as_ref()) {
+                            m.last_modified = *t;
+                        }
+                        m
+                    })
+                })
+                .boxed()
         }
 
         async fn list_with_delimiter(
@@ -529,12 +625,98 @@ pub mod hooked {
 
     /// 以它為底的 Backend（位置當成本機：只影響 replicas 的預設與快取目錄的名稱）。
     pub fn backend(name: &str) -> (Arc<Hooked>, kist_backend::Backend) {
-        let store = Arc::new(Hooked::default());
+        backend_with(name, None)
+    }
+
+    /// 同 [`backend`]，修改時間取自虛擬時鐘。
+    pub fn backend_with(
+        name: &str,
+        clock: Option<Arc<super::VClock>>,
+    ) -> (Arc<Hooked>, kist_backend::Backend) {
+        let store = Arc::new(Hooked {
+            clock,
+            ..Hooked::default()
+        });
         let b = kist_backend::Backend::from_store(
             store.clone(),
             kist_backend::RepoLocation::Local(format!("/hooked/{name}").into()),
         );
         (store, b)
+    }
+}
+
+/// 虛擬時鐘（§11.1 的兩個時鐘）：[`hooked`] 後端的修改時間與維護命令、backup 的牆鐘都從這裡讀。`advance`
+/// 讓兩邊一起前進；兩邊各有自己的偏差（後端時鐘與寫入者的牆鐘可以各自出錯）。起點是建立時的真實時間。
+#[derive(Debug)]
+pub struct VClock {
+    base: time::OffsetDateTime,
+    state: std::sync::Mutex<VState>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct VState {
+    /// 從起點經過的秒數（單調時鐘也走這麼多）。
+    elapsed: i64,
+    backend_skew: i64,
+    writer_skew: i64,
+}
+
+impl VClock {
+    pub fn new() -> std::sync::Arc<Self> {
+        let now = time::OffsetDateTime::now_utc();
+        std::sync::Arc::new(Self {
+            base: now.replace_nanosecond(0).unwrap(),
+            state: std::sync::Mutex::new(VState::default()),
+        })
+    }
+
+    fn state(&self) -> VState {
+        *self.state.lock().unwrap()
+    }
+
+    /// 兩個時鐘一起前進。
+    pub fn advance(&self, secs: i64) {
+        self.state.lock().unwrap().elapsed += secs;
+    }
+
+    pub fn advance_hours(&self, hours: i64) {
+        self.advance(hours * 3600);
+    }
+
+    /// 後端時鐘的偏差（秒，正的是快）。
+    pub fn set_backend_skew(&self, secs: i64) {
+        self.state.lock().unwrap().backend_skew = secs;
+    }
+
+    /// 寫入者牆鐘的偏差（秒，正的是快）。單調時鐘不受影響。
+    pub fn set_writer_skew(&self, secs: i64) {
+        self.state.lock().unwrap().writer_skew = secs;
+    }
+
+    pub fn backend_now(&self) -> time::OffsetDateTime {
+        let s = self.state();
+        self.base + time::Duration::seconds(s.elapsed + s.backend_skew)
+    }
+
+    pub fn writer_now(&self) -> time::OffsetDateTime {
+        let s = self.state();
+        self.base + time::Duration::seconds(s.elapsed + s.writer_skew)
+    }
+
+    /// 給維護命令與 backup 的時鐘：牆鐘是寫入者的時鐘，單調時鐘是經過的秒數。
+    pub fn clock(self: &std::sync::Arc<Self>) -> kist_core::v4::Clock {
+        let c = std::sync::Arc::clone(self);
+        kist_core::v4::Clock::new(move || kist_core::v4::Reading {
+            wall: c.writer_now(),
+            boot: Duration::from_secs(u64::try_from(c.state().elapsed).unwrap() + 1_000_000),
+        })
+    }
+
+    /// 維護命令的選項，時鐘是這個。
+    pub fn maint(self: &std::sync::Arc<Self>) -> kist_core::v4::MaintOptions {
+        kist_core::v4::MaintOptions {
+            clock: self.clock(),
+        }
     }
 }
 
@@ -547,14 +729,26 @@ pub struct HookedRepo {
 
 impl HookedRepo {
     pub async fn new(opts: InitOptions) -> Self {
+        Self::with_clock(opts, None).await
+    }
+
+    /// 修改時間取自虛擬時鐘的 repo（init 寫的 head 0 也是）。
+    pub async fn with_clock(opts: InitOptions, clock: Option<std::sync::Arc<VClock>>) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let (store, backend) = hooked::backend(&dir.path().display().to_string());
+        let (store, backend) = hooked::backend_with(&dir.path().display().to_string(), clock);
         Repo::init(backend.clone(), PASSWORD, opts).await.unwrap();
         Self {
             dir,
             store,
             backend,
         }
+    }
+
+    /// 不用本地快取打開。
+    pub async fn open_uncached(&self) -> Repo {
+        Repo::open(self.backend.clone(), PASSWORD, None)
+            .await
+            .unwrap()
     }
 
     pub async fn open_as(&self, cache: &str) -> Repo {

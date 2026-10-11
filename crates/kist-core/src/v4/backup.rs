@@ -633,11 +633,11 @@ impl Repo {
             ));
         };
         let mut g = g;
-        if !copies.replica {
+        if copies.replica.is_none() {
             tokio::time::sleep(wait).await;
             let again = self.list_heads(Some(g)).await?;
             match again.iter().next_back() {
-                Some((&newest, c)) if c.replica => g = newest,
+                Some((&newest, c)) if c.replica.is_some() => g = newest,
                 _ => {
                     return Err(CoreError::Generation(format!(
                         "generation head {g} has no .r1 yet (its writer is between its two writes or crashed); \

@@ -35,6 +35,7 @@ xattr.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 filetime.workspace = true
 futures.workspace = true
 object_store.workspace = true

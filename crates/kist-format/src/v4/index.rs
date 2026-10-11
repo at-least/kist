@@ -70,7 +70,9 @@ impl Settings {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    /// §10 的範圍：grace 至少 [`MIN_GRACE`]、replicas 0 或 1、兩個 target 在 [`MIN_PACK_TARGET`] 到
+    /// [`MAX_PACK_TARGET`]。讀取端（解碼 head）與改 settings 的命令（寫之前）都用它。
+    pub fn check(&self) -> Result<()> {
         let bad = |msg: String| Err(corrupt("head settings", msg));
         if self.grace < MIN_GRACE {
             return bad(format!("grace {} s is under {MIN_GRACE} s", self.grace));

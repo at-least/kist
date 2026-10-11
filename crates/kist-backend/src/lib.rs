@@ -420,6 +420,15 @@ impl Backend {
     /// [`PROBE_TOLERANCE`](kist_format::v4::index::PROBE_TOLERANCE) 就拒絕。不論結果都刪掉探針
     /// （也就驗證了維護角色能刪）。
     pub async fn probe(&self) -> Result<Probe> {
+        self.probe_with(&time::OffsetDateTime::now_utc).await
+    }
+
+    /// [`probe`](Self::probe)，本機牆鐘由呼叫端給：維護命令以自己的時鐘讀「P0 時的本機牆鐘」，測試注入
+    /// 虛擬的時鐘。
+    pub async fn probe_with(
+        &self,
+        local_now: &(dyn Fn() -> time::OffsetDateTime + Send + Sync),
+    ) -> Result<Probe> {
         if !self.create_only() {
             return Err(BackendError::Probe(format!(
                 "{}: the rclone bridge emulates conditional create with stat + rename, which \
@@ -432,7 +441,7 @@ impl Backend {
         getrandom::fill(&mut nonce)
             .map_err(|e| BackendError::Probe(format!("random name: {e}")))?;
         let key = kist_format::v4::keys::Key::Probe(nonce).path();
-        let probed = self.probe_at(&key).await;
+        let probed = self.probe_at(&key, local_now).await;
         let deleted = self.delete(&key).await;
         match (probed, deleted) {
             (Ok(probe), Ok(())) => Ok(probe),
@@ -446,7 +455,11 @@ impl Backend {
         }
     }
 
-    async fn probe_at(&self, key: &str) -> Result<Probe> {
+    async fn probe_at(
+        &self,
+        key: &str,
+        local_now: &(dyn Fn() -> time::OffsetDateTime + Send + Sync),
+    ) -> Result<Probe> {
         self.put_if_absent(key, b"kist probe".to_vec()).await?;
         match self.put_if_absent(key, b"kist probe".to_vec()).await {
             Err(BackendError::AlreadyExists(_)) => {}
@@ -461,7 +474,7 @@ impl Backend {
             Err(e) => return Err(e),
         }
         let backend = self.head(key).await?.modified;
-        let local = time::OffsetDateTime::now_utc();
+        let local = local_now();
         let tolerance = time::Duration::seconds(kist_format::v4::index::PROBE_TOLERANCE as i64);
         if (backend - local).abs() > tolerance {
             return Err(BackendError::Probe(format!(

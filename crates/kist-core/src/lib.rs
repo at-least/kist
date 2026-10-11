@@ -129,6 +129,10 @@ pub enum CoreError {
     /// 再試（[`v4::live`]）。
     #[error("no usable copy of {what}: {reasons}")]
     Unavailable { what: String, reasons: String },
+    /// v4 的維護命令：輸掉柵欄（下一代已經有人寫了，§11.3 P8），或拒絕之前重新列出世代時發現已有更新的
+    /// head（P3、P5）。什麼都沒刪；重跑就以新的世代為基礎。
+    #[error("{0}; nothing was deleted, rerun to start from the newer generation")]
+    Superseded(String),
 }
 
 impl CoreError {

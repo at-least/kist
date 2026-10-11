@@ -26,13 +26,22 @@ pub struct Generation {
     pub hash: ObjectId,
 }
 
-/// `maint/gen/` 的列表：每個世代的主體與 `.r1` 在不在。
+/// 讀到的一份 head：內容、密封的 bytes、是不是 `.r1`。
+#[derive(Debug, Clone)]
+pub struct HeadCopy {
+    pub gen: Generation,
+    pub bytes: Vec<u8>,
+    pub replica: bool,
+}
+
+/// `maint/gen/` 的列表：每個世代的主體與 `.r1` 在不在、各自的後端修改時間。
 pub type HeadListing = BTreeMap<Gen, Copies>;
 
+/// 一個世代在列表裡的兩份：後端修改時間（截到秒，§10 的 `T`），不在列表裡是 `None`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Copies {
-    pub body: bool,
-    pub replica: bool,
+    pub body: Option<time::OffsetDateTime>,
+    pub replica: Option<time::OffsetDateTime>,
 }
 
 /// 持有者從哪裡來。
@@ -279,9 +288,9 @@ impl Repo {
                 Ok(Key::Head { g, replica }) => {
                     let c = out.entry(g).or_default();
                     if replica {
-                        c.replica = true;
+                        c.replica = Some(o.modified);
                     } else {
-                        c.body = true;
+                        c.body = Some(o.modified);
                     }
                 }
                 _ => tracing::warn!("{}: not a v4 generation head; ignored", o.key),
@@ -292,6 +301,12 @@ impl Repo {
 
     /// 讀 head g：主體，不行讀 `.r1`。兩份都不行（讀不了、解不開、版本不認得）就是錯誤，訊息帶兩份的原因。
     pub async fn read_head(&self, g: Gen) -> Result<Generation> {
+        Ok(self.read_head_copy(g).await?.gen)
+    }
+
+    /// [`Repo::read_head`]，連同讀到的那一份的密封 bytes 與它是不是 `.r1`：維護角色補寫 `.r1` 要原樣的 bytes
+    /// （P1），`T(g)` 取讀到的那一份的修改時間。
+    pub async fn read_head_copy(&self, g: Gen) -> Result<HeadCopy> {
         let mut reasons = Vec::new();
         for replica in [false, true] {
             let key = Key::Head { g, replica }.path();
@@ -302,19 +317,23 @@ impl Repo {
                     .open_head(g, &bytes)
                     .map_err(|e| CoreError::corrupt(&key, e.to_string()))?;
                 let head = Head::decode(&plain, g)?;
-                Ok::<_, CoreError>(Generation {
-                    g,
-                    head,
-                    hash: ObjectId::of(&bytes),
+                Ok::<_, CoreError>(HeadCopy {
+                    gen: Generation {
+                        g,
+                        head,
+                        hash: ObjectId::of(&bytes),
+                    },
+                    bytes,
+                    replica,
                 })
             }
             .await;
             match result {
-                Ok(gen) => {
+                Ok(copy) => {
                     if replica {
                         tracing::warn!("generation {g} read from its .r1 (the body is unusable)");
                     }
-                    return Ok(gen);
+                    return Ok(copy);
                 }
                 Err(e) => reasons.push(format!("{key}: {e}")),
             }
