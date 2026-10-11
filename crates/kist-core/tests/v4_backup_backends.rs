@@ -87,8 +87,60 @@ async fn round_trip(backend: Backend) {
         "{report:?}"
     );
     assert_eq!(report.snapshots, 3);
+    // prune（第 6 段）：真的後端上時間不能快轉，只驗 P0 到 P8 跑得完、寫出下一代、沒有到期的東西就不刪，之後
+    // check 照樣乾淨。寬鬆後端（rclone）上 P0 拒絕、什麼都不寫。
+    let before = *repo
+        .list_heads(None)
+        .await
+        .unwrap()
+        .keys()
+        .next_back()
+        .unwrap();
+    let pruned = repo.prune(kist_core::v4::PruneOptions::default()).await;
+    if backend.create_only() {
+        let pruned = pruned.unwrap();
+        assert_eq!(pruned.generation, before + 1, "{pruned:?}");
+        assert!(pruned.newcomers > 0);
+        assert_eq!(
+            (pruned.deleted_packs, pruned.condemned, pruned.tombstoned),
+            (0, 0, 0)
+        );
+        assert!(backend.list("deltas").await.unwrap().is_empty(), "absorbed");
+        let report = repo
+            .check(kist_core::v4::check::CheckOptions {
+                read_data: true,
+                repair: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            report.errors.is_empty() && report.warnings.is_empty(),
+            "{report:?}"
+        );
+    } else {
+        let err = pruned.unwrap_err();
+        assert!(err.to_string().contains("probe"), "{err}");
+        assert_eq!(
+            *repo
+                .list_heads(None)
+                .await
+                .unwrap()
+                .keys()
+                .next_back()
+                .unwrap(),
+            before
+        );
+    }
     // 清掉（只有測試用的前綴）
-    for prefix in ["keys", "packs", "mpacks", "deltas", "snapshots", "maint"] {
+    for prefix in [
+        "keys",
+        "packs",
+        "mpacks",
+        "parity",
+        "deltas",
+        "snapshots",
+        "maint",
+    ] {
         for o in backend.list(prefix).await.unwrap() {
             backend.delete(&o.key).await.unwrap();
         }

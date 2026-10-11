@@ -64,6 +64,18 @@ pub fn check_version(what: &'static str, version: u32) -> Result<()> {
     }
 }
 
+/// 先只讀 `v`：版本不認得時，不論其他欄位長什麼樣都回 [`Error::Version`]。較舊的讀取端據此分辨「看不懂」與
+/// 「壞掉」：prune 不刪看不懂的 pack、遇到看不懂的 snapshot 就停（§11.3 P4、P5），較新的版本改了其他欄位的
+/// 形狀也一樣。
+pub(crate) fn peek_version(what: &'static str, bytes: &[u8]) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct V {
+        v: u32,
+    }
+    let V { v } = crate::cbor::decode(bytes)?;
+    check_version(what, v)
+}
+
 /// 寫入端拒絕寫出。
 pub(crate) fn invalid(what: &'static str, detail: impl Into<String>) -> Error {
     Error::Invalid {

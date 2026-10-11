@@ -591,3 +591,40 @@ async fn exclusions_and_hardlinks_follow_the_v3_walk() {
     assert_eq!(again.report.files_reused, 4, "{:?}", again.report);
     assert_eq!(again.stats, s.stats);
 }
+
+/// 進度回報（kist-app 的網頁介面用）：每處理完一個項目一次（帶路徑），最後依序是 flush、verify、commit。
+#[tokio::test]
+async fn progress_is_reported_per_item_then_flush_verify_commit() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let src = t.dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a"), b"a").unwrap();
+    std::fs::write(src.join("sub/b"), b"b").unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&seen);
+    let mut o = opts(1);
+    o.progress = Some(kist_core::v4::ProgressCallback(std::sync::Arc::new(
+        move |p: &kist_core::v4::BackupProgress| {
+            log.lock()
+                .unwrap()
+                .push((p.phase, p.current.clone(), p.stats.files));
+        },
+    )));
+    repo.backup(std::slice::from_ref(&src), o).await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    let files: Vec<String> = seen
+        .iter()
+        .filter(|(phase, _, _)| *phase == "files")
+        .map(|(_, current, _)| current.clone().unwrap())
+        .collect();
+    for name in ["a", "sub", "b"] {
+        assert!(
+            files.iter().any(|f| f.ends_with(name)),
+            "{name} in {files:?}"
+        );
+    }
+    let tail: Vec<&str> = seen.iter().rev().take(3).map(|(p, _, _)| *p).collect();
+    assert_eq!(tail, ["commit", "verify", "flush"]);
+    assert_eq!(seen.last().unwrap().2, 2, "stats travel with the events");
+}

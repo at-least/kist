@@ -206,12 +206,12 @@ impl Check {
             expected = g + 1;
             let body = Key::Head { g, replica: false };
             let r1 = Key::Head { g, replica: true };
-            let b = if copies.body {
+            let b = if copies.body.is_some() {
                 Some(self.head_copy(g, &body).await)
             } else {
                 None
             };
-            let r = if copies.replica {
+            let r = if copies.replica.is_some() {
                 Some(self.head_copy(g, &r1).await)
             } else {
                 None

@@ -146,8 +146,11 @@ pub fn decode_trailer(
     let plain = keys
         .open_trailer(sealed)
         .map_err(|e| CoreError::corrupt(&path, e.to_string()))?;
-    PackTrailer::decode(&plain, key, start, max_r)
-        .map_err(|e| CoreError::corrupt(&path, e.to_string()))
+    // 版本不認得的留著原本的錯誤：prune 把它記成 unknown（不使用、不刪除），不是 unreadable（§11.3 P4）
+    PackTrailer::decode(&plain, key, start, max_r).map_err(|e| match e {
+        kist_format::v4::Error::Version { .. } => CoreError::FormatV4(e),
+        e => CoreError::corrupt(&path, e.to_string()),
+    })
 }
 
 /// 一個已封好、待上傳的 pack 或 mpack。

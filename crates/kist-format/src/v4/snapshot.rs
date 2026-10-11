@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{ClientId, MetaId};
 use super::keys::Key;
 use super::meta::{build_dir_levels, kind, node_type, segment, Built, DirSeg, Entry, Item, Limits};
-use super::{check_version, corrupt, invalid, Result, VERSION};
+use super::{check_version, corrupt, invalid, peek_version, Result, VERSION};
 use crate::cbor;
 
 /// `..` 映射成的名稱（§9）。
@@ -251,6 +251,7 @@ impl Snapshot {
 
     /// 讀取端：版本不是 4 就拒絕（較舊的 prune 遇到較新的 snapshot 也是在這裡停下，§11.3 P5）。
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        peek_version("snapshot", bytes)?;
         let s: Snapshot = cbor::decode(bytes)?;
         s.validate()?;
         Ok(s)
