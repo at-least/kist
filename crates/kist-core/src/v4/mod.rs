@@ -1,6 +1,6 @@
-//! v4（`docs/format-v4.md`）：與 v3 的模組並存。實作第 4 段是 init、open 與 backup（B1–B5），讀取路徑
-//! （restore、mount、check）在第 5 段、prune 與維護命令在第 6 段；CLI、kist-app、kist-mount 在 v3 移除時
-//! 一起換過來。章節號碼（§n）指 `docs/format-v4.md`。
+//! v4（`docs/format-v4.md`）：唯一的格式（v3 在實作第 6 段移除）。實作第 4 段是 init、open 與 backup（B1–B5），
+//! 讀取路徑（restore、mount、check）在第 5 段、prune 與維護命令在第 6 段；CLI、kist-app、kist-mount 在第 6 段換過來。
+//! 章節號碼（§n）指 `docs/format-v4.md`。
 //!
 //! 模組一覽：
 //! - [`pack`]：pack 與 mpack 的寫入、讀取一項並驗證、trailer（§6）。

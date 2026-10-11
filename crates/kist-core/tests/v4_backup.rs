@@ -64,21 +64,27 @@ async fn init_writes_config_one_slot_and_head_zero_and_open_checks_the_password(
     assert!(matches!(none, CoreError::NotARepository), "{none}");
 }
 
+/// v3 repo 的 `config`（移除的 v3 fixture repo，ADR 018，commit 5cf1197）：v4 只讀 `v` 就拒絕。
+const V3_CONFIG_HEX: &str = concat!(
+    "a8617603677265706f5f696450a4fd84bbf24208a29fb821cc3eacd07b67637265617465641b18d8f56cb347979f6763",
+    "68756e6b6572a3636d696e184063617667190100636d61781904006b7061636b5f7461726765741a000100006a6d696e",
+    "5f72656164657203687265706c696361730164736c6f74a5617603646e616d656764656661756c746763726561746564",
+    "1b18d8f56cb347979f636b6466a563616c67686172676f6e326964617401616d086170016473616c7450e64093c7069c",
+    "5ed3aa900aaa7bc4462f677772617070656458829cb3ec48ae84789568e0cf2834679a54ac23916a4e33ee8679b8d6d2",
+    "87434d30fc7396af186e422fc8f9fa6267d7732f701cb6910a821b5261614c6019ef288fdd03274fec8994a28a34dfa7",
+    "7ca7565de6e05ad1a47776e9f7469cc1a16fd4bdfbd3a3ea17e4475cef2df9846c1201577240c0a91e1cfc605406e949",
+    "457d311865e0",
+);
+
 #[tokio::test]
 async fn a_v3_repository_is_refused_with_its_version() {
     let dir = tempfile::tempdir().unwrap();
     let backend = kist_backend::Backend::local(dir.path()).unwrap();
-    let opts = kist_core::InitOptions {
-        kdf_cost: kist_crypto::KdfCost {
-            m_cost_kib: 8,
-            t_cost: 1,
-            p_cost: 1,
-        },
-        ..Default::default()
-    };
-    kist_core::Repository::init(backend.clone(), PASSWORD, opts)
-        .await
-        .unwrap();
+    let config: Vec<u8> = (0..V3_CONFIG_HEX.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&V3_CONFIG_HEX[i..i + 2], 16).unwrap())
+        .collect();
+    backend.put_if_absent("config", config).await.unwrap();
     let err = Repo::open(backend, PASSWORD, None).await.unwrap_err();
     assert!(err.to_string().contains("format v3"), "{err}");
 }

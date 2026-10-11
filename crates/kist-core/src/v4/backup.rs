@@ -14,8 +14,8 @@
 //!   寫幾個就寫一份 delta 列出它們（重跑時沿用已上傳的），最後再寫一份。`E ≥ grace − M` 之後不再寫 delta。
 //! - **B4、B5**：[`PreparedBackup::commit`]。
 //!
-//! 走訪的骨架（排除規則、記號檔、不跨檔案系統、深度上限、硬連結、快速路徑）照 v3 的 `crate::backup`，
-//! 改用 v4 的 Entry；v3 移除時這份重複一起消失。
+//! 走訪的骨架（排除規則、記號檔、不跨檔案系統、深度上限、硬連結、快速路徑）來自 v3（ADR 019–021、024）；
+//! 來源與排除規則的型別（[`SourceSpec`]、[`Exclusions`]、[`Marker`]）在 v3 移除時從 v3 的 backup 搬來這裡。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -41,8 +41,7 @@ use super::pack::{FinishedPack, PackWriter};
 use super::read::{DirStream, Reader};
 use super::repo::Repo;
 use super::state::{pack_key, Generation, Holder, Source as HolderSource, State};
-use crate::backup::{Exclusions, SourceSpec};
-use crate::filter::FilterState;
+use crate::filter::{FilterState, PathFilter};
 use crate::{blocking, fsmeta, CoreError, Result};
 
 /// §11.1 的 `M`。
@@ -50,6 +49,120 @@ pub const M: Duration = Duration::from_secs(3600);
 
 /// 同時上傳中的 pack 數（每個最多 pack_target 的記憶體，同 v3）。
 const MAX_INFLIGHT_UPLOADS: usize = 1;
+
+/// 備份來源的指定（[`BackupOptions::source`]）。
+#[derive(Clone, Default)]
+pub enum SourceSpec {
+    /// `paths` 是本機檔案系統路徑（可多個；預設）。
+    #[default]
+    LocalPaths,
+    /// 單一遠端 URL（`sftp://`、`s3://`）：`backup`/`backup_prepare` 的
+    /// `paths` 必須正好是這個 URL——整個 backup 只有這一個 root。
+    Url(String),
+    /// 直接注入來源（測試與程式內嵌用）：給定 `Source` 與 `Root.path` 的
+    /// 定位 bytes，不經 `open_source`；`paths` 被忽略。
+    Injected(Arc<dyn Source>, Vec<u8>),
+}
+
+// `Arc<dyn Source>` 沒有 Debug（trait object 不帶），手動把定位印出來。
+impl std::fmt::Debug for SourceSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalPaths => f.write_str("LocalPaths"),
+            Self::Url(url) => f.debug_tuple("Url").field(url).finish(),
+            Self::Injected(_, locator) => f
+                .debug_tuple("Injected")
+                .field(&String::from_utf8_lossy(locator))
+                .finish(),
+        }
+    }
+}
+
+/// backup 的排除規則（ADR 020、021）。[`Default`]＝什麼都不排除。被排除的項目都計進
+/// [`BackupReport::excluded`]；指名的來源本身一律照備，規則只管它們底下的東西。
+#[derive(Debug, Clone, Default)]
+pub struct Exclusions {
+    /// 路徑樣式：比對到的檔案與目錄不進 snapshot（目錄整棵不走）。
+    pub patterns: PathFilter,
+    /// 記號檔：目錄裡有其中任何一個時，除了記號檔本身，目錄的內容都不備份；目錄本身照備。
+    pub if_present: Vec<Marker>,
+    /// 比這大（bytes）的檔案不備份；剛好等於的照備。
+    pub larger_than: Option<u64>,
+    /// 不進入別的檔案系統：裝置號碼與它所屬來源不同的目錄（掛載點、btrfs 子卷）照備成
+    /// 空目錄，這樣的檔案（單一檔案的 bind mount）不備份。只適用本機來源。
+    pub one_file_system: bool,
+}
+
+impl Exclusions {
+    /// CLI 旗標與設定檔共用的組法（審查修正：原本兩邊各組一次）：`if_present` 逐一以
+    /// [`Marker::parse`] 解析，`exclude_caches` 再加上 [`Marker::cachedir_tag`]。不支援的平台上
+    /// `one_file_system` 在這裡就報錯：CLI 在碰 repo 之前、設定檔在載入時，不是每次 backup 才失敗。
+    pub fn new(
+        patterns: PathFilter,
+        if_present: &[String],
+        exclude_caches: bool,
+        larger_than: Option<u64>,
+        one_file_system: bool,
+    ) -> Result<Self> {
+        if one_file_system && cfg!(not(unix)) {
+            return Err(one_file_system_unsupported());
+        }
+        let mut markers = if_present
+            .iter()
+            .map(|spec| Marker::parse(spec))
+            .collect::<Result<Vec<_>>>()?;
+        if exclude_caches {
+            markers.push(Marker::cachedir_tag());
+        }
+        Ok(Self {
+            patterns,
+            if_present: markers,
+            larger_than,
+            one_file_system,
+        })
+    }
+}
+
+fn one_file_system_unsupported() -> CoreError {
+    CoreError::Usage(
+        "one-file-system is not supported on this platform (no device numbers)".to_owned(),
+    )
+}
+
+/// [`Exclusions::if_present`] 的記號檔：名稱，加上檔案開頭必須是的 bytes（空的＝任何
+/// 種類、任何內容都算）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    pub(crate) name: Vec<u8>,
+    pub(crate) header: Vec<u8>,
+}
+
+impl Marker {
+    /// `NAME` 或 `NAME:HEADER`（同 restic 的 `--exclude-if-present`）。NAME 是單一路徑元件；
+    /// 有 HEADER 時，記號必須是開頭為 HEADER 的一般檔案。
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (name, header) = spec.split_once(':').unwrap_or((spec, ""));
+        // Windows 上 `\` 也是路徑分隔符（同 fsmeta::validate_child_name；審查修正）。
+        let separator = |c: char| c == '/' || c == '\0' || (cfg!(windows) && c == '\\');
+        if name.is_empty() || name == "." || name == ".." || name.contains(separator) {
+            return Err(CoreError::Usage(format!(
+                "exclude marker {spec:?}: NAME must be a single file name (NAME or NAME:HEADER)"
+            )));
+        }
+        Ok(Self {
+            name: name.as_bytes().to_vec(),
+            header: header.as_bytes().to_vec(),
+        })
+    }
+
+    /// CACHEDIR.TAG（<https://bford.info/cachedir/>）：開頭是規格固定的 43 bytes 簽章。
+    pub fn cachedir_tag() -> Self {
+        Self {
+            name: b"CACHEDIR.TAG".to_vec(),
+            header: b"Signature: 8a477f597d28d172789f06886806bc55".to_vec(),
+        }
+    }
+}
 
 /// 一次時鐘讀數：牆鐘與含休眠的單調時鐘（§11.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

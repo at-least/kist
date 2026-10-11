@@ -1,6 +1,6 @@
 //! v4 的 restore：backup → restore 的往返、§9 依 `Root.t` 的落點、§7 的 chunk 索引，以及從 v3 的
 //! `restore_hardening.rs` 搬過來的走訪層強化（重複還原、擋路的東西、壞掉的 chunk、過深的目錄、唯讀目錄、
-//! 硬連結、metadata 的順序；ADR 019）。檔案系統那一層的單元行為由 v3 的測試覆蓋（共用 `crate::restore`）。
+//! 硬連結、metadata 的順序；ADR 019）。metadata 經寫入時的 handle 套用的測試（ADR 019 A2、A3）是 `crate::v4::restore` 的單元測試。
 
 #[path = "v4_common/mod.rs"]
 mod v4_common;

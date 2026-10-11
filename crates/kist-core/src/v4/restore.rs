@@ -5,8 +5,8 @@
 //! 持有者全部失敗時重新載入一次世代再試。部分還原（include、exclude、SNAPSHOT:PATH）與 dry run 的規則同 v3
 //! （ADR 020、022、023）；SNAPSHOT:PATH 在 root 裡面時沿 Dir 的索引查找，只讀涵蓋路徑的段。
 //!
-//! 檔案系統這一層（暫存檔加 rename、擋路的東西、目錄 handle、硬連結、唯讀目錄、選取、metadata 的順序）與 v3
-//! 共用 `crate::restore`（ADR 019），v3 移除時搬進來；這裡只有走訪。
+//! 檔案系統這一層（暫存檔加 rename、擋路的東西、目錄 handle、硬連結、唯讀目錄、選取、metadata 的順序）在
+//! `crate::restore`（ADR 019；原本與 v3 共用，v3 移除後留在 crate 的根）；這裡只有走訪。
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -533,6 +533,8 @@ async fn restore_file_entry(
         }
     }
     let temp = restore_file(w.live, dir, name, node).await?;
+    #[cfg(all(test, unix))]
+    meta_via_handle_tests::before_meta(&temp.temp.path(), &path);
     // metadata 經寫入內容的同一個 handle 套用：路徑在寫完之後被換成符號連結，也改不到外面的檔。
     let (applied, owner) = apply_meta(&temp.file, &path, node);
     // metadata 套不上時內容仍是對的：照樣 rename 成正式名、記下這個錯。先關檔再 rename（Windows）。
@@ -592,6 +594,8 @@ async fn restore_dir(
         return Ok(());
     };
     w.summary.dirs += 1;
+    #[cfg(all(test, unix))]
+    meta_via_handle_tests::before_meta(dir.path(), dir.path());
     // 子項目都寫完後才設目錄的 mtime；沒有要套的 metadata（s3／generic 來源的目錄）就不動。
     if node.xattrs.is_none() && node.mtime.is_none() {
         return Ok(());
@@ -642,4 +646,225 @@ async fn restore_file(
         ));
     }
     Ok(temp)
+}
+
+/// ADR 019 A3：metadata 必須經寫入時的 handle 套用。以路徑套用的話，內容寫完
+/// 之後路徑被換成指向外面的 symlink，mode（含 setuid 位）與時間就套到外面的檔上。
+/// 搬自 v3 的 restore（測試接縫 [`before_meta`] 一起搬到 v4 的走訪）。
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod meta_via_handle_tests {
+    use std::cell::RefCell;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    use kist_format::v4::keys::Key;
+
+    use crate::v4::{BackupOptions, ClientId, InitOptions, Repo};
+    use crate::RestoreOptions;
+
+    thread_local! {
+        /// 測試接縫的設定：(要換掉的路徑, symlink 指向的外部路徑)。
+        /// `#[tokio::test]` 是單執行緒 runtime，restore 的走訪跑在測試自己的
+        /// 執行緒上，所以 thread_local 只影響設定它的那個測試。
+        static SWAP: RefCell<Option<(PathBuf, PathBuf)>> = const { RefCell::new(None) };
+        /// 每次呼叫 [`before_meta`] 時 `written` 的權限位元：(path, mode)。
+        static SEEN_MODES: RefCell<Vec<(PathBuf, u32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// restore 在內容寫完（目錄：子項目都寫完）、metadata 還沒套之前呼叫。
+    /// `written` 是內容實際所在的路徑：檔案是暫存檔（ADR 019 A2），目錄就是
+    /// `path`。`path` 符合設定時，把 `written` 搬到旁邊（`<path>.moved`），
+    /// 原位換成指向外面的 symlink——模擬本機攻擊者在這個空檔動手。
+    pub(super) fn before_meta(written: &Path, path: &Path) {
+        let mode = std::fs::symlink_metadata(written).unwrap().mode() & 0o7777;
+        SEEN_MODES.with(|seen| seen.borrow_mut().push((path.to_path_buf(), mode)));
+        SWAP.with(|swap| {
+            if let Some((victim, outside)) = swap.borrow().as_ref() {
+                if victim == path {
+                    std::fs::rename(written, moved(path)).unwrap();
+                    std::os::unix::fs::symlink(outside, written).unwrap();
+                }
+            }
+        });
+    }
+
+    fn moved(path: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.moved", path.display()))
+    }
+
+    const RECORDED_MTIME: i64 = 1_000_000;
+    const OUTSIDE_MTIME: i64 = 2_000_000_000;
+
+    struct Setup {
+        dir: tempfile::TempDir,
+        repo: Repo,
+        snapshot: Key,
+        /// 還原後來源根所在的位置（`<target>/<來源的絕對路徑>`）。
+        restored: PathBuf,
+        target: PathBuf,
+    }
+
+    /// 來源：`f.bin` 記錄成 mode 0o4755、`d/` 記錄成 0o700，mtime 都是
+    /// RECORDED_MTIME。目標之外（同一個 tempdir 的 `outside/`）：`victim.txt`
+    /// 0o600、`victim_dir/` 0o750，mtime 都是 OUTSIDE_MTIME。
+    async fn setup() -> Setup {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = kist_backend::Backend::local(&dir.path().join("repo")).unwrap();
+        let repo = Repo::init(
+            backend,
+            b"test password",
+            InitOptions {
+                kdf: kist_crypto::KdfCost {
+                    m_cost_kib: 8,
+                    t_cost: 1,
+                    p_cost: 1,
+                },
+                ..InitOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let recorded = filetime::FileTime::from_unix_time(RECORDED_MTIME, 0);
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("d")).unwrap();
+        std::fs::write(src.join("d").join("inner.txt"), b"inner").unwrap();
+        std::fs::write(src.join("f.bin"), b"payload").unwrap();
+        std::fs::set_permissions(src.join("f.bin"), PermissionsExt::from_mode(0o4755)).unwrap();
+        std::fs::set_permissions(src.join("d"), PermissionsExt::from_mode(0o700)).unwrap();
+        filetime::set_file_mtime(src.join("f.bin"), recorded).unwrap();
+        filetime::set_file_mtime(src.join("d"), recorded).unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("victim_dir")).unwrap();
+        std::fs::write(outside.join("victim.txt"), b"not yours").unwrap();
+        std::fs::set_permissions(outside.join("victim.txt"), PermissionsExt::from_mode(0o600))
+            .unwrap();
+        std::fs::set_permissions(outside.join("victim_dir"), PermissionsExt::from_mode(0o750))
+            .unwrap();
+        let outside_time = filetime::FileTime::from_unix_time(OUTSIDE_MTIME, 0);
+        filetime::set_file_mtime(outside.join("victim.txt"), outside_time).unwrap();
+        filetime::set_file_mtime(outside.join("victim_dir"), outside_time).unwrap();
+
+        let mut opts = BackupOptions::new(ClientId::from_bytes([0x11; 16]), "testhost", "tester");
+        opts.lone_head_wait = std::time::Duration::ZERO;
+        let summary = repo.backup(std::slice::from_ref(&src), opts).await.unwrap();
+        let target = dir.path().join("out");
+        let restored = target.join(src.strip_prefix("/").unwrap());
+        Setup {
+            dir,
+            repo,
+            snapshot: Key::parse(&summary.snapshot).unwrap(),
+            restored,
+            target,
+        }
+    }
+
+    /// (八進位 mode 字串, mtime 秒)：斷言失敗時直接看得出 4755 之類的值。
+    fn mode_and_mtime(path: &Path) -> (String, i64) {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (format!("{:o}", m.mode() & 0o7777), m.mtime())
+    }
+
+    /// 檔案：內容寫完後（寫在暫存檔，ADR 019 A2）暫存檔的路徑被換成指向外面
+    /// 檔案的 symlink。外面的檔不能被改成 4755、mtime 也不能動；metadata 落在
+    /// 寫入的那個 inode（被搬到旁邊的檔）上。之後 rename 把換上的 symlink 本身
+    /// 搬到正式名（rename 不跟隨），外面的檔同樣不受影響。
+    #[tokio::test]
+    async fn file_meta_does_not_follow_a_swapped_in_symlink() {
+        let s = setup().await;
+        let victim = s.dir.path().join("outside").join("victim.txt");
+        let path = s.restored.join("f.bin");
+        SWAP.with(|swap| *swap.borrow_mut() = Some((path.clone(), victim.clone())));
+
+        let summary = s
+            .repo
+            .restore(&s.snapshot, &s.target, RestoreOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mode_and_mtime(&victim),
+            ("600".to_owned(), OUTSIDE_MTIME),
+            "目標之外的檔被改了 (mode, mtime)；summary：{summary:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "換上的 symlink 不該被動到"
+        );
+        assert_eq!(
+            mode_and_mtime(&moved(&path)),
+            ("4755".to_owned(), RECORDED_MTIME),
+            "metadata 應該套在寫入的那個檔上"
+        );
+        assert!(summary.errors.is_empty(), "{summary:?}");
+    }
+
+    /// ADR 019 A2（審查）：內容寫進暫存檔之後、記錄的 mode 套上之前，暫存檔
+    /// 不能讓群組與其他人讀得到——那段時間別的本機使用者開了它，之後的 fchmod
+    /// 收不回已開的 fd。以 umask 預設（0o644）建暫存檔時，覆寫使用者 0o600 的
+    /// 檔也會經過這一段。記錄的 mode（f.bin：4755）之後照常套上。
+    #[tokio::test]
+    async fn temp_file_is_private_until_the_recorded_mode_is_applied() {
+        let s = setup().await;
+        let path = s.restored.join("f.bin");
+
+        let summary = s
+            .repo
+            .restore(&s.snapshot, &s.target, RestoreOptions::default())
+            .await
+            .unwrap();
+
+        let before = SEEN_MODES.with(|seen| {
+            seen.borrow()
+                .iter()
+                .find(|(p, _)| p == &path)
+                .map(|(_, mode)| format!("{mode:o}"))
+        });
+        assert_eq!(
+            before.as_deref(),
+            Some("600"),
+            "套 metadata 之前暫存檔的權限；summary：{summary:?}"
+        );
+        assert_eq!(mode_and_mtime(&path), ("4755".to_owned(), RECORDED_MTIME));
+        assert!(summary.errors.is_empty(), "{summary:?}");
+    }
+
+    /// 目錄：子項目寫完後路徑被換成指向外面目錄的 symlink。外面的目錄不能被
+    /// 改 mode 與 mtime。ADR 019 A4 之後目錄的 metadata 套在往下走時開的那個
+    /// handle 上，不再以路徑重開：metadata 落在被搬到旁邊的真目錄，與檔案
+    /// 一樣，也就沒有錯誤（A3 時重開遇到 symlink 回報擋路錯誤）。
+    #[tokio::test]
+    async fn dir_meta_does_not_follow_a_swapped_in_symlink() {
+        let s = setup().await;
+        let victim = s.dir.path().join("outside").join("victim_dir");
+        let path = s.restored.join("d");
+        SWAP.with(|swap| *swap.borrow_mut() = Some((path.clone(), victim.clone())));
+
+        let summary = s
+            .repo
+            .restore(&s.snapshot, &s.target, RestoreOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mode_and_mtime(&victim),
+            ("750".to_owned(), OUTSIDE_MTIME),
+            "目標之外的目錄被改了 (mode, mtime)；summary：{summary:?}"
+        );
+        assert_eq!(
+            std::fs::read(moved(&path).join("inner.txt")).unwrap(),
+            b"inner"
+        );
+        assert_eq!(
+            mode_and_mtime(&moved(&path)),
+            ("700".to_owned(), RECORDED_MTIME),
+            "metadata 應該套在還原出的那個目錄上"
+        );
+        assert!(summary.errors.is_empty(), "{summary:?}");
+    }
 }

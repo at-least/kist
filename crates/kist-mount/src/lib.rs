@@ -1,10 +1,10 @@
 //! kist-mount：把 repo 的 snapshots 掛成**唯讀**檔案系統（FUSE）。
 //!
 //! 佈局：`<client id hex>/<timestamp>/<備份的樹>`。備份來源是絕對路徑
-//! （`/tmp/x/src`），根目錄會展開成虛擬的中介層級讓你一路瀏覽下去
-//! （見 [`vpath`]）。頂兩層 volatile（TTL 1 秒，重複 ls 看得到新 snapshot）、
-//! snapshot 內容 immutable（TTL 24 小時）。檔案讀取走 index 的
-//! `raw_len` 直接定位 chunk（隨機讀不用先解前面的資料），解密後的 chunk
+//! （`/tmp/x/src`），snapshot 的頂層照 roots 的定位展開成中介層級讓你一路瀏覽下去
+//! （見 [`v4`]）。頂兩層 volatile（TTL 1 秒，重複 ls 看得到新 snapshot）、
+//! snapshot 內容 immutable（TTL 24 小時）。檔案讀取以持有者記錄的 chunk 長度
+//! 直接定位 chunk（隨機讀不用先解前面的資料），解密後的 chunk
 //! 有小 LRU（預設 8 顆 = 8 MiB chunk 時 64 MiB 上限）。
 //!
 //! 執行模型：fuser 0.18 的 callback 是同步 `&self`，非同步工作用共用的
@@ -17,10 +17,8 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-pub mod corefs;
 pub mod offsets;
 pub mod v4;
-pub mod vpath;
 
 use std::path::{Path, PathBuf};
 
@@ -29,8 +27,7 @@ use kist_core::v4::Repo;
 #[cfg(unix)]
 mod fuse;
 
-pub use corefs::{Attr, DirEntryData, FsError, Kind, Lookup, MountConfig};
-pub use v4::FsCore;
+pub use v4::{Attr, DirEntryData, FsCore, FsError, Kind, Lookup, MountConfig};
 
 #[cfg(unix)]
 pub use fuse::KistFs;

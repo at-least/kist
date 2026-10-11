@@ -1,5 +1,6 @@
-//! v4 的 mount 核心（docs/format-v4.md）：與 v3 的 [`crate::corefs::FsCore`] 同樣的方法與回傳型別，`fuse.rs` 在
-//! v3 移除時換過來；在那之前以測試直接驅動（`tests/v4_fs_read.rs`）。
+//! mount 的核心（docs/format-v4.md）：inode 表、snapshot 瀏覽、chunk 隨機讀。**不知道 FUSE 的存在**——[`FsCore`]
+//! 吃 [`Repo`]、吐 [`Attr`]／[`Listing`]／bytes，`crate::fuse` 只做 fuser 回覆的轉接；測試直接開 `FsCore`，不用真的
+//! 掛載（`tests/v4_fs_read.rs`）。介面的型別原本在 v3 的 `corefs`，v3 移除時搬來這裡。
 //!
 //! 佈局同 v3：`<client>/<時間戳>/<roots>`，頂兩層 volatile（TTL 1 秒），snapshot 內容 immutable（TTL 24 小時）。
 //! 與 v3 不同的地方：
@@ -23,10 +24,76 @@ use kist_format::v4::keys::{Key, SnapTs};
 use kist_format::v4::meta::{meta_kind, node_type, Entry};
 use kist_format::v4::snapshot::{split_locator, Root, Snapshot};
 
-use crate::corefs::{
-    Attr, DirEntryData, FsError, Kind, Listing, Lookup, MountConfig, IMMUTABLE_TTL, VOLATILE_TTL,
-};
 use crate::offsets::ChunkOffsets;
+
+/// 頂兩層（client、timestamp 列表）的快取期限。
+pub const VOLATILE_TTL: Duration = Duration::from_secs(1);
+/// snapshot 內容（內容定址、不可變）的快取期限。
+pub const IMMUTABLE_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// mount 設定。`chunk_cache` = 解密後 chunk 的快取顆數（0 視為 1；預設 8；
+/// 8 MiB chunk 時上限 64 MiB）。
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    pub chunk_cache: usize,
+}
+
+impl Default for MountConfig {
+    fn default() -> Self {
+        Self { chunk_cache: 8 }
+    }
+}
+
+/// FUSE 無關的檔案種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+    Symlink,
+}
+
+/// 平台無關的檔案屬性（fuse.rs 轉成 fuser 的 `FileAttr`）。
+#[derive(Debug, Clone, Copy)]
+pub struct Attr {
+    pub kind: Kind,
+    pub perm: u32,
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+/// 錯誤：fuse.rs 對映到 errno（`NotFound` → ENOENT、`EroFs` → EROFS、其餘 EIO）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsError {
+    NotFound,
+    Io,
+    InvalidInput,
+    BadHandle,
+}
+
+/// readdir 的一筆項目。
+#[derive(Debug, Clone)]
+pub struct DirEntryData {
+    pub name: Vec<u8>,
+    pub kind: Kind,
+}
+
+/// opendir 當下拍下的目錄快照：之後的 readdir 分頁都從這份讀，
+/// 新 snapshot 掃到一半出現也不會重複或漏掉。
+#[derive(Debug)]
+pub struct Listing {
+    pub entries: Vec<DirEntryData>,
+}
+
+/// lookup 的結果：inode 號、屬性、這個名字該用的 TTL（entry 與 attr 共用）。
+#[derive(Debug, Clone)]
+pub struct Lookup {
+    pub ino: u64,
+    pub attr: Attr,
+    pub ttl: Duration,
+}
 
 /// 看到新的 snapshot 時，兩次重新載入之間至少隔這麼久（同 v3）。
 const RELOAD_EAGER_MIN_INTERVAL: Duration = Duration::from_secs(1);

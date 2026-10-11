@@ -5,7 +5,7 @@
 //! - 讀取用 `get`、`get_range`、`head`、`list`，`maint/gen/` 從上次看過的世代起 [`Backend::list_after`]；
 //! - `delete` 與 P0 的 [`Backend::probe`] 只有維護角色（prune 與其他維護命令）會用。
 //!
-//! 覆寫（[`Backend::put`]）只給還沒遷移的 v3 程式碼（`config` 與 GC 的 `touch/`），v3 移除時一起移除。
+//! 覆寫（[`Backend::put`]）沒有正式的使用者了（v3 已移除）：只剩測試以它造出損壞的物件與後端自己的合約測試。
 //!
 //! 支援四種位置（見 [`RepoLocation`]）：本機目錄、`s3://bucket[/prefix]`（AWS S3 與
 //! MinIO 等相容服務）、`sftp://[user@]host[:port]/path` 與 rclone 橋接
@@ -293,9 +293,8 @@ impl Backend {
         }
     }
 
-    /// 寫入（覆蓋既有物件）。**只給 v3**：覆寫的合法使用者是 v3 的 `config` 與 GC 的 `touch/*`
-    /// （固定 8 bytes 內容、刷新 mtime；docs/format.md §13.1/§15）。v4 不覆寫任何物件
-    /// （format-v4.md §1），一律 [`put_if_absent`](Self::put_if_absent)；v3 移除時一起移除。
+    /// 寫入（覆蓋既有物件）。v4 不覆寫任何物件（format-v4.md §1），一律
+    /// [`put_if_absent`](Self::put_if_absent)；這個只剩測試在用（造出損壞的物件、後端的合約測試）。
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         self.store
             .put(&Self::path(key)?, bytes.into())

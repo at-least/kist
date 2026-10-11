@@ -18,8 +18,7 @@ use fuser::{
 };
 use tokio::runtime::Handle;
 
-use crate::corefs::{Attr, FsError, Kind};
-use crate::v4::FsCore;
+use crate::v4::{Attr, FsCore, FsError, Kind};
 
 pub struct KistFs {
     pub(crate) core: FsCore,
