@@ -76,9 +76,9 @@ impl TestRepo {
     }
 
     /// 打一個 session：`kist_mount::FsCore`（不掛載、直接驅動核心邏輯）。
-    pub async fn fs_core(&self) -> kist_mount::FsCore {
+    pub async fn fs_core(&self) -> kist_mount::corefs::FsCore {
         let repo = self.open().await;
-        kist_mount::FsCore::new(repo, kist_mount::MountConfig::default())
+        kist_mount::corefs::FsCore::new(repo, kist_mount::MountConfig::default())
             .await
             .unwrap()
     }

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use kist_app::{Config, Daemon, JobKind, JobStatus};
-use kist_core::{InitOptions, Repository};
+use kist_core::v4::{InitOptions, Repo};
 use time::macros::datetime;
 
 const PASSWORD: &str = "app test password";
@@ -19,14 +19,14 @@ async fn init_repo(dir: &Path) -> std::path::PathBuf {
     let repo = dir.join("repo");
     let backend = kist_backend::Backend::local(&repo).unwrap();
     let opts = InitOptions {
-        kdf_cost: kist_crypto::KdfCost {
+        kdf: kist_crypto::KdfCost {
             m_cost_kib: 8,
             t_cost: 1,
             p_cost: 1,
         },
         ..InitOptions::default()
     };
-    Repository::init(backend, PASSWORD.as_bytes(), opts)
+    Repo::init(backend, PASSWORD.as_bytes(), opts)
         .await
         .unwrap();
     repo
@@ -59,7 +59,6 @@ password_file = "/tmp/p"
 [backup]
 paths = ["/etc"]
 schedule = "0 2 * * *"
-gc_grace = "48h"
 exclude = ["/home/*", "!/home/me"]
 iexclude = ["*.BAK"]
 exclude_if_present = [".nobackup"]
@@ -71,7 +70,6 @@ keep_daily = 7
 keep_within = "2w"
 schedule = "0 4 * * *"
 [prune]
-grace = "3d"
 repack_below = 40
 [notify]
 webhook_url = "https://example.com/hook"
@@ -81,10 +79,6 @@ on = ["failure", "success"]
     );
     let cfg = Config::parse(&good).unwrap();
     cfg.validate().unwrap();
-    assert_eq!(
-        cfg.backup.as_ref().unwrap().gc_grace,
-        Some(std::time::Duration::from_secs(48 * 3600))
-    );
     let exclusions = cfg.backup.as_ref().unwrap().exclusions().unwrap();
     assert_eq!(exclusions.larger_than, Some(100 << 20));
     assert_eq!(
@@ -116,14 +110,7 @@ on = ["failure", "success"]
         cfg.forget.as_ref().unwrap().policy().keep_within,
         Some(std::time::Duration::from_secs(14 * 86_400))
     );
-    assert_eq!(
-        cfg.prune.as_ref().unwrap().options().grace,
-        std::time::Duration::from_secs(3 * 86_400)
-    );
-    assert_eq!(
-        cfg.prune.as_ref().unwrap().options().repack_below_percent,
-        40
-    );
+    assert_eq!(cfg.prune.as_ref().unwrap().options().repack_below, 40);
 
     let bad = [
         ("repo = \"/x\"\npassword_file = \"/p\"\n", "nothing to do"),
@@ -135,7 +122,9 @@ on = ["failure", "success"]
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[notify]\nwebhook_url = \"ftp://x\"\n", "http"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\n[notify]\nwebhook_url = \"https://x\"\non = [\"sometimes\"]\n", "unknown event"),
         ("repo = \"/x\"\npassword_file = \"/p\"\npassword = \"inline\"\n[backup]\npaths = [\"/e\"]\n", "unknown field"),
-        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"3 days\"\n", "unknown unit"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[forget]\nkeep_within = \"3 days\"\n", "unknown unit"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"72h\"\n", "unknown field"),
+        ("repo = \"/x\"\npassword_file = \"/p\"\n[prune]\ngrace = \"72h\"\n", "unknown field"),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude = [\"*.tmp\", \"[bad\"]\n", "[backup] exclude: invalid pattern \"[bad\""),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_if_present = [\"a/b\"]\n", "[backup] exclude marker \"a/b\""),
         ("repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\nexclude_larger_than = \"1MB\"\n", "unknown unit"),
@@ -157,48 +146,6 @@ on = ["failure", "success"]
             .expect_err(text);
         assert!(err.to_string().contains(needle), "{text}\n→ {err}");
     }
-}
-
-/// grace 的交叉檢查有方向（ADR 019 A5）：backup 以為的 grace 比 prune 給的長才是錯
-/// （prune 可能刪掉 backup 還在用的資料）；反方向只會讓 backup 早一點以 BackupTooLong
-/// 失敗，是安全的，要接受。
-#[test]
-fn gc_grace_longer_than_prune_grace_is_rejected() {
-    let longer = "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"72h\"\n[prune]\ngrace = \"1h\"\n";
-    let err = Config::parse(longer)
-        .and_then(|c| c.validate())
-        .expect_err("backup.gc_grace > prune.grace 要報錯");
-    assert!(
-        err.to_string()
-            .contains("must not be longer than [prune] grace"),
-        "{err}"
-    );
-
-    // [prune] 沒寫 grace：prune 用預設 72h，backup 設得更長一樣是危險方向。
-    let longer_than_default = "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"96h\"\n[prune]\nrepack_below = 40\n";
-    let err = Config::parse(longer_than_default)
-        .and_then(|c| c.validate())
-        .expect_err("backup.gc_grace > prune 的預設 grace 要報錯");
-    assert!(
-        err.to_string()
-            .contains("must not be longer than [prune] grace"),
-        "{err}"
-    );
-
-    // 安全方向與相等：接受。
-    for (backup, prune) in [("1h", "72h"), ("72h", "72h")] {
-        let text = format!(
-            "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"{backup}\"\n[prune]\ngrace = \"{prune}\"\n"
-        );
-        Config::parse(&text).unwrap().validate().unwrap();
-    }
-    // 沒有 [prune]（prune 在另一台維護主機）：無從比較，不檢查。
-    Config::parse(
-        "repo = \"/x\"\npassword_file = \"/p\"\n[backup]\npaths = [\"/e\"]\ngc_grace = \"96h\"\n",
-    )
-    .unwrap()
-    .validate()
-    .unwrap();
 }
 
 /// `[serve]`：選填的 UI 密碼檔與額外允許的 Host；沒有排程也算合法設定。
@@ -280,15 +227,12 @@ async fn run_once_executes_backup_forget_prune_in_order() {
     let src = dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("a.txt"), b"hello").unwrap();
-    // `[prune] grace` 會轉給 backup 閘門（ADR 019 A5）：0s 會讓 backup 必然
-    // BackupTooLong（見 run_once_backup_gate_uses_prune_grace）。這裡只驗工作順序，
-    // 用一個 backup 跑得完的 grace。
     let text = config_text(
         &repo,
         &password,
         dir.path(),
         &format!(
-            "[backup]\npaths = [{:?}]\n[forget]\nkeep_last = 1\n[prune]\ngrace = \"1h\"\n",
+            "[backup]\npaths = [{:?}]\n[forget]\nkeep_last = 1\n[prune]\n",
             src.display().to_string()
         ),
     );
@@ -340,35 +284,6 @@ async fn run_once_backup_honours_exclude() {
     assert_eq!(outcomes[0].status, JobStatus::Success, "{:?}", outcomes[0]);
     assert_eq!(outcomes[0].detail["stats"]["files"].as_u64(), Some(1));
     assert_eq!(outcomes[0].detail["report"]["excluded"].as_u64(), Some(2));
-}
-
-/// 同一份設定只寫 `[prune] grace`：backup 的閘門要用它（ADR 019 A5），不是 72h 預設。
-/// grace 0 時閘門是 `elapsed + 0 >= 0`，恆真，所以 backup 必然 BackupTooLong；
-/// 錯誤訊息要點名設定檔的 key，不只 CLI 旗標。
-#[tokio::test]
-async fn run_once_backup_gate_uses_prune_grace() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = init_repo(dir.path()).await;
-    let password = write_password(dir.path());
-    let src = dir.path().join("src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("a.txt"), b"hello").unwrap();
-    let text = config_text(
-        &repo,
-        &password,
-        dir.path(),
-        &format!(
-            "[backup]\npaths = [{:?}]\n[prune]\ngrace = \"0s\"\n",
-            src.display().to_string()
-        ),
-    );
-    let daemon = Daemon::new(Config::parse(&text).unwrap()).unwrap();
-    let outcomes = daemon.run_once(None, |_| {}).await;
-    assert_eq!(outcomes[0].job, JobKind::Backup);
-    assert_eq!(outcomes[0].status, JobStatus::Failure, "{:?}", outcomes[0]);
-    let err = outcomes[0].error.as_deref().unwrap_or("");
-    assert!(err.contains("longer than the GC grace period"), "{err}");
-    assert!(err.contains("[prune] grace"), "{err}");
 }
 
 #[tokio::test]
@@ -456,7 +371,7 @@ async fn scheduled_runs_and_webhook() {
     assert_eq!(got.len(), 2, "{got:?}");
     assert_eq!(got[0]["event"], "backup.success");
     assert_eq!(got[0]["job"], "backup");
-    assert!(got[0]["detail"]["snapshot_key"]
+    assert!(got[0]["detail"]["snapshot"]
         .as_str()
         .unwrap()
         .starts_with("snapshots/"));
@@ -477,7 +392,7 @@ async fn run_once_skips_remaining_jobs_after_shutdown() {
         &password,
         dir.path(),
         &format!(
-            "[backup]\npaths = [{:?}]\nschedule = \"@daily\"\n[forget]\nschedule = \"@daily\"\nkeep_last = 1\n[prune]\nschedule = \"@daily\"\ngrace = \"0s\"\n",
+            "[backup]\npaths = [{:?}]\nschedule = \"@daily\"\n[forget]\nschedule = \"@daily\"\nkeep_last = 1\n[prune]\nschedule = \"@daily\"\n",
             src.display().to_string()
         ),
     );

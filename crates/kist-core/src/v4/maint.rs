@@ -488,3 +488,31 @@ impl Repo {
         Ok(report)
     }
 }
+
+/// `settings`（不改）：最新的 head 的 settings 與進行中的 drain、hold。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SettingsView {
+    pub generation: Gen,
+    pub settings: Settings,
+    pub drain: Option<Drain>,
+    pub hold: Option<kist_format::v4::index::Hold>,
+}
+
+impl Repo {
+    /// 列出來的最大世代的 settings（讀那一代的 head，主體不行讀 `.r1`）。
+    pub async fn settings(&self) -> Result<SettingsView> {
+        let listing = self.list_heads(None).await?;
+        let Some(&g) = listing.keys().next_back() else {
+            return Err(CoreError::Generation(
+                "no generation head under maint/gen/".to_owned(),
+            ));
+        };
+        let head = self.read_head(g).await?.head;
+        Ok(SettingsView {
+            generation: g,
+            settings: head.settings,
+            drain: head.drain,
+            hold: head.hold,
+        })
+    }
+}

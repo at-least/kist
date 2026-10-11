@@ -20,7 +20,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use kist_core::SnapshotInfo;
+use kist_core::v4::SnapshotListing;
 use maud::{html, Markup, DOCTYPE};
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
@@ -506,7 +506,13 @@ async fn list_snapshots(state: &ServeState) -> std::result::Result<Vec<SnapshotR
     let repo = open_repo(state.daemon.config())
         .await
         .map_err(|e| e.to_string())?;
-    let infos = repo.list_snapshots().await.map_err(|e| e.to_string())?;
+    let (infos, errors) = repo
+        .list_snapshots_with_roots()
+        .await
+        .map_err(|e| e.to_string())?;
+    for e in errors {
+        tracing::warn!("cannot read snapshot {e}");
+    }
     Ok(infos.iter().rev().map(snapshot_row).collect())
 }
 
@@ -517,18 +523,18 @@ fn format_ns_time(ns: i64) -> String {
         .unwrap_or_default()
 }
 
-fn snapshot_row(info: &SnapshotInfo) -> SnapshotRow {
+fn snapshot_row(info: &SnapshotListing) -> SnapshotRow {
     let s = &info.snapshot;
     SnapshotRow {
-        client: info.client_hex().chars().take(8).collect(),
-        time: format_ns_time(s.time_ns),
+        client: s.client.to_string().chars().take(8).collect(),
+        time: format_ns_time(s.time),
         hostname: s.host.clone(),
         files: s.stats.files.to_string(),
         size: human_bytes(s.stats.bytes),
-        paths: s
+        paths: info
             .roots
             .iter()
-            .map(|r| String::from_utf8_lossy(r.path.as_slice()).into_owned())
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
             .collect::<Vec<_>>()
             .join(", "),
     }

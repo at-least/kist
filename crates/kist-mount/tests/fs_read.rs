@@ -4,8 +4,8 @@
 mod common;
 
 use common::{TestRepo, CLIENT};
+use kist_mount::corefs::FsCore;
 use kist_mount::corefs::Kind;
-use kist_mount::FsCore;
 
 /// 準備一份備份：src/ 下有小檔、跨多 chunk 的大檔、subdir、symlink。
 /// 回傳 big.bin 的原始 bytes。

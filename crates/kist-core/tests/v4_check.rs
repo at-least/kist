@@ -226,6 +226,38 @@ async fn a_missing_mpack_r1_is_repaired_when_replicas_is_one() {
     clean(&repo.check(READ).await.unwrap());
 }
 
+/// 還沒收錄（只有 delta 提到）的 mpack 也照兩份檢查：第一次 prune 之前每個 mpack 都是這樣。
+#[tokio::test]
+async fn an_mpack_known_only_from_a_delta_gets_both_copies_checked() {
+    let t = TestRepo::with(init_options(1)).await;
+    let repo = t.open().await;
+    let src = t.dir.path().join("src");
+    sample_source(&src);
+    repo.backup(std::slice::from_ref(&src), opts(1))
+        .await
+        .unwrap();
+    clean(&repo.check(READ).await.unwrap());
+    let mpack = first(&t, "mpacks", 1).await;
+    let r1 = format!("{mpack}.r1");
+
+    t.backend.delete(&r1).await.unwrap();
+    let r = repo.check(PLAIN).await.unwrap();
+    assert!(has(&r.warnings, &format!("{mpack}: has no .r1")), "{r:?}");
+    let r = repo.check(REPAIR).await.unwrap();
+    assert!(has(&r.repaired, &r1), "{r:?}");
+    clean(&repo.check(READ).await.unwrap());
+
+    t.backend.delete(&mpack).await.unwrap();
+    let r = repo.check(PLAIN).await.unwrap();
+    assert!(
+        has(&r.errors, &format!("{mpack}: missing; its .r1 is intact")),
+        "{r:?}"
+    );
+    let r = repo.check(REPAIR).await.unwrap();
+    assert!(has(&r.repaired, &mpack), "{r:?}");
+    clean(&repo.check(READ).await.unwrap());
+}
+
 #[tokio::test]
 async fn a_damaged_shard_body_is_repairable_but_not_rewritten() {
     let (t, repo, _) = indexed(1).await;

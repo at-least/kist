@@ -1,5 +1,5 @@
 //! fuser 0.18 的轉接層：把 FUSE callback 翻成 [`FsCore`] 呼叫。邏輯都在
-//! `corefs`，這裡只有 errno 對映、`FileAttr` 組裝與 TTL 選擇。
+//! `v4`，這裡只有 errno 對映、`FileAttr` 組裝與 TTL 選擇。
 //!
 //! 執行模型：fuser 的 callback 是同步 `&self`（多條 event loop 併發呼叫），
 //! 非同步工作用共用的 tokio runtime `Handle::block_on` 完成——fuser 執行緒
@@ -18,7 +18,8 @@ use fuser::{
 };
 use tokio::runtime::Handle;
 
-use crate::corefs::{Attr, FsCore, FsError, Kind};
+use crate::corefs::{Attr, FsError, Kind};
+use crate::v4::FsCore;
 
 pub struct KistFs {
     pub(crate) core: FsCore,

@@ -35,12 +35,14 @@ pub mod state;
 
 pub use backup::{
     BackupOptions, BackupProgress, BackupReport, BackupSummary, Clock, PreparedBackup,
-    ProgressCallback, Reading,
+    ProgressCallback, Reading, RootSummary,
 };
 pub use forget::{ForgetOptions, ForgetSummary};
+/// backup 的 client id（kist-app 不直接依賴 kist-format，從這裡轉出去）。
+pub use kist_format::v4::ids::ClientId;
 pub use live::Live;
-pub use maint::{MaintOptions, SettingsChange, SettingsReport, UnknownReport};
+pub use maint::{MaintOptions, SettingsChange, SettingsReport, SettingsView, UnknownReport};
 pub use prune::{PruneOptions, PruneReport};
 pub use rebuild::RebuildReport;
 pub use repo::{InitOptions, Repo, SlotInfo};
-pub use snapshots::SnapshotInfo;
+pub use snapshots::{SnapshotInfo, SnapshotListing};

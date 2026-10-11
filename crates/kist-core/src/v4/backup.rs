@@ -211,7 +211,28 @@ pub struct BackupReport {
     pub excluded: u64,
 }
 
-#[derive(Debug, Clone)]
+/// 回報用的一個 root：定位（lossy UTF-8）與種類（`file`、`dir`、`symlink`）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RootSummary {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+}
+
+impl RootSummary {
+    fn new(path: &[u8], t: u8) -> Self {
+        Self {
+            path: String::from_utf8_lossy(path).into_owned(),
+            kind: match t {
+                node_type::DIR => "dir",
+                node_type::SYMLINK => "symlink",
+                _ => "file",
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupSummary {
     /// snapshot 主體的 key。
     pub snapshot: String,
@@ -220,6 +241,8 @@ pub struct BackupSummary {
     pub generation: Gen,
     pub stats: SnapshotStats,
     pub report: BackupReport,
+    /// 這個 snapshot 的 roots。
+    pub roots: Vec<RootSummary>,
 }
 
 /// 一個檔案在 Entry 裡的內容。
@@ -932,6 +955,10 @@ impl Repo {
             used_subtree: w.used_subtree,
             settings,
             progress: opts.progress,
+            root_summaries: root_types
+                .iter()
+                .map(|(p, t)| RootSummary::new(p, *t))
+                .collect(),
         })
     }
 
@@ -1950,6 +1977,7 @@ pub struct PreparedBackup {
     used_subtree: bool,
     settings: Settings,
     progress: Option<ProgressCallback>,
+    root_summaries: Vec<RootSummary>,
 }
 
 impl PreparedBackup {
@@ -2099,6 +2127,7 @@ impl PreparedBackup {
             generation: g_c,
             stats: self.stats,
             report: self.report,
+            roots: self.root_summaries,
         })
     }
 

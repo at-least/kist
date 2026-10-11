@@ -465,7 +465,7 @@ impl Check {
         }
     }
 
-    /// 解不開的 delta（讀取端跳過）；delta 提到、卻不在列表裡的 pack。
+    /// 解不開的 delta（讀取端跳過）；delta 提到、卻不在列表裡的 pack；delta 提到的 mpack 的兩份（同 records）。
     async fn deltas(&mut self, state: &State) {
         let mut keys: Vec<String> = self
             .listed
@@ -503,6 +503,7 @@ impl Check {
         }
         self.report.packs += state.deltas.packs().count() as u64;
         let mut missing = Vec::new();
+        let mut mpacks = Vec::new();
         for (client, p) in state.deltas.packs() {
             let body = pack_key(p.kind, *client, p.id);
             let r1 = Key::Mpack {
@@ -510,14 +511,24 @@ impl Check {
                 id: p.id,
                 replica: true,
             };
-            if !self.is_listed(&body) && !(p.kind == Kind::Meta && self.is_listed(&r1)) {
+            let body_listed = self.is_listed(&body);
+            let r1_listed = p.kind == Kind::Meta && self.is_listed(&r1);
+            if !body_listed && !r1_listed {
                 missing.push(body.path());
+            } else if p.kind == Kind::Meta && (!body_listed || (self.replicas && !r1_listed)) {
+                // mpack 的兩份同 records：只在要修或要判斷時才下載
+                mpacks.push((body, r1, p.id));
             }
         }
         for path in missing {
             self.warn(format!(
                 "{path}: a delta lists it, but it is not in the repository"
             ));
+        }
+        for (body, r1, id) in mpacks {
+            let b = self.named_copy(&body, &id).await;
+            let c = self.named_copy(&r1, &id).await;
+            self.two_copies(&body, &r1, b, c, self.replicas).await;
         }
     }
 
