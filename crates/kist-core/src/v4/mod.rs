@@ -33,7 +33,10 @@ pub mod restore;
 pub mod snapshots;
 pub mod state;
 
-pub use backup::{BackupOptions, BackupReport, BackupSummary, Clock, PreparedBackup, Reading};
+pub use backup::{
+    BackupOptions, BackupProgress, BackupReport, BackupSummary, Clock, PreparedBackup,
+    ProgressCallback, Reading,
+};
 pub use forget::{ForgetOptions, ForgetSummary};
 pub use live::Live;
 pub use maint::{MaintOptions, SettingsChange, SettingsReport, UnknownReport};

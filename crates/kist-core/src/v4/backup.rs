@@ -125,6 +125,47 @@ pub struct BackupOptions {
     /// B3：每寫這麼多個 pack（資料與 mpack 合計）寫一份中間的 delta。
     #[doc(hidden)]
     pub delta_every: usize,
+    /// 進度回報：每處理完一個項目一次，結尾的 flush、B4 的檢查與 B5 的 commit 各一次。
+    pub progress: Option<ProgressCallback>,
+}
+
+/// backup 進行中的即時狀態（給 UI 顯示進度）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupProgress {
+    /// "files" | "flush" | "verify" | "commit"
+    pub phase: &'static str,
+    pub stats: SnapshotStats,
+    pub report: BackupReport,
+    /// 剛處理完的路徑（lossy UTF-8）；結尾的階段是 `None`。
+    pub current: Option<String>,
+}
+
+/// 進度 callback：`Arc` 包起來讓 [`BackupOptions`] 仍可 `Clone`；backup 的 future 在多執行緒的 runtime 上，所以
+/// 要 `Send + Sync`。
+#[derive(Clone)]
+pub struct ProgressCallback(pub Arc<dyn Fn(&BackupProgress) + Send + Sync>);
+
+impl std::fmt::Debug for ProgressCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProgressCallback")
+    }
+}
+
+fn report_progress(
+    progress: Option<&ProgressCallback>,
+    phase: &'static str,
+    stats: SnapshotStats,
+    report: BackupReport,
+    current: Option<String>,
+) {
+    if let Some(cb) = progress {
+        (cb.0)(&BackupProgress {
+            phase,
+            stats,
+            report,
+            current,
+        });
+    }
 }
 
 impl BackupOptions {
@@ -139,6 +180,7 @@ impl BackupOptions {
             clock: Clock::system(),
             lone_head_wait: Duration::from_secs(5),
             delta_every: 16,
+            progress: None,
         }
     }
 }
@@ -835,6 +877,7 @@ impl Repo {
             started,
             clock: opts.clock.clone(),
             delta_every: opts.delta_every.max(1),
+            progress: opts.progress.clone(),
         };
 
         // B2、B3：走訪每個 root
@@ -888,6 +931,7 @@ impl Repo {
             own_packs: w.own_packs,
             used_subtree: w.used_subtree,
             settings,
+            progress: opts.progress,
         })
     }
 
@@ -925,6 +969,7 @@ struct Walk {
     started: Reading,
     clock: Clock,
     delta_every: usize,
+    progress: Option<ProgressCallback>,
 }
 
 /// 一個檔案切塊到一半的狀態，在 blocking closure 之間移進移出：一輪最多封一個 pack 就回 async 端上傳。
@@ -1246,8 +1291,30 @@ impl Walk {
         })
     }
 
-    /// 處理一個目錄項目：回傳它的 Entry 與它沿用的 (item, 持有者)；讀不到的、別的檔案系統上的檔案回 `None`。
+    /// [`Walk::process_entry_inner`]，做完回報一次進度（不論寫進目錄、略過或記成錯誤）。
     async fn process_entry(
+        &mut self,
+        ctx: &SourceCtx,
+        rel: &[u8],
+        item: SourceItem,
+        parent: Option<&Entry>,
+        visit: Visit,
+    ) -> Result<Option<(Entry, Used)>> {
+        let out = self
+            .process_entry_inner(ctx, rel, item, parent, visit)
+            .await?;
+        report_progress(
+            self.progress.as_ref(),
+            "files",
+            self.stats,
+            self.report,
+            Some(ctx.display_path(rel)),
+        );
+        Ok(out)
+    }
+
+    /// 處理一個目錄項目：回傳它的 Entry 與它沿用的 (item, 持有者)；讀不到的、別的檔案系統上的檔案回 `None`。
+    async fn process_entry_inner(
         &mut self,
         ctx: &SourceCtx,
         rel: &[u8],
@@ -1787,6 +1854,13 @@ impl Walk {
 
     /// 走訪結束：剩下的 pack 與 mpack、等上傳完、最後一份 delta。
     async fn flush(&mut self) -> Result<()> {
+        report_progress(
+            self.progress.as_ref(),
+            "flush",
+            self.stats,
+            self.report,
+            None,
+        );
         let mut work = self.take_work()?;
         let (work, data, meta) = blocking(move || {
             let data = work.data.finish();
@@ -1875,6 +1949,7 @@ pub struct PreparedBackup {
     own_packs: Vec<ObjectId>,
     used_subtree: bool,
     settings: Settings,
+    progress: Option<ProgressCallback>,
 }
 
 impl PreparedBackup {
@@ -1897,6 +1972,13 @@ impl PreparedBackup {
 
     /// B4（緊接在寫 snapshot 之前）與 B5：檢查去重用到的每個 pack、沿用子樹時的 parent，然後寫 snapshot。
     pub async fn commit(self) -> Result<BackupSummary> {
+        report_progress(
+            self.progress.as_ref(),
+            "verify",
+            self.stats,
+            self.report,
+            None,
+        );
         // B4
         let g_s = self.state.gen.g;
         let listing = self.repo.list_heads(Some(g_s)).await?;
@@ -1998,6 +2080,13 @@ impl PreparedBackup {
         }
 
         // B5
+        report_progress(
+            self.progress.as_ref(),
+            "commit",
+            self.stats,
+            self.report,
+            None,
+        );
         let key = self.write_snapshot(grace).await?;
         if let Some(c) = self.repo.cache() {
             c.add_verified(&self.reader.take_new_verified());
