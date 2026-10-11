@@ -11,9 +11,10 @@ use kist_backend::{Backend, BackendError, RepoLocation};
 use kist_crypto::v4::{derive_kek, unwrap_master, wrap_master, Keys};
 use kist_crypto::{CryptoError, KdfCost, MasterKey};
 use kist_format::v4::config::{Chunker, Config, Kdf, KdfSalt, Slot, KDF_ARGON2ID};
+use kist_format::v4::ids::parse_lower_hex;
 use kist_format::v4::ids::RepoId;
 use kist_format::v4::index::{Head, Settings};
-use kist_format::v4::keys::Key;
+use kist_format::v4::keys::{Key, KEYS};
 use zeroize::Zeroizing;
 
 use super::cache::Cache;
@@ -34,6 +35,10 @@ pub struct Repo {
     config: Config,
     keys: Arc<Keys>,
     cache: Option<Cache>,
+    /// `key add` 用：master 本身、config 原樣的 bytes（槽的 AAD 綁它）、這個程序開啟時用的槽（`key remove` 不刪它）。
+    master: Arc<MasterKey>,
+    config_bytes: Arc<Vec<u8>>,
+    slot: [u8; 16],
 }
 
 impl Repo {
@@ -111,7 +116,7 @@ impl Repo {
 
         // 寬鬆後端（rclone://）上兩個 init 可能互相覆蓋 config：讀回比對攔下大多數交錯（同 v3）。
         match backend
-            .put_if_absent_verified(&Key::Config.path(), config_bytes)
+            .put_if_absent_verified(&Key::Config.path(), config_bytes.clone())
             .await
         {
             Ok(()) => {}
@@ -121,6 +126,7 @@ impl Repo {
         backend
             .put_if_absent(&Key::Slot(slot_name).path(), slot.encode()?)
             .await?;
+        let config_bytes = Arc::new(config_bytes);
         for replica in [false, true] {
             backend
                 .put_if_absent(&Key::Head { g: 0, replica }.path(), head.clone())
@@ -131,6 +137,9 @@ impl Repo {
             config,
             keys,
             cache: None,
+            master: Arc::new(master),
+            config_bytes,
+            slot: slot_name,
         })
     }
 
@@ -165,6 +174,7 @@ impl Repo {
             }
             Err(e) => return Err(e.into()),
         };
+        let slot_name = kek.slot_name();
         let master = unwrap_master(&kek, &slot, &config_bytes)?;
         let keys = Arc::new(Keys::derive(&master));
         let cache = cache_root.map(|root| {
@@ -175,6 +185,9 @@ impl Repo {
             config,
             keys,
             cache,
+            master: Arc::new(master),
+            config_bytes: Arc::new(config_bytes),
+            slot: slot_name,
         })
     }
 
@@ -192,5 +205,89 @@ impl Repo {
 
     pub fn cache(&self) -> Option<&Cache> {
         self.cache.as_ref()
+    }
+}
+
+/// 一個金鑰槽：名稱（32 位小寫 hex）與它是不是這個程序開啟時用的那一個。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SlotInfo {
+    pub name: String,
+    pub current: bool,
+}
+
+impl Repo {
+    /// `key add`（§3）：以新密碼推導 KEK 與槽的名稱，把 master 包進新的槽 `keys/<名稱>`（只在不存在時建立）。
+    /// 這個密碼已經有槽就拒絕。回傳新槽的名稱。
+    pub async fn key_add(&self, password: &[u8]) -> Result<String> {
+        let kdf = self.config.kdf.clone();
+        let master = Arc::clone(&self.master);
+        let config_bytes = Arc::clone(&self.config_bytes);
+        let password = Zeroizing::new(password.to_vec());
+        let (name, slot) = blocking(move || {
+            let kek = derive_kek(&password, &kdf)?;
+            Ok((kek.slot_name(), wrap_master(&kek, &master, &config_bytes)?))
+        })
+        .await?;
+        let key = Key::Slot(name).path();
+        match self.backend.put_if_absent(&key, slot.encode()?).await {
+            Ok(()) => Ok(hex::encode(name)),
+            Err(BackendError::AlreadyExists(_)) => Err(CoreError::Usage(format!(
+                "this password already has a key slot ({key})"
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 列表裡的金鑰槽。
+    pub async fn key_list(&self) -> Result<Vec<SlotInfo>> {
+        let mut out = Vec::new();
+        for o in self.backend.list(KEYS.trim_end_matches('/')).await? {
+            match Key::parse(&o.key) {
+                Ok(Key::Slot(name)) => out.push(SlotInfo {
+                    name: hex::encode(name),
+                    current: name == self.slot,
+                }),
+                _ => tracing::warn!("{}: not a v4 key slot; ignored", o.key),
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// `key remove`（§3，維護角色）：刪掉名稱是 `name` 的槽。只在這個程序開啟時用的槽仍在列表裡、而且不是
+    /// 要刪的那一個時才刪，所以最後一個槽刪不掉。同一台主機一次一個維護命令（檔案鎖）；不同主機同時互刪對方
+    /// 的槽仍可能兩個都刪掉——這個命令很少用，接受這個風險。
+    pub async fn key_remove(&self, name: &str) -> Result<()> {
+        let target = parse_lower_hex::<16>("key slot name", name)
+            .map_err(|e| CoreError::Usage(e.to_string()))?;
+        if target == self.slot {
+            return Err(CoreError::Usage(format!(
+                "key slot {name} is the one this command opened the repository with; open it with \
+                 another password to remove this one"
+            )));
+        }
+        let _lock = super::maint::lock(self)?;
+        let listed: Vec<[u8; 16]> = self
+            .backend
+            .list(KEYS.trim_end_matches('/'))
+            .await?
+            .into_iter()
+            .filter_map(|o| match Key::parse(&o.key) {
+                Ok(Key::Slot(n)) => Some(n),
+                _ => None,
+            })
+            .collect();
+        if !listed.contains(&self.slot) {
+            return Err(CoreError::Usage(format!(
+                "the key slot this command opened the repository with ({}) is no longer listed; \
+                 not removing another one",
+                hex::encode(self.slot)
+            )));
+        }
+        if !listed.contains(&target) {
+            return Err(CoreError::Usage(format!("no key slot {name}")));
+        }
+        self.backend.delete(&Key::Slot(target).path()).await?;
+        Ok(())
     }
 }

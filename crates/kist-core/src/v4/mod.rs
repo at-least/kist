@@ -39,5 +39,5 @@ pub use live::Live;
 pub use maint::{MaintOptions, SettingsChange, SettingsReport};
 pub use prune::{PruneOptions, PruneReport};
 pub use rebuild::RebuildReport;
-pub use repo::{InitOptions, Repo};
+pub use repo::{InitOptions, Repo, SlotInfo};
 pub use snapshots::SnapshotInfo;

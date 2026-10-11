@@ -107,7 +107,7 @@ pub(crate) struct Session {
 
 /// 同一台主機一次一個維護命令（§11.3）：鎖檔在這個 repo 的本地快取目錄裡；沒有快取時在系統的暫存目錄，以
 /// 快取目錄的名稱區分 repo。程序結束或 drop 時釋放。
-fn lock(repo: &Repo) -> Result<std::fs::File> {
+pub(crate) fn lock(repo: &Repo) -> Result<std::fs::File> {
     let path = match repo.cache() {
         Some(c) => c.dir().join("maint.lock"),
         None => std::env::temp_dir().join(format!(
