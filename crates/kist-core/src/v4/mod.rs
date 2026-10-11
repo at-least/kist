@@ -14,6 +14,7 @@
 //! - [`restore`]：restore 與 dry run 的走訪（§9 的落點）；檔案系統那一層與 v3 共用。
 //! - [`check`]：check、`--read-data` 與只在不存在時建立的 `--repair`（§13.1）。
 //! - [`forget`]：依保留政策或明確指定刪掉 snapshot，不刪每一組最新的那一份（§9）。
+//! - [`prune`]：P0–P9（§11.3），照 GC 模型。
 //! - [`maint`]：維護角色的共用步驟（檔案鎖、P0、P1、柵欄、兩個時鐘，§11.1、§11.3）與改 settings（§11.4）。
 
 pub mod backup;
@@ -23,6 +24,7 @@ pub mod forget;
 pub mod live;
 pub mod maint;
 pub mod pack;
+pub mod prune;
 pub mod read;
 pub mod repo;
 pub mod restore;
@@ -33,5 +35,6 @@ pub use backup::{BackupOptions, BackupReport, BackupSummary, Clock, PreparedBack
 pub use forget::{ForgetOptions, ForgetSummary};
 pub use live::Live;
 pub use maint::{MaintOptions, SettingsChange, SettingsReport};
+pub use prune::{PruneOptions, PruneReport};
 pub use repo::{InitOptions, Repo};
 pub use snapshots::SnapshotInfo;

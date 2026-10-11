@@ -53,7 +53,7 @@ impl Mpacks {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn get(&self, id: &ObjectId) -> Option<Arc<Vec<u8>>> {
+    pub(crate) fn get(&self, id: &ObjectId) -> Option<Arc<Vec<u8>>> {
         let mut l = self.lock();
         let bytes = l.map.get(id).cloned()?;
         l.order.retain(|x| x != id);
@@ -502,12 +502,20 @@ impl Reader {
             })
     }
 
-    /// B4：一個 pack 的 trailer，直接從 repo 讀（HEAD 取大小、range 讀檔尾與 trailer），照 §6 檢查。
+    /// B4：一個 pack 的 trailer，直接從 repo 讀（HEAD 取大小，再 [`Repo::trailer_sized`]）。
     pub async fn trailer(&self, key: &Key) -> Result<PackTrailer> {
+        let size = self.repo.backend().head(&key.path()).await?.size;
+        self.repo.trailer_sized(key, size).await
+    }
+}
+
+impl Repo {
+    /// 大小已知（列表裡有）的 pack 的 trailer：range 讀檔尾與 trailer，照 §6 檢查。版本不認得是
+    /// [`CoreError::FormatV4`] 的 `Version`，其他內容問題是 [`CoreError::Corrupt`]，讀不到是後端的錯誤。
+    pub async fn trailer_sized(&self, key: &Key, size: u64) -> Result<PackTrailer> {
         let path = key.path();
         let kind = fpack::Kind::of_key(key)
             .ok_or_else(|| CoreError::corrupt(&path, "not a pack or mpack key"))?;
-        let size = self.repo.backend().head(&path).await?.size;
         let footer_len = fpack::FOOTER_LEN as u64;
         if size < (fpack::HEADER_LEN as u64) + footer_len {
             return Err(CoreError::corrupt(
@@ -516,7 +524,6 @@ impl Reader {
             ));
         }
         let footer = self
-            .repo
             .backend()
             .get_range(&path, size - footer_len..size)
             .await?;
@@ -529,16 +536,15 @@ impl Reader {
                 CoreError::corrupt(&path, format!("trailer length {len} does not fit"))
             })?;
         let sealed = self
-            .repo
             .backend()
             .get_range(&path, start..size - footer_len)
             .await?;
         decode_trailer(
-            self.repo.keys(),
+            self.keys(),
             key,
             start,
             &sealed,
-            max_r(kind, self.repo.config().chunker.max),
+            max_r(kind, self.config().chunker.max),
         )
     }
 }

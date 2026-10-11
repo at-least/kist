@@ -422,13 +422,13 @@ pub mod hooked {
     use object_store::memory::InMemory;
     use object_store::path::Path as StorePath;
     use object_store::{
-        GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, PutOptions, PutPayload,
-        PutResult,
+        GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt as _,
+        PutOptions, PutPayload, PutResult,
     };
 
     #[derive(Debug, Default)]
     pub struct Hooked {
-        inner: InMemory,
+        inner: Arc<InMemory>,
         counts: Mutex<BTreeMap<&'static str, usize>>,
         puts: Mutex<Vec<String>>,
         ranged: Mutex<Vec<String>>,
@@ -440,6 +440,13 @@ pub mod hooked {
         pub after_get: Mutex<Vec<(String, String, Vec<u8>)>>,
         /// 刪除過的 key，依順序。
         deleted: Arc<Mutex<Vec<String>>>,
+        /// 這些 key 的下一次讀取（GET、HEAD、range）失敗（暫時的錯誤，例如逾時）。
+        pub fail_get: Mutex<Vec<String>>,
+        /// 這些 key 的下一次刪除被拒絕（Object Lock、權限）。
+        pub fail_delete: Arc<Mutex<Vec<String>>>,
+        /// (A, 秒)：GET 或 PUT 了 A 之後，虛擬時鐘前進這麼多（在一個命令的兩步之間經過時間）。
+        pub advance_after_get: Mutex<Vec<(String, i64)>>,
+        pub advance_after_put: Mutex<Vec<(String, i64)>>,
         /// 有虛擬時鐘時，修改時間是寫入當下的虛擬後端時間（[`super::VClock`]），不是真的時間。
         clock: Option<Arc<super::VClock>>,
         stamps: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -485,6 +492,17 @@ pub mod hooked {
             self.deleted.lock().unwrap().clone()
         }
 
+        /// `hooks` 裡有 `key` 就拿掉它、讓虛擬時鐘前進。
+        fn maybe_advance(&self, hooks: &Mutex<Vec<(String, i64)>>, key: &str) {
+            let secs = {
+                let mut h = hooks.lock().unwrap();
+                h.iter().position(|(k, _)| k == key).map(|i| h.remove(i).1)
+            };
+            if let (Some(secs), Some(c)) = (secs, &self.clock) {
+                c.advance(secs);
+            }
+        }
+
         fn stamp(&self, mut meta: ObjectMeta) -> ObjectMeta {
             if let Some(t) = self.stamps.lock().unwrap().get(meta.location.as_ref()) {
                 meta.last_modified = *t;
@@ -520,6 +538,7 @@ pub mod hooked {
                     chrono::DateTime::from_timestamp(t.unix_timestamp(), t.nanosecond()).unwrap();
                 self.stamps.lock().unwrap().insert(location.to_string(), t);
             }
+            self.maybe_advance(&self.advance_after_put, location.as_ref());
             let mut echo = self.echo.lock().unwrap();
             if let Some(i) = echo.iter().position(|k| k == location.as_ref()) {
                 echo.remove(i);
@@ -553,9 +572,20 @@ pub mod hooked {
                 "get"
             });
             let plain = !options.head && options.range.is_none();
+            {
+                let mut fail = self.fail_get.lock().unwrap();
+                if let Some(i) = fail.iter().position(|k| k == location.as_ref()) {
+                    fail.remove(i);
+                    return Err(object_store::Error::Generic {
+                        store: "Hooked",
+                        source: "simulated read failure (timeout)".into(),
+                    });
+                }
+            }
             let mut r = self.inner.get_opts(location, options).await?;
             r.meta = self.stamp(r.meta);
             if plain {
+                self.maybe_advance(&self.advance_after_get, location.as_ref());
                 let hook = {
                     let mut hooks = self.after_get.lock().unwrap();
                     hooks
@@ -591,15 +621,33 @@ pub mod hooked {
         ) -> BoxStream<'static, object_store::Result<StorePath>> {
             self.bump("delete");
             let log = Arc::clone(&self.deleted);
-            self.inner.delete_stream(
-                locations
-                    .inspect(move |l| {
-                        if let Ok(p) = l {
-                            log.lock().unwrap().push(p.to_string());
+            let fail = Arc::clone(&self.fail_delete);
+            let inner = Arc::clone(&self.inner);
+            locations
+                .then(move |l| {
+                    let (log, fail, inner) =
+                        (Arc::clone(&log), Arc::clone(&fail), Arc::clone(&inner));
+                    async move {
+                        let p = l?;
+                        let refused = {
+                            let mut f = fail.lock().unwrap();
+                            f.iter()
+                                .position(|k| k == p.as_ref())
+                                .map(|i| f.remove(i))
+                                .is_some()
+                        };
+                        if refused {
+                            return Err(object_store::Error::Generic {
+                                store: "Hooked",
+                                source: "simulated delete refusal (Object Lock)".into(),
+                            });
                         }
-                    })
-                    .boxed(),
-            )
+                        log.lock().unwrap().push(p.to_string());
+                        inner.delete(&p).await?;
+                        Ok(p)
+                    }
+                })
+                .boxed()
         }
 
         fn list(

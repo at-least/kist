@@ -17,12 +17,13 @@
 //! 不了後端還在。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use kist_backend::BackendError;
 use kist_format::v4::index::{Drain, Head, Settings};
 use kist_format::v4::keys::{Gen, Key};
 
-use super::backup::{Clock, M};
+use super::backup::{elapsed, Clock, Reading, M};
 use super::repo::Repo;
 use super::state::{HeadCopy, HeadListing};
 use crate::{CoreError, Result};
@@ -75,6 +76,8 @@ pub(crate) struct Newest {
     /// 當作現在的 `T(g)`：比本機時鐘晚超過 `M` 時是「本機時鐘 + M」。原值在 [`Session::times`]（`T(g)` 當成
     /// 某個世代的起點時用它）。
     pub now_t: i64,
+    /// `T(g)` 比本機時鐘晚超過 `M` 時的回報。
+    pub ahead: Option<String>,
 }
 
 impl Newest {
@@ -92,6 +95,8 @@ pub(crate) struct Session {
     /// 不用本地快取的 repo。
     pub repo: Repo,
     clock: Clock,
+    /// P0 開始的時間：整輪時限從這裡算（§11.1）。
+    started: Reading,
     _lock: std::fs::File,
     /// P0 的讀數：探針的後端時間 `N_P` 與那時的本機牆鐘。
     pub probe: Pair,
@@ -135,6 +140,7 @@ impl Session {
     /// 取得檔案鎖、執行 P0。
     pub async fn begin(repo: &Repo, clock: Clock) -> Result<Self> {
         let lock = lock(repo)?;
+        let started = clock.now();
         let wall = {
             let clock = clock.clone();
             move || clock.now().wall
@@ -143,6 +149,7 @@ impl Session {
         Ok(Self {
             repo: repo.uncached(),
             clock,
+            started,
             _lock: lock,
             probe: Pair {
                 t: unix_ns(p.backend),
@@ -156,6 +163,16 @@ impl Session {
     /// 本機牆鐘（Unix 奈秒）：head 的 `w`。
     pub fn wall(&self) -> i64 {
         unix_ns(self.clock.now().wall)
+    }
+
+    /// 整輪時限（§11.1）：從 P0 起已過 `grace − M`（經過時間取牆鐘與含休眠的單調時鐘中較大的）。
+    pub fn out_of_time(&self, grace: u64) -> bool {
+        self.elapsed() + M >= Duration::from_secs(grace)
+    }
+
+    /// 從 P0 起經過的時間。
+    pub fn elapsed(&self) -> Duration {
+        elapsed(&self.started, &self.clock.now())
     }
 
     /// 列 `maint/gen/`，存起來給之後的 `T` 用。
@@ -196,18 +213,19 @@ impl Session {
             },
         );
         let local = self.wall();
-        let ahead = local.saturating_add(secs(M.as_secs()));
-        let now_t = if t > ahead {
-            tracing::warn!(
+        let limit = local.saturating_add(secs(M.as_secs()));
+        let (now_t, ahead) = if t > limit {
+            let msg = format!(
                 "generation head {g} has backend time {}, more than an hour ahead of the local \
                  clock; using the local clock plus one hour as now",
                 fmt_ns(t)
             );
-            ahead
+            tracing::warn!("{msg}");
+            (limit, Some(msg))
         } else {
-            t
+            (t, None)
         };
-        Ok(Newest { copy, now_t })
+        Ok(Newest { copy, now_t, ahead })
     }
 
     /// head g 的 `T` 與 `w`（較舊的世代：起點、drain、hold）。head 永不刪除，讀不到就是錯誤。

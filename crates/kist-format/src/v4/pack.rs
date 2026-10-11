@@ -26,7 +26,7 @@ pub use crate::Algorithm;
 
 use super::ids::ItemId;
 use super::keys::Key;
-use super::{check_version, corrupt, invalid, Result, VERSION};
+use super::{check_version, corrupt, invalid, peek_version, Result, VERSION};
 use crate::cbor;
 
 /// 頭尾的 magic：`"kistpk"` ‖ `0x0004`。
@@ -118,6 +118,7 @@ impl PackTrailer {
     /// 讀取端：解開 trailer 後檢查。`key` 是 pack 所在的 key，`trailer_start` 由檔尾算出，`max_r` 是這個
     /// 種類的明文上限（資料是 `chunker.max`、metadata 是 [`MAX_META_ITEM`]）。
     pub fn decode(bytes: &[u8], key: &Key, trailer_start: u64, max_r: u64) -> Result<Self> {
+        peek_version("pack trailer", bytes)?;
         let t: PackTrailer = cbor::decode(bytes)?;
         t.check(trailer_start, max_r)?;
         match Kind::of_key(key) {
