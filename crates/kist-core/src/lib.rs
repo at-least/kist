@@ -28,6 +28,7 @@ pub mod reach;
 pub mod rebuild;
 pub mod repo;
 pub mod restore;
+pub mod retention;
 pub mod snapshots;
 pub mod v4;
 

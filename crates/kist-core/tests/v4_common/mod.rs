@@ -438,6 +438,8 @@ pub mod hooked {
         pub fail: Mutex<Vec<String>>,
         /// (A, B, bytes)：A 被讀（GET，不含 HEAD 與 range）之後建立 B——在一個命令的兩步之間插入別人的寫入。
         pub after_get: Mutex<Vec<(String, String, Vec<u8>)>>,
+        /// 刪除過的 key，依順序。
+        deleted: Arc<Mutex<Vec<String>>>,
         /// 有虛擬時鐘時，修改時間是寫入當下的虛擬後端時間（[`super::VClock`]），不是真的時間。
         clock: Option<Arc<super::VClock>>,
         stamps: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
@@ -476,6 +478,11 @@ pub mod hooked {
 
         pub fn puts(&self) -> Vec<String> {
             self.puts.lock().unwrap().clone()
+        }
+
+        /// 刪除過的 key，依順序。
+        pub fn deleted(&self) -> Vec<String> {
+            self.deleted.lock().unwrap().clone()
         }
 
         fn stamp(&self, mut meta: ObjectMeta) -> ObjectMeta {
@@ -583,7 +590,16 @@ pub mod hooked {
             locations: BoxStream<'static, object_store::Result<StorePath>>,
         ) -> BoxStream<'static, object_store::Result<StorePath>> {
             self.bump("delete");
-            self.inner.delete_stream(locations)
+            let log = Arc::clone(&self.deleted);
+            self.inner.delete_stream(
+                locations
+                    .inspect(move |l| {
+                        if let Ok(p) = l {
+                            log.lock().unwrap().push(p.to_string());
+                        }
+                    })
+                    .boxed(),
+            )
         }
 
         fn list(
