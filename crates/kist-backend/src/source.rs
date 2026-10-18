@@ -43,14 +43,12 @@ pub enum SourceItemKind {
 
 /// 目錄裡的一個條目。
 ///
-/// 刻意**不**攜帶完整 metadata：list 會把整個目錄（可能 100 萬條目）常駐
-/// 記憶體（排序所需），每條目多幾十 bytes 就是上百 MiB（大 repo 記憶體
-/// 門檻的回歸教訓）。本地來源的 ctime/inode/mode 等由走訪端在處理該
-/// 條目時對路徑再 lstat 一次取得——每檔一次系統呼叫。
-/// 已知極小視窗：條目的 kind 在 yield 時判定，走訪端第二次 lstat 之間
-/// 檔案被換成別種型別的話，會以「當下的 metadata + 讀到的內容」收尾
-/// （content 已驗 size 與 chunk；racy 變更由下一次備份的 ctime guard
-/// 兜底）。
+/// 刻意**不**攜帶完整 metadata：遠端來源的 list 會把整個目錄（可能 100 萬
+/// 條目）常駐記憶體（排序所需），每條目多幾十 bytes 就是上百 MiB（大 repo
+/// 記憶體門檻的回歸教訓）。本機來源在 yield 時 lstat 一次，ctime/inode/mode
+/// 等由 [`SortedItems::posix`] 交給走訪端（同一次 lstat，不再 stat 第二次；
+/// M12 第 7 段第十七步）。條目的 kind 與 metadata 因此一致；內容在之後才讀，
+/// 讀的時候已被改的由 size 與 chunk 的檢查、下一次備份的 ctime guard 兜底。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceItem {
     /// 名稱（單一路徑元件；Unix = 原 OS bytes）。
@@ -64,6 +62,12 @@ pub struct SourceItem {
 /// 其餘欄位在 yield 當下取得。
 pub trait SortedItems: Send {
     fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>>;
+
+    /// 上一次 [`SortedItems::next_item`] 回傳的條目的 POSIX metadata：本機來源取自 yield 時的同一次
+    /// lstat，走訪端不必再 stat 一次；其他來源沒有（`None`，走訪端照舊自己取）。
+    fn posix(&self) -> Option<crate::fsmeta::PosixMeta> {
+        None
+    }
 }
 
 /// 備份來源。名稱一律 bytes；`list` 回傳的條目依名稱 bytes 排序。
@@ -188,6 +192,7 @@ impl Source for LocalSource {
         Ok(Box::new(LocalListing {
             root: path,
             names: names.into_iter(),
+            last: None,
         }))
     }
 
@@ -225,10 +230,17 @@ impl Source for LocalSource {
 struct LocalListing {
     root: std::path::PathBuf,
     names: std::vec::IntoIter<Vec<u8>>,
+    /// 上一個回傳的條目的 metadata（[`SortedItems::posix`]）。
+    last: Option<crate::fsmeta::PosixMeta>,
 }
 
 impl SortedItems for LocalListing {
+    fn posix(&self) -> Option<crate::fsmeta::PosixMeta> {
+        self.last
+    }
+
     fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
+        self.last = None;
         for name in self.names.by_ref() {
             let path = self.root.join(crate::fsmeta::bytes_to_os(&name));
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
@@ -259,6 +271,7 @@ impl SortedItems for LocalListing {
                     vern: None,
                 }
             };
+            self.last = Some(crate::fsmeta::capture(&meta));
             return Some(Ok(SourceItem { name, kind }));
         }
         None
@@ -538,6 +551,42 @@ pub async fn open_source(spec: &str) -> Result<Box<dyn Source>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// 本機列舉交出的 metadata 是剛回傳的那個條目的（同一次 lstat；走訪端不再 stat 第二次）：每個條目的 inode
+    /// 與 mode 等於另外 lstat 的結果；還沒回傳任何條目、或列舉完之後是 `None`。
+    #[cfg(unix)]
+    #[test]
+    fn local_listing_hands_out_the_metadata_of_the_item_it_just_returned() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"1").unwrap();
+        std::fs::write(dir.path().join("b"), b"22").unwrap();
+        std::fs::set_permissions(dir.path().join("b"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        std::fs::create_dir(dir.path().join("c")).unwrap();
+        std::os::unix::fs::symlink("a", dir.path().join("d")).unwrap();
+        let src = LocalSource::new(dir.path().to_path_buf()).unwrap();
+        let mut listing = src.list(b"").unwrap();
+        assert_eq!(listing.posix(), None, "nothing returned yet");
+        let mut seen = Vec::new();
+        while let Some(item) = listing.next_item() {
+            let item = item.unwrap();
+            let path = dir.path().join(std::str::from_utf8(&item.name).unwrap());
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let p = listing.posix().unwrap();
+            assert_eq!(
+                (p.inode, p.mode, p.mtime_ns),
+                (meta.ino(), meta.mode(), crate::fsmeta::mtime_ns_of(&meta)),
+                "{path:?}"
+            );
+            seen.push(item.name);
+        }
+        assert_eq!(listing.posix(), None, "nothing returned by the last call");
+        assert_eq!(
+            seen,
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+    }
 
     #[test]
     fn local_source_lists_sorted() {

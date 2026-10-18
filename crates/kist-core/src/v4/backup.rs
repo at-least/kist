@@ -1280,6 +1280,7 @@ impl Walk {
                         &ctx,
                         &name,
                         item,
+                        None,
                         parent_entry.as_ref(),
                         Visit::root(FilterState::default(), None),
                     )
@@ -1306,6 +1307,7 @@ impl Walk {
                         &ctx,
                         b"",
                         item,
+                        None,
                         parent_entry.as_ref(),
                         Visit::root(FilterState::default(), None),
                     )
@@ -1412,6 +1414,8 @@ impl Walk {
                         continue;
                     }
                 };
+                // 本機來源：列舉時那一次 lstat 的 metadata（不必再 stat 一次）
+                let posix = listing.posix();
                 let child_rel = join_rel(dir_rel, &item.name);
                 let named = ctx.named.paths.contains(&child_rel);
                 let toward_named = !named && ctx.named.toward.contains(&child_rel);
@@ -1469,7 +1473,7 @@ impl Walk {
                 };
                 let display = ctx.display_path(&child_rel);
                 let Some((entry, child_used)) = self
-                    .process_entry(ctx, &child_rel, item, parent_entry.as_ref(), child)
+                    .process_entry(ctx, &child_rel, item, posix, parent_entry.as_ref(), child)
                     .await?
                 else {
                     continue;
@@ -1501,11 +1505,12 @@ impl Walk {
         ctx: &SourceCtx,
         rel: &[u8],
         item: SourceItem,
+        posix: Option<kist_backend::fsmeta::PosixMeta>,
         parent: Option<&Entry>,
         visit: Visit,
     ) -> Result<Option<(Entry, Used)>> {
         let out = self
-            .process_entry_inner(ctx, rel, item, parent, visit)
+            .process_entry_inner(ctx, rel, item, posix, parent, visit)
             .await?;
         report_progress(
             self.progress.as_ref(),
@@ -1518,20 +1523,24 @@ impl Walk {
     }
 
     /// 處理一個目錄項目：回傳它的 Entry 與它沿用的 (item, 持有者)；讀不到的、別的檔案系統上的檔案回 `None`。
+    /// `listed` 是列舉時取得的 metadata（本機來源的目錄列舉有；root 與其他來源沒有，這裡自己 lstat）。
     async fn process_entry_inner(
         &mut self,
         ctx: &SourceCtx,
         rel: &[u8],
         item: SourceItem,
+        listed: Option<kist_backend::fsmeta::PosixMeta>,
         parent: Option<&Entry>,
         visit: Visit,
     ) -> Result<Option<(Entry, Used)>> {
         let mk = ctx.source.meta_kind();
         let posix = if mk == meta_kind::POSIX {
-            ctx.source
-                .local_path(rel)
-                .and_then(|p| std::fs::symlink_metadata(&p).ok())
-                .map(|m| kist_backend::fsmeta::capture(&m))
+            listed.or_else(|| {
+                ctx.source
+                    .local_path(rel)
+                    .and_then(|p| std::fs::symlink_metadata(&p).ok())
+                    .map(|m| kist_backend::fsmeta::capture(&m))
+            })
         } else {
             None
         };
