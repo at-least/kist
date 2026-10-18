@@ -85,16 +85,18 @@ pub const MPACK_MEMORY: usize = 64 * 1024 * 1024;
 
 /// 讀取端：一個世代的狀態加上讀 mpack 的快取。`own` 是這台 client。
 ///
-/// 也記著這台 client 驗證過哪些 (item, pack)（B2 的第三種可信）：開始時從本地快取載入，之後每次從別台的副本
-/// 讀到並驗證成功就加一筆；backup 結束時把新的寫回快取。自己前綴下的與 `by_prune` 的持有者不記：它們本來就
-/// 可信。
+/// backup 的讀取端（[`Reader::with_verified`]）也記著這台 client 驗證過哪些 (item, pack)（B2 的第三種可信）：
+/// 開始時從本地快取載入，之後每次從別台的副本讀到並驗證成功就加一筆；backup 結束時把新的寫回快取。自己前綴下的
+/// 與 `by_prune` 的持有者不記：它們本來就可信。restore、mount、check 的讀取端不記：沒有人寫回，記了只是占記憶體
+/// （100 萬個 chunk 的 restore 約 260 MiB，M12 第 7 段的 bench）。
 #[derive(Clone)]
 pub struct Reader {
     pub repo: Repo,
     pub state: Arc<State>,
     pub mpacks: Arc<Mpacks>,
     own: Option<ClientId>,
-    verified: Arc<Mutex<Verified>>,
+    /// 只有 `with_verified` 之後才有。
+    verified: Option<Arc<Mutex<Verified>>>,
     /// check 用：每一份驗證失敗的副本與只剩 tombstone 讀得到的項目都記下來（[`Reader::with_failure_log`]）。
     failures: Option<Arc<Mutex<Vec<String>>>>,
 }
@@ -112,7 +114,7 @@ impl Reader {
             state,
             mpacks: Arc::new(Mpacks::new(MPACK_MEMORY)),
             own,
-            verified: Arc::new(Mutex::new(Verified::default())),
+            verified: None,
             failures: None,
         }
     }
@@ -143,37 +145,47 @@ impl Reader {
         self
     }
 
-    /// 開始時從本地快取載入的驗證記錄。
-    pub fn with_verified(self, known: HashSet<(ItemId, ObjectId)>) -> Self {
-        self.lock_verified().known = known;
+    /// 開始時從本地快取載入的驗證記錄；從此記下每一筆新驗證的 (item, pack)（backup 用）。
+    pub fn with_verified(mut self, known: HashSet<(ItemId, ObjectId)>) -> Self {
+        self.verified = Some(Arc::new(Mutex::new(Verified {
+            known,
+            new: Vec::new(),
+        })));
         self
     }
 
-    fn lock_verified(&self) -> std::sync::MutexGuard<'_, Verified> {
-        self.verified.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_verified(&self) -> Option<std::sync::MutexGuard<'_, Verified>> {
+        self.verified
+            .as_ref()
+            .map(|v| v.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// B2 的「可信」：`by_prune`、在自己的前綴下、或這台 client 取回驗證過。
+    /// B2 的「可信」：`by_prune`、在自己的前綴下、或這台 client 取回驗證過（只有 backup 的讀取端記得）。
     pub fn trusted(&self, id: &ItemId, h: &Holder) -> bool {
         h.by_prune
             || Some(h.client) == self.own
-            || self.lock_verified().known.contains(&(*id, h.pack))
+            || self
+                .lock_verified()
+                .is_some_and(|v| v.known.contains(&(*id, h.pack)))
     }
 
-    /// 從這個持有者讀到 `id` 並驗證成功。
+    /// 從這個持有者讀到 `id` 並驗證成功（沒有 `with_verified` 的讀取端什麼都不記）。
     pub fn note_verified(&self, id: ItemId, h: &Holder) {
         if h.by_prune || Some(h.client) == self.own {
             return;
         }
-        let mut v = self.lock_verified();
-        if v.known.insert((id, h.pack)) {
-            v.new.push((id, h.pack));
+        if let Some(mut v) = self.lock_verified() {
+            if v.known.insert((id, h.pack)) {
+                v.new.push((id, h.pack));
+            }
         }
     }
 
     /// 這次新驗證的 (item, pack)，寫回本地快取用。
     pub fn take_new_verified(&self) -> Vec<(ItemId, ObjectId)> {
-        std::mem::take(&mut self.lock_verified().new)
+        self.lock_verified()
+            .map(|mut v| std::mem::take(&mut v.new))
+            .unwrap_or_default()
     }
 
     /// 一個 mpack 的整份 bytes：記憶體、本地快取、repo 的主體，不行讀 `.r1`。名稱一律重算。

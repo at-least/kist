@@ -66,15 +66,17 @@ allocation site 樹）。歸因用，量測數字一律以 dhat **關閉**的 bu
 | backup，第二次（快速路徑，0 新 chunk） | 150 MiB，41 s | 278 MiB，18 s | A 過（141）、B 過（281） |
 | prune，第一輪（收錄全部 pack）／第二輪 | 604／638 MiB，10 s | 587／638 MiB，8 s | **A、B 都被殺** |
 | `check` | 228 MiB，6 s | 238 MiB，6 s | 過（262／236） |
-| `check --read-data` | 454 MiB，16 s | 381 MiB，10 s | 過（496／422） |
-| `restore latest` | 362 MiB，147 s | 789 MiB，90 s | A 過（385）、**B 被殺**（開始 3 秒內） |
+| `check --read-data` | 473 MiB，14 s | 428 MiB，10 s | 過（432／443） |
+| `restore latest` | 148 MiB，74 s | 538 MiB，84 s | A 過（156）、**B 被殺**（開始 2 秒內） |
 
 - backup 的目標（M5：< 512 MiB）v4 仍然達到，A 集比 v3 的 373–431 MiB 低。
 - **prune 超過門檻**：v3 的 `prune --dry-run` 在 A 集是 550 MiB（下表，當時記為「沒做」），v4 是 587–638 MiB。
   dhat 歸因見 ADR 026「實作第七段」；修法留給負責人。
-- **restore 單一平面目錄的 100 萬個項目超過門檻**（A 集的 1000 個目錄不會）。v3 只量過 A 集的 restore（71 MiB，
-  v4 是 362 MiB）。dhat 歸因同上。
-- `check --read-data` 在 A 集離門檻只剩 16 MiB（門檻跑法 496 MiB）。
+- **restore 單一平面目錄的 100 萬個項目超過門檻**（A 集的 1000 個目錄不會）：dhat 在 `open_placement` 量到一個 336 MiB
+  的配置——整個目錄的 100 萬個 `Entry` 一次解進記憶體。第一次量的 restore 是 362 MiB（A）／789 MiB（B）：dhat 另外
+  抓到讀取端白記的「驗證過的 (item, pack)」集合（195 MiB HashSet 加 64 MiB Vec，只有 backup 會寫回快取），改成只有
+  backup 的讀取端才記之後（M12 第 7 段第 10 步）是上表的 148／538 MiB。v3 只量過 A 集的 restore（71 MiB）。
+- `check --read-data` 在兩個集上離門檻都不到 100 MiB（門檻跑法 432／443 MiB）；dhat 歸因見 ADR 026「實作第七段」。
 
 ## 結果摘要（v3，2026-09-06，16 核 / 61 GiB / ext4，release build）
 

@@ -438,3 +438,46 @@ async fn snapshots_are_listed_by_time_and_resolved_from_a_spec() {
         CoreError::AmbiguousSnapshot(_, 2)
     ));
 }
+
+/// 驗證過的 (item, pack) 只有 backup 的讀取端記（`with_verified`：開始時從本地快取載入、結束時把新的寫回）。restore、
+/// mount、check 的讀取端沒有人寫回，記了只是占記憶體——第 7 段的 bench 在 100 萬個 chunk 的 restore 量到約 260 MiB
+/// 的 HashSet 與 Vec（dhat），改掉之後 restore 的峰值從 362 MiB 降到 148 MiB。
+#[tokio::test]
+async fn only_a_reader_with_a_verified_set_records_what_it_verified() {
+    use kist_core::v4::state::{Holder, Source};
+    use kist_format::v4::pack::PackEntry;
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let id = ItemId::from(ChunkId::from_bytes([1u8; 32]));
+    let h = Holder {
+        pack: ObjectId::from_bytes([7u8; 32]),
+        client: client(2),
+        kind: Kind::Data,
+        entry: PackEntry {
+            i: id,
+            o: 0,
+            l: 0,
+            r: 0,
+        },
+        source: Source::Map,
+        by_prune: false,
+        status: status::LIVE,
+    };
+    // restore／mount／check 的讀取端：不記
+    let plain = repo.reader(None).await.unwrap();
+    assert!(!plain.trusted(&id, &h));
+    plain.note_verified(id, &h);
+    assert!(plain.take_new_verified().is_empty());
+    assert!(!plain.trusted(&id, &h));
+    // backup 的讀取端：記，而且記過的就可信
+    let backup = repo
+        .reader(None)
+        .await
+        .unwrap()
+        .with_verified(std::collections::HashSet::new());
+    assert!(!backup.trusted(&id, &h));
+    backup.note_verified(id, &h);
+    assert!(backup.trusted(&id, &h));
+    assert_eq!(backup.take_new_verified(), vec![(id, h.pack)]);
+    assert!(backup.take_new_verified().is_empty());
+}
