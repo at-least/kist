@@ -10,7 +10,7 @@
 #![no_main]
 
 use kist_chunker::Chunker;
-use kist_format::config::ChunkerParams;
+use kist_format::chunker::ChunkerParams;
 use libfuzzer_sys::fuzz_target;
 use std::io::Cursor;
 

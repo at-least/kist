@@ -14,6 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 hex = "0.4"
+blake3 = "1"
 kist-chunker = { path = "../crates/kist-chunker" }
 kist-core = { path = "../crates/kist-core" }
 kist-crypto = { path = "../crates/kist-crypto" }

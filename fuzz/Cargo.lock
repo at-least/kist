@@ -1408,6 +1408,7 @@ dependencies = [
  "kist-chunker",
  "kist-crypto",
  "kist-format",
+ "rustix",
  "serde",
  "serde_bytes",
  "thiserror",
@@ -1430,7 +1431,6 @@ dependencies = [
  "kist-format",
  "thiserror",
  "zeroize",
- "zstd",
 ]
 
 [[package]]
@@ -1451,6 +1451,7 @@ dependencies = [
 name = "kist-fuzz"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "hex",
  "kist-chunker",
  "kist-core",

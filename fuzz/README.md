@@ -1,21 +1,17 @@
 # Fuzzing（M5 硬化）
 
-> **狀態（2026-10-11，v4 實作第 6 段）：目前編不過。** 四個 target 都對準 v3：`pack` 走的 `kist-core::pack` 已隨
-> v3 移除，`cbor` 與 `parity` 吃 v3 的結構與 golden，而且 v3 移除之前 `pack` 與 `parity` 就已跟不上先前的改動。
-> M12 第 7 段改成 v4 並重新播種（ADR 026「實作第六段」的「延到後面的」）；以下描述的是 v3 時代的狀態。
-
 `cargo-fuzz` + libFuzzer，target 對準所有吃外部 bytes 的解析路徑。
 fuzz crate 獨立於主 workspace（自己的 lockfile），seed corpus 進版控、
 長出來的 corpus 與 artifacts 不進（見 `.gitignore`）。
 
 ## Targets
 
-| target   | 吃的輸入                          | 走的路徑                                                                 |
+| target   | 吃的輸入                          | 走的路徑（v4，M12 第 7 段改寫）                                           |
 |----------|-----------------------------------|--------------------------------------------------------------------------|
-| `pack`   | 整個 pack / trailer 明文 / chunk  | `kist-core::pack::read_trailer`（footer 算術、magic、密封、trailer 一致性驗證）、`compress_chunk`→`decode_chunk` roundtrip |
-| `cbor`   | 任意 CBOR（第一 byte 選結構）     | `kist-format::cbor::decode` 對全部 metadata 結構 + `parity::parse`        |
+| `pack`   | 整個 pack / trailer 明文 / 一項的明文 | `kist_core::v4::pack::trailer_of`（footer 算術、magic、密封、§6 的一致性驗證、種類與命名空間）、`compress`→`open_chunk`／`open_meta` roundtrip、`split_trailer`／`parse_footer`／`unframe` |
+| `cbor`   | 任意 CBOR（第一 byte 選結構）     | v4 的讀取端驗證：`PackTrailer`、`Head`、`Shard`、`Delta`、`Snapshot`、`Config`、`Slot`、`decode_item`、`parity::parse` |
 | `chunker`| 任意 bytes                        | FastCDC 切塊；斷言：決定論、總和==輸入、每塊 ≤ max、非末塊 ≥ min          |
-| `parity` | sidecar bytes / 損壞 pack bytes   | `parity::parse`（配置前邊界檢查）、golden sidecar 對任意損壞做 `repair`（repair 內部驗 hash==pack 名；fuzz 補驗它沒檢查的「回傳長度==pack_size」）、encode→parse→repair roundtrip |
+| `parity` | parity 物件 bytes / 損壞 pack bytes | `v4::parity::parse`（配置前邊界檢查）、golden parity 對任意損壞做 `repair`（repair 內部驗 hash==pack 名；fuzz 補驗它沒檢查的「回傳長度==pack_size」與名稱）、encode→parse→repair roundtrip |
 
 斷言有效性用負向對照驗證過：把 chunker 的 max 斷言調小 1 byte，
 libFuzzer 立刻在 seed 上抓到並存 artifact（2026-09-06）。
@@ -84,6 +80,7 @@ header 觸發巨大配置；觸發時 abort stack 指向 target 配置點）。�
 
 ## 種子
 
-`fuzz/seeds/`：golden CBOR（pack_trailer、index、tree、snapshot、config，
-前面加 selector byte）、parity golden sidecar（原檔/截斷）、固定與
-隨機圖樣。新增格式結構或 golden 時，記得在這裡補對應種子。
+`fuzz/seeds/`：v4 的 golden（`crates/kist-format/tests/golden-v4/`：pack_trailer、head、map_shard、
+delta、snapshot、config、slot、root_seg、parity，前面加 selector byte，另有翻一個 byte 的 `_flip` 版）、
+pack 的 golden 排版與 trailer 明文、parity golden（原檔／截斷）、固定與隨機圖樣。新增格式結構或
+golden 時，記得在這裡補對應種子。
