@@ -424,9 +424,10 @@ fn s3_repo_url_works_end_to_end() {
     };
     let (code, _, stderr) = run(&["init"]);
     assert_eq!(code, Some(0), "{stderr}");
+    // v4 不覆寫 config，不再提醒開 versioning；提醒的是留一份 config 與密碼（所有後端一樣）
     assert!(
-        stderr.contains("versioning"),
-        "S3 repo 要提醒開 versioning：{stderr}"
+        stderr.contains("keep a copy of the `config` object"),
+        "init 要提醒留一份 config：{stderr}"
     );
     let (code, stdout, stderr) = run(&["backup", src.to_str().unwrap()]);
     assert_eq!(code, Some(0), "{stdout}\n{stderr}");

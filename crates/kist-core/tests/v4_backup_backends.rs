@@ -201,3 +201,135 @@ async fn rclone_v4_backup_round_trips() {
         .unwrap();
     round_trip(b).await;
 }
+
+/// 依 client 分前綴的憑證（format-v4.md §1 的建議部署，負責人決定 1）：tests/minio-setup.sh 的 kistclient 只能在
+/// `*/{packs,mpacks,parity,deltas,snapshots}/<client id>/` 底下建立物件、讀全部、列 bucket。它備得了份；寫別台
+/// client 的前綴、`maint/`、`keys/`、刪除都被擋；以另一個 client id 備份失敗（pack 寫不進去）；prune 在 P0 就
+/// 失敗（探針建不起來），不寫任何東西。`s3:if-none-match` 的 bucket policy 條件沒有測（MinIO 是否支援
+/// UNVERIFIED）。
+#[tokio::test]
+async fn s3_client_prefix_credentials_confine_a_client() {
+    let (Some(endpoint), Some(bucket)) = (
+        std::env::var("KIST_TEST_S3_ENDPOINT").ok(),
+        std::env::var("KIST_TEST_S3_BUCKET").ok(),
+    ) else {
+        eprintln!("S3 client-prefix test skipped");
+        return;
+    };
+    let (Some(key), Some(secret), Some(cid)) = (
+        std::env::var("KIST_TEST_S3_CLIENT_KEY").ok(),
+        std::env::var("KIST_TEST_S3_CLIENT_SECRET").ok(),
+        std::env::var("KIST_TEST_S3_CLIENT_ID").ok(),
+    ) else {
+        eprintln!("KIST_TEST_S3_CLIENT_KEY / _SECRET / _ID not set; skipped");
+        return;
+    };
+    std::env::set_var("AWS_ENDPOINT", endpoint);
+    std::env::set_var("AWS_ALLOW_HTTP", "true");
+    if std::env::var("AWS_DEFAULT_REGION").is_err() {
+        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+    }
+    let me = kist_format::v4::ids::ClientId::from_hex(&cid).unwrap();
+    let prefix = format!("client-{}", std::process::id());
+    // root 的憑證 init；client 的憑證做其他事
+    let root = Backend::from_url(&format!("s3://{bucket}/{prefix}"))
+        .await
+        .unwrap();
+    Repo::init(root.clone(), PASSWORD, init_options(0))
+        .await
+        .unwrap();
+    let mine = Backend::s3_with_credentials(&bucket, &prefix, &key, &secret).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repo::open(mine.clone(), PASSWORD, Some(&dir.path().join("cache")))
+        .await
+        .unwrap();
+    let src = dir.path().join("src");
+    sample_source(&src);
+    let mut o = opts(1);
+    o.client = me;
+    let s = repo.backup(std::slice::from_ref(&src), o).await.unwrap();
+    assert!(
+        s.report.packs_new > 0 && s.report.mpacks_new > 0,
+        "{:?}",
+        s.report
+    );
+    assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+
+    // 別台 client 的前綴、maint/、keys/：建立被擋；刪除被擋
+    let other = kist_format::v4::ids::ClientId::from_bytes([0xc2; 16]);
+    let zero = kist_format::v4::ids::ObjectId::ZERO;
+    for k in [
+        Key::Pack {
+            client: other,
+            id: zero,
+        }
+        .path(),
+        Key::Snapshot {
+            client: other,
+            ts: kist_format::v4::keys::SnapTs::from_nanos(0).unwrap(),
+            replica: false,
+        }
+        .path(),
+        Key::Probe([7; 16]).path(),
+        Key::Head {
+            g: 1,
+            replica: false,
+        }
+        .path(),
+        Key::Slot([7; 16]).path(),
+    ] {
+        let err = mine.put_if_absent(&k, vec![1]).await.unwrap_err();
+        assert!(
+            matches!(err, kist_backend::BackendError::Store(_)),
+            "{k}: {err}"
+        );
+        assert!(!root.exists(&k).await.unwrap(), "{k} was created");
+    }
+    let err = mine.delete(&s.snapshot).await.unwrap_err();
+    assert!(matches!(err, kist_backend::BackendError::Store(_)), "{err}");
+    assert!(root.exists(&s.snapshot).await.unwrap());
+
+    // 同一組憑證冒充另一台 client：pack 寫不進去，backup 失敗、沒有 snapshot
+    let mut o = opts(2);
+    o.client = other;
+    let copy = dir.path().join("copy");
+    sample_source(&copy);
+    assert!(repo.backup(&[copy], o).await.is_err());
+    assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+
+    // prune：P0 的探針建不起來，什麼都不寫（探針的 key 在錯誤裡；maint/ 底下只有世代 0 的 head）
+    let err = repo
+        .prune(kist_core::v4::PruneOptions::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("maint/probe-"), "{err}");
+    let maint: Vec<String> = root
+        .list("maint")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    assert_eq!(
+        maint,
+        vec![
+            "maint/gen/0000000000000000".to_owned(),
+            "maint/gen/0000000000000000.r1".to_owned()
+        ]
+    );
+
+    for prefix in [
+        "keys",
+        "packs",
+        "mpacks",
+        "parity",
+        "deltas",
+        "snapshots",
+        "maint",
+    ] {
+        for o in root.list(prefix).await.unwrap() {
+            root.delete(&o.key).await.unwrap();
+        }
+    }
+    root.delete("config").await.unwrap();
+}

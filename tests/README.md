@@ -12,7 +12,10 @@ docker rm -f kist-minio             # 用完關掉
 ```
 
 `tests/minio-setup.sh` 會印出要 export 的環境變數（root 帳號、Put/Get/List-only 的 `kistbackup`
-帳號）。每個測試用隨機 prefix，同一個 bucket 可以重複跑。（CI workflow
+帳號，以及依 client 分前綴的 `kistclient` 帳號：`KIST_TEST_S3_CLIENT_KEY` / `_SECRET` / `_ID`，政策只允許在
+`*/{packs,mpacks,parity,deltas,snapshots}/<client id>/` 底下 PutObject、讀全部、列 bucket——format-v4.md §1
+建議的部署；`v4_backup_backends.rs` 的 `s3_client_prefix_credentials_confine_a_client` 驗它備得了份、寫別處與刪除
+都被擋、prune 在 P0 就失敗）。每個測試用隨機 prefix，同一個 bucket 可以重複跑。（CI workflow
 只手動觸發；平時以本機 gate 為準。）
 
 ## SFTP

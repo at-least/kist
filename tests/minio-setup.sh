@@ -10,6 +10,10 @@ ROOT_PASS=kistsecret123
 BUCKET=kist-test
 PUTONLY_USER=kistbackup
 PUTONLY_PASS=kistbackupsecret
+# 依 client 分前綴的備份憑證（format-v4.md §1 建議的部署）：只能在自己 client 的前綴下建立物件，讀全部。
+CLIENT_USER=kistclient
+CLIENT_PASS=kistclientsecret
+CLIENT_ID=c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" -p "127.0.0.1:$PORT:9000" \
@@ -26,13 +30,30 @@ POLICY='{"Version":"2012-10-17","Statement":[
   {"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::'"$BUCKET"'/*"]},
   {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::'"$BUCKET"'"]}
 ]}'
+# v4 的每台備份主機：只能在 <repo 前綴>/{packs,mpacks,parity,deltas,snapshots}/<client id>/ 底下建立物件
+# （repo 前綴以 * 代替：測試每次用隨機前綴），讀全部、列 bucket；沒有 Delete，也寫不了 config、keys/、maint/
+# 與別台 client 的前綴。
+CLIENT_POLICY='{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:PutObject"],"Resource":[
+    "arn:aws:s3:::'"$BUCKET"'/*/packs/'"$CLIENT_ID"'/*",
+    "arn:aws:s3:::'"$BUCKET"'/*/mpacks/'"$CLIENT_ID"'/*",
+    "arn:aws:s3:::'"$BUCKET"'/*/parity/'"$CLIENT_ID"'/*",
+    "arn:aws:s3:::'"$BUCKET"'/*/deltas/'"$CLIENT_ID"'/*",
+    "arn:aws:s3:::'"$BUCKET"'/*/snapshots/'"$CLIENT_ID"'/*"]},
+  {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::'"$BUCKET"'/*"]},
+  {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::'"$BUCKET"'"]}
+]}'
 docker exec "$NAME" sh -c "
   mc alias set local http://127.0.0.1:9000 $ROOT_USER $ROOT_PASS >/dev/null &&
   mc mb -p local/$BUCKET >/dev/null &&
   printf '%s' '$POLICY' > /tmp/putonly.json &&
   mc admin policy create local kist-putonly /tmp/putonly.json >/dev/null &&
   mc admin user add local $PUTONLY_USER $PUTONLY_PASS >/dev/null &&
-  mc admin policy attach local kist-putonly --user $PUTONLY_USER >/dev/null
+  mc admin policy attach local kist-putonly --user $PUTONLY_USER >/dev/null &&
+  printf '%s' '$CLIENT_POLICY' > /tmp/client.json &&
+  mc admin policy create local kist-client /tmp/client.json >/dev/null &&
+  mc admin user add local $CLIENT_USER $CLIENT_PASS >/dev/null &&
+  mc admin policy attach local kist-client --user $CLIENT_USER >/dev/null
 "
 cat <<ENV
 export KIST_TEST_S3_ENDPOINT=http://127.0.0.1:$PORT
@@ -41,4 +62,7 @@ export AWS_ACCESS_KEY_ID=$ROOT_USER
 export AWS_SECRET_ACCESS_KEY=$ROOT_PASS
 export KIST_TEST_S3_PUTONLY_KEY=$PUTONLY_USER
 export KIST_TEST_S3_PUTONLY_SECRET=$PUTONLY_PASS
+export KIST_TEST_S3_CLIENT_KEY=$CLIENT_USER
+export KIST_TEST_S3_CLIENT_SECRET=$CLIENT_PASS
+export KIST_TEST_S3_CLIENT_ID=$CLIENT_ID
 ENV
