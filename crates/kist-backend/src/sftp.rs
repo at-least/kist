@@ -629,6 +629,80 @@ fn is_unsupported(e: &SftpError) -> bool {
     )
 }
 
+/// 來源模式的讀取（M12 第 7 段之三第二步）：`location` 從 `start` 起的 `len` bytes，一次一個 SFTP READ、一塊一塊交出，
+/// 不整份放進記憶體。一次要求 1 MiB，`File::read` 再依伺服器的上限截短（OpenSSH 255 KiB）。少送是錯誤，同
+/// [`SftpInner::read_whole`]。
+fn stream_range(
+    inner: Arc<SftpInner>,
+    location: StorePath,
+    start: u64,
+    len: u64,
+) -> BoxStream<'static, object_store::Result<Bytes>> {
+    const CHUNK: u64 = 1024 * 1024;
+    struct Reading {
+        inner: Arc<SftpInner>,
+        location: StorePath,
+        file: Option<openssh_sftp_client::file::File>,
+        start: u64,
+        done: u64,
+        len: u64,
+    }
+    let state = Reading {
+        inner,
+        location,
+        file: None,
+        start,
+        done: 0,
+        len,
+    };
+    futures::stream::try_unfold(state, |mut st| async move {
+        use tokio::io::AsyncSeekExt as _;
+        if st.done == st.len {
+            return Ok(None);
+        }
+        let mut file = match st.file.take() {
+            Some(f) => f,
+            None => {
+                let full = st.inner.full(&st.location);
+                let mut f = st
+                    .inner
+                    .sftp
+                    .open(&full)
+                    .await
+                    .map_err(|e| st.inner.store_error(&st.location, e))?;
+                if st.start > 0 {
+                    f.seek(std::io::SeekFrom::Start(st.start))
+                        .await
+                        .map_err(generic)?;
+                }
+                f
+            }
+        };
+        let want = (st.len - st.done).min(CHUNK) as u32;
+        let got = file
+            .read(want, bytes::BytesMut::with_capacity(want as usize))
+            .await
+            .map_err(generic)?;
+        st.file = Some(file);
+        match got {
+            Some(buf) if !buf.is_empty() => {
+                st.done += buf.len() as u64;
+                Ok(Some((buf.freeze(), st)))
+            }
+            _ => Err(generic(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "{}: server closed after {} of {} bytes",
+                    st.inner.full(&st.location),
+                    st.done,
+                    st.len
+                ),
+            ))),
+        }
+    })
+    .boxed()
+}
+
 fn generic(e: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     StoreError::Generic {
         store: "sftp",
@@ -1213,6 +1287,23 @@ impl ObjectStore for SftpStore {
                 extensions: Default::default(),
             });
         }
+        if inner.list_all {
+            // 來源模式：一塊一塊交出（M12 第 7 段之三第二步），不整份放進記憶體；repo 模式照舊整份讀（repo 物件有
+            // 上限，讀完要驗 hash）
+            let stream = stream_range(
+                Arc::clone(&self.0),
+                location.clone(),
+                range.start,
+                range.end - range.start,
+            );
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(stream),
+                meta,
+                range,
+                attributes: Default::default(),
+                extensions: Default::default(),
+            });
+        }
         let buf = inner
             .read_whole(location, range.start, range.end - range.start)
             .await?;
@@ -1507,5 +1598,73 @@ mod hardening_tests {
         assert!(too_deep(false, REPO_MAX_DEPTH + 1));
         assert!(!too_deep(true, REPO_MAX_DEPTH + 1));
         assert!(!too_deep(true, 10_000));
+    }
+}
+
+/// 來源模式的讀取（M12 第 7 段之三）：對 tests/sftp-setup.sh 的伺服器跑，環境變數沒設就略過。放在模組裡是因為
+/// [`SftpStore`] 不公開。
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod source_mode_tests {
+    use super::*;
+    use object_store::ObjectStoreExt;
+
+    fn env() -> Option<(SftpConfig, SftpAuth)> {
+        let url = std::env::var("KIST_TEST_SFTP_URL").ok()?;
+        let password = std::env::var("KIST_TEST_SFTP_PASSWORD").ok()?;
+        let known_hosts = std::env::var("KIST_TEST_SFTP_KNOWN_HOSTS").ok()?;
+        let cfg = parse_sftp_url(&url).unwrap();
+        let auth = SftpAuth {
+            known_hosts: Some(known_hosts.into()),
+            key: None,
+            password: Some(password),
+        };
+        Some((cfg, auth))
+    }
+
+    /// 來源模式讀一個大檔不整份放進記憶體（第二步）：`get` 的串流一塊一塊來，每塊不超過 1 MiB（一次 SFTP READ
+    /// 的長度上限，OpenSSH 的是 255 KiB）。原本 `read_whole` 把整個檔案讀進一個 Vec 再當成一塊交出：1 GiB 的檔案要
+    /// 1 GiB 的記憶體（實測峰值 RSS 1 229 MiB）。
+    #[tokio::test]
+    async fn source_reads_stream_in_bounded_chunks() {
+        let Some((mut cfg, auth)) = env() else {
+            eprintln!("SFTP source streaming test skipped (tests/sftp-setup.sh 未跑)");
+            return;
+        };
+        cfg.path = format!(
+            "{}/stream-{}",
+            cfg.path.trim_matches('/'),
+            std::process::id()
+        );
+        let writer = SftpStore::open(&cfg, &auth).await.unwrap();
+        let content: Vec<u8> = (0..8 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        let path = StorePath::from("big.bin");
+        writer
+            .put_opts(
+                &path,
+                PutPayload::from(content.clone()),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let source = SftpStore::open_source(&cfg, &auth).await.unwrap();
+        let mut stream = source.get(&path).await.unwrap().into_stream();
+        let (mut sizes, mut read) = (Vec::new(), Vec::new());
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            sizes.push(chunk.len());
+            read.extend_from_slice(&chunk);
+        }
+        writer.delete(&path).await.unwrap();
+        assert!(read == content, "the bytes read back differ");
+        assert!(
+            sizes.len() > 1,
+            "one chunk of {} bytes: the whole file was in memory",
+            sizes[0]
+        );
+        assert!(sizes.iter().all(|s| *s <= 1024 * 1024), "{sizes:?}");
     }
 }
