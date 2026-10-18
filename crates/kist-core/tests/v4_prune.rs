@@ -1590,3 +1590,155 @@ async fn a_newer_snapshot_keeps_condemned_unknown_packs_from_being_deleted() {
     }
     assert!(t.pack_ids("packs").await.contains(&id));
 }
+
+/// `--read-data`（修法 C 的替代）：稠密、live 的資料 pack 位元損壞、有 parity。平常的 prune 讀不到它（不是 repack
+/// 候選、P5 不取回 chunk、不是 condemned 的正本）；`--read-data` 整份讀、逐項驗證 → 以 parity 修復、repack，
+/// snapshot 一路還原得出來，損壞的那個之後照常刪除。
+#[tokio::test]
+async fn read_data_repairs_a_damaged_dense_live_data_pack_with_parity() {
+    let t = setup_with(0).await;
+    t.write("d", "a", &data("a", 10 * 1024));
+    let mut o = opts(1);
+    o.clock = t.clock.clock();
+    o.parity = 2;
+    let snap = t
+        .repo
+        .backup(&[t.src.path().join("d")], o)
+        .await
+        .unwrap()
+        .snapshot;
+    t.prune().await; // g1
+    let packs = t.pack_ids("packs").await;
+    assert_eq!(packs.len(), 1);
+    let p = packs[0];
+    let rec = t.records().await[&p].clone();
+    damage(
+        &t,
+        &Key::Pack {
+            client: client(1),
+            id: p,
+        },
+        &rec.entries[0],
+    )
+    .await;
+    // 對照：沒有 --read-data 的 prune 什麼都沒發現
+    let r = t.prune().await; // g2
+    assert_eq!(
+        (r.repaired, r.repacked, r.false_entries, r.read_packs),
+        (0, 0, 0, 0)
+    );
+    let r = t.prune_read_data().await; // g3
+    assert_eq!(
+        (r.repaired, r.repacked, r.false_entries, r.read_packs),
+        (1, 1, 0, 1),
+        "{:?}",
+        r.warnings
+    );
+    let recs = t.records().await;
+    assert_eq!(recs[&p].status.s, status::CONDEMNED);
+    let n: Vec<&Record> = recs.values().filter(|r| r.by_prune).collect();
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0].kind, Kind::Data);
+    assert_eq!(restored(&t, &snap).await, only_a());
+    t.prune_after(73).await;
+    t.prune_after(73).await;
+    assert!(
+        !t.pack_ids("packs").await.contains(&p),
+        "the damaged pack is deleted"
+    );
+    assert_eq!(restored(&t, &snap).await, only_a());
+}
+
+/// `--read-data` 讀到修不回的 chunk（沒有 parity）：從記錄移除並回報；它是唯一的持有者，下一輪 P5 拒絕——資料
+/// 真的遺失了，大聲失敗，不自己過期。
+#[tokio::test]
+async fn read_data_drops_an_unrepairable_chunk_and_the_next_prune_refuses() {
+    let t = setup_with(0).await;
+    t.write("d", "a", &data("a", 10 * 1024));
+    t.backup(1, "d").await;
+    t.prune().await; // g1
+    let p = t.pack_ids("packs").await[0];
+    let rec = t.records().await[&p].clone();
+    damage(
+        &t,
+        &Key::Pack {
+            client: client(1),
+            id: p,
+        },
+        &rec.entries[0],
+    )
+    .await;
+    let r = t.prune_read_data().await; // g2
+    assert_eq!(
+        (r.repaired, r.repacked, r.false_entries, r.read_packs),
+        (0, 0, 1, 1)
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("cannot be repaired")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(t.records().await[&p].entries.is_empty());
+    let err = t.try_prune().await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Unsafe(m) if m.contains("no readable holder")),
+        "{err}"
+    );
+}
+
+/// `--read-data` 在健康的 repo 上：每個 live 的資料 pack 讀一次、什麼都不改。
+#[tokio::test]
+async fn read_data_on_a_healthy_repo_reads_every_live_data_pack_and_changes_nothing() {
+    let t = setup().await;
+    t.write("d", "a", &data("a", 10 * 1024));
+    t.backup(1, "d").await;
+    t.write("e", "b", &data("b", 10 * 1024));
+    t.backup(2, "e").await;
+    t.prune().await; // g1
+    let before = t.records().await;
+    let r = t.prune_read_data().await; // g2
+    assert_eq!(
+        (r.read_packs, r.repaired, r.repacked, r.false_entries),
+        (2, 0, 0, 0)
+    );
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let after = t.records().await;
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    for (id, rec) in &after {
+        assert_eq!(rec.status.s, before[id].status.s, "{id}");
+        assert_eq!(rec.entries, before[id].entries, "{id}");
+    }
+}
+
+/// `--read-data` 的時限：整輪的時間用掉一半就停（讀了幾個回報），這一輪照樣寫 head；沒讀的留給下一次。
+#[tokio::test]
+async fn read_data_stops_half_way_through_the_time_limit_and_still_writes_the_head() {
+    let t = setup().await;
+    t.write("d", "a", &data("a", 10 * 1024));
+    t.backup(1, "d").await;
+    t.write("e", "b", &data("b", 10 * 1024));
+    t.backup(2, "e").await;
+    t.prune().await; // g1
+                     // 讀了任何一個 pack 之後時鐘前進 36 小時：(72h − 1h) / 2 的預算已過（讀的順序依 ObjectId，先掛好兩個）
+    for key in t.hooked.keys("packs").await {
+        t.hooked
+            .store
+            .advance_after_get
+            .lock()
+            .unwrap()
+            .push((key, 36 * 3600));
+    }
+    let r = t.prune_read_data().await; // g2
+    assert_eq!(r.read_packs, 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("--read-data stopped after 1 pack")),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(t.newest().await, 2, "the head is still written");
+}

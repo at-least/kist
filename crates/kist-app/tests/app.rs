@@ -71,6 +71,7 @@ keep_within = "2w"
 schedule = "0 4 * * *"
 [prune]
 repack_below = 40
+read_data = true
 [notify]
 webhook_url = "https://example.com/hook"
 on = ["failure", "success"]
@@ -111,6 +112,7 @@ on = ["failure", "success"]
         Some(std::time::Duration::from_secs(14 * 86_400))
     );
     assert_eq!(cfg.prune.as_ref().unwrap().options().repack_below, 40);
+    assert!(cfg.prune.as_ref().unwrap().options().read_data);
 
     let bad = [
         ("repo = \"/x\"\npassword_file = \"/p\"\n", "nothing to do"),

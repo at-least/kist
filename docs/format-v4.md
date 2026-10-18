@@ -490,7 +490,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
     有 parity 就以同樣的片數為新的寫 parity，§13），**讀回驗證**（名稱、trailer、每一項）後記為 `by_prune`
     的 live；舊的（損壞而修好的那個也是）→ condemned，保留全部項目，之後照常兩階段刪除——不覆寫任何東西、
     只有 P9 會刪。讀回驗證失敗：新 pack 記為 unreadable（`since = g+1`），舊的維持 live，回報；寫入失敗只
-    回報，舊的維持 live；
+    回報，舊的維持 live。`prune --read-data`（實作第 7 段，修法 C 的替代）：其他 live、當正本的資料 pack 也
+    整份讀、逐項驗證它當正本的 chunk（mpack 不必：P5 走訪時已逐一取回驗證）——有項目驗證失敗就先以
+    parity 修復，修得回的 pack 一律 repack；修不回的項目從記錄移除並回報（它若是唯一的持有者，下一輪 P5
+    拒絕：資料真的遺失了）。整輪的時間用掉一半就停、回報讀了幾個，剩下的留給下一次，這一輪照樣寫 head；
   - d) condemned（`at = c`、`age`）、不是任何 ID 的正本、`T(c) + age` ≤ 現在的 `T` **而且** `w(c) + age`
     ≤ 現在的 `w`（§11.1 的現在）→ 刪前驗證：它宣稱持有的每個被引用 ID，正本必須是 `by_prune`，或現在在正本那裡解密、重算 ID 成功；
     驗證失敗就把那個項目從正本的記錄移除並回報，這個 pack 留在 condemned；全部通過 → tombstone
@@ -643,9 +646,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   bytes 重算 BLAKE3 等於名稱，或 `.r1` 完好——不寫回。修回的路徑是 prune（ADR 026 規格錯誤第 17 項的修法
   D，實作第 6 段）：P5、P7c、P7d 讀到驗證失敗的副本時先以 parity 在記憶體裡修復，修好的 pack 一律 repack
   寫進新的 pack，損壞的那個走兩階段刪除（§11.3）。restore 與 mount 不用 parity：損壞的副本換下一個持有者，
-  全部失敗就報錯（§10），直到 prune 修好它。只有 prune 讀到的項目會被修（被引用的 metadata item、repack
-  候選與刪前驗證的正本）；稠密、live 的資料 pack 裡損壞的 chunk 不會，restore 讀不到那一份（修法 C 沒做，
-  見 ADR 026「實作第六段」）。
+  全部失敗就報錯（§10），直到 prune 修好它。平常的 prune 只讀到被引用的 metadata item、repack 候選與刪前
+  驗證的正本；稠密、live 的資料 pack 裡損壞的 chunk 要 `prune --read-data`（§11.3 P7c：每個 live 的資料
+  pack 整份讀、逐項驗證、修得回的 repack）才修得回，所以 `check --read-data` 回報 `repairable` 之後接著跑
+  它（restore 自己不用 parity：修法 C 沒做，ADR 026 第七段）。
 
 ### 13.1 check
 

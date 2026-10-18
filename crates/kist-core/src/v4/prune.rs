@@ -10,7 +10,10 @@
 //! - **P5**：走訪每一個 snapshot（主體，與只有 `.r1` 的）引用的每一個 metadata item 與 chunk。metadata item 照
 //!   持有者的順序取回驗證：不實的項目從記錄移除（同 GC 模型）、換下一個；沒有可讀、非 tombstone、種類相符的
 //!   持有者 → 先重新列出世代再拒絕。兩份都解不開的 snapshot 照 `bad` 清單處理；版本不認得的拒絕。
-//! - **P6、P7**：正本與 `Map(g+1)`；P7d 的刪前驗證與兩個時鐘。P7c（repack）在下一步。
+//! - **P6、P7**：正本與 `Map(g+1)`；P7d 的刪前驗證與兩個時鐘；P7c 的 repack 與修法 D（parity 在記憶體裡修復）。
+//!   `--read-data`：其他 live 的資料 pack 也整份讀、逐項驗證（mpack 的項目 P5 走訪時已逐一取回驗證），壞而修得回
+//!   的 repack、修不回的項目從記錄移除——平常的 prune 讀不到稠密、live 的資料 pack，位元損壞的 chunk 只有這樣
+//!   才修得回（修法 C 的替代，ADR 026 第七段）。
 //! - **P8**：寫出有變動的分片、時限內以柵欄寫 head g+1、再寫 `.r1`。
 //! - **P9**：時限內刪除 tombstone 而仍在列表的 pack（`.r1`、parity、主體）、收錄完的 delta、過了 grace 的
 //!   解不開的 delta、兩代都沒引用的舊分片、pack 已不在的 parity、`bad` 裡已不再當成起點的 snapshot。刪不掉的
@@ -29,7 +32,7 @@ use kist_format::v4::meta::{content_type, decode_item, node_type, Entry, Item};
 use kist_format::v4::pack::{Kind, PackEntry};
 use kist_format::v4::snapshot::Snapshot;
 
-use super::backup::Clock;
+use super::backup::{Clock, M};
 use super::maint::{secs, unix_ns, window_passed, Newest, Pair, Session};
 use super::pack::{open_chunk, open_meta, PackWriter};
 use super::repo::Repo;
@@ -42,6 +45,9 @@ pub struct PruneOptions {
     /// P7c：live、是正本、比 grace 老的 pack，當正本的項目（sealed bytes）不到這個百分比就 repack；0 不依比例
     /// repack。以 parity 修復過的 pack 一律 repack（規格錯誤第 17 項的修法 D）。
     pub repack_below: u8,
+    /// `--read-data`：每個 live、當正本的資料 pack 整份讀、逐項驗證（下載整個 repo 的資料）。壞而 parity 修得回的
+    /// repack，修不回的項目從記錄移除並回報。時間用掉一半就停、剩下的留給下一次（整輪仍寫 head）。
+    pub read_data: bool,
     /// 牆鐘與含休眠的單調時鐘（P0 的本機讀數、head 的 `w`、整輪時限）。測試注入假的。
     #[doc(hidden)]
     pub clock: Clock,
@@ -54,6 +60,7 @@ impl Default for PruneOptions {
     fn default() -> Self {
         Self {
             repack_below: DEFAULT_REPACK_BELOW,
+            read_data: false,
             clock: Clock::system(),
         }
     }
@@ -82,6 +89,8 @@ pub struct PruneReport {
     pub repacked: u64,
     /// 損壞、以 parity 在記憶體裡修復的 pack（它當正本的項目由 repack 寫進新的 pack）。
     pub repaired: u64,
+    /// `--read-data` 整份讀過並逐項驗證的資料 pack 數（不含因比例被 repack 的）。
+    pub read_packs: u64,
     pub deleted_packs: u64,
     pub deleted_bytes: u64,
     pub deleted_deltas: u64,
@@ -403,6 +412,7 @@ struct Prune {
     bad_ignored: Vec<String>,
     mpacks: MpackCache,
     repack_below: u8,
+    read_data: bool,
     /// 以 parity 修復過的 pack 的完整 bytes（P7c 從它 repack）與修不回的 pack。
     repaired: HashMap<ObjectId, Arc<Vec<u8>>>,
     unrepairable: HashSet<ObjectId>,
@@ -473,6 +483,7 @@ impl Repo {
             bad_ignored: Vec::new(),
             mpacks: MpackCache::new(super::read::MPACK_MEMORY),
             repack_below: opts.repack_below,
+            read_data: opts.read_data,
             repaired: HashMap::new(),
             unrepairable: HashSet::new(),
             canon: HashMap::new(),
@@ -1320,6 +1331,11 @@ impl Prune {
     /// 回報；整份讀到的 bytes 名稱不符時先以 parity 修復），寫進全零 client 前綴下的新 pack（一個舊的對一個新的，
     /// 同 GC 模型），讀回驗證後記為 by_prune 的 live、舊的 → condemned（保留全部項目）。讀回驗證失敗：新的記為
     /// unreadable，舊的維持 live，回報。
+    ///
+    /// `--read-data`（[`PruneOptions::read_data`]）：不是候選的 live 資料 pack 也整份讀、逐項驗證它當正本的
+    /// chunk（mpack 不必：P5 走訪時已逐一取回驗證）。有項目驗證失敗 → 先以 parity 修復（[`Prune::repair`]），
+    /// 修得回就進 repack；修不回的項目從記錄移除並回報（同 P7c 對不實項目的處理；它若是唯一的持有者，下一輪
+    /// P5 拒絕——資料真的遺失了，大聲失敗）。整輪的時間用掉一半就停、回報，剩下的留給下一次：這一輪照樣寫 head。
     async fn repack(&mut self) -> Result<()> {
         if self.hold_active {
             return Ok(());
@@ -1329,6 +1345,7 @@ impl Prune {
             canon_of.entry(*p).or_default().insert(*id);
         }
         let mut jobs = Vec::new();
+        let mut verify = Vec::new();
         for r in self.map.values() {
             if r.status.s != status::LIVE {
                 continue;
@@ -1351,10 +1368,56 @@ impl Prune {
                 let sparse =
                     live.saturating_mul(100) < total.saturating_mul(u64::from(self.repack_below));
                 if !(old && sparse) {
+                    if self.read_data && r.kind == Kind::Data {
+                        verify.push((r.id, items.clone()));
+                    }
                     continue;
                 }
             }
             jobs.push((r.id, items.clone()));
+        }
+        for (id, items) in verify {
+            if self.session.elapsed().as_secs().saturating_mul(2) + M.as_secs() >= self.grace {
+                self.warn(format!(
+                    "--read-data stopped after {} pack(s): half of this prune's time limit is \
+                     used; the rest are read by a later prune",
+                    self.report.read_packs
+                ));
+                break;
+            }
+            let Some(rec) = self.map.get(&id).cloned() else {
+                continue;
+            };
+            // 列表之後就不見了：P3 下一輪處理
+            let Some(bytes) = self.whole(id, rec.client, rec.kind).await? else {
+                continue;
+            };
+            self.report.read_packs += 1;
+            let bad: Vec<PackEntry> = rec
+                .entries
+                .iter()
+                .filter(|e| items.contains(&e.i) && self.open_in(rec.kind, e, &bytes).is_err())
+                .copied()
+                .collect();
+            if bad.is_empty() {
+                continue;
+            }
+            if self.repair(id, rec.client, rec.kind).await?.is_some() {
+                jobs.push((id, items));
+                continue;
+            }
+            let path = pack_key(rec.kind, rec.client, id).path();
+            for e in bad {
+                if let Some(r) = self.map.get_mut(&id) {
+                    r.entries.retain(|x| x.i != e.i);
+                }
+                self.report.false_entries += 1;
+                self.warn(format!(
+                    "{path} claims {} but its copy is damaged and cannot be repaired; removed from \
+                     the record (--read-data)",
+                    e.i
+                ));
+            }
         }
         for (id, items) in jobs {
             self.repack_one(id, &items).await?;

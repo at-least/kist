@@ -66,12 +66,20 @@ struct PruneArgs {
     /// damaged packs that their parity repairs are always repacked).
     #[arg(long, value_name = "PERCENT", default_value_t = kist_core::v4::prune::DEFAULT_REPACK_BELOW, value_parser = clap::value_parser!(u8).range(0..=100))]
     repack_below: u8,
+    /// Also read every live data pack in full and verify every chunk it holds (slow: downloads all
+    /// the data). A damaged pack that its parity repairs is repacked; a chunk that cannot be repaired
+    /// is reported and dropped from the record, so the next prune refuses until the snapshots that
+    /// need it are forgotten. Stops half-way through the time limit and continues next time.
+    /// Metadata packs are verified by every prune already.
+    #[arg(long)]
+    read_data: bool,
 }
 
 impl PruneArgs {
     fn options(&self) -> PruneOptions {
         PruneOptions {
             repack_below: self.repack_below,
+            read_data: self.read_data,
             ..PruneOptions::default()
         }
     }
@@ -1315,6 +1323,12 @@ fn output_prune(p: &PruneReport) {
         "{} new pack(s) recorded; {} marked, {} revived, {} to delete",
         p.newcomers, p.condemned, p.revived, p.tombstoned
     );
+    if p.read_packs > 0 {
+        println!(
+            "read {} data pack(s) in full and verified every chunk",
+            p.read_packs
+        );
+    }
     if p.repacked > 0 || p.repaired > 0 {
         println!(
             "repacked {} pack(s) ({} repaired from parity first)",

@@ -66,8 +66,21 @@ impl T {
             .prune(PruneOptions {
                 repack_below,
                 clock: self.clock.clock(),
+                ..PruneOptions::default()
             })
             .await
+    }
+
+    /// `prune --read-data`。
+    pub async fn prune_read_data(&self) -> PruneReport {
+        self.repo
+            .prune(PruneOptions {
+                read_data: true,
+                clock: self.clock.clock(),
+                ..PruneOptions::default()
+            })
+            .await
+            .unwrap()
     }
 
     /// 前進 `hours` 小時之後 prune。

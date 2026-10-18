@@ -242,6 +242,7 @@ schedule = "0 4 * * *"
 [prune]
 schedule = "0 5 * * *"
 repack_below = 50                         # 選填；同 `prune --repack-below`
+read_data = false                         # 選填；同 `prune --read-data`（每輪整份讀資料 pack，慢）
 ```
 
 ```sh
@@ -330,8 +331,12 @@ grace（預設 72 小時）、再經過刪前驗證，下一輪才真的刪；�
 - grace 存在 repo 裡（`kist settings --grace`，至少 2h），不是命令列或設定檔的選項。每個 backup 必須在 grace
   減一小時內做完，否則不寫 snapshot、以錯誤結束（重跑即可）。調高立刻生效；調低要「排空」一個舊的 grace
   才完全生效（期間新的標記仍以舊的 grace 計）。
-- `prune` 只有 `--repack-below`（預設 50%）：活資料比例低於它的舊 pack 會被重新打包；損壞而 parity 修得回的
-  pack 一律重新打包，壞的那份之後照常刪掉。沒有 `--dry-run`。
+- `prune` 的選項：`--repack-below`（預設 50%）：活資料比例低於它的舊 pack 會被重新打包；損壞而 parity 修得回
+  的 pack 一律重新打包，壞的那份之後照常刪掉。`--read-data`：另外把每個活的資料 pack 整份讀回、逐一驗證它持有
+  的 chunk（慢：下載整個 repo 的資料），壞而 parity 修得回的重新打包、修不回的從記錄移除並回報（它若是唯一的
+  一份，下一輪 prune 會拒絕，直到 forget 掉需要它的 snapshot）；時間用掉一半就停、下次接著讀。平常的 prune 只
+  讀它要用的 metadata 與要刪的 pack，稠密的活資料 pack 裡的位元損壞要靠它修；`check --read-data` 回報
+  `repairable` 之後接著跑它。沒有 `--dry-run`。
 - 刪除只看 prune 自己讀過、驗證過的東西：備份主機寫的提示（delta）只用來加速去重，左右不了刪什麼。
 - 刪不掉的物件（S3 Object Lock、權限）會回報並留到下一輪再試；一輪超過時限也會停下來、下一輪接著做。
   兩種都是結束碼 3。

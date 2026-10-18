@@ -24,6 +24,7 @@
 //!
 //! [prune]                      # 選填；同上（grace 存在 repo 裡，以 `kist settings --grace` 改）
 //! repack_below = 50
+//! read_data = false             # 選填；同 --read-data（每輪整份讀資料 pack 驗證、修復，慢）
 //! schedule = "0 5 * * *"
 //!
 //! [notify]
@@ -137,6 +138,9 @@ pub struct PruneSection {
     /// v4 的 grace 在 repo 的 head 裡（`kist settings --grace`），v3 的 grace、clock_skew、inactive_after
     /// 都不再是設定：寫了就是 deny_unknown_fields 的錯誤，不默默忽略。
     pub repack_below: Option<u8>,
+    /// 同 `prune --read-data`。
+    #[serde(default)]
+    pub read_data: bool,
     #[serde(default)]
     pub schedule: Option<String>,
 }
@@ -310,6 +314,7 @@ impl PruneSection {
         let d = kist_core::v4::PruneOptions::default();
         kist_core::v4::PruneOptions {
             repack_below: self.repack_below.unwrap_or(d.repack_below),
+            read_data: self.read_data,
             ..d
         }
     }
