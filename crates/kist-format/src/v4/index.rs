@@ -335,6 +335,24 @@ impl Shard {
         Ok(cbor::encode(self)?)
     }
 
+    /// 借用記錄編碼：bytes 與 [`Shard::encode`] 相同。prune 的 P8 從它唯一的一份記錄（依名稱排序的 map 裡
+    /// 連續的一段）直接編，不 clone 記錄集合。
+    pub fn encode_borrowed(index: u8, records: &[&Record]) -> Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct Borrowed<'a> {
+            v: u32,
+            index: u8,
+            records: &'a [&'a Record],
+        }
+        check_records(index, records.iter().copied())
+            .map_err(|e| invalid("map shard", e.to_string()))?;
+        Ok(cbor::encode(&Borrowed {
+            v: VERSION,
+            index,
+            records,
+        })?)
+    }
+
     /// 讀取端：`index` 是 head 指向它的位置，必須等於明文裡的分片號碼（§5）。
     pub fn decode(bytes: &[u8], index: u8) -> Result<Self> {
         let s: Shard = cbor::decode(bytes)?;
@@ -350,25 +368,30 @@ impl Shard {
 
     fn check(&self) -> Result<()> {
         check_version("map shard", self.v)?;
-        let mut prev: Option<ObjectId> = None;
-        for r in &self.records {
-            r.check()?;
-            if shard_of(&r.id) != self.index {
-                return Err(corrupt(
-                    "map shard",
-                    format!("pack {} does not belong in shard {}", r.id, self.index),
-                ));
-            }
-            if prev.is_some_and(|p| p >= r.id) {
-                return Err(corrupt(
-                    "map shard",
-                    format!("pack {} is out of order or repeats", r.id),
-                ));
-            }
-            prev = Some(r.id);
-        }
-        Ok(())
+        check_records(self.index, self.records.iter())
     }
+}
+
+/// 分片的記錄：都屬於這一片、依名稱嚴格遞增。
+fn check_records<'a>(index: u8, records: impl Iterator<Item = &'a Record>) -> Result<()> {
+    let mut prev: Option<ObjectId> = None;
+    for r in records {
+        r.check()?;
+        if shard_of(&r.id) != index {
+            return Err(corrupt(
+                "map shard",
+                format!("pack {} does not belong in shard {index}", r.id),
+            ));
+        }
+        if prev.is_some_and(|p| p >= r.id) {
+            return Err(corrupt(
+                "map shard",
+                format!("pack {} is out of order or repeats", r.id),
+            ));
+        }
+        prev = Some(r.id);
+    }
+    Ok(())
 }
 
 /// delta 裡的一個 pack：§4 的欄位順序 id, kind, size, entries。
@@ -874,6 +897,32 @@ mod tests {
         r.client = ClientId::MAINT;
         let shard = Shard::new(7, vec![r]);
         assert_eq!(Shard::decode(&shard.encode().unwrap(), 7).unwrap(), shard);
+    }
+
+    /// prune 的 P8 以借用的記錄編碼分片，再以明文的 BLAKE3 判斷分片有沒有變：bytes 要與 `encode` 完全相同；
+    /// 順序與分片號碼的檢查也一樣。
+    #[test]
+    fn encode_borrowed_gives_the_same_bytes_as_encode() {
+        let a = record(name(7, 1), 1, Status::LIVE);
+        let mut b = record(name(7, 2), 2, st(status::CONDEMNED, 2, 7200));
+        b.by_prune = true;
+        b.client = ClientId::MAINT;
+        let shard = Shard::new(7, vec![b.clone(), a.clone()]);
+        assert_eq!(
+            Shard::encode_borrowed(7, &[&a, &b]).unwrap(),
+            shard.encode().unwrap()
+        );
+        assert!(
+            matches!(
+                Shard::encode_borrowed(7, &[&b, &a]),
+                Err(Error::Invalid { .. })
+            ),
+            "out of order"
+        );
+        assert!(
+            matches!(Shard::encode_borrowed(8, &[&a]), Err(Error::Invalid { .. })),
+            "the wrong shard"
+        );
     }
 
     #[test]

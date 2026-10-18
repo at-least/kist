@@ -71,9 +71,9 @@ impl Repo {
                 Ok(map) => {
                     g_r = Some(g);
                     base = map
-                        .records()
-                        .iter()
-                        .map(|r| (r.id, r.clone()))
+                        .into_records()
+                        .into_iter()
+                        .map(|r| (r.id, r))
                         .collect::<BTreeMap<ObjectId, Record>>();
                     break;
                 }

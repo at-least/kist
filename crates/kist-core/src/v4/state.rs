@@ -144,6 +144,10 @@ impl MapView {
         &self.records
     }
 
+    pub fn into_records(self) -> Vec<Record> {
+        self.records
+    }
+
     /// 種類相符的持有者，依 §10 的順序（live、condemned、tombstone）。
     pub fn holders(&self, id: &ItemId, kind: Kind) -> Vec<Holder> {
         self.ids
@@ -375,6 +379,12 @@ impl Repo {
     /// 載入 head 指向的分片（依名稱快取），組成 `Map(g)`。任何一片讀不了就是錯誤：map 不完整就不知道誰是
     /// 持有者。
     pub async fn load_map(&self, gen: &Generation) -> Result<MapView> {
+        Ok(MapView::new(self.load_map_records(gen).await?))
+    }
+
+    /// [`Repo::load_map`] 的記錄，依分片的順序、不建 ID 的表：prune 只留這一份記錄、索引自己建（100 萬個項目的
+    /// 表是 40 MiB）。每筆記錄的項目縮到剛好的容量（解碼時的成長留下三成的空位）。
+    pub async fn load_map_records(&self, gen: &Generation) -> Result<Vec<Record>> {
         let mut records = Vec::new();
         let mut referenced = HashSet::new();
         for (i, id) in gen.head.shards.iter().enumerate() {
@@ -405,12 +415,15 @@ impl Repo {
                     gen.g
                 ))
             })?;
-            records.extend(shard.records);
+            records.extend(shard.records.into_iter().map(|mut r| {
+                r.entries.shrink_to_fit();
+                r
+            }));
         }
         if let Some(c) = self.cache() {
             c.retain(CacheKind::Shard, &referenced);
         }
-        Ok(MapView::new(records))
+        Ok(records)
     }
 
     /// 列 `deltas/` 並讀列表裡的每一份（依名稱快取）。解不開、名稱不符、明文的 client 與前綴不同的跳過並

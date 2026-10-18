@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use kist_backend::BackendError;
 use kist_format::v4::ids::{ClientId, ItemId, MetaId, ObjectId};
-use kist_format::v4::index::{shard_of, status, Bad, Delta, Head, Record, Shard, Status, SHARDS};
+use kist_format::v4::index::{status, Bad, Delta, Head, Record, Shard, Status, SHARDS};
 use kist_format::v4::keys::{Gen, Key, DELTAS, MAP, MPACKS, PACKS, PARITY, SNAPSHOTS};
 use kist_format::v4::meta::{content_type, decode_item, node_type, Entry, Item};
 use kist_format::v4::pack::{Kind, PackEntry};
@@ -36,7 +36,7 @@ use super::backup::{Clock, M};
 use super::maint::{secs, unix_ns, window_passed, Newest, Pair, Session};
 use super::pack::{open_chunk, open_meta, PackWriter};
 use super::repo::Repo;
-use super::state::{pack_key, Holder, MapView};
+use super::state::{pack_key, Holder, Source};
 use crate::{CoreError, Result};
 
 /// prune 的選項。
@@ -273,32 +273,47 @@ pub(crate) async fn newcomer(
     )))
 }
 
-/// P8：`new` 與 `base` 有差別的分片才寫（`replicas=1` 時先主體、再 `.r1`），名稱填進 `head`；變空的分片是 null。
+/// 分片 i 的記錄：名稱第一個 byte 等於 i 的那些——map 依名稱排序，是連續的一段。
+fn shard_range(i: u8) -> std::ops::RangeInclusive<ObjectId> {
+    let mut lo = [0u8; 32];
+    lo[0] = i;
+    let mut hi = [0xffu8; 32];
+    hi[0] = i;
+    ObjectId::from_bytes(lo)..=ObjectId::from_bytes(hi)
+}
+
+/// 每一片明文的 BLAKE3（空的是 `None`）：P8 以它判斷分片有沒有改變，不必留一份基礎世代的記錄集合。
+pub(crate) fn shard_hashes(map: &BTreeMap<ObjectId, Record>) -> Result<Vec<Option<ObjectId>>> {
+    let mut out = Vec::with_capacity(SHARDS);
+    for i in 0..SHARDS {
+        let recs: Vec<&Record> = map.range(shard_range(i as u8)).map(|(_, r)| r).collect();
+        out.push(if recs.is_empty() {
+            None
+        } else {
+            Some(ObjectId::of(&Shard::encode_borrowed(i as u8, &recs)?))
+        });
+    }
+    Ok(out)
+}
+
+/// P8：明文與基礎世代不同的分片才寫（`replicas=1` 時先主體、再 `.r1`），名稱填進 `head`；變空的分片是 null。
 pub(crate) async fn put_changed_shards(
     repo: &Repo,
-    base: &BTreeMap<ObjectId, Record>,
+    base: &[Option<ObjectId>],
     new: &BTreeMap<ObjectId, Record>,
     head: &mut Head,
 ) -> Result<()> {
-    let group = |m: &BTreeMap<ObjectId, Record>| {
-        let mut out: BTreeMap<u8, Vec<Record>> = BTreeMap::new();
-        for r in m.values() {
-            out.entry(shard_of(&r.id)).or_default().push(r.clone());
-        }
-        out
-    };
-    let (mut new, old) = (group(new), group(base));
-    for i in 0..SHARDS {
-        let i = i as u8;
-        let recs = new.remove(&i).unwrap_or_default();
-        if old.get(&i).map_or(recs.is_empty(), |o| *o == recs) {
-            continue;
-        }
+    for (i, base_hash) in base.iter().enumerate() {
+        let recs: Vec<&Record> = new.range(shard_range(i as u8)).map(|(_, r)| r).collect();
         if recs.is_empty() {
-            head.shards[i as usize] = None;
+            head.shards[i] = None;
             continue;
         }
-        let sealed = repo.keys().seal_shard(&Shard::new(i, recs).encode()?)?;
+        let plain = Shard::encode_borrowed(i as u8, &recs)?;
+        if *base_hash == Some(ObjectId::of(&plain)) {
+            continue;
+        }
+        let sealed = repo.keys().seal_shard(&plain)?;
         let id = ObjectId::of(&sealed);
         for replica in [false, true] {
             if replica && head.settings.replicas == 0 {
@@ -313,7 +328,7 @@ pub(crate) async fn put_changed_shards(
                 Err(e) => return Err(e.into()),
             }
         }
-        head.shards[i as usize] = Some(id);
+        head.shards[i] = Some(id);
     }
     Ok(())
 }
@@ -386,6 +401,247 @@ impl MpackCache {
     }
 }
 
+/// P5–P7 的索引（第 7 段第十二步）：P4 之後的記錄裡每一個項目一列，依 (ID, §10 的持有者順序) 排好；記錄本身
+/// 只有 [`Prune::map`] 一份，列以 pack 的名稱（`packs[ri]`）與項目的位置（`ei`）指回去。三張依 (記錄, 項目)
+/// 索引的表：`dead`（證明不實的項目；P8 之前才真的從記錄移除，索引才一直有效）、`referenced`（P5 走到、種類
+/// 相符）、`canon`（P6 的正本）。100 萬個項目：列 40 MiB、三張表各 1 MiB。原本以 32 bytes 的 ID 當鍵的
+/// `referenced` 與 `canon` 兩張 HashMap 在 dhat 裡是 263 MiB，加上每個階段各 clone 一份記錄集合與 ID 的表
+/// （第八步的歸因）。
+struct Index {
+    packs: Vec<ObjectId>,
+    rows: Vec<Row>,
+    dead: Vec<Vec<bool>>,
+    referenced: Vec<Vec<bool>>,
+    canon: Vec<Vec<bool>>,
+    /// 有項目被當成正本的記錄。
+    canonical_pack: Vec<bool>,
+    /// 被引用的 metadata item 與 chunk 的數目（報告用）。
+    items: u64,
+    chunks: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Row {
+    item: ItemId,
+    ri: u32,
+    ei: u32,
+}
+
+impl Index {
+    fn new(map: &BTreeMap<ObjectId, Record>) -> Self {
+        let packs: Vec<ObjectId> = map.keys().copied().collect();
+        let keys: Vec<Option<(u8, Gen, ObjectId)>> = map.values().map(Record::order_key).collect();
+        let mut rows = Vec::with_capacity(map.values().map(|r| r.entries.len()).sum());
+        let mut flags = Vec::with_capacity(packs.len());
+        for (ri, r) in map.values().enumerate() {
+            flags.push(vec![false; r.entries.len()]);
+            if keys[ri].is_none() {
+                continue;
+            }
+            rows.extend(r.entries.iter().enumerate().map(|(ei, e)| Row {
+                item: e.i,
+                ri: ri as u32,
+                ei: ei as u32,
+            }));
+        }
+        rows.sort_unstable_by(|a, b| {
+            a.item
+                .cmp(&b.item)
+                .then_with(|| keys[a.ri as usize].cmp(&keys[b.ri as usize]))
+        });
+        Self {
+            canonical_pack: vec![false; packs.len()],
+            packs,
+            rows,
+            dead: flags.clone(),
+            referenced: flags.clone(),
+            canon: flags,
+            items: 0,
+            chunks: 0,
+        }
+    }
+
+    /// 一個 ID 的列（連續的一段）。
+    fn find(&self, item: &ItemId) -> std::ops::Range<usize> {
+        let start = self.rows.partition_point(|r| r.item < *item);
+        let end = start + self.rows[start..].partition_point(|r| r.item == *item);
+        start..end
+    }
+
+    fn ri(&self, pack: &ObjectId) -> Option<usize> {
+        self.packs.binary_search(pack).ok()
+    }
+
+    fn is_canonical_pack(&self, pack: &ObjectId) -> bool {
+        self.ri(pack).is_some_and(|ri| self.canonical_pack[ri])
+    }
+
+    /// `pack` 的每一項是不是被引用（種類相符）：與記錄的 `entries` 同樣的位置。索引建好之後才進 map 的記錄
+    /// （repack 寫出的）沒有。
+    fn referenced_in(&self, pack: &ObjectId) -> Option<&[bool]> {
+        self.ri(pack).map(|ri| self.referenced[ri].as_slice())
+    }
+
+    /// `pack` 的每一項是不是正本。
+    fn canon_in(&self, pack: &ObjectId) -> Option<&[bool]> {
+        self.ri(pack).map(|ri| self.canon[ri].as_slice())
+    }
+
+    /// 一個 ID 的持有者（P5、P7d）：記錄裡種類相符、live 或 condemned、還在列表裡、不是不實的項目，依 §10
+    /// 的順序。
+    fn holders(
+        &self,
+        map: &BTreeMap<ObjectId, Record>,
+        listed: &BTreeMap<ObjectId, Listed>,
+        item: &ItemId,
+        kind: Kind,
+    ) -> Vec<Holder> {
+        let mut out = Vec::new();
+        for row in &self.rows[self.find(item)] {
+            let (ri, ei) = (row.ri as usize, row.ei as usize);
+            if self.dead[ri][ei] {
+                continue;
+            }
+            let Some(r) = map.get(&self.packs[ri]) else {
+                continue;
+            };
+            if r.kind != kind
+                || !matches!(r.status.s, status::LIVE | status::CONDEMNED)
+                || !listed.contains_key(&r.id)
+            {
+                continue;
+            }
+            out.push(Holder {
+                pack: r.id,
+                client: r.client,
+                kind: r.kind,
+                entry: r.entries[ei],
+                source: Source::Map,
+                by_prune: r.by_prune,
+                status: r.status.s,
+            });
+        }
+        out
+    }
+
+    /// P5：記下 (ID, 種類) 被引用。`None`：沒有任何記錄有它（呼叫端拒絕）；`Some(false)`：已經記過；
+    /// `Some(true)`：這次記的。
+    fn mark_referenced(
+        &mut self,
+        map: &BTreeMap<ObjectId, Record>,
+        item: &ItemId,
+        kind: Kind,
+    ) -> Option<bool> {
+        let mut any = false;
+        for i in self.find(item) {
+            let row = self.rows[i];
+            let (ri, ei) = (row.ri as usize, row.ei as usize);
+            if !matches!(map.get(&self.packs[ri]), Some(r) if r.kind == kind) {
+                continue;
+            }
+            if self.referenced[ri][ei] {
+                return Some(false);
+            }
+            self.referenced[ri][ei] = true;
+            any = true;
+        }
+        if !any {
+            return None;
+        }
+        match kind {
+            Kind::Meta => self.items += 1,
+            Kind::Data => self.chunks += 1,
+        }
+        Some(true)
+    }
+
+    /// P6：每個被引用的 (ID, 種類) 的正本——依 §10 的順序第一個 live 或 condemned、還在列表裡、不是不實的持有者。
+    fn compute_canon(
+        &mut self,
+        map: &BTreeMap<ObjectId, Record>,
+        listed: &BTreeMap<ObjectId, Listed>,
+    ) {
+        for v in &mut self.canon {
+            v.iter_mut().for_each(|b| *b = false);
+        }
+        self.canonical_pack.iter_mut().for_each(|b| *b = false);
+        let mut i = 0;
+        while i < self.rows.len() {
+            let item = self.rows[i].item;
+            let end = i + self.rows[i..].partition_point(|r| r.item == item);
+            let mut done = [false; 2];
+            for row in &self.rows[i..end] {
+                let (ri, ei) = (row.ri as usize, row.ei as usize);
+                if self.dead[ri][ei] || !self.referenced[ri][ei] {
+                    continue;
+                }
+                let Some(r) = map.get(&self.packs[ri]) else {
+                    continue;
+                };
+                let k = usize::from(r.kind == Kind::Data);
+                if done[k]
+                    || !matches!(r.status.s, status::LIVE | status::CONDEMNED)
+                    || !listed.contains_key(&r.id)
+                {
+                    continue;
+                }
+                self.canon[ri][ei] = true;
+                self.canonical_pack[ri] = true;
+                done[k] = true;
+            }
+            i = end;
+        }
+    }
+
+    /// (ID, 種類) 的正本：記錄的名稱與那一項的位置。
+    fn canon_of(
+        &self,
+        map: &BTreeMap<ObjectId, Record>,
+        item: &ItemId,
+        kind: Kind,
+    ) -> Option<(ObjectId, usize)> {
+        self.rows[self.find(item)].iter().find_map(|row| {
+            let (ri, ei) = (row.ri as usize, row.ei as usize);
+            if !self.canon[ri][ei] {
+                return None;
+            }
+            let r = map.get(&self.packs[ri])?;
+            (r.kind == kind).then_some((r.id, ei))
+        })
+    }
+
+    /// 項目證明不實：標成 dead。回傳這次標的數目（已經標過的不算）。
+    fn kill(&mut self, pack: &ObjectId, item: &ItemId) -> usize {
+        let Some(ri) = self.ri(pack) else {
+            return 0;
+        };
+        let mut n = 0;
+        for i in self.find(item) {
+            let row = self.rows[i];
+            if row.ri as usize == ri && !self.dead[ri][row.ei as usize] {
+                self.dead[ri][row.ei as usize] = true;
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+/// P5 的拒絕：一個被引用的 item 沒有可用的持有者。
+fn no_holder(kind: Kind, item: &ItemId, snap: &str) -> String {
+    match kind {
+        Kind::Meta => format!(
+            "metadata item {} (snapshot {snap}) has no readable holder that is not a tombstone: \
+             data loss; run check",
+            item.to_meta()
+        ),
+        Kind::Data => format!(
+            "chunk {item} (snapshot {snap}) has no readable holder that is not a tombstone: data \
+             loss; run check"
+        ),
+    }
+}
+
 struct Prune {
     session: Session,
     newest: Newest,
@@ -400,16 +656,18 @@ struct Prune {
     now: Pair,
     /// 只看 `T` 的規則用的現在：`T(g)`，比本機時鐘晚超過 `M` 時是本機時鐘 + M。
     n_t: i64,
-    base: BTreeMap<ObjectId, Record>,
+    /// 基礎世代每一片明文的 BLAKE3（P8 以它判斷分片有沒有改變；不留第二份記錄集合）。
+    base_hashes: Vec<Option<ObjectId>>,
+    /// 唯一的一份記錄：載入的 `Map(g)`，P3、P4、P7、P7c 直接在上面改成 `Map(g+1)`。
     map: BTreeMap<ObjectId, Record>,
+    /// P5 建的索引（P5–P7c 用）。
+    index: Option<Index>,
     snaps: BTreeMap<String, (bool, bool)>,
     deltas: Vec<(Object, Option<Delta>)>,
     packs: BTreeMap<ObjectId, Listed>,
     parity: Vec<Object>,
     shards: Vec<Object>,
-    /// 被引用的 ID 與它的種類。
-    referenced: HashMap<ItemId, Kind>,
-    /// P5 發現的不實項目（從記錄移除了的 (ID, pack)）。
+    /// 證明不實的 (ID, pack)：索引裡標成 dead，P8 之前從記錄移除。
     false_claims: HashSet<(ItemId, ObjectId)>,
     bad_ignored: Vec<String>,
     mpacks: MpackCache,
@@ -418,8 +676,6 @@ struct Prune {
     /// 以 parity 修復過的 pack 的完整 bytes（P7c 從它 repack）與修不回的 pack。
     repaired: HashMap<ObjectId, Arc<Vec<u8>>>,
     unrepairable: HashSet<ObjectId>,
-    /// P6 的正本（P7c 用）。
-    canon: HashMap<ItemId, ObjectId>,
     report: PruneReport,
 }
 
@@ -432,7 +688,7 @@ impl Repo {
         session.repair_r1(&newest).await?;
         let g = newest.g();
         let head = newest.head().clone();
-        let map = session.repo.load_map(&newest.copy.gen).await?;
+        let records = session.repo.load_map_records(&newest.copy.gen).await?;
         let now = session.now(&newest);
         let grace = head.settings.grace;
         let mut age = grace;
@@ -460,8 +716,8 @@ impl Repo {
             }
             hold_active = !window_passed(latest, now, h.grace);
         }
-        let records: BTreeMap<ObjectId, Record> =
-            map.records().iter().map(|r| (r.id, r.clone())).collect();
+        let map: BTreeMap<ObjectId, Record> = records.into_iter().map(|r| (r.id, r)).collect();
+        let base_hashes = shard_hashes(&map)?;
         let mut p = Prune {
             n_t: newest.now_t,
             session,
@@ -473,14 +729,14 @@ impl Repo {
             drain_over,
             hold_active,
             now,
-            base: records.clone(),
-            map: records,
+            base_hashes,
+            map,
+            index: None,
             snaps: BTreeMap::new(),
             deltas: Vec::new(),
             packs: BTreeMap::new(),
             parity: Vec::new(),
             shards: Vec::new(),
-            referenced: HashMap::new(),
             false_claims: HashSet::new(),
             bad_ignored: Vec::new(),
             mpacks: MpackCache::new(super::read::MPACK_MEMORY),
@@ -488,7 +744,6 @@ impl Repo {
             read_data: opts.read_data,
             repaired: HashMap::new(),
             unrepairable: HashSet::new(),
-            canon: HashMap::new(),
             report: PruneReport {
                 base: g,
                 ..Default::default()
@@ -508,6 +763,7 @@ impl Repo {
             .values()
             .filter(|r| r.status.s == status::LIVE)
             .count() as u64;
+        p.drop_false_entries();
         p.put_shards(&mut new_head).await?;
         if p.session.out_of_time(p.grace) {
             return Err(CoreError::Unsafe(format!(
@@ -695,10 +951,18 @@ impl Prune {
         Ok(())
     }
 
-    /// P5：每一個 snapshot 當成起點。持有者的表在走訪之前建一次（P3、P4 之後的記錄），之後發現的不實項目
-    /// 以 `false_claims` 排除。
+    /// P5：每一個 snapshot 當成起點。持有者的索引在走訪之前建一次（P3、P4 之後的記錄）；之後發現的不實項目在
+    /// 索引裡標成 dead。
     async fn walk_all(&mut self) -> Result<()> {
-        let view = MapView::new(self.map.values().cloned().collect());
+        let mut index = Index::new(&self.map);
+        let result = self.walk_snapshots(&mut index).await;
+        self.report.items = index.items;
+        self.report.chunks = index.chunks;
+        self.index = Some(index);
+        result
+    }
+
+    async fn walk_snapshots(&mut self, index: &mut Index) -> Result<()> {
         let snaps: Vec<(String, (bool, bool))> =
             self.snaps.iter().map(|(k, v)| (k.clone(), *v)).collect();
         for (path, (body, r1)) in snaps {
@@ -737,7 +1001,7 @@ impl Prune {
             }
             if let Some(s) = readable {
                 self.report.snapshots += 1;
-                self.walk(&view, &path, s.roots).await?;
+                self.walk(index, &path, s.roots).await?;
                 continue;
             }
             if let Some(v) = version {
@@ -788,31 +1052,23 @@ impl Prune {
         )))
     }
 
-    /// 一個 ID 的持有者：記錄裡種類相符、live 或 condemned、還在列表裡、不是已知的不實項目，依 §10 的順序。
-    fn holders(&self, view: &MapView, id: &ItemId, kind: Kind) -> Vec<Holder> {
-        view.holders(id, kind)
-            .into_iter()
-            .filter(|h| matches!(h.status, status::LIVE | status::CONDEMNED))
-            .filter(|h| self.packs.contains_key(&h.pack))
-            .filter(|h| !self.false_claims.contains(&(*id, h.pack)))
-            .collect()
-    }
-
-    /// P5：走訪一個 snapshot 引用的每一個 item（每個 ID 一次）。
-    async fn walk(&mut self, view: &MapView, snap: &str, roots: MetaId) -> Result<()> {
+    /// P5：走訪一個 snapshot 引用的每一個 item（每個 (ID, 種類) 一次）。
+    async fn walk(&mut self, index: &mut Index, snap: &str, roots: MetaId) -> Result<()> {
         let mut stack: Vec<MetaId> = Vec::new();
-        if self.referenced.insert(roots.into(), Kind::Meta).is_none() {
-            stack.push(roots);
+        match index.mark_referenced(&self.map, &roots.into(), Kind::Meta) {
+            Some(true) => stack.push(roots),
+            Some(false) => {}
+            None => {
+                return Err(self
+                    .refuse(no_holder(Kind::Meta, &roots.into(), snap))
+                    .await)
+            }
         }
         while let Some(id) = stack.pop() {
             let item: ItemId = id.into();
-            let holders = self.holders(view, &item, Kind::Meta);
+            let holders = index.holders(&self.map, &self.packs, &item, Kind::Meta);
             if holders.is_empty() {
-                let msg = format!(
-                    "metadata item {id} (snapshot {snap}) has no readable holder that is not a \
-                     tombstone: data loss; run check"
-                );
-                return Err(self.refuse(msg).await);
+                return Err(self.refuse(no_holder(Kind::Meta, &item, snap)).await);
             }
             let mut cbor = None;
             for h in &holders {
@@ -821,7 +1077,14 @@ impl Prune {
                         cbor = Some(c);
                         break;
                     }
-                    Copy::False(why) => self.remove_false(item, h, &why),
+                    Copy::False(why) => self.remove_false(
+                        index,
+                        item,
+                        h.pack,
+                        &h.key(),
+                        &format!("false ({why})"),
+                        "",
+                    ),
                     Copy::Missing => {}
                 }
             }
@@ -858,41 +1121,55 @@ impl Prune {
                 }
             }
             for (child, kind) in children {
-                if self.referenced.contains_key(&child) {
-                    continue;
-                }
-                self.referenced.insert(child, kind);
-                match kind {
-                    Kind::Meta => stack.push(child.to_meta()),
-                    Kind::Data => {
-                        if self.holders(view, &child, Kind::Data).is_empty() {
-                            let msg = format!(
-                                "chunk {child} (snapshot {snap}) has no readable holder that is \
-                                 not a tombstone: data loss; run check"
-                            );
-                            return Err(self.refuse(msg).await);
+                match index.mark_referenced(&self.map, &child, kind) {
+                    Some(false) => {}
+                    Some(true) => match kind {
+                        Kind::Meta => stack.push(child.to_meta()),
+                        Kind::Data => {
+                            if index
+                                .holders(&self.map, &self.packs, &child, Kind::Data)
+                                .is_empty()
+                            {
+                                return Err(self.refuse(no_holder(kind, &child, snap)).await);
+                            }
                         }
-                    }
+                    },
+                    None => return Err(self.refuse(no_holder(kind, &child, snap)).await),
                 }
             }
         }
         Ok(())
     }
 
-    /// 不實的項目從記錄移除並回報（P5、P7d）。
-    fn remove_false(&mut self, id: ItemId, h: &Holder, why: &str) {
-        if let Some(r) = self.map.get_mut(&h.pack) {
-            let before = r.entries.len();
-            r.entries.retain(|e| e.i != id);
-            if r.entries.len() < before {
-                self.report.false_entries += 1;
-            }
+    /// 不實的項目：在索引裡標成 dead（P8 之前才真的從記錄移除）並回報（P5、P7c、P7d、`--read-data`）。
+    fn remove_false(
+        &mut self,
+        index: &mut Index,
+        id: ItemId,
+        pack: ObjectId,
+        key: &Key,
+        because: &str,
+        stage: &str,
+    ) {
+        if index.kill(&pack, &id) > 0 {
+            self.report.false_entries += 1;
         }
-        self.false_claims.insert((id, h.pack));
+        self.false_claims.insert((id, pack));
         self.warn(format!(
-            "{} claims {id} but its copy is false ({why}); removed from the record",
-            h.key().path()
+            "{} claims {id} but its copy is {because}; removed from the record{stage}",
+            key.path()
         ));
+    }
+
+    /// P8 之前：證明不實的項目真的從記錄移除。走訪與 P7 期間記錄不動，索引（以項目的位置指回記錄）才一直有效。
+    fn drop_false_entries(&mut self) {
+        if self.false_claims.is_empty() {
+            return;
+        }
+        for (id, r) in &mut self.map {
+            r.entries
+                .retain(|e| !self.false_claims.contains(&(e.i, *id)));
+        }
     }
 
     /// 從一份 pack 的完整 bytes 打開一項（解密、解壓、長度、重算 ID）：chunk 回明文，metadata item 回規範 CBOR。
@@ -1097,31 +1374,24 @@ impl Prune {
         Ok(self.session.times(g).await?.t.saturating_add(secs(span)) <= self.n_t)
     }
 
-    /// P6：每個被引用的 ID 的正本。
-    fn canonical(&self, map: &BTreeMap<ObjectId, Record>) -> HashMap<ItemId, ObjectId> {
-        let view = MapView::new(map.values().cloned().collect());
-        let mut out = HashMap::new();
-        for (id, kind) in &self.referenced {
-            let first = view
-                .holders(id, *kind)
-                .into_iter()
-                .filter(|h| matches!(h.status, status::LIVE | status::CONDEMNED))
-                .find(|h| self.packs.contains_key(&h.pack));
-            if let Some(h) = first {
-                out.insert(*id, h.pack);
-            }
-        }
-        out
+    /// P6、P7：在 `map` 上建 `Map(g+1)`，回傳 head g+1（分片在 P8 填）。
+    async fn plan(&mut self) -> Result<Head> {
+        let mut index = self
+            .index
+            .take()
+            .ok_or_else(|| CoreError::Unsafe("prune: P5 did not run".to_owned()))?;
+        let result = self.plan_with(&mut index).await;
+        self.index = Some(index);
+        result
     }
 
-    /// P6、P7：建 `Map(g+1)`，回傳 head g+1（分片在 P8 填）。
-    async fn plan(&mut self) -> Result<Head> {
+    async fn plan_with(&mut self, index: &mut Index) -> Result<Head> {
         let next = self.g + 1;
-        let mut newmap = self.map.clone();
 
         // 已過 age 的 condemned（P7d 的兩個時鐘）
         let mut aged: BTreeSet<ObjectId> = BTreeSet::new();
-        let condemned_: Vec<(ObjectId, Gen, u64)> = newmap
+        let condemned_: Vec<(ObjectId, Gen, u64)> = self
+            .map
             .values()
             .filter(|r| r.status.s == status::CONDEMNED)
             .map(|r| (r.id, r.status.at, r.status.age))
@@ -1133,51 +1403,55 @@ impl Prune {
             }
         }
 
-        // P6 與刪前驗證：驗證時發現不實的項目就從正本的記錄移除，再重算正本，直到沒有變動
+        // P6 與刪前驗證：驗證時發現不實的項目就標成 dead，再重算正本，直到沒有變動
         let mut verdicts: HashMap<(ItemId, ObjectId), bool> = HashMap::new();
         let mut tainted: HashSet<ObjectId> = HashSet::new();
-        let canon = loop {
-            let canon = self.canonical(&newmap);
+        loop {
+            index.compute_canon(&self.map, &self.packs);
             if self.hold_active {
-                break canon;
+                break;
             }
-            let canonical_packs: HashSet<ObjectId> = canon.values().copied().collect();
             let mut removals: Vec<(ItemId, ObjectId, String)> = Vec::new();
             for pid in &aged {
-                if canonical_packs.contains(pid) {
+                if index.is_canonical_pack(pid) {
                     continue;
                 }
-                let Some(rec) = newmap.get(pid) else { continue };
+                let Some(rec) = self.map.get(pid) else {
+                    continue;
+                };
+                let Some(refd) = index.referenced_in(pid) else {
+                    continue;
+                };
+                let kind = rec.kind;
                 let ids: Vec<ItemId> = rec
                     .entries
                     .iter()
-                    .filter(|e| self.referenced.get(&e.i) == Some(&rec.kind))
-                    .map(|e| e.i)
+                    .zip(refd)
+                    .filter(|(_, r)| **r)
+                    .map(|(e, _)| e.i)
                     .collect();
                 for id in ids {
-                    let Some(c) = canon.get(&id).copied() else {
+                    let Some((c, cei)) = index.canon_of(&self.map, &id, kind) else {
                         continue;
                     };
-                    let Some(crec) = newmap.get(&c) else { continue };
+                    let Some(crec) = self.map.get(&c) else {
+                        continue;
+                    };
                     if crec.by_prune {
                         continue;
                     }
+                    let h = Holder {
+                        pack: c,
+                        client: crec.client,
+                        kind: crec.kind,
+                        entry: crec.entries[cei],
+                        source: Source::Map,
+                        by_prune: false,
+                        status: crec.status.s,
+                    };
                     let v = match verdicts.get(&(id, c)) {
                         Some(v) => *v,
                         None => {
-                            let Some(entry) = crec.entries.iter().find(|e| e.i == id).copied()
-                            else {
-                                continue;
-                            };
-                            let h = Holder {
-                                pack: c,
-                                client: crec.client,
-                                kind: crec.kind,
-                                entry,
-                                source: super::state::Source::Map,
-                                by_prune: false,
-                                status: crec.status.s,
-                            };
                             // 修得回的副本：不移除，但這一輪不憑它標 tombstone——repack 把它寫進
                             // by_prune 的新 pack 之後，下一輪以那一份驗證（規格錯誤第 17 項的修法 D）
                             let v = match self.fetch(&h).await? {
@@ -1198,27 +1472,16 @@ impl Prune {
                 }
             }
             if removals.is_empty() {
-                break canon;
+                break;
             }
             for (id, c, why) in removals {
-                if let Some(r) = newmap.get_mut(&c) {
-                    let path = pack_key(r.kind, r.client, c).path();
-                    let before = r.entries.len();
-                    r.entries.retain(|e| e.i != id);
-                    if r.entries.len() < before {
-                        self.report.false_entries += 1;
-                        let msg = format!(
-                            "{path} claims {id} but its copy is false ({why}); removed from the \
-                             record (P7d)"
-                        );
-                        tracing::warn!("{msg}");
-                        self.report.warnings.push(msg);
-                    }
+                if let Some((kind, client)) = self.map.get(&c).map(|r| (r.kind, r.client)) {
+                    let key = pack_key(kind, client, c);
+                    self.remove_false(index, id, c, &key, &format!("false ({why})"), " (P7d)");
                 }
                 verdicts.remove(&(id, c));
             }
-        };
-        let canonical_packs: HashSet<ObjectId> = canon.values().copied().collect();
+        }
 
         let named: HashSet<ObjectId> = self
             .deltas
@@ -1227,33 +1490,35 @@ impl Prune {
             .flat_map(|d| d.packs.iter().map(|p| p.id))
             .collect();
         let mut removed = Vec::new();
-        let ids: Vec<ObjectId> = newmap.keys().copied().collect();
+        let ids: Vec<ObjectId> = self.map.keys().copied().collect();
         for pid in ids {
-            let Some(rec) = newmap.get(&pid).cloned() else {
+            let Some(rec) = self.map.get(&pid) else {
                 continue;
             };
+            let (status_s, held, since, at) = (rec.status.s, rec.held, rec.since, rec.status.at);
             let listed = self.packs.get(&pid).copied();
-            let new_status = match rec.status.s {
+            let new_status = match status_s {
                 status::CONDEMNED => {
-                    if canonical_packs.contains(&pid) {
-                        if self.hold_active && rec.held {
+                    if index.is_canonical_pack(&pid) {
+                        if self.hold_active && held {
                             None
                         } else {
                             self.report.revived += 1;
                             Some(Status::LIVE)
                         }
                     } else if !self.hold_active && aged.contains(&pid) {
-                        let ok = !tainted.contains(&pid)
-                            && rec
-                                .entries
-                                .iter()
-                                .filter(|e| self.referenced.get(&e.i) == Some(&rec.kind))
-                                .all(|e| match canon.get(&e.i) {
-                                    None => false,
-                                    Some(c) => {
-                                        newmap.get(c).is_some_and(|cr| cr.by_prune)
-                                            || verdicts.get(&(e.i, *c)) == Some(&true)
-                                    }
+                        let ok =
+                            !tainted.contains(&pid)
+                                && index.referenced_in(&pid).is_some_and(|refd| {
+                                    rec.entries.iter().zip(refd).filter(|(_, r)| **r).all(
+                                        |(e, _)| match index.canon_of(&self.map, &e.i, rec.kind) {
+                                            None => false,
+                                            Some((c, _)) => {
+                                                self.map.get(&c).is_some_and(|cr| cr.by_prune)
+                                                    || verdicts.get(&(e.i, c)) == Some(&true)
+                                            }
+                                        },
+                                    )
                                 });
                         if ok {
                             self.report.tombstoned += 1;
@@ -1266,7 +1531,7 @@ impl Prune {
                     }
                 }
                 status::LIVE => {
-                    if canonical_packs.contains(&pid) {
+                    if index.is_canonical_pack(&pid) {
                         None
                     } else {
                         match listed {
@@ -1279,7 +1544,7 @@ impl Prune {
                     }
                 }
                 status::UNREADABLE => {
-                    if rec.since <= self.g && self.t_passed(rec.since, self.grace).await? {
+                    if since <= self.g && self.t_passed(since, self.grace).await? {
                         self.report.condemned += 1;
                         Some(condemned(next, self.age))
                     } else {
@@ -1290,8 +1555,7 @@ impl Prune {
                     if listed.is_some() {
                         Some(tombstone(next))
                     } else {
-                        if self.t_passed(rec.status.at, self.grace).await? && !named.contains(&pid)
-                        {
+                        if self.t_passed(at, self.grace).await? && !named.contains(&pid) {
                             removed.push(pid);
                         }
                         None
@@ -1301,7 +1565,7 @@ impl Prune {
                 _ => None,
             };
             if let Some(s) = new_status {
-                if let Some(r) = newmap.get_mut(&pid) {
+                if let Some(r) = self.map.get_mut(&pid) {
                     if s == Status::LIVE {
                         r.held = false;
                     }
@@ -1310,15 +1574,9 @@ impl Prune {
             }
         }
         for pid in removed {
-            newmap.remove(&pid);
+            self.map.remove(&pid);
             self.report.removed_records += 1;
         }
-        self.report.items = self
-            .referenced
-            .values()
-            .filter(|k| **k == Kind::Meta)
-            .count() as u64;
-        self.report.chunks = self.referenced.len() as u64 - self.report.items;
 
         let mut head = self.head.clone();
         if head.drain.is_some() && self.drain_over {
@@ -1328,38 +1586,45 @@ impl Prune {
         if head.hold.is_some() && !self.hold_active {
             head.hold = None;
         }
-        self.map = newmap;
-        self.canon = canon;
         Ok(head)
     }
 
     /// P7c：repack（hold 期間不做）。候選是 live、是正本的 pack：以 parity 修復過的一律做；其他的要比 grace 老、
-    /// 當正本的項目（sealed bytes）不到 `repack_below` 百分比。把它當正本的項目逐一解密驗證（不實的從記錄移除並
+    /// 當正本的項目（sealed bytes）不到 `repack_below` 百分比。把它當正本的項目逐一解密驗證（不實的標成 dead 並
     /// 回報；整份讀到的 bytes 名稱不符時先以 parity 修復），寫進全零 client 前綴下的新 pack（一個舊的對一個新的，
     /// 同 GC 模型），讀回驗證後記為 by_prune 的 live、舊的 → condemned（保留全部項目）。讀回驗證失敗：新的記為
     /// unreadable，舊的維持 live，回報。
     ///
     /// `--read-data`（[`PruneOptions::read_data`]）：不是候選的 live 資料 pack 也整份讀、逐項驗證它當正本的
     /// chunk（mpack 不必：P5 走訪時已逐一取回驗證）。有項目驗證失敗 → 先以 parity 修復（[`Prune::repair`]），
-    /// 修得回就進 repack；修不回的項目從記錄移除並回報（同 P7c 對不實項目的處理；它若是唯一的持有者，下一輪
+    /// 修得回就進 repack；修不回的項目標成 dead 並回報（同 P7c 對不實項目的處理；它若是唯一的持有者，下一輪
     /// P5 拒絕——資料真的遺失了，大聲失敗）。整輪的時間用掉一半就停、回報，剩下的留給下一次：這一輪照樣寫 head。
     async fn repack(&mut self) -> Result<()> {
         if self.hold_active {
             return Ok(());
         }
-        let mut canon_of: HashMap<ObjectId, HashSet<ItemId>> = HashMap::new();
-        for (id, p) in &self.canon {
-            canon_of.entry(*p).or_default().insert(*id);
-        }
+        let mut index = self
+            .index
+            .take()
+            .ok_or_else(|| CoreError::Unsafe("prune: P5 did not run".to_owned()))?;
+        let result = self.repack_with(&mut index).await;
+        self.index = Some(index);
+        result
+    }
+
+    async fn repack_with(&mut self, index: &mut Index) -> Result<()> {
         let mut jobs = Vec::new();
         let mut verify = Vec::new();
         for r in self.map.values() {
             if r.status.s != status::LIVE {
                 continue;
             }
-            let Some(items) = canon_of.get(&r.id) else {
+            let Some(canon) = index.canon_in(&r.id) else {
                 continue;
             };
+            if !canon.iter().any(|c| *c) {
+                continue;
+            }
             if !self.repaired.contains_key(&r.id) {
                 let old = self
                     .packs
@@ -1369,21 +1634,22 @@ impl Prune {
                 let live: u64 = r
                     .entries
                     .iter()
-                    .filter(|e| items.contains(&e.i))
-                    .map(|e| e.l)
+                    .zip(canon)
+                    .filter(|(_, c)| **c)
+                    .map(|(e, _)| e.l)
                     .sum();
                 let sparse =
                     live.saturating_mul(100) < total.saturating_mul(u64::from(self.repack_below));
                 if !(old && sparse) {
                     if self.read_data && r.kind == Kind::Data {
-                        verify.push((r.id, items.clone()));
+                        verify.push(r.id);
                     }
                     continue;
                 }
             }
-            jobs.push((r.id, items.clone()));
+            jobs.push(r.id);
         }
-        for (id, items) in verify {
+        for id in verify {
             if self.session.elapsed().as_secs().saturating_mul(2) + M.as_secs() >= self.grace {
                 self.warn(format!(
                     "--read-data stopped after {} pack(s): half of this prune's time limit is \
@@ -1392,111 +1658,115 @@ impl Prune {
                 ));
                 break;
             }
-            let Some(rec) = self.map.get(&id).cloned() else {
+            let Some((client, kind)) = self.map.get(&id).map(|r| (r.client, r.kind)) else {
                 continue;
             };
             // 列表之後就不見了：P3 下一輪處理
-            let Some(bytes) = self.whole(id, rec.client, rec.kind).await? else {
+            let Some(bytes) = self.whole(id, client, kind).await? else {
                 continue;
             };
             self.report.read_packs += 1;
-            let bad: Vec<PackEntry> = rec
-                .entries
-                .iter()
-                .filter(|e| items.contains(&e.i) && self.open_in(rec.kind, e, &bytes).is_err())
-                .copied()
-                .collect();
+            let bad: Vec<ItemId> = match (self.map.get(&id), index.canon_in(&id)) {
+                (Some(rec), Some(canon)) => rec
+                    .entries
+                    .iter()
+                    .zip(canon)
+                    .filter(|(e, c)| **c && self.open_in(kind, e, &bytes).is_err())
+                    .map(|(e, _)| e.i)
+                    .collect(),
+                _ => Vec::new(),
+            };
             if bad.is_empty() {
                 continue;
             }
-            if self.repair(id, rec.client, rec.kind).await?.is_some() {
-                jobs.push((id, items));
+            if self.repair(id, client, kind).await?.is_some() {
+                jobs.push(id);
                 continue;
             }
-            let path = pack_key(rec.kind, rec.client, id).path();
-            for e in bad {
-                if let Some(r) = self.map.get_mut(&id) {
-                    r.entries.retain(|x| x.i != e.i);
-                }
-                self.report.false_entries += 1;
-                self.warn(format!(
-                    "{path} claims {} but its copy is damaged and cannot be repaired; removed from \
-                     the record (--read-data)",
-                    e.i
-                ));
+            let key = pack_key(kind, client, id);
+            for i in bad {
+                self.remove_false(
+                    index,
+                    i,
+                    id,
+                    &key,
+                    "damaged and cannot be repaired",
+                    " (--read-data)",
+                );
             }
         }
-        for (id, items) in jobs {
-            self.repack_one(id, &items).await?;
+        for id in jobs {
+            self.repack_one(index, id).await?;
         }
         Ok(())
     }
 
-    async fn repack_one(&mut self, id: ObjectId, items: &HashSet<ItemId>) -> Result<()> {
+    async fn repack_one(&mut self, index: &mut Index, id: ObjectId) -> Result<()> {
         let next = self.g + 1;
-        let Some(rec) = self.map.get(&id).cloned() else {
+        let Some((client, kind, entries)) = self.map.get(&id).and_then(|rec| {
+            let canon = index.canon_in(&id)?;
+            let entries: Vec<PackEntry> = rec
+                .entries
+                .iter()
+                .zip(canon)
+                .filter(|(_, c)| **c)
+                .map(|(e, _)| *e)
+                .collect();
+            Some((rec.client, rec.kind, entries))
+        }) else {
             return Ok(());
         };
-        let entries: Vec<PackEntry> = rec
-            .entries
-            .iter()
-            .filter(|e| items.contains(&e.i))
-            .copied()
-            .collect();
         let mut bytes = match self.repaired.get(&id) {
             Some(b) => Arc::clone(b),
-            None => match self.whole(id, rec.client, rec.kind).await? {
+            None => match self.whole(id, client, kind).await? {
                 Some(b) => Arc::new(b),
                 // 列表之後就不見了：P3 下一輪處理
                 None => return Ok(()),
             },
         };
-        let mut opened: Vec<std::result::Result<Vec<u8>, String>> = entries
-            .iter()
-            .map(|e| self.open_in(rec.kind, e, &bytes))
-            .collect();
-        if opened.iter().any(|o| o.is_err()) && !self.repaired.contains_key(&id) {
-            if let Some(b) = self.repair(id, rec.client, rec.kind).await? {
+        // 有打不開的先試 parity 修復；之後一項一項打開、寫進新 pack（明文不整批留在記憶體裡）
+        if !self.repaired.contains_key(&id)
+            && entries
+                .iter()
+                .any(|e| self.open_in(kind, e, &bytes).is_err())
+        {
+            if let Some(b) = self.repair(id, client, kind).await? {
                 bytes = b;
-                opened = entries
-                    .iter()
-                    .map(|e| self.open_in(rec.kind, e, &bytes))
-                    .collect();
             }
         }
-        let path = pack_key(rec.kind, rec.client, id).path();
-        let mut good = Vec::new();
-        for (e, o) in entries.iter().zip(opened) {
-            match o {
-                Ok(plain) => good.push((e.i, plain)),
-                Err(why) => {
-                    if let Some(r) = self.map.get_mut(&id) {
-                        r.entries.retain(|x| x.i != e.i);
-                    }
-                    self.report.false_entries += 1;
-                    self.warn(format!(
-                        "{path} claims {} but its copy is false ({why}); removed from the record (P7c)",
-                        e.i
-                    ));
-                }
-            }
-        }
-        if good.is_empty() {
-            return Ok(());
-        }
+        let key_old = pack_key(kind, client, id);
+        let path = key_old.path();
         let repo = self.session.repo.clone();
         let chunk_max = repo.config().chunker.max;
-        let mut w = PackWriter::new(Arc::clone(repo.keys()), rec.kind, u64::MAX, chunk_max);
-        for (i, plain) in &good {
-            w.add(*i, plain)?;
+        let mut w = PackWriter::new(Arc::clone(repo.keys()), kind, u64::MAX, chunk_max);
+        let mut good = 0usize;
+        for e in &entries {
+            match self.open_in(kind, e, &bytes) {
+                Ok(plain) => {
+                    w.add(e.i, &plain)?;
+                    good += 1;
+                }
+                Err(why) => self.remove_false(
+                    index,
+                    e.i,
+                    id,
+                    &key_old,
+                    &format!("false ({why})"),
+                    " (P7c)",
+                ),
+            }
+        }
+        drop(bytes);
+        if good == 0 {
+            return Ok(());
         }
         let Some(p) = w.finish()? else {
             return Ok(());
         };
-        let key = pack_key(rec.kind, ClientId::MAINT, p.id);
+        let key = pack_key(kind, ClientId::MAINT, p.id);
         let backend = repo.backend().clone();
         let mut copies = vec![key.clone()];
-        if rec.kind == Kind::Meta && self.head.settings.replicas == 1 {
+        if kind == Kind::Meta && self.head.settings.replicas == 1 {
             copies.push(Key::Mpack {
                 client: ClientId::MAINT,
                 id: p.id,
@@ -1516,10 +1786,7 @@ impl Prune {
             }
         }
         // repack 為新 pack 寫 parity（§13）：片數同舊的 parity，沒有就不寫；寫失敗只回報
-        let old_parity = Key::Parity {
-            client: rec.client,
-            id,
-        };
+        let old_parity = Key::Parity { client, id };
         if self.parity.iter().any(|o| o.key == old_parity) {
             let written = async {
                 let raw = backend.get(&old_parity.path()).await?;
@@ -1565,7 +1832,7 @@ impl Prune {
                 ));
             }
             for e in &t.entries {
-                self.open_in(rec.kind, e, &back)
+                self.open_in(kind, e, &back)
                     .map_err(|why| CoreError::corrupt(key.path(), why))?;
             }
             Ok(())
@@ -1578,7 +1845,7 @@ impl Prune {
                     Record {
                         id: p.id,
                         client: ClientId::MAINT,
-                        kind: rec.kind,
+                        kind,
                         size: p.bytes.len() as u64,
                         entries: p.entries,
                         by_prune: true,
@@ -1598,7 +1865,7 @@ impl Prune {
                     Record {
                         id: p.id,
                         client: ClientId::MAINT,
-                        kind: rec.kind,
+                        kind,
                         size: p.bytes.len() as u64,
                         entries: Vec::new(),
                         by_prune: false,
@@ -1622,7 +1889,7 @@ impl Prune {
 
     /// P8：寫出有變動的分片（`replicas=1` 時先主體、再 `.r1`），把名稱填進 head。
     async fn put_shards(&mut self, head: &mut Head) -> Result<()> {
-        put_changed_shards(&self.session.repo, &self.base, &self.map, head).await
+        put_changed_shards(&self.session.repo, &self.base_hashes, &self.map, head).await
     }
 
     /// 刪一個物件；Object Lock 或權限擋下時回報。整輪時限過了就停止、回 false。

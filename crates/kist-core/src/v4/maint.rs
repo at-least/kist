@@ -447,14 +447,14 @@ impl Repo {
     pub async fn condemn_unknown(&self, opts: MaintOptions) -> Result<UnknownReport> {
         let mut session = Session::begin(self, opts.clock).await?;
         let newest = session.newest().await?;
-        let base: std::collections::BTreeMap<_, _> = session
+        let mut map: std::collections::BTreeMap<_, _> = session
             .repo
-            .load_map(&newest.copy.gen)
+            .load_map_records(&newest.copy.gen)
             .await?
-            .records()
-            .iter()
-            .map(|r| (r.id, r.clone()))
+            .into_iter()
+            .map(|r| (r.id, r))
             .collect();
+        let base_hashes = super::prune::shard_hashes(&map)?;
         let g = newest.g() + 1;
         let head = newest.head().clone();
         let mut age = head.settings.grace;
@@ -464,7 +464,6 @@ impl Repo {
                 age = d.old_grace;
             }
         }
-        let mut map = base.clone();
         let mut report = UnknownReport::default();
         for r in map.values_mut() {
             if r.status.s == status::UNKNOWN {
@@ -483,7 +482,7 @@ impl Repo {
         }
         session.repair_r1(&newest).await?;
         let mut head = head;
-        super::prune::put_changed_shards(&session.repo, &base, &map, &mut head).await?;
+        super::prune::put_changed_shards(&session.repo, &base_hashes, &map, &mut head).await?;
         report.generation = Some(session.fence(&newest, head).await?);
         Ok(report)
     }
