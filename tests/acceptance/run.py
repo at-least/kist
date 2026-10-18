@@ -1,5 +1,6 @@
-"""M1 驗收腳本：backup → restore → diff -r；第二次 backup；check 偵測破壞；記錄峰值記憶體。
-每一步都有斷言，任何一步失敗就非 0 結束。"""
+"""M1 驗收腳本（v4）：backup → 第二次 backup（不寫新 pack）→ restore → diff -r → check → check --read-data →
+人為破壞 pack 後 check 要抓到；記錄峰值記憶體。每一步都有斷言，任何一步失敗就非 0 結束。
+用法：python3 -u run.py <kist binary>（在 repo 之外的目錄跑，需要 src/ 已由 gen.py 產生）。"""
 import os, resource, shutil, subprocess, sys, time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -40,8 +41,8 @@ print(f"source: {nfiles} files, {du(SRC)/2**30:.2f} GiB")
 
 run([KIST, "init"])
 _, t_backup1 = run([KIST, "backup", SRC])
-packs1, trees1 = count("packs"), count("trees")
-print(f"after backup 1: {packs1} packs, {trees1} trees, repo {du(REPO)/2**30:.2f} GiB")
+packs1, mpacks1 = count("packs"), count("mpacks")
+print(f"after backup 1: {packs1} packs, {mpacks1} mpacks, repo {du(REPO)/2**30:.2f} GiB")
 peak_backup = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
 
 _, t_backup2 = run([KIST, "backup", SRC])
@@ -57,8 +58,8 @@ print("diff -r: identical")
 _, t_check = run([KIST, "check"])
 _, t_check_data = run([KIST, "check", "--read-data"])
 
-# 人為破壞一個 pack
-packs_dir = os.path.join(REPO, "packs")
+# 人為破壞一個 pack（v4：packs/<client>/<hex>）
+packs_dir = os.path.join(REPO, "packs", os.listdir(os.path.join(REPO, "packs"))[0])
 victim = sorted(os.listdir(packs_dir))[0]
 path = os.path.join(packs_dir, victim)
 data = bytearray(open(path, "rb").read())
@@ -70,7 +71,7 @@ assert victim in p.stderr, "check did not name the corrupted pack"
 print(f"corruption detected in {victim}")
 
 print("\n=== SUMMARY ===")
-print(f"files: {nfiles}, source {du(SRC)/2**30:.2f} GiB, repo {du(REPO)/2**30:.2f} GiB, packs {packs1}, trees {trees1}")
+print(f"files: {nfiles}, source {du(SRC)/2**30:.2f} GiB, repo {du(REPO)/2**30:.2f} GiB, packs {packs1}, mpacks {mpacks1}")
 print(f"backup 1: {t_backup1:.0f}s  backup 2: {t_backup2:.0f}s  restore: {t_restore:.0f}s  check: {t_check:.0f}s  check --read-data: {t_check_data:.0f}s")
 print(f"peak RSS (max over all child processes, dominated by backup 1): {peak_backup/1024:.0f} MiB")
 print("ALL ACCEPTANCE CHECKS PASSED")

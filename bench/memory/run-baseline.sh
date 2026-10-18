@@ -3,7 +3,7 @@
 # 用法：run-baseline.sh <kist-bin> <workdir> <setdir> <label> [--gate]
 #   --gate：加上 MemoryMax=512M 的硬門檻跑法（advisor：kernel 會先回收
 #   clean page cache，過了才算真的過）。預設為不限量的量測跑法。
-# 產出：<workdir>/samples/<label>-{first,second}.{samples,result}
+# 產出：<workdir>/samples/<label>-{first,second}.{samples,result}（--gate：gate-<label>-…）
 # <workdir> 的 repo-<label>、cache-<label> 每次重建（基線必須乾淨）。
 set -eu
 
@@ -12,8 +12,10 @@ work=$1; shift
 setdir=$1; shift
 label=$1; shift
 gate=""
+out="$label"
 if [ "${1:-}" = "--gate" ]; then
     gate="--max-bytes 536870912"  # 512 MiB
+    out="gate-$label"
     shift
 fi
 
@@ -29,10 +31,11 @@ common="--repo $work/repo-$label --cache-dir $work/cache-$label"
 run() { # run <runlabel> <cmd...>
     local rl=$1; shift
     echo "=== $(date -Is) $rl start"
-    sh "$(dirname "$0")/run-measured.sh" "$rl" "$work/samples" $gate "$@"
-    echo "=== $(date -Is) $rl rc=$?"
+    rc=0
+    sh "$(dirname "$0")/run-measured.sh" "$rl" "$work/samples" $gate "$@" || rc=$?
+    echo "=== $(date -Is) $rl rc=$rc"
 }
 
 "$bin" init $common
-run "$label-first"  "$bin" backup $common "$setdir"
-run "$label-second" "$bin" backup $common "$setdir"
+run "$out-first"  "$bin" backup $common "$setdir"
+run "$out-second" "$bin" backup $common "$setdir"

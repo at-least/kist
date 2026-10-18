@@ -65,8 +65,11 @@ chmod +x "$inner"
 rm -f "$outdir/$label.samples.peak" "$outdir/$label.samples.events"
 
 # shellcheck disable=SC2086
-systemd-run --user --scope -q $props "$inner" "$outdir/$label.samples" "$@"
-rc=$?
+rc=0
+systemd-run --user --scope -q $props "$inner" "$outdir/$label.samples" "$@" || rc=$?
+# 被 OOM 殺掉時 inner 來不及留 peak／events；從 .samples 的最後一筆補（events 只留 oom_kill 未知）
+[ -f "$outdir/$label.samples.peak" ] || awk '{if($1>m)m=$1} END{print m+0}' "$outdir/$label.samples" > "$outdir/$label.samples.peak"
+[ -f "$outdir/$label.samples.events" ] || : > "$outdir/$label.samples.events"
 sampled=$(awk '{d=$1-$2; if(d>m)m=d} END{print m+0}' "$outdir/$label.samples")
 sampled_ex_slab=$(awk '{d=$1-$2-$3; if(d>m)m=d} END{print m+0}' "$outdir/$label.samples")
 peak=$(cat "$outdir/$label.samples.peak")
@@ -79,6 +82,6 @@ oom=$(awk '$1=="oom_kill"{print $2}' "$outdir/$label.samples.events")
     echo "sampled_max_ex_file_slab=$sampled_ex_slab"
     echo "memory_peak_total=$peak"
     echo "memory_peak_last_seen=$peak"
-    echo "oom_kill_last_seen=$oom"
+    echo "oom_kill_last_seen=${oom:-unknown}"
 } | tee "$outdir/$label.result"
 exit "$rc"

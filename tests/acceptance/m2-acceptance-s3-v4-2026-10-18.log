@@ -1,0 +1,91 @@
+source: 100000 files, 9.75 GiB -> s3://kist-test/acceptance
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 init
+  -> exit 0, 0.1s, child peak RSS so far 75 MiB
+  repository initialized at s3://kist-test/acceptance
+  stderr: note: keep a copy of the `config` object and of your password somewhere safe; without either the repository cannot be opened
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 backup /home/newlix/kist-acceptance-m1/src
+  -> exit 0, 42.4s, child peak RSS so far 216 MiB
+  snapshot 7ef762f9/20261018T082506094525683Z
+    100000 files, 1100 dirs, 0 symlinks, 9.7 GiB total
+    new: 9.4 GiB in 71185 chunks, 77 packs and 1 metadata packs written
+after backup 1: 77 packs, 1 mpacks, repo 4.90 GiB
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 backup /home/newlix/kist-acceptance-m1/src
+  -> exit 0, 2.1s, child peak RSS so far 216 MiB
+  snapshot 7ef762f9/20261018T082551785645548Z
+    100000 files, 1100 dirs, 0 symlinks, 9.7 GiB total
+    new: 0 B in 0 chunks, 0 packs and 0 metadata packs written
+  S3 requests to acceptance: 9: s3.GetObject 6, s3.HeadObject 2, s3.PutObject 1
+after backup 2: 77 packs
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 restore latest /home/newlix/kist-acceptance-m1/out
+  -> exit 0, 121.2s, child peak RSS so far 216 MiB
+  restored 7ef762f9/20261018T082551785645548Z to /home/newlix/kist-acceptance-m1/out: 100000 files, 1100 dirs, 0 symlinks
+$ diff -r /home/newlix/kist-acceptance-m1/src /home/newlix/kist-acceptance-m1/out/home/newlix/kist-acceptance-m1/src
+  -> exit 0, 35.6s, child peak RSS so far 216 MiB
+diff -r: identical
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 check
+  -> exit 0, 0.5s, child peak RSS so far 216 MiB
+  checked generation 0: 2 snapshots, 1102 metadata items, 71185 chunks, 78 packs
+  no errors found
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 check --read-data
+  -> exit 0, 12.8s, child peak RSS so far 216 MiB
+  checked generation 0: 2 snapshots, 1102 metadata items, 71185 chunks, 78 packs (data read)
+  no errors found
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 --json prune
+  -> exit 0, 1.0s, child peak RSS so far 216 MiB
+  {
+    "base": 0,
+    "generation": 1,
+    "snapshots": 2,
+    "items": 1102,
+    "chunks": 71185,
+    "newcomers": 78,
+    "revived": 0,
+    "condemned": 0,
+    "tombstoned": 0,
+    "removed_records": 0,
+    "false_entries": 0,
+    "repacked": 0,
+    "repaired": 0,
+    "read_packs": 0,
+    "live": 78,
+    "deleted_packs": 0,
+    "deleted_bytes": 0,
+    "deleted_deltas": 5,
+    "deleted_shards": 0,
+    "deleted_parity": 0,
+    "deleted_snapshots": 0,
+    "undeleted": [],
+    "unfinished": null,
+    "warnings": []
+  }
+  prune report: generation 1, newcomers 78, deleted packs 0, warnings 0
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 check
+  -> exit 0, 0.7s, child peak RSS so far 216 MiB
+  checked generation 1: 2 snapshots, 1102 metadata items, 71185 chunks, 78 packs
+  no errors found
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 backup /home/newlix/kist-acceptance-m1/src
+  -> exit 0, 2.2s, child peak RSS so far 216 MiB
+  snapshot 7ef762f9/20261018T082850917621435Z
+    100000 files, 1100 dirs, 0 symlinks, 9.7 GiB total
+    new: 0 B in 0 chunks, 0 packs and 0 metadata packs written
+  S3 requests to acceptance: 74: s3.GetObject 72, s3.HeadObject 1, s3.PutObject 1
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 backup /home/newlix/kist-acceptance-m1/src
+  -> exit 0, 3.2s, child peak RSS so far 216 MiB
+  snapshot 7ef762f9/20261018T082858291774369Z
+    100000 files, 1100 dirs, 0 symlinks, 9.7 GiB total
+    new: 0 B in 0 chunks, 0 packs and 0 metadata packs written
+  S3 requests to acceptance: 6: s3.GetObject 4, s3.HeadObject 1, s3.PutObject 1
+$ /home/newlix/kist-acceptance-m1/kist-1f70388 check --read-data
+  -> exit 1, 10.0s, child peak RSS so far 216 MiB
+  checked generation 1: 4 snapshots, 1102 metadata items, 71185 chunks, 78 packs (data read)
+  stderr: error: packs/7ef762f906434a2b13bdd846ad2ca1cc/fe0fa4829b3ed2a893588381e46c6bbff755c49f81ea1ebebdc481b6e7d0130a: content does not match its name
+  error: 1 error(s) found
+corruption detected in fe0fa4829b3ed2a893588381e46c6bbff755c49f81ea1ebebdc481b6e7d0130a
+
+=== SUMMARY (S3/MinIO) ===
+files: 100000, source 9.75 GiB, repo 4.90 GiB, packs 77, mpacks 1
+backup 1: 42s  backup 2: 2s  restore: 121s  check: 1s  check --read-data: 13s  prune (index 78 packs): 1s  check after prune: 1s  backup 3 (after prune): 2s  backup 4: 3s
+S3 requests of an unchanged backup: 9 before the map holds the packs, 74 right after prune (new generation: the cache downloads its map shards), 6 once the cache has that generation
+peak RSS (max over all child processes, dominated by backup 1): 216 MiB
+ALL ACCEPTANCE CHECKS PASSED
+M2_EXIT 0
