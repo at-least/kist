@@ -159,7 +159,13 @@ async fn repo_listing_rejects_absurd_directory_depth() {
         eprintln!("SFTP depth test skipped (tests/sftp-setup.sh 未跑)");
         return;
     };
-    let cfg = parse_sftp_url(&url).unwrap();
+    let mut cfg = parse_sftp_url(&url).unwrap();
+    // 每次一個自己的目錄：寫的是固定的 key，放在共用的根底下，同一個伺服器上第二次跑就 AlreadyExists。
+    cfg.path = format!(
+        "{}/depth-{}",
+        cfg.path.trim_matches('/'),
+        std::process::id()
+    );
     let auth = SftpAuth {
         known_hosts: Some(known_hosts.into()),
         key: None,
@@ -183,4 +189,6 @@ async fn repo_listing_rejects_absurd_directory_depth() {
     // 對照：正常深度的 prefix 照常可列。
     b.put_if_absent("packs/normal", vec![2u8]).await.unwrap();
     assert!(b.list("packs").await.is_ok(), "正常深度的 list 不能被連坐");
+    b.delete(&format!("{key}/x")).await.unwrap();
+    b.delete("packs/normal").await.unwrap();
 }
