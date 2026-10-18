@@ -35,10 +35,18 @@ fn metrics_render_after_jobs() {
             "report": {"bytes_stored": 50, "chunks_new": 2, "errors": 0}
         }),
     ));
+    // prune 的 detail 是 v4 PruneReport 的序列化：fixture 直接從它產生，欄位改名時這裡會跟著紅
+    // （v3 的 marked／live_packs 曾在換 v4 之後留在 metrics 裡讀不到任何東西）。
     m.record(&outcome(
         JobKind::Prune,
         JobStatus::Incomplete,
-        json!({"deleted_bytes": 1024, "marked": 3, "live_packs": 5}),
+        serde_json::to_value(kist_core::v4::PruneReport {
+            deleted_bytes: 1024,
+            condemned: 3,
+            live: 5,
+            ..Default::default()
+        })
+        .unwrap(),
     ));
     // 失敗也要算進 runs_total，但不能更新 last_success
     m.record(&outcome(JobKind::Backup, JobStatus::Failure, json!(null)));

@@ -283,7 +283,7 @@ grace 減一小時內做完，超過就不寫 snapshot、以錯誤結束（重�
 | `kist_backup_bytes_new` / `kist_backup_chunks_new` | 最後一次 backup 上傳的量 |
 | `kist_backup_skipped_items` | 最後一次 backup 略過的項目數 |
 | `kist_prune_deleted_bytes_total` | prune 自 daemon 啟動以來刪掉的 bytes |
-| `kist_prune_marked_objects` / `kist_prune_live_packs` | v3 時代的欄位：v4 的 prune 報告沒有這兩個數字，目前停在 0（讀碼，UNVERIFIED；M12 第 7 段處理） |
+| `kist_prune_marked_objects` / `kist_prune_live_packs` | 最後一次 prune 標記（condemned）的 pack 數 / 結束時 live 的 pack 數 |
 
 告警請用「多久沒看到成功」（例如 `time() - kist_job_last_success_timestamp_seconds{job="backup"} > 90000`），
 不要用「有沒有成功過」；incomplete（有項目被略過/刪不掉）不算成功，所以要另外對

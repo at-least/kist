@@ -121,13 +121,13 @@ impl Metrics {
         let prune_marked = Gauge::default();
         registry.register(
             "prune_marked_objects",
-            "Objects marked for deletion by the last prune this daemon ran",
+            "Packs marked (condemned) for deletion by the last prune this daemon ran",
             prune_marked.clone(),
         );
         let prune_live_packs = Gauge::default();
         registry.register(
             "prune_live_packs",
-            "Live packs seen by the last prune this daemon ran",
+            "Live packs in the map after the last prune this daemon ran",
             prune_live_packs.clone(),
         );
         Self {
@@ -192,13 +192,16 @@ impl Metrics {
                 }
             }
             JobKind::Prune => {
+                // v4 PruneReport 的形狀（jobs.rs 以 serde_json::to_value 放進 detail）：condemned 是這一輪
+                // 標記的 pack 數，live 是這一輪結束時 live 的記錄數。tests/metrics_http.rs 的 fixture 直接從
+                // PruneReport 產生，欄位改名時會跟著紅。
                 if let Some(n) = get(&["deleted_bytes"]) {
                     self.prune_deleted_bytes_total.inc_by(n as u64);
                 }
-                if let Some(n) = get(&["marked"]) {
+                if let Some(n) = get(&["condemned"]) {
                     self.prune_marked.set(n);
                 }
-                if let Some(n) = get(&["live_packs"]) {
+                if let Some(n) = get(&["live"]) {
                     self.prune_live_packs.set(n);
                 }
             }

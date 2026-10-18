@@ -91,6 +91,8 @@ pub struct PruneReport {
     pub repaired: u64,
     /// `--read-data` 整份讀過並逐項驗證的資料 pack 數（不含因比例被 repack 的）。
     pub read_packs: u64,
+    /// 這一輪結束時 live 的記錄數（含這一輪收錄與 repack 寫出的）；kist-app 的 metrics 用。
+    pub live: u64,
     pub deleted_packs: u64,
     pub deleted_bytes: u64,
     pub deleted_deltas: u64,
@@ -501,6 +503,11 @@ impl Repo {
         p.walk_all().await?;
         let mut new_head = p.plan().await?;
         p.repack().await?;
+        p.report.live = p
+            .map
+            .values()
+            .filter(|r| r.status.s == status::LIVE)
+            .count() as u64;
         p.put_shards(&mut new_head).await?;
         if p.session.out_of_time(p.grace) {
             return Err(CoreError::Unsafe(format!(
