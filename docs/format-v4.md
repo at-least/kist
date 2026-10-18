@@ -707,7 +707,10 @@ mpack 的 `.r1` 與主體 bytes 相同；有 parity 的修得回自己。損壞�
 重建、grace 調低再調高、晚到的 delta、沿用被 forget 的 parent 子樹、不實的 trailer、讀不了的物件）；讀取端
 （持有者的順序、驗證失敗換下一份、重新載入與限流、退回較舊的世代、restore 依 `Root.t` 的落點）；§13.1 的
 每一條 check 規則與每一種修復。
-v3 的 fixture 已移除（實作第 6 段）；v4 的在第 7 段凍結。
+v3 的 fixture 已移除（實作第 6 段）。v4 的 fixture 在 `crates/kist-core/tests/fixtures/v4/repo`（第 7 段凍結；
+固定密碼、client id、mtime 與小參數做出來的兩個 snapshot；`v4_fixture.rs` 驗它打得開、check 乾淨、還原得出來、每個
+物件解碼再編碼逐 byte 相同、同樣的來源不寫新 chunk、parity 與 `.r1` 修得回）。它只在格式升版時換、永不重生；golden
+與向量會隨程式重錄，fixture 不會。
 
 ## 16. 設計決定 × 教訓
 

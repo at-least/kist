@@ -56,7 +56,8 @@ allocation site 樹）。歸因用，量測數字一律以 dhat **關閉**的 bu
 
 ## 結果（v4，2026-10-18，16 核 / 62 GiB / ext4，release build，M12 第 7 段）
 
-`run-v4.sh` 一次跑完（log 在 `~/kist-bench/run-v4-2.log`，不進版控）。數字是量測跑法的 `sampled_max_ex_file_slab`，
+`run-v4.sh` 一次跑完（log 在 `~/kist-bench/run-v4-2.log`，不進版控；`check` 與 `restore` 的兩列是第九步（`55f8e56`）修後以
+`run-read.sh` 重跑的 `run-read-fix.log`）。數字是量測跑法的 `sampled_max_ex_file_slab`，
 括號是門檻跑法的同一個數字；「殺」= `MemoryMax=512M` 下被 OOM 殺掉。兩個測試集都是 100 萬檔、100 萬個 chunk
 （A、B 都是 16 個 pack、5 個 mpack）。
 
@@ -75,7 +76,7 @@ allocation site 樹）。歸因用，量測數字一律以 dhat **關閉**的 bu
 - **restore 單一平面目錄的 100 萬個項目超過門檻**（A 集的 1000 個目錄不會）：dhat 在 `open_placement` 量到一個 336 MiB
   的配置——整個目錄的 100 萬個 `Entry` 一次解進記憶體。第一次量的 restore 是 362 MiB（A）／789 MiB（B）：dhat 另外
   抓到讀取端白記的「驗證過的 (item, pack)」集合（195 MiB HashSet 加 64 MiB Vec，只有 backup 會寫回快取），改成只有
-  backup 的讀取端才記之後（M12 第 7 段第 10 步）是上表的 148／538 MiB。v3 只量過 A 集的 restore（71 MiB）。
+  backup 的讀取端才記之後（M12 第 7 段第九步，`55f8e56`）是上表的 148／538 MiB。v3 只量過 A 集的 restore（71 MiB）。
 - `check --read-data` 在兩個集上離門檻都不到 100 MiB（門檻跑法 432／443 MiB）；dhat 歸因見 ADR 026「實作第七段」。
 
 ## 結果摘要（v3，2026-09-06，16 核 / 61 GiB / ext4，release build）

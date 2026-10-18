@@ -1,9 +1,9 @@
 # ADR 026：v4 格式——從需求重新推導
 
-日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作第 1–6 段完成
-（2026-10-11），第 7 段（收尾）待負責人確認後開始。** 規格全文在 `docs/format-v4.md`；kist-core、kist-mount、CLI
+日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作七段全部完成
+（第 1–6 段 2026-10-11，第 7 段收尾 2026-10-18）。** 規格全文在 `docs/format-v4.md`；kist-core、kist-mount、CLI
 與 kist-app 全部是 v4，v3 的 kist-core／kist-mount 模組、測試與 fixture 已在第 6 段移除，kist-format 與 kist-crypto
-根下的 v3 模組與 v3 的規格 `docs/format.md` 在第 7 段移除（`git show 0b3d425:docs/format.md` 取回）。本 ADR 取代
+根下的 v3 模組與 v3 的規格 `docs/format.md` 已在第 7 段移除（`git show 0b3d425:docs/format.md` 取回）。本 ADR 取代
 同編號的第一版草稿（commit `054c7e1`）。
 
 ## 一頁白話
@@ -342,9 +342,9 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 | grace 72 小時、M 1 小時、探針容差 5 分鐘 | 沿用 v3 的 grace 與邊際；容差同 Kopia（外部事實 7c） |
 | 沿用前先驗證的成本可以接受 | 猜測：一群相似的機器，每台要下載一次別台寫的內容 |
 | 100 萬個 ID 的 map 約 40 MB | 估計（設計者 A） |
-| backup 記憶體裡的持有者表（`Map(g_s)` 的每一項 40 bytes 的索引，加上記錄本身每項約 60 bytes）100 萬個 ID 約 100 MB | 估計（實作第 4 段）；第 7 段的記憶體 bench 量 |
-| backup 記憶體不高於 v3、prune 150–250 MiB | 估計 |
-| check 的成本：每一代的 head 讀兩份、讀取端那一代的分片全讀，走過的 ID 各記 32 bytes（目錄、清單、chunk 各一個集合） | 估計（實作第 5 段）；第 7 段的 bench 量 |
+| backup 記憶體裡的持有者表（`Map(g_s)` 的每一項 40 bytes 的索引，加上記錄本身每項約 60 bytes）100 萬個 ID 約 100 MB | 估計（實作第 4 段）。第 7 段量：100 萬檔的第一次 backup 峰值 326 MiB（A 集）／362 MiB（B 集），第二次 150／278 MiB；沒有單獨量持有者表 |
+| backup 記憶體不高於 v3、prune 150–250 MiB | 第 7 段量：backup 成立（A 集 326 MiB 對 v3 的 373–431 MiB）；**prune 估錯**：604–638 MiB，512 MiB 門檻下被殺（dhat 歸因見「實作第七段」） |
+| check 的成本：每一代的 head 讀兩份、讀取端那一代的分片全讀，走過的 ID 各記 32 bytes（目錄、清單、chunk 各一個集合） | 第 7 段量：100 萬個 chunk 的 repo `check` 6 秒、228 MiB；`--read-data` 16 秒、454 MiB（門檻內，剩 16 MiB） |
 | mount 第一次讀一個檔案時解析整個 chunk 清單（同 v3）就夠快 | 猜測；ChunkIndex 的 `size` 可以讓隨機讀只讀需要的段，沒做 |
 | 單一 PUT 的大小上限放得下一個 pack | AWS S3 的單一 PUT 最多 5 GB（官方文件，2026-10-11 查）。預設的 pack_target 64 MiB 遠低於它；pack_target 接近 4 GiB、chunk 又很小（avg 接近 256 bytes）時，trailer 可能讓 pack 超過，PUT 失敗而 backup 報錯，不會無聲出錯。其他 S3 相容服務未查 |
 
@@ -366,20 +366,33 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 
 - **沒變的 backup**：v4 估計約 6–11 個請求，與目錄數無關。實作第 4 段在記憶體後端上數過（`v4_backup_dedup.rs`）：
   10 個與 1000 個目錄都是 11 個請求（pack 還只在 delta 裡時，B4 讀一個 trailer：HEAD 加兩個 range），維護角色
-  收錄進 map 之後 8 個（4 個 list、2 個 get、1 個 head、1 個 put）。真的 S3 上沒有量。v3 估計每個目錄約 4 個
+  收錄進 map 之後 8 個（4 個 list、2 個 get、1 個 head、1 個 put）。v3 估計每個目錄約 4 個
   請求（設計者 B 讀碼）；M2 在 v2 時代量過 1 102 個目錄的沒變 backup：MinIO 35 秒，本機 0.8 秒。
-- **2000 個 root**：v4 是一個 root 清單，寫進一個 mpack。v3 是 2000 個樹物件，量測 10.96 秒。
+  **實測（第 7 段，MinIO，`mc admin trace`）**：prune 之前 9 個（6 GET、2 HEAD、1 PUT）、2.1 秒；prune 寫了新的一代
+  之後第一次 74 個（72 個 GET 是那一代的 72 片 map 分片第一次進本地快取）、之後 6 個（4 GET、1 HEAD、1 PUT）。
+- **2000 個 root**：v4 是一個 root 清單，寫進一個 mpack。v3 是 2000 個樹物件，量測 10.96 秒。**實測（第 7 段）**：
+  v4 0.23 秒（同樣的檔案放在一個目錄裡 0.17 秒）、1 個 mpack、24 次 fsync；20 000 個 root 1.01 秒（v3 162 秒）。
 - **還原**：合併 range GET 屬於 client 端的改動，與格式無關，v4 前後都可以做。
 - **prune**：每輪寫一個 head 與有變動的分片（256 片，改動少就寫得少），全部 map 約 40 MB／100 萬個 ID。
   刪除之前要驗證被引用的 ID；下載量與 condemned 的 pack 有多少有效項目成正比，`by_prune` 的正本不必
-  再下載。
+  再下載。**實測（第 7 段）**：100 萬個 ID 的分片解碼後 64 MiB，但 prune 的峰值 658 MiB（dhat；主要是以 32 bytes
+  的 ID 當鍵的兩張 HashMap 與記錄集合的多份 clone），超過 512 MiB——見「實作第七段」。
 - **沿用前先驗證**：別台寫的內容，每台主機第一次沿用時下載一次，之後存在本地快取。沒有採用的替代方案
   是「由 prune 驗證每個新進 pack 的全部項目」：prune 的工作量會變成與新資料量成正比，而且在 prune
   收錄之前的沿用仍然沒有保護。「全部信任」不在 v4 裡；如果日後要加，只能是標明不安全的選項（Kopia 的
   `--safety=none` 也是這樣標示）。
 - **刪除延遲**：沒人用的 pack 被標成 condemned 之後，要等到有一個 head 比它晚一個 grace，下一次 prune
   才把它變成 tombstone 並刪除：約一個 grace 加兩次 prune 的間隔。剛寫入不久的 pack 還要先比 grace 老
-  才會被標，所以最多約兩個 grace。tombstone 的記錄再留一個 grace。
+  才會被標，所以最多約兩個 grace。tombstone 的記錄再留一個 grace。**實測（第 7 段，真實時鐘，grace 2 小時；
+  見「實作第七段」）**：每個階段確實要兩輪——「現在的 T」是這一輪 P1 讀到的 head 的時間，等過一個 grace 之後的
+  第一輪只是寫一個把 T 推到現在的 head，第二輪才標記；第一次的驗收腳本一個階段只跑一輪、在標記那裡斷言失敗，
+  錯的是腳本。第二次跑看到兩件事：(1) 這份資料集刪掉的目錄的 pack 沒有一個是整個沒人引用的（同長度的小文字檔
+  跨目錄相同、去重成一個 chunk），走的是 P7c 的 repack——舊 pack 一樣標成 condemned，但數在 repacked 不在
+  condemned；(2) init 之後 `settings --grace 2h` 是從 72 小時調低，開始一個 72 小時的 drain（`settings` 印得出來），
+  期間的新標記都以 72 小時當 age（§11.4），所以兩小時後的第三階段刪不到東西——這一句是讀碼推的（prune.rs 的 `age`），
+  那次跑在第二階段就停了。新 repo 要用短的 grace 只能在 head 0 給：第十步（`9acbafb`）加了 `init --grace`（與 replicas、兩個
+  target）。第三次跑（`init --grace 2h`，沒有 drain）實測了刪除：repack 之後再等一個 grace，第一輪什麼都不做、第二輪 tombstone 並
+  刪掉那 8 個 pack（521 MiB）——與標記同樣的節奏。照這個規則推算（沒有量）：每天一輪 prune、grace 72 小時，從沒人用到刪掉約 8 天。
 
 ## 殘餘風險
 
@@ -930,3 +943,172 @@ kist-app 的 prune metrics；Linux 以外的 E（§11.1 的 UNVERIFIED）。
 （cargo-zigbuild，workspace 不含 kist-mount／kist-cli，與 kist-cli 單獨）乾淨；nextest 700 個通過、8 個略過
 （第五段 792＋9 → 第 19 步 884＋9 → 第 21 步 927＋9 → 移除 v3 後 700＋8：刪掉的檔案裡 230 個，其中 2 個只在
 Windows 或非 unix 上編譯）；`KIST_TEST_FUSE=1` 的 `mount_round_trip` 在第 20、22 步過（這份文件的 commit 沒有重跑）。
+## 實作第七段：收尾（2026-10-18）
+
+負責人：「全部按照你的建議做到完」（第六段的回報之後）。建議的內容：第 7 段整段做完，而且第六段「留給負責人的」
+三項都照建議處理——`Backend::put` 移除、修法 C 不做而改加 `prune --read-data`、第 7 段的清單照 PLAN 再加上第六段
+文件步驟發現的 prune metrics。一步一個 commit、不 squash、不 push。
+
+**內容**（每一步一個 commit，gate 寫在各 commit 訊息裡）：
+1. `879570e` 移除 `Backend::put`：v4 不覆寫任何物件（§1、§12），`Backend` 從此沒有覆寫的 API——kist 的任何
+   角色都發不出會覆寫的請求，不只是「沒有人呼叫」。SFTP 後端拿掉 `PutMode::Overwrite` 的分支；v3 的契約測試
+   `contract.rs` 刪除；需要「把物件換成壞的」的測試改用測試用的 `overwrite`（直接走 `object_store`，不經 `Backend`）。
+2. `2c74d3a` 移除 kist-format／kist-crypto 根下的 v3 模組、刪 `docs/format.md`：kist-format 根下只留 v4 也用的
+   `cbor`、`chunker`（原 `config::ChunkerParams`）、`ids`、`parity`（`encode_version`／`parse_version`，v3 的包裝與
+   key 拿掉）；kist-crypto 根下只留共用型別（`MasterKey`、`KdfCost`、`CryptoError`、`random_bytes`、nonce 與 tag
+   長度），zstd 依賴拿掉；v3 的 golden 與向量測試刪除。`format-v4.md` 原本把切塊演算法交給 `format.md`，刪它之前
+   把規範（gear 表的摘要、兩個 mask、邊界函數、與緩衝區切法無關）從 v2 的 `format.md` §12 搬成 §6.1，逐句對照
+   kist-chunker 的程式碼。golden-v4 與向量一個 byte 都沒變——這就是格式沒被改到的檢查。
+3. `3236728` fuzz 改成 v4 並重新播種：四個 target 都對準 v4 的讀取端（`cbor` 以第一個 byte 選九種結構；`pack`
+   走 `trailer_of`、chunk 與 metadata item 的壓縮→密封→解開 roundtrip、`split_trailer`／`parse_footer`／`unframe`；
+   `parity` 以 golden-v4 的 parity 當凍結的修復基準；`chunker` 只改參數的路徑），seeds 從 golden-v4 重新產生。
+   每個 target 煙霧 120 秒：`cbor` 跑了幾十秒就抓到一個 panic（下一項）；修後 `pack` 64 562、`parity` 111 180、
+   `chunker` 43 318、`cbor` 10 211 619 次執行，都乾淨。這一步的 gate 還抓到 cargo deny 的四個 advisory
+   （rustls 0.23.45，RUSTSEC-2026-0346～0349；kist 沒有自訂 session store 也沒開 ECH），`a3833a4` 升到 0.23.46。
+4. `5002aa8` fuzz 找到的 bug：`Snapshot::decode` 驗 parent 欄位時把 key 裡的時間戳交給 `time` 的 parser，
+   `20260904T1200000[0000.1Z` 這種字串讓 time 0.3.55 在 debug（與 fuzz 的 `-Cdebug-assertions`）下減法溢位 panic。
+   讀取端不能因為一個壞掉的欄位 panic：改成先驗形狀（恰好 25 個 ASCII 字元 `YYYYMMDDTHHMMSSnnnnnnnnnZ`、數字自己
+   讀）再以 `time` 的 `Result` 建構子組出時間、最後重新格式化必須等於輸入；規範寫法的結果不變（canonical 測試、
+   fixture、golden 都照過）。先紅後綠的單元測試（fuzz 的輸入加十五種壞寫法）；crash 輸入留在
+   `fuzz/seeds/cbor/4_snapshot_bad_parent_time` 當回歸種子。
+5. `dafc043` `prune --read-data`（修法 C 的替代）：修法 D 只修 prune 讀到的項目（P5 被引用的 metadata item、P7c 的
+   repack 候選、P7d 刪前驗證的正本），稠密、live 的資料 pack 裡位元損壞的 chunk 誰也不讀，有 parity 也修不回。
+   不做 C（restore 自己以 parity 在記憶體修復、不寫回：每次都重新下載、資料永遠壞著）；改加一個 prune 模式：
+   P7c 之外，每個 live、當正本的資料 pack 整份讀、逐項驗證它當正本的 chunk（mpack 不必：P5 已逐一取回驗證），
+   驗證失敗就走既有的 parity 修復與 repack（損壞的那個 condemned、之後照常刪除，不覆寫）；修不回的項目從記錄
+   移除並回報（同 P7c 對不實項目的處理；它若是唯一的持有者，下一輪 P5 拒絕——資料真的遺失了，大聲失敗）。
+   整輪的時間用掉一半（elapsed × 2 + M ≥ grace）就停、回報讀了幾個，剩下的留給下一次，這一輪照樣寫 head。
+   CLI 的 `prune --read-data`（`forget --prune` 也吃）、設定檔 `[prune] read_data`、`PruneReport.read_packs`；
+   規格 §11.3 P7c 與 §13（`check --read-data` 回報 repairable 之後接著跑它）。先紅後綠四個測試，反向檢查（拿掉
+   `read_data` 的分支）四個都紅。
+6. `2e6b20b` kist-app 的 prune metrics：`kist_prune_marked_objects` 與 `kist_prune_live_packs` 讀的是 v3 report
+   的 `marked` 與 `live_packs`，v4 的 `PruneReport` 沒有這兩個鍵，換 v4 之後永遠是 0；原本的測試 fixture 手寫成 v3
+   的形狀所以沒抓到。`PruneReport` 加 `live`（這一輪結束時 live 的記錄數），metrics 改讀 `condemned` 與 `live`；
+   測試的 fixture 改成直接從 `PruneReport` 序列化（欄位改名時測試會跟著紅）。
+7. `1f70388` 凍結 v4 fixture（`crates/kist-core/tests/fixtures/v4/repo`，264 KiB）：固定密碼、client id、mtime
+   與小參數做出來的兩個 snapshot。四個測試：打得開、check 乾淨、兩個 snapshot 都還原得出來；每個物件（config、
+   head、snapshot、每個 mpack 的每一項）解碼後重新編碼逐 byte 相同；同樣的來源再備份一次不寫新 chunk；每個 parity
+   修得回它的 pack、刪掉正本後還原走 `.r1`、`check --repair` 從 `.r1` 重建、之後 check 乾淨。寫 fixture 的測試留著
+   （ignored，`KIST_WRITE_FIXTURE=1`）；只在 unix 跑。
+8. `f24675b` S3 依 client 分前綴的權限在 MinIO 上實測（負責人決定 1 的部署到這一步才有實測）：
+   `tests/minio-setup.sh` 多建 `kistclient`，政策只允許在 `kist-test/*/{packs,mpacks,parity,deltas,snapshots}/<固定
+   client id>/*` PutObject、GetObject 全部、ListBucket；MinIO RELEASE.2025-09-07 接受 resource 中段的 `*`
+   （第一次跑就過）。測試：client 憑證備得了份；對別台 client 的前綴、`maint/probe`、`maint/gen/1`、`keys/` 的建立
+   都被擋且物件不存在；刪自己的 snapshot 被擋；冒充另一個 client id 備份失敗、沒有多出 snapshot；prune 在 P0
+   探針建不起來就失敗、`maint/` 底下只剩世代 0 的兩份 head。整合全開（MinIO、SFTP、rclone、FUSE）的 nextest 抓到
+   一個第六段留下的過期測試：kist-cli 的 `s3_repo_url_works_end_to_end` 還在等 v3 的「開 bucket versioning」提醒，
+   `0b3d425` 換成 v4 時把它換成「留一份 config 與密碼」（config 不再覆寫），MinIO 沒開所以 gate 沒跑到；斷言改成
+   新的提醒。
+9. `23d0b01` 量測：bench 與驗收腳本改成 v4（下一節），log 進 `tests/acceptance/`。
+10. `55f8e56` 量測找到的：讀取端的「驗證過的 (item, pack)」只有 backup 需要。`Reader` 對每一筆從別台的副本讀到
+    並驗證成功的 (item, pack) 都記進一個 HashSet 與一個 Vec，為了 backup 結束時寫回本地快取（B2 的第三種可信）；
+    restore、mount、check 的讀取端（`live.rs`、`check.rs`）以 `own = None` 建立，每個 chunk 都算「別台的」，記了卻沒有
+    人取走——dhat 在 100 萬個 chunk 的 restore 裡量到 195 MiB（HashSet，含 rehash 時的雙份）加 64 MiB（Vec）。改成只有
+    `with_verified`（backup）的讀取端才記；`trusted` 在沒有記錄時只看 `by_prune` 與自己的前綴（與原本空集合的行為
+    相同）。先紅後綠：`v4_read.rs` 新加一個測試——沒有 `with_verified` 的讀取端 `note_verified` 之後 `take_new_verified`
+    是空的、`trusted` 仍是 false；有的那個記下來、變成可信。重量：restore A 集 362 → 148 MiB（門檻跑法 156，過），B 集 789 → 538 MiB（門檻下仍被殺：剩下的是
+    `open_placement` 一次把整個目錄的 100 萬個 `Entry` 解進記憶體的 336 MiB，dhat 裡是單一一個配置）；`check --read-data`
+    沒有變（它的峰值不是這個集合，見下）。M1／M2 的驗收 log 是修之前的 binary 跑的（restore 與 check 的時間與 RSS
+    不受影響：M1 的 restore 同一台 client，M1／M2 的 RSS 峰值在 backup）。
+11. `9acbafb` `init` 可以指定 head 0 的 settings（`--grace`、`--replicas`、`--pack-target`、`--mpack-target`；parser 同
+    `settings`，沒給的用預設、replicas 看後端，範圍由 `Head::encode` 的檢查擋在寫任何東西之前）。真實時鐘的 GC 驗收
+    找到的：init 之後 `settings --grace 2h` 是調低，開始 72 小時的 drain，期間的標記都以 72 小時當 age（§11.4），兩小時後
+    的刪除階段永遠刪不到——新 repo 要用短的 grace 在命令列上沒有辦法（core 的 `InitOptions.settings` 早就有）。先紅後綠：
+    `cli.rs` 的 init_takes_the_settings_of_generation_0_without_a_drain（含 `--grace 1h` 被擋且沒寫 config、init 之後調低的
+    對照）。規格 §4 加一句。
+12. 這份文件的 commit：ADR、PLAN、README 的驗收數據、`format-v4.md` §15、`tests/README.md`、`bench/memory/README.md`、
+    `tests/acceptance/README.md` 與 `run_gc.py`（三次跑的教訓）、GC 的 log。
+
+**量測**（release build；16 核／62 GiB／ext4；詳細的命令與 log 在各目錄。binary 的來歷有三種：M1、M2、V21、請求數與
+bench 的 backup／prune／check 是 `2e6b20b` 的程式碼（第 7 項之後的 commit 到那時只有測試與腳本）；restore 與 check
+的重量是 `55f8e56`（第 10 項修後）；GC 是 `9acbafb` 的 binary（第 11 項之後的第三次跑；前兩次失敗的原因在那一項）：
+
+- 記憶體 bench（`bench/memory/run-v4.sh`，兩個 100 萬檔的測試集，數字是 `memory.current − file − slab_reclaimable`
+  的取樣峰值；門檻 = `MemoryMax=512M` 不被殺）：
+| 命令 | A 集（1000 dir × 1000 檔） | B 集（單一平面 1M 檔） | 512 MiB gate |
+  |---|---|---|---|
+  | backup 第一次 | 326 MiB，90 s | 362 MiB，68 s | 過（285／354） |
+  | backup 第二次（快速路徑） | 150 MiB，41 s | 278 MiB，18 s | 過（141／281） |
+  | prune 第一輪（收錄 16 個 pack、5 個 mpack）／第二輪 | 604／638 MiB，10 s | 587／638 MiB，8 s | **A、B 都被 OOM 殺掉** |
+  | `check` | 228 MiB，6 s | 238 MiB，6 s | 過（262／236） |
+  | `check --read-data` | 473 MiB，14 s | 428 MiB，10 s | 過（432／443） |
+  | `restore latest`（第 10 項修後；修前 362／789） | 148 MiB，74 s | 538 MiB，84 s | A 過（156）、**B 被 OOM 殺掉**（開始 2 秒內） |
+
+  backup 的 M5 目標（< 512 MiB）v4 仍達到，A 集比 v3 的 373–431 MiB 低（B 集 v3 是 442–524 MiB）。
+  **prune 在 100 萬個 chunk 的 repo 上超過 512 MiB**：量測跑法 604–638 MiB（A）、587–638 MiB（B），門檻跑法兩個都在十秒內被 OOM 殺掉。dhat（另一個
+  target dir 編 `--features dhat`，A 集第三輪）：峰值 658 MiB——`canon: HashMap<ItemId, ObjectId>`（P6 的正本）195 MiB
+  （rehash 時新舊兩張表同時在；每筆 64 bytes 的鍵值加 hashbrown 的額外空間）、`referenced: HashMap<ItemId, Kind>` 68 MiB、
+  100 萬個 entry 的記錄集合三到四份各約 50 MiB（`load_map` 的分片解碼一份、`base`／`map`／`records` 的 clone）、`MapView`
+  的 ID → 持有者表兩份各 40 MiB（`load_map` 與 `canonical` 各建一次）、`fetch` 的 mpack bytes 36 MiB。
+  v3 的 `prune --dry-run` 在同一個 A 集是 550 MiB（ADR 011 的「沒做」），v4 的估計是 150–250 MiB（「假設」表），估錯了。
+- check 的成本（同一個 repo，A 集 100 萬 chunk、16 個 pack、5 個 mpack）：`check` 6 s、228 MiB（B 集 6 s、238 MiB）；`check --read-data` 14 s、473 MiB（B 集 10 s、428 MiB），
+  門檻跑法 432／443 MiB。dhat（A 集，第 10 項修後；堆積峰值 395 MiB，取樣的 cgroup 數字含配置器的額外空間）：
+  `--read-data` 正在驗的那一個 pack 整份在記憶體裡兩次（`object_store` 讀回的 bytes 與複製出來的 Vec，各 67 MiB）、
+  走過的 chunk ID 的 HashSet 66 MiB（「假設」表那一項）、map 分片解碼 64 MiB、`read_data` 裡記錄的一份 clone 54 MiB、
+  `MapView` 的 ID 表 40 MiB、mpack 快取 32 MiB。「走過的 ID 各記 32 bytes」估得對，少算的是 map 本身與 pack 的兩份。
+- M1（本機，`tests/acceptance/run.py`，100 000 檔 9.75 GiB，`m1-acceptance-v4-2026-10-18.log`）：第一次 backup
+  57 s、77 個 pack 與 2 個 mpack（repo 4.90 GiB）；第二次 2.8 s、0 個新 pack、0 個新 chunk、0 個新 mpack；restore
+  30 s、`diff -r` 相同；`check` 0.7 s；`check --read-data` 20.5 s；翻一個 bit 之後 `check --read-data` 以非 0 結束並
+  指名那個 pack；峰值 RSS 236 MiB（v3：54 s／0.8 s／41 s／0.3 s／17 s／186 MiB）。第二次 backup 的 `--json` report：`files_reused` 100 000、`subtrees` 1 102、`items_reused` 1 102、
+  `verified` 0——全部走快速路徑、每個目錄都沿用 parent 的子樹。比 v3 的 0.8 s 慢 2 秒，沒有 profile（UNVERIFIED 原因）。
+- M2（MinIO，`tests/acceptance/run_s3.py`，同一份資料，`m2-acceptance-s3-v4-2026-10-18.log`）：第一次 backup 42 s、77 個 pack 與 1 個 mpack（S3 上 mpack 預設不寫 `.r1`，負責人決定 3；repo
+  4.90 GiB）；第二次 2.1 s、0 個新 pack；restore 121 s、`diff -r` 相同；`check` 0.5 s；`check --read-data` 12.8 s；
+  `prune`（第一輪，收錄 78 個 pack 進 map，不刪東西）1.0 s；之後 `check` 0.7 s、沒變的 backup 2.2 s 與 3.2 s；翻一個
+  bit 之後 `check --read-data` 以非 0 結束並指名那個 pack；峰值 RSS 216 MiB（v3：157 s／35 s／213 s／2 s／28 s／
+  242 MiB）。
+- 沒變的 backup 在真的 S3（MinIO）上的請求數（`mc admin trace --json` 數，依 API 分類）：pack 只在 delta 裡（prune 之前）9 個：6 GET（config、金鑰槽、head、parent snapshot…）、2 HEAD、1 PUT
+  （snapshot）；prune 寫了新的一代之後的第一次 74 個：其中 72 個 GET 是新一代的 72 個 map 分片第一次進本地快取
+  （78 個 pack 散在 256 片裡的 72 片；`mc admin trace` 的 path 逐一對過）；快取有這一代之後 6 個：4 GET、1 HEAD、
+  1 PUT。都與目錄數（1 102）無關；新一代的一次性成本上限是 256 片加 head。
+  第 4 段在記憶體後端上數的是 11（收錄進 map 之後 8）；v2 時代同一份資料在 MinIO 上 35 秒。
+- V21（2000 個 root，`--files-from`，本機後端，release build，機器閒置）：2000 個 root 0.23 s（三次：0.34、0.23、0.23），同樣的檔案放在一個目錄裡 0.17 s；20 000 個 root
+  1.01 s 對 0.69 s；兩種都是 1 個 pack、1 個 mpack（加 `.r1`）、1 個 delta；strace 數到 24 次 fsync。
+  v3 是 10.96 s（2000 個樹物件各一個 `.r1`，8017 次 fsync）；同樣的檔案放在一個目錄裡 v3 是 0.16 s。
+- GC（真實時鐘，`tests/acceptance/run_gc.py`，grace 2 h，`m3-acceptance-gc-v4-2026-10-18.log`）：第三次跑才過（binary `9acbafb`，2026-10-18 19:29–23:35；前兩次失敗都是腳本的錯，原因在第 11 項）：
+  `init --grace 2h`（世代 0，沒有 drain）；backup 100 000 檔 44 s（4.90 GiB，77 個 pack、2 個 mpack）；刪掉
+  dir000–dir009 再 backup 2 s；forget 舊的；prune 1 收錄 79 個（1 s）；等 7316 s；prune 2a 什麼都不做（它的「現在的 T」
+  還是 prune 1 的 head 的）；prune 2b repack 8 個 pack（1 s；condemned 0——這份資料集刪掉的目錄的 pack 都還剩幾個跨目錄
+  相同的小檔的 chunk，走 P7c：舊的 8 個標成 condemned、新的 8 個 by_prune 的 pack（第二次跑時量過：7 個各 68–90 KiB、
+  1 個 17 MiB），repo 4.90 → 4.93 GiB）；等 7320 s；prune 3a 什麼都不做；prune 3b tombstone 並刪掉那 8 個（521 MiB，
+  不到一秒；repo 4.42 GiB，少 9.8%）；prune 4 無事可做；`check --read-data` 8 s 無錯誤（87 個 pack 整份讀）；restore
+  17 s、`diff -r` 完全相同；整段峰值 RSS 230 MiB。v3 的 M3（`prune --grace 0s`，2026-09-05）：標記 3.3 s、刪除 1.1 s
+  （520 MiB，4.90 → 4.41 GiB）、restore 57 s、RSS 233 MiB——v4 多的只是等兩個 grace 與每個階段多一輪。
+
+**找到的**（不是規格錯誤；規格錯誤的編號停在第 18 項）：
+- 實作的 bug 兩個：fuzz 找到的 panic（第 4 項）；讀取端白記的驗證集合（第 10 項，bench 找到的）。
+- 第六段留下的兩件：prune metrics 讀 v3 的欄位（第 6 項）；過期的 S3 CLI 測試（第 8 項）。
+- 用法的缺口一個：新 repo 要用短的 grace，命令列上沒有地方給——init 之後調低就排空 72 小時（第 11 項，真實時鐘的
+  GC 驗收找到的；`init --grace`）。
+- 記憶體：prune 在 100 萬個 chunk 的 repo 上超過 512 MiB；restore 單一平面目錄的 100 萬個項目也超過（789 MiB，B 集；
+  A 集的 1000 個目錄 362 MiB 在門檻內）。backup 與 check 都在門檻內。restore 的 dhat 歸因：峰值 738 MiB（B 集，修第 10 項之前）——`restore::open_placement` 的一個 336 MiB 配置（整個單一目錄的
+  100 萬個 `Entry` 一次解進記憶體：目錄雖然依內容切了段，restore 仍先取整份清單）、`Reader::note_verified` 的 195 MiB
+  HashSet 加 64 MiB Vec（第 10 項修掉）、map 分片解碼 64 MiB、`MapView` 的 ID 表 40 MiB、mpack 快取 32 MiB。A 集的
+  1000 個目錄沒有第一項，所以 362 → 148 MiB。
+
+**對規格的修改**：§4（init 可以指定 head 0 的 settings，第 11 項）；§6.1（切塊的規範從 v3 的 `format.md` 搬進來；原本
+只有參考）；§11.3 P7c（`prune --read-data`）；
+§13（損壞的物件：`check --read-data` 回報 repairable 之後跑 `prune --read-data`）；§15（fixture 的位置與測試）；
+標頭（`format.md` 已刪，取回的方法）。§8 與 §8.1 只有措辭（`Backend::put` 移除後「覆寫」的說法）。
+
+**偏離建議的**：沒有。第 7 段清單裡「ChunkIndex 的跳段讀」（第五段延後的）沒有做：它是讀取端的最佳化、不改格式，
+第五段已記為「沒做」，這一段只量不改。
+
+**留給負責人的**：
+- prune 與 restore 的記憶體：100 萬個 chunk 的 repo 上 prune 要 ~640 MiB，512 MiB 的 M5 門檻只訂給 backup，但 prune 在同一台
+  小機器上跑的話一樣會被殺。看 dhat 的歸因，不改格式就能省掉大半：`canon` 與 `referenced` 改用 ID 表的列號（u32）而不是
+  32 bytes 的 ID 當鍵（195＋68 → 約 10 MiB），並預先配置容量避免 rehash 的雙份；記錄集合只留一份（`base`、`map`、
+  `records`、`MapView` 現在各自 clone）；ID 表只建一次。估計 658 → 250–300 MiB，一天的工；要不要做、門檻要不要也
+  訂給 prune 與 restore，請決定。restore 單一目錄 100 萬項的 789 MiB 見下一項的 dhat。
+  restore 單一目錄 100 萬項的 538 MiB：`open_placement` 改成逐段（`Seg`）取目錄的項目、邊取邊還原，
+  不先 collect 整個 `Vec<Entry>`（336 B × 項目數）；mount 的目錄查找已經是依索引逐段，restore 可以走同樣的路。半天到
+  一天；一般的目錄（A 集每個 1000 項）不受影響，要不要做看會不會有這種目錄。
+- `s3:if-none-match` 的 bucket policy 條件（§1 的部署建議）沒有實測：MinIO 的政策引擎支不支援這個條件 key
+  UNVERIFIED；這一段只測了前綴的 PutObject 限制。
+- Linux 以外的 E（§11.1 的 `CLOCK_BOOTTIME`）仍是 UNVERIFIED。
+- 沒有 push（等明確的指示）。
+
+**gate**（這份文件的 commit 之前在最終的樹上重跑，第一手）：最終的樹是 `9acbafb`（第 11 項）：fmt、clippy 乾淨；windows-gnu clippy（cargo-zigbuild，workspace 不含
+kist-mount／kist-cli，與 kist-cli 單獨）乾淨；nextest 659 個通過、9 個略過（沒設整合的環境變數）；`cargo deny check`
+advisories／bans／licenses／sources 都 ok。MinIO、SFTP、rclone、FUSE 全開的 nextest 在第 8 項的樹（`f24675b`）跑過：
+657 個全過；之後的程式碼改動只有第 10 項（讀取端）與第 11 項（init 的選項），它們的測試不需要環境變數。這份文件的
+commit 只有文件、驗收腳本與 GC 的 log。

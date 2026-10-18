@@ -434,7 +434,7 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
   455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
-## M12：v4 格式（2026-10-10 設計已確認；第 1–6 段完成 2026-10-11，第 7 段待確認）
+## M12：v4 格式（2026-10-10 設計已確認；第 1–6 段完成 2026-10-11，第 7 段完成 2026-10-18）
 
 起因：ADR 017 的 v4 草稿，加上 ADR 025 留下要改格式的 V19、V21。負責人說明系統還沒上線、相容性
 不重要、不需要支援上一代。第一版草稿（`054c7e1`，v3 加樹進 pack）負責人要求重新設計。
@@ -481,11 +481,20 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
      `--retire`，設定檔拿掉 v3 的 grace 等欄位）；v3 的測試搬進 v4、移除 v3 的 kist-core／kist-mount 模組與
      fixture。找到一個規格錯誤（第 18 項：§12 把 forget 也擋在寬鬆後端之外）與 check 的一個漏洞（只在 delta 裡的
      mpack 不檢查兩份）。見 ADR 026「實作第六段」。等負責人確認後開始第 7 段。
-  7. 收尾——待確認：凍結 v4 fixture；fuzz 改成 v4 並重新播種（目前編不過）；記憶體 bench；MinIO 與 SFTP 整合
-     重跑、S3 依 client 分前綴的權限實測；重量 V21 與 M2 的請求數、check 的成本與記憶體；kist-format／kist-crypto
-     根下的 v3 模組與 golden 整理、刪 `docs/format.md`；`Backend::put` 要不要移除；kist-app 的 prune metrics
-     （`kist_prune_marked_objects`、`kist_prune_live_packs` 讀的是 v3 report 的欄位，v4 之後不會更新——只讀碼，
-     UNVERIFIED）；修法 C 要不要做。
+  7. 收尾——**完成**（2026-10-18，`879570e`…這份文件的 commit，一步一個）：`Backend::put` 移除；kist-format／
+     kist-crypto 根下的 v3 模組與 `docs/format.md` 移除（切塊的規範搬成 format-v4.md §6.1）；fuzz 改成 v4 並重新
+     播種（煙霧找到一個讀取端的 panic：snapshot 的 parent 時間戳交給 `time` 的 parser，改成先驗形狀）；修法 C 不做、
+     改加 `prune --read-data`（整份讀每個 live 的資料 pack、以 parity 修復並 repack，用掉一半時限就停）；kist-app 的
+     prune metrics 改讀 v4 的欄位（確認是真的壞了：fixture 從 `PruneReport` 序列化就紅）；v4 fixture 凍結
+     （`crates/kist-core/tests/fixtures/v4/`）；S3 依 client 分前綴的權限在 MinIO 上實測（`kistclient` 使用者）；
+     MinIO、SFTP、rclone、FUSE 全開的整合重跑（抓到一個過期的 S3 CLI 測試）；記憶體 bench、M1／M2／GC 驗收重量、
+     V21 與 M2 的請求數、check 的成本——數字在 ADR 026「實作第七段」與 README「驗收數據」。真實時鐘的 GC 驗收找到
+     init 之後調低 grace 會排空 72 小時（短的 grace 只能在 head 0 給）：加了 `init --grace`（與 replicas、兩個 target）。
+     bench 找到並修掉一個讀取端
+     白記的驗證集合（restore 100 萬個 chunk 少 215 MiB）。**發現 prune 在 100 萬個 chunk 的 repo 上超過 512 MiB 門檻**
+     （587–638 MiB；v3 的 dry run 也是 550 MiB）、**restore 單一目錄 100 萬項也超過**（538 MiB：整個目錄一次解進
+     記憶體）；backup、check 都在門檻內。兩個都有 dhat 歸因與修法的估計，要不要做留給負責人（ADR 026「留給負責人
+     的」）。沒有 push。
 
 ## 已接受的限制（非待辦）
 

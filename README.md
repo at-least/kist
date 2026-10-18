@@ -2,8 +2,8 @@
 
 去重、加密、可多台機器共用 repo 的備份工具（Rust）。
 
-> 目前狀態：**格式 v4（2026-10-11，[ADR 026](docs/decisions/026-v4-format.md)；實作第 1–6 段完成，第 7 段
-> 收尾待開始）**。`init` / `backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild` /
+> 目前狀態：**格式 v4（2026-10-11，[ADR 026](docs/decisions/026-v4-format.md)；實作七段全部完成，
+> 2026-10-18）**。`init` / `backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild` /
 > `settings` / `key` / `remove-unknown-packs` 可用；多台機器可同時備份到同一個 repo，GC 不需要鎖（世代柵欄：
 > 只有建立下一個世代成功的 prune 能刪東西，刪除只看 prune 自己驗證過的資料，任何物件都不覆寫；規格
 > [docs/format-v4.md](docs/format-v4.md)）。v4 不讀 v3 的 repo、沒有遷移（系統還沒上線，負責人決定）。
@@ -13,8 +13,8 @@
 > （[ADR 014](docs/decisions/014-rclone-bridge.md)；能 backup、restore、forget，不能 prune）。
 > 另有：唯讀 FUSE 掛載（[ADR 015](docs/decisions/015-mount-fuse.md)）、選配 Reed-Solomon parity
 > （[ADR 009](docs/decisions/009-m5-parity.md)）、設定檔／排程／webhook（`kist run`）、`--json`、
-> Prometheus metrics 與 Web UI（`kist serve`）。v3 的凍結 fixture 已隨 v3 移除，v4 的 fixture 在 M12 第 7 段
-> 凍結（原本的 Go 參考實作已移除，見 [ADR 018](docs/decisions/018-remove-go-reference.md)；拿掉 Go 之後的
+> Prometheus metrics 與 Web UI（`kist serve`）。v4 的凍結 fixture 在 `crates/kist-core/tests/fixtures/v4/`
+> （原本的 Go 參考實作已移除，見 [ADR 018](docs/decisions/018-remove-go-reference.md)；拿掉 Go 之後的
 > Rust 端盤點與修正清單見 [ADR 019](docs/decisions/019-rust-after-go.md)）。
 > 已接受的限制：Windows VSS（不在路線圖上，見 [PLAN.md](PLAN.md)）。
 
@@ -435,10 +435,11 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 
 S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
-格式相容性：v3 的凍結 fixture（`fixture_v3.rs`）已隨 v3 移除；v4 的 fixture repo（提交在 git 裡、**永不重生**）
-在 M12 第 7 段凍結。golden 與向量（`crates/kist-format/tests/golden_v4.rs`、`scripts/v4-vectors`）會隨程式重錄，
-fixture 不會；它只在格式升版時換（見 [ADR 018](docs/decisions/018-remove-go-reference.md)）。`fuzz/` 目前
-編不過（四個 target 都對準 v3），第 7 段改成 v4。
+格式相容性：v4 的 fixture repo（`crates/kist-core/tests/fixtures/v4/repo`，提交在 git 裡、**永不重生**；
+`crates/kist-core/tests/v4_fixture.rs` 驗它打得開、check 乾淨、還原得出來、每個物件解碼再編碼逐 byte 相同、同樣的
+來源不寫新 chunk、parity 與 `.r1` 修得回）。golden 與向量（`crates/kist-format/tests/golden_v4.rs`、
+`scripts/v4-vectors`）會隨程式重錄，fixture 不會；它只在格式升版時換（見
+[ADR 018](docs/decisions/018-remove-go-reference.md)）。`fuzz/` 的四個 target 對準 v4 的讀取端（`fuzz/README.md`）。
 
 ## Workspace 結構
 
@@ -456,12 +457,79 @@ fixture 不會；它只在格式升版時換（見 [ADR 018](docs/decisions/018-
 格式規格：[docs/format-v4.md](docs/format-v4.md)（v3 的 `docs/format.md` 已刪，`git show 0b3d425:docs/format.md`
 取回）。設計決策：[docs/decisions/](docs/decisions/)。
 
-## 驗收數據（v2／v3 時代）
+## 驗收數據（v4，2026-10-18）
 
-以下三節的數字量的是 2026-09-05 的 v2／v3 實作（`rebuild-index`、tree 物件、`prune --grace` 都已不存在）；
-v4 的重量在 M12 第 7 段。
+同一台機器（Ryzen 7 7700、NVMe/ext4）、與 v3 時代同一份資料集（100 000 個檔案、9.75 GiB，一半亂數一半可壓縮，
+`tests/acceptance/gen.py`）、release build（程式碼是 `2e6b20b`；之後的 `55f8e56` 只少了 restore 的記憶體，不影響這裡的
+時間）。腳本與完整 log 在 `tests/acceptance/`
+（`*-v4-2026-10-18.log`）；100 萬檔的記憶體 bench 在 `bench/memory/README.md`（v4 的 prune 與單一平面目錄的
+restore 超過 512 MiB 門檻，見該處與 ADR 026「實作第七段」）。對照欄是下一節 v3 時代的數字。
 
-## M1 驗收數據
+### M1（本機目錄後端）
+
+| 項目 | v4 | v3（2026-09-05） |
+| --- | --- | --- |
+| 第一次 backup | 57 s；77 個 pack、2 個 mpack 物件（repo 4.90 GiB） | 54 s；77 個 pack |
+| 第二次 backup（內容未變） | 2.8 s；**0 個新 pack、0 個新 chunk、0 個新 mpack**（`--json`：100 000 個檔案全走快速路徑，1 102 個目錄全沿用 parent 的子樹） | 0.8 s |
+| restore | 30 s；`diff -r` **完全相同** | 41 s |
+| `check` | 0.7 s | 0.3 s |
+| `check --read-data` | 20.5 s | 17 s |
+| 人為翻轉 pack 中一個 bit | `check --read-data` 以非 0 結束並指名該 pack | 同 |
+| 峰值 RSS（backup 期間） | 236 MiB | 186 MiB |
+
+### M2（S3 / MinIO）
+
+repo 放在本機 Docker 裡的 MinIO（`minio/minio:RELEASE.2025-09-07`，HTTP），腳本 `tests/acceptance/run_s3.py`；
+請求數由容器內的 `mc admin trace --json` 數、依 API 分類。
+
+| 項目 | v4 | v3 |
+| --- | --- | --- |
+| 第一次 backup | 42 s；77 個 pack、1 個 mpack 物件（S3 上 mpack 預設不寫 `.r1`） | 157 s |
+| 第二次 backup（內容未變，pack 還只在 delta 裡） | 2.1 s；0 個新 pack；**9 個 S3 請求**（6 GET、2 HEAD、1 PUT） | 35 s（每次重新 put 1 102 個 tree） |
+| restore | 121 s；`diff -r` **完全相同** | 213 s |
+| `check` | 0.5 s | 2 s |
+| `check --read-data` | 12.8 s | 28 s |
+| `prune` 第一輪（收錄 78 個 pack 進 map，不刪東西） | 1.0 s；之後 `check` 0.7 s | `rebuild-index` 0.4 s |
+| 收錄進 map 之後、內容未變的 backup | 新的一代第一次 74 個請求（其中 72 個 GET 是那一代的 72 個 map 分片第一次進本地快取）；快取有了之後 **6 個**（4 GET、1 HEAD、1 PUT） | — |
+| 人為翻轉 pack 中一個 bit（透過 `mc` 上傳） | `check --read-data` 以非 0 結束並指名該 pack | 同 |
+| 峰值 RSS（backup 期間） | 216 MiB | 242 MiB |
+
+內容未變的 backup 的請求數與目錄數無關；新的一代的一次性成本上限是 256 片分片加 head。restore 對 S3 仍比本機慢
+（121 s 對 30 s），差距的原因沒有 profile（UNVERIFIED）。
+
+### M3（GC，真實時鐘）
+
+同一份資料集、本機目錄後端，腳本 `tests/acceptance/run_gc.py`，log `tests/acceptance/m3-acceptance-gc-v4-2026-10-18.log`
+（binary 是 `9acbafb`）。流程：backup → 刪掉一成的目錄再 backup → forget 舊 snapshot → prune（收錄）→ 等一個 grace
+（設 2 小時，v4 的最低值）→ prune 兩輪（第一輪只把「現在的 T」推到現在，第二輪標記與 repack）→ 再等一個 grace →
+prune 兩輪（第二輪 tombstone 並刪除）→ 再一輪（沒事可做）→ `check --read-data` → restore 與 `diff -r`。
+
+| 項目 | v4 | v3（`prune --grace 0s`，2026-09-05） |
+| --- | --- | --- |
+| backup 1／backup 2（少一成） | 44 s／2 s | — |
+| prune 1（收錄 77 個 pack 與 2 個 mpack 進 map） | 1 s | — |
+| grace 之後的第一輪（只推進 T） | 0 s，0 個標記 | — |
+| 第二輪（標記 0 個 pack、repack 8 個） | 1 s | 3.3 s（標記 112 個 tree + 8 個 pack） |
+| 再一個 grace 之後的第一輪 | 0 s，不刪 | — |
+| 第二輪（tombstone 並刪 8 個 pack、521 MiB） | 0 s | 1.1 s（刪 120 個物件、520 MiB） |
+| 之後一輪 | 0 s，無事可做 | 1.1 s |
+| repo 大小 | 4.90 GiB → 4.93 GiB（標記後，沒刪）→ **4.42 GiB** | 4.90 → 4.41 GiB |
+| `check --read-data` 之後 | 8 s，無錯誤 | 26 s |
+| restore 最新 snapshot | 17 s，`diff -r` **完全相同** | 57 s |
+| 峰值 RSS（整個流程） | 230 MiB | 233 MiB |
+
+這是第三次跑。第一次的腳本每個階段只跑一輪 prune、在標記那裡斷言失敗——v4 的時間只比 head（§11.1），一輪的「現在的 T」
+是它讀到的最新 head 的時間，等過一個 grace 之後第一輪只是寫一個把 T 推到現在的 head。第二次斷言 `condemned > 0` 又失敗：
+這份資料集刪掉的目錄的 pack 都還剩幾個跨目錄相同的小檔的 chunk，走的是 repack（舊 pack 一樣標成 condemned，數在
+`repacked`）；同一次跑也看到 init 之後 `settings --grace 2h` 開始了 72 小時的排空，期間的標記照 72 小時算、刪除階段
+永遠到不了——所以加了 `kist init --grace`。兩次錯的都是腳本，不是 GC；但「新 repo 想用短的 grace」是 kist 的用法缺口。
+grace 設 2 小時只是為了驗收能在一個晚上走完；實際使用請保留預設 72 小時（每天一輪 prune 時，從沒人用到刪掉推算約 8 天）。
+
+## 驗收數據（v2／v3 時代，2026-09-05）
+
+以下三節的數字量的是 2026-09-05 的 v2／v3 實作（`rebuild-index`、tree 物件、`prune --grace` 都已不存在），留作對照。
+
+### M1 驗收數據
 
 2026-09-05，commit `26637f0`（審查修正後），同一台機器（Ryzen 7 7700、NVMe/btrfs，
 本機目錄後端），release build。資料集：100 000 個檔案、9.75 GiB（一半亂數、一半可壓縮），
@@ -478,7 +546,7 @@ v4 的重量在 M12 第 7 段。
 | 峰值 RSS（backup 期間，`ru_maxrss`） | **186 MiB**（審查修正前 253 MiB） |
 | 512 MiB 單一大檔的 RSS 成長（reviewer 的 probe） | 22 MiB（修正前 736 MiB） |
 
-## M2 驗收數據（S3 / MinIO）
+### M2 驗收數據（S3 / MinIO）
 
 2026-09-05，commit `09f6f82`，同一台機器、同一份資料集，repo 放在本機 Docker 裡的 MinIO
 （`minio/minio:RELEASE.2025-09-07`，HTTP、無 TLS），腳本 `tests/acceptance/run_s3.py`，
@@ -499,7 +567,7 @@ v4 的重量在 M12 第 7 段。
 後者對每個 chunk 各發一次 range GET（71 040 次）。
 UNVERIFIED（未做 profile，只是從請求數推測）。兩者都列在 M3/M4 待辦（ADR 004「沒做」）。
 
-## M3 驗收數據（GC）
+### M3 驗收數據（GC）
 
 2026-09-05，commit `0d0e107`（兩輪審查修正後），本機目錄後端，同一份資料集，腳本 `tests/acceptance/run_gc.py`，
 完整 log `tests/acceptance/m3-acceptance-gc-2026-09-05.log`。流程：backup → 刪掉一成的目錄再 backup →

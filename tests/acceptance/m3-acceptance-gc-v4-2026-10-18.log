@@ -1,0 +1,273 @@
+source: 100000 files, 9.75 GiB; grace 2h
+$ 19:29:12 /home/newlix/kist-acceptance/kist-9acbafb init --grace 2h
+  -> exit 0, 0.1s, child peak RSS so far 72 MiB
+  repository initialized at /home/newlix/kist-acceptance/repo-gc
+  stderr: note: keep a copy of the `config` object and of your password somewhere safe; without either the repository cannot be opened
+$ 19:29:12 /home/newlix/kist-acceptance/kist-9acbafb settings
+  -> exit 0, 0.1s, child peak RSS so far 73 MiB
+  generation 0
+  grace         2h
+  replicas      1
+  pack_target   64.0 MiB
+  mpack_target  8.0 MiB
+$ 19:29:55 /home/newlix/kist-acceptance/kist-9acbafb backup /home/newlix/kist-acceptance/src
+  -> exit 0, 43.7s, child peak RSS so far 195 MiB
+  snapshot 029abf0e/20261018T112912199089960Z
+    100000 files, 1100 dirs, 0 symlinks, 9.7 GiB total
+    new: 9.4 GiB in 71191 chunks, 77 packs and 1 metadata packs written
+after backup 1: 77 packs, 2 mpacks, repo 4.90 GiB
+$ 19:29:58 /home/newlix/kist-acceptance/kist-9acbafb backup /home/newlix/kist-acceptance/src
+  -> exit 0, 2.4s, child peak RSS so far 195 MiB
+  snapshot 029abf0e/20261018T112956212482639Z
+    90000 files, 990 dirs, 0 symlinks, 8.8 GiB total
+    new: 0 B in 0 chunks, 0 packs and 1 metadata packs written
+$ 19:29:58 /home/newlix/kist-acceptance/kist-9acbafb --json snapshots
+  -> exit 0, 0.1s, child peak RSS so far 195 MiB
+  [
+    {
+      "key": "snapshots/029abf0e1d8fca7855d19b8fd985f361/20261018T112912199089960Z",
+      "client": "029abf0e1d8fca7855d19b8fd985f361",
+      "timestamp": "20261018T112912199089960Z",
+      "time": "2026-10-18T11:29:12.19908996Z",
+      "hostname": "lab",
+      "username": "newlix",
+      "paths": [
+        "/home/newlix/kist-acceptance/src"
+      ],
+      "roots": [
+        {
+          "path": "/home/newlix/kist-acceptance/src",
+          "type": "dir"
+        }
+      ],
+      "parent": null,
+      "stats": {
+        "files": 100000,
+        "dirs": 1100,
+        "bytes": 10465051722
+      }
+    },
+    {
+      "key": "snapshots/029abf0e1d8fca7855d19b8fd985f361/20261018T112956212482639Z",
+      "client": "029abf0e1d8fca7855d19b8fd985f361",
+      "timestamp": "20261018T112956212482639Z",
+      "time": "2026-10-18T11:29:56.212482639Z",
+      "hostname": "lab",
+      "username": "newlix",
+      "paths": [
+        "/home/newlix/kist-acceptance/src"
+      ],
+      "roots": [
+        {
+          "path": "/home/newlix/kist-acceptance/src",
+          "type": "dir"
+        }
+      ],
+      "parent": "snapshots/029abf0e1d8fca7855d19b8fd985f361/20261018T112912199089960Z",
+      "stats": {
+        "files": 90000,
+        "dirs": 990,
+        "bytes": 9418206631
+      }
+    }
+  ]
+$ 19:29:58 /home/newlix/kist-acceptance/kist-9acbafb forget snapshots/029abf0e1d8fca7855d19b8fd985f361/20261018T112912199089960Z
+  -> exit 0, 0.2s, child peak RSS so far 195 MiB
+  removed 029abf0e/20261018T112912199089960Z
+  removed 1 snapshot(s), kept 0
+  run `kist prune` to reclaim the space
+$ 19:29:59 /home/newlix/kist-acceptance/kist-9acbafb --json prune
+  -> exit 0, 1.0s, child peak RSS so far 195 MiB
+  {
+    "base": 0,
+    "generation": 1,
+    "snapshots": 1,
+    "items": 992,
+    "chunks": 65410,
+    "newcomers": 79,
+    "revived": 0,
+    "condemned": 0,
+    "tombstoned": 0,
+    "removed_records": 0,
+    "false_entries": 0,
+    "repacked": 0,
+    "repaired": 0,
+    "read_packs": 0,
+    "live": 79,
+    "deleted_packs": 0,
+    "deleted_bytes": 0,
+    "deleted_deltas": 6,
+    "deleted_shards": 0,
+    "deleted_parity": 0,
+    "deleted_snapshots": 0,
+    "undeleted": [],
+    "unfinished": null,
+    "warnings": []
+  }
+  prune report: generation 1 (from 0), newcomers 79, condemned 0, revived 0, tombstoned 0, repacked 0, deleted packs 0 (0 MiB), warnings 0
+  sleeping 7316s (packs must be older than the grace before P7b marks them; until 21:31:55)
+$ 21:31:56 /home/newlix/kist-acceptance/kist-9acbafb --json prune
+  -> exit 0, 0.4s, child peak RSS so far 195 MiB
+  {
+    "base": 1,
+    "generation": 2,
+    "snapshots": 1,
+    "items": 992,
+    "chunks": 65410,
+    "newcomers": 0,
+    "revived": 0,
+    "condemned": 0,
+    "tombstoned": 0,
+    "removed_records": 0,
+    "false_entries": 0,
+    "repacked": 0,
+    "repaired": 0,
+    "read_packs": 0,
+    "live": 79,
+    "deleted_packs": 0,
+    "deleted_bytes": 0,
+    "deleted_deltas": 0,
+    "deleted_shards": 0,
+    "deleted_parity": 0,
+    "deleted_snapshots": 0,
+    "undeleted": [],
+    "unfinished": null,
+    "warnings": []
+  }
+  prune report: generation 2 (from 1), newcomers 0, condemned 0, revived 0, tombstoned 0, repacked 0, deleted packs 0 (0 MiB), warnings 0
+$ 21:31:57 /home/newlix/kist-acceptance/kist-9acbafb --json prune
+  -> exit 0, 1.0s, child peak RSS so far 230 MiB
+  {
+    "base": 2,
+    "generation": 3,
+    "snapshots": 1,
+    "items": 992,
+    "chunks": 65410,
+    "newcomers": 0,
+    "revived": 0,
+    "condemned": 0,
+    "tombstoned": 0,
+    "removed_records": 0,
+    "false_entries": 0,
+    "repacked": 8,
+    "repaired": 0,
+    "read_packs": 0,
+    "live": 79,
+    "deleted_packs": 0,
+    "deleted_bytes": 0,
+    "deleted_deltas": 0,
+    "deleted_shards": 0,
+    "deleted_parity": 0,
+    "deleted_snapshots": 0,
+    "undeleted": [],
+    "unfinished": null,
+    "warnings": []
+  }
+  prune report: generation 3 (from 2), newcomers 0, condemned 0, revived 0, tombstoned 0, repacked 8, deleted packs 0 (0 MiB), warnings 0
+after prune 2b: 85 packs, repo 4.93 GiB
+  sleeping 7320s (marks must be older than the grace on both clocks before P7d deletes; until 23:33:57)
+$ 23:33:57 /home/newlix/kist-acceptance/kist-9acbafb --json prune
+  -> exit 0, 0.4s, child peak RSS so far 230 MiB
+  {
+    "base": 3,
+    "generation": 4,
+    "snapshots": 1,
+    "items": 992,
+    "chunks": 65410,
+    "newcomers": 0,
+    "revived": 0,
+    "condemned": 0,
+    "tombstoned": 0,
+    "removed_records": 0,
+    "false_entries": 0,
+    "repacked": 0,
+    "repaired": 0,
+    "read_packs": 0,
+    "live": 79,
+    "deleted_packs": 0,
+    "deleted_bytes": 0,
+    "deleted_deltas": 0,
+    "deleted_shards": 16,
+    "deleted_parity": 0,
+    "deleted_snapshots": 0,
+    "undeleted": [],
+    "unfinished": null,
+    "warnings": []
+  }
+  prune report: generation 4 (from 3), newcomers 0, condemned 0, revived 0, tombstoned 0, repacked 0, deleted packs 0 (0 MiB), warnings 0
+$ 23:33:58 /home/newlix/kist-acceptance/kist-9acbafb --json prune
+  -> exit 0, 0.5s, child peak RSS so far 230 MiB
+  {
+    "base": 4,
+    "generation": 5,
+    "snapshots": 1,
+    "items": 992,
+    "chunks": 65410,
+    "newcomers": 0,
+    "revived": 0,
+    "condemned": 0,
+    "tombstoned": 8,
+    "removed_records": 0,
+    "false_entries": 0,
+    "repacked": 0,
+    "repaired": 0,
+    "read_packs": 0,
+    "live": 79,
+    "deleted_packs": 8,
+    "deleted_bytes": 545989840,
+    "deleted_deltas": 0,
+    "deleted_shards": 0,
+    "deleted_parity": 0,
+    "deleted_snapshots": 0,
+    "undeleted": [],
+    "unfinished": null,
+    "warnings": []
+  }
+  prune report: generation 5 (from 4), newcomers 0, condemned 0, revived 0, tombstoned 8, repacked 0, deleted packs 8 (521 MiB), warnings 0
+after prune 3b: 77 packs, repo 4.42 GiB
+$ 23:33:58 /home/newlix/kist-acceptance/kist-9acbafb --json prune
+  -> exit 0, 0.4s, child peak RSS so far 230 MiB
+  {
+    "base": 5,
+    "generation": 6,
+    "snapshots": 1,
+    "items": 992,
+    "chunks": 65410,
+    "newcomers": 0,
+    "revived": 0,
+    "condemned": 0,
+    "tombstoned": 0,
+    "removed_records": 0,
+    "false_entries": 0,
+    "repacked": 0,
+    "repaired": 0,
+    "read_packs": 0,
+    "live": 79,
+    "deleted_packs": 0,
+    "deleted_bytes": 0,
+    "deleted_deltas": 0,
+    "deleted_shards": 16,
+    "deleted_parity": 0,
+    "deleted_snapshots": 0,
+    "undeleted": [],
+    "unfinished": null,
+    "warnings": []
+  }
+  prune report: generation 6 (from 5), newcomers 0, condemned 0, revived 0, tombstoned 0, repacked 0, deleted packs 0 (0 MiB), warnings 0
+$ 23:34:06 /home/newlix/kist-acceptance/kist-9acbafb check --read-data
+  -> exit 0, 8.1s, child peak RSS so far 230 MiB
+  checked generation 6: 1 snapshots, 992 metadata items, 65410 chunks, 87 packs (data read)
+  no errors found
+$ 23:34:23 /home/newlix/kist-acceptance/kist-9acbafb restore latest /home/newlix/kist-acceptance/out-gc
+  -> exit 0, 16.8s, child peak RSS so far 230 MiB
+  restored 029abf0e/20261018T112956212482639Z to /home/newlix/kist-acceptance/out-gc: 90000 files, 990 dirs, 0 symlinks
+$ 23:34:37 diff -r /home/newlix/kist-acceptance/src /home/newlix/kist-acceptance/out-gc/home/newlix/kist-acceptance/src
+  -> exit 0, 14.4s, child peak RSS so far 230 MiB
+diff -r: identical
+
+=== SUMMARY (GC, v4) ===
+backup 1: 44s (4.90 GiB, 77 packs, 2 mpacks)  backup 2 (-10%): 2s  prune 1 (absorb): 1s  prune 2a (advance T): 0s  prune 2b (mark 0, repack 8): 1s  prune 3a (advance T): 0s  prune 3b (delete 8 packs, 521 MiB): 0s  prune 4: 0s  check --read-data: 8s  restore: 17s
+repo: 4.90 GiB → 4.93 GiB after prune 2b → 4.42 GiB after prune 3b
+peak RSS (max over all child processes): 230 MiB
+ALL GC ACCEPTANCE CHECKS PASSED
+GC_EXIT 0
