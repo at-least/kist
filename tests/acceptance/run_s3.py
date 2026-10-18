@@ -43,7 +43,7 @@ def count(prefix):
 
 def traced(args):
     """在容器內開 `mc admin trace`，跑一個命令，回傳 (run 的結果, 依 API 分類的請求數)。"""
-    import collections, json
+    import collections, json, urllib.parse
     mc("admin", "trace", "--help")  # 這版 mc 要有 trace
     subprocess.run(["docker", "exec", CONTAINER, "sh", "-c", "rm -f /tmp/trace.jsonl"], check=True)
     tracer = subprocess.Popen(["docker", "exec", "-i", CONTAINER, "mc", "admin", "trace", "--json", "--call", "s3", "local"],
@@ -58,7 +58,9 @@ def traced(args):
             if not line.strip():
                 continue
             rec = json.loads(line)
-            if PREFIX in rec.get("path", ""):
+            # LIST 的 path 是 bucket 本身，repo 的前綴在 query 的 prefix 參數裡（2026-10-19 之前漏數了 LIST）
+            listed = urllib.parse.parse_qs(rec.get("query", "")).get("prefix", [""])[0]
+            if PREFIX in rec.get("path", "") or listed.startswith(PREFIX + "/"):
                 counts[rec["api"]] += 1
     total = sum(counts.values())
     print(f"  S3 requests to {PREFIX}: {total}: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())), flush=True)

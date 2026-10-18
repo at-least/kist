@@ -1,0 +1,44 @@
+source: 100000 files, 9.75 GiB
+$ /home/newlix/kist-acceptance-m1/kist-b48e007 init
+  -> exit 0, 0.1s, child peak RSS so far 72 MiB
+  repository initialized at /home/newlix/kist-acceptance-m1/repo
+  stderr: note: keep a copy of the `config` object and of your password somewhere safe; without either the repository cannot be opened
+$ /home/newlix/kist-acceptance-m1/kist-b48e007 backup /home/newlix/kist-acceptance-m1/src
+  -> exit 0, 33.4s, child peak RSS so far 192 MiB
+  snapshot 7ef762f9/20261018T220502994115044Z
+    100000 files, 1100 dirs, 0 symlinks, 9.7 GiB total
+    new: 9.4 GiB in 71185 chunks, 77 packs and 1 metadata packs written
+after backup 1: 77 packs, 2 mpacks, repo 4.90 GiB
+$ /home/newlix/kist-acceptance-m1/kist-b48e007 backup /home/newlix/kist-acceptance-m1/src
+  -> exit 0, 1.1s, child peak RSS so far 192 MiB
+  snapshot 7ef762f9/20261018T220536392312619Z
+    100000 files, 1100 dirs, 0 symlinks, 9.7 GiB total
+    new: 0 B in 0 chunks, 0 packs and 0 metadata packs written
+after backup 2: 77 packs
+$ /home/newlix/kist-acceptance-m1/kist-b48e007 restore latest /home/newlix/kist-acceptance-m1/out
+  -> exit 0, 30.9s, child peak RSS so far 192 MiB
+  restored 7ef762f9/20261018T220536392312619Z to /home/newlix/kist-acceptance-m1/out: 100000 files, 1100 dirs, 0 symlinks
+$ diff -r /home/newlix/kist-acceptance-m1/src /home/newlix/kist-acceptance-m1/out/home/newlix/kist-acceptance-m1/src
+  -> exit 0, 36.4s, child peak RSS so far 192 MiB
+diff -r: identical
+$ /home/newlix/kist-acceptance-m1/kist-b48e007 check
+  -> exit 0, 0.7s, child peak RSS so far 192 MiB
+  checked generation 0: 2 snapshots, 1102 metadata items, 71185 chunks, 78 packs
+  no errors found
+$ /home/newlix/kist-acceptance-m1/kist-b48e007 check --read-data
+  -> exit 0, 17.4s, child peak RSS so far 192 MiB
+  checked generation 0: 2 snapshots, 1102 metadata items, 71185 chunks, 78 packs (data read)
+  no errors found
+$ /home/newlix/kist-acceptance-m1/kist-b48e007 check --read-data
+  -> exit 1, 8.8s, child peak RSS so far 192 MiB
+  checked generation 0: 2 snapshots, 1102 metadata items, 71185 chunks, 78 packs (data read)
+  stderr: error: packs/7ef762f906434a2b13bdd846ad2ca1cc/0099eb0411b42e65512c4cb301985f4975cac62eb8d3867d9d1810bdea421622: content does not match its name
+  error: 1 error(s) found
+corruption detected in 0099eb0411b42e65512c4cb301985f4975cac62eb8d3867d9d1810bdea421622
+
+=== SUMMARY ===
+files: 100000, source 9.75 GiB, repo 4.90 GiB, packs 77, mpacks 2
+backup 1: 33s  backup 2: 1s  restore: 31s  check: 1s  check --read-data: 17s
+peak RSS (max over all child processes, dominated by backup 1): 192 MiB
+ALL ACCEPTANCE CHECKS PASSED
+RUN_EXIT 0

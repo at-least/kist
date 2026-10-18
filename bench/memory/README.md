@@ -54,30 +54,35 @@ sh bench/memory/run-v4.sh target/release/kist /path/work /path/set-a /path/set-b
 跑完在 cwd 寫 `dhat-heap.json`（Total / t-gmax live / t-end 三個數字加
 allocation site 樹）。歸因用，量測數字一律以 dhat **關閉**的 build 為準。
 
-## 結果（v4，2026-10-18，16 核 / 62 GiB / ext4，release build，M12 第 7 段）
+## 結果（v4，2026-10-19，16 核 / 62 GiB / ext4，release build，M12 第 7 段之二）
 
-`run-v4.sh` 一次跑完（log 在 `~/kist-bench/run-v4-2.log`，不進版控；`check` 與 `restore` 的兩列是第九步（`55f8e56`）修後以
-`run-read.sh` 重跑的 `run-read-fix.log`）。數字是量測跑法的 `sampled_max_ex_file_slab`，
-括號是門檻跑法的同一個數字；「殺」= `MemoryMax=512M` 下被 OOM 殺掉。兩個測試集都是 100 萬檔、100 萬個 chunk
-（A、B 都是 16 個 pack、5 個 mpack）。
+`run-v4.sh` 以 `b48e007` 的 binary 一次跑完（log 在 `~/kist-bench/run-v4-2026-10-19.log`，不進版控）。數字是量測跑法的
+`sampled_max_ex_file_slab`，括號是 `MemoryMax=512M` 門檻跑法的同一個數字；這一輪 26 次全部 exit 0、沒有 OOM。兩個測試集
+都是 100 萬檔、100 萬個 chunk。
 
 | 命令 | A 集（1000 dir × 1000 檔） | B 集（單一平面 1M 檔） | 512 MiB gate |
 |---|---|---|---|
-| backup，第一次（全部新寫） | 326 MiB，90 s | 362 MiB，68 s | A 過（285）、B 過（354） |
-| backup，第二次（快速路徑，0 新 chunk） | 150 MiB，41 s | 278 MiB，18 s | A 過（141）、B 過（281） |
-| prune，第一輪（收錄全部 pack）／第二輪 | 604／638 MiB，10 s | 587／638 MiB，8 s | **A、B 都被殺** |
-| `check` | 228 MiB，6 s | 238 MiB，6 s | 過（262／236） |
-| `check --read-data` | 473 MiB，14 s | 428 MiB，10 s | 過（432／443） |
-| `restore latest` | 148 MiB，74 s | 538 MiB，84 s | A 過（156）、**B 被殺**（開始 2 秒內） |
+| backup，第一次（全部新寫） | 264 MiB，54 s | 314 MiB，63 s | 過（292／394） |
+| backup，第二次（快速路徑，0 新 chunk） | 143 MiB，12 s | 285 MiB，20 s | 過（149／285） |
+| prune，第一輪（收錄全部 pack）／第二輪 | 233／161 MiB，7／6 s | 236／171 MiB，6／5 s | 過（第三輪：159／168） |
+| `check` | 229 MiB，6 s | 240 MiB，5 s | 過（230／271） |
+| `check --read-data` | 441 MiB，10 s | 436 MiB，10 s | 過（440／432） |
+| `restore latest` | 151 MiB，79 s | 151 MiB，98 s | 過（156／161） |
 
-- backup 的目標（M5：< 512 MiB）v4 仍然達到，A 集比 v3 的 373–431 MiB 低。
-- **prune 超過門檻**：v3 的 `prune --dry-run` 在 A 集是 550 MiB（下表，當時記為「沒做」），v4 是 587–638 MiB。
-  dhat 歸因見 ADR 026「實作第七段」；修法留給負責人。
-- **restore 單一平面目錄的 100 萬個項目超過門檻**（A 集的 1000 個目錄不會）：dhat 在 `open_placement` 量到一個 336 MiB
-  的配置——整個目錄的 100 萬個 `Entry` 一次解進記憶體。第一次量的 restore 是 362 MiB（A）／789 MiB（B）：dhat 另外
-  抓到讀取端白記的「驗證過的 (item, pack)」集合（195 MiB HashSet 加 64 MiB Vec，只有 backup 會寫回快取），改成只有
-  backup 的讀取端才記之後（M12 第 7 段第九步，`55f8e56`）是上表的 148／538 MiB。v3 只量過 A 集的 restore（71 MiB）。
-- `check --read-data` 在兩個集上離門檻都不到 100 MiB（門檻跑法 432／443 MiB）；dhat 歸因見 ADR 026「實作第七段」。
+- M5 的目標（backup < 512 MiB）v4 仍然達到；負責人 2026-10-19 決定門檻也訂給 prune 與 restore，兩個現在都在門檻內。
+- **prune** 原本（第 7 段，`9acbafb`）A 集 676 MiB、B 集 587–638 MiB，門檻下都被殺；dhat 的歸因是以 32 bytes 的 ID 當鍵的
+  兩張 HashMap 與每個階段各 clone 一份的記錄集合。M12 第 7 段第十二步（`668c02c`）改成記錄只留一份、以位置索引取代
+  HashMap（ADR 026「實作第七段之二」）。第一輪比之後幾輪高，是因為它讀全部 pack 的 trailer、寫全部的分片。
+- **restore** 單一平面目錄的 100 萬個項目原本 529 MiB、門檻下被殺（`open_placement` 一次把整個目錄的 `Entry` 解進
+  記憶體，dhat 量到 336 MiB 的單一配置）；第十三步（`479871b`）改成一段一段讀目錄。再之前第九步（`55f8e56`）拿掉了
+  讀取端白記的驗證集合（362 → 148 MiB，A 集）。
+- 離門檻最近的是 `check --read-data`（量測 441／436 MiB）：正在驗的 pack 在記憶體裡兩份、走過的 chunk ID 的 HashSet、
+  map 分片解碼與記錄的 clone（dhat 歸因見 ADR 026「實作第七段」）；沒改。第十三步那一輪量到的 B 集門檻跑法是 464 MiB。
+- 第二次 backup A 集 41 → 12 s：第十六步（快速路徑的 B2 不再每個檔案換一次執行緒）與第十七步（每個條目只 lstat 一次）
+  拿掉的就是每個檔案的成本，在 M1 的資料集上各自量過（ADR 026「實作第七段之二」）；這裡沒有逐步量。第一次 backup 也從
+  90 變 54 s，那不是這兩步能解釋的——兩輪之間機器的狀態（page cache）不同，時間只當參考，記憶體才是這份 bench 的數字。
+
+第 7 段（2026-10-18，`2e6b20b`／`55f8e56`）的舊表在 git 的歷史裡（`git show 0f679e8:bench/memory/README.md`）。
 
 ## 結果摘要（v3，2026-09-06，16 核 / 61 GiB / ext4，release build）
 

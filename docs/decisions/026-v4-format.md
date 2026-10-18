@@ -1,7 +1,7 @@
 # ADR 026：v4 格式——從需求重新推導
 
 日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作七段全部完成
-（第 1–6 段 2026-10-11，第 7 段收尾 2026-10-18）。** 規格全文在 `docs/format-v4.md`；kist-core、kist-mount、CLI
+（第 1–6 段 2026-10-11，第 7 段收尾 2026-10-18；負責人對第 7 段疑問的決定與後續 2026-10-19，見「實作第七段之二」）。** 規格全文在 `docs/format-v4.md`；kist-core、kist-mount、CLI
 與 kist-app 全部是 v4，v3 的 kist-core／kist-mount 模組、測試與 fixture 已在第 6 段移除，kist-format 與 kist-crypto
 根下的 v3 模組與 v3 的規格 `docs/format.md` 已在第 7 段移除（`git show 0b3d425:docs/format.md` 取回）。本 ADR 取代
 同編號的第一版草稿（commit `054c7e1`）。
@@ -331,20 +331,20 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
 | 假設 | 狀態 |
 | --- | --- |
 | 沒有要讀回的 v3 資料，不需要遷移 | 負責人陳述（2026-10-10） |
-| S3 能以 bucket policy 強制 `If-None-Match` | 查證（外部事實 11c） |
+| S3 能以 bucket policy 強制 `If-None-Match` | AWS：查證（外部事實 11c）；MinIO RELEASE.2025-09-07：不能——政策的條件 key `s3:if-none-match` 建不起來（實測，實作第七段之二）；其他 S3 相容服務未查 |
 | `maint/gen/` 的條件建立是原子的 | S3、R2、Azure、Ceph、MinIO：文件或原始碼（外部事實 11a、13）；GCS：generation-match 0；SFTP 的 hardlink、本機的 link：v3 已在用；B2、Wasabi：沒有文件。P0 每輪實測，但探針通過不代表每次都原子。rclone 橋接不是原子的（先 stat 再 rename），P0 依種類拒絕（實作第三段，第 15 項） |
 | LIST 在寫入與刪除之後一致 | AWS 有文件；MinIO 只在 xfs/zfs/btrfs（v3 已記）；其他後端：猜測 |
 | head 可見的延遲、E 的低估、snapshot PUT 的延遲合計小於 1 小時 | 猜測 |
 | 備份角色寫不了 `maint/`、`keys/`、`config` | S3：bucket policy（部署）；本機與 SFTP：與 v3 同樣的信任 |
-| `CLOCK_BOOTTIME` 計入休眠 | Linux 的 `clock_gettime(2)` man page；其他平台未查（UNVERIFIED） |
+| E 的單調時鐘計入休眠 | Linux 的 `CLOCK_BOOTTIME`：`clock_gettime(2)` man page；macOS 的 `CLOCK_MONOTONIC`：Apple 的 clock_gettime(3)；Windows 的 QueryPerformanceCounter：Microsoft〈Acquiring high-resolution time stamps〉（實作第七段之二查證；macOS 原本用的 `Instant` 是 `CLOCK_UPTIME_RAW`，休眠時不走，已改）。macOS 與 Windows 沒有在實機上休眠驗證 |
 | 真實目錄平均每項約 128 bytes | 量測（2026-10-10，兩個目錄共 36 476 項） |
 | mpack 8 MiB、資料 pack 64 MiB | 猜測，放在 head 的 settings，可以改 |
 | grace 72 小時、M 1 小時、探針容差 5 分鐘 | 沿用 v3 的 grace 與邊際；容差同 Kopia（外部事實 7c） |
 | 沿用前先驗證的成本可以接受 | 猜測：一群相似的機器，每台要下載一次別台寫的內容 |
 | 100 萬個 ID 的 map 約 40 MB | 估計（設計者 A） |
-| backup 記憶體裡的持有者表（`Map(g_s)` 的每一項 40 bytes 的索引，加上記錄本身每項約 60 bytes）100 萬個 ID 約 100 MB | 估計（實作第 4 段）。第 7 段量：100 萬檔的第一次 backup 峰值 326 MiB（A 集）／362 MiB（B 集），第二次 150／278 MiB；沒有單獨量持有者表 |
-| backup 記憶體不高於 v3、prune 150–250 MiB | 第 7 段量：backup 成立（A 集 326 MiB 對 v3 的 373–431 MiB）；**prune 估錯**：604–638 MiB，512 MiB 門檻下被殺（dhat 歸因見「實作第七段」） |
-| check 的成本：每一代的 head 讀兩份、讀取端那一代的分片全讀，走過的 ID 各記 32 bytes（目錄、清單、chunk 各一個集合） | 第 7 段量：100 萬個 chunk 的 repo `check` 6 秒、228 MiB；`--read-data` 16 秒、454 MiB（門檻內，剩 16 MiB） |
+| backup 記憶體裡的持有者表（`Map(g_s)` 的每一項 40 bytes 的索引，加上記錄本身每項約 60 bytes）100 萬個 ID 約 100 MB | 估計（實作第 4 段）。第 7 段量：100 萬檔的第一次 backup 峰值 326 MiB（A 集）／362 MiB（B 集），第二次 150／278 MiB；第七段之二（`b48e007`）264／314 MiB、143／285 MiB；沒有單獨量持有者表 |
+| backup 記憶體不高於 v3、prune 150–250 MiB | 第 7 段量：backup 成立（A 集 326 MiB 對 v3 的 373–431 MiB）；**prune 估錯**：604–638 MiB，512 MiB 門檻下被殺（dhat 歸因見「實作第七段」）。第七段之二修後（`668c02c`）：第一輪 233／236 MiB、之後 161／171 MiB，門檻內 |
+| check 的成本：每一代的 head 讀兩份、讀取端那一代的分片全讀，走過的 ID 各記 32 bytes（目錄、清單、chunk 各一個集合） | 第 7 段量：100 萬個 chunk 的 repo `check` 6 秒、228 MiB；`--read-data` 14 秒、473 MiB（門檻跑法 432／443 MiB）。第七段之二（`b48e007`）：`check` 229／240 MiB、`--read-data` 10 秒、441／436 MiB，門檻內 |
 | mount 第一次讀一個檔案時解析整個 chunk 清單（同 v3）就夠快 | 猜測；ChunkIndex 的 `size` 可以讓隨機讀只讀需要的段，沒做 |
 | 單一 PUT 的大小上限放得下一個 pack | AWS S3 的單一 PUT 最多 5 GB（官方文件，2026-10-11 查）。預設的 pack_target 64 MiB 遠低於它；pack_target 接近 4 GiB、chunk 又很小（avg 接近 256 bytes）時，trailer 可能讓 pack 超過，PUT 失敗而 backup 報錯，不會無聲出錯。其他 S3 相容服務未查 |
 
@@ -368,8 +368,9 @@ pack 排版、snapshot 是唯一的 commit point、先標記再刪的兩階段�
   10 個與 1000 個目錄都是 11 個請求（pack 還只在 delta 裡時，B4 讀一個 trailer：HEAD 加兩個 range），維護角色
   收錄進 map 之後 8 個（4 個 list、2 個 get、1 個 head、1 個 put）。v3 估計每個目錄約 4 個
   請求（設計者 B 讀碼）；M2 在 v2 時代量過 1 102 個目錄的沒變 backup：MinIO 35 秒，本機 0.8 秒。
-  **實測（第 7 段，MinIO，`mc admin trace`）**：prune 之前 9 個（6 GET、2 HEAD、1 PUT）、2.1 秒；prune 寫了新的一代
-  之後第一次 74 個（72 個 GET 是那一代的 72 片 map 分片第一次進本地快取）、之後 6 個（4 GET、1 HEAD、1 PUT）。
+  **實測（第 7 段，MinIO，`mc admin trace`；2026-10-19 更正，含 LIST）**：prune 之前 13 個（6 GET、2 HEAD、4 LIST、
+  1 PUT）、1.1 秒；prune 寫了新的一代之後第一次 76 個（70 GET：那一代的 66 片 map 分片第一次進本地快取，加每次都有的
+  4 個）、之後 10 個（4 GET、1 HEAD、4 LIST、1 PUT）。10-18 記的 9／74／6 漏數了 LIST（見「實作第七段之二」）。
 - **2000 個 root**：v4 是一個 root 清單，寫進一個 mpack。v3 是 2000 個樹物件，量測 10.96 秒。**實測（第 7 段）**：
   v4 0.23 秒（同樣的檔案放在一個目錄裡 0.17 秒）、1 個 mpack、24 次 fsync；20 000 個 root 1.01 秒（v3 162 秒）。
 - **還原**：合併 range GET 屬於 client 端的改動，與格式無關，v4 前後都可以做。
@@ -1056,10 +1057,13 @@ bench 的 backup／prune／check 是 `2e6b20b` 的程式碼（第 7 項之後的
   `prune`（第一輪，收錄 78 個 pack 進 map，不刪東西）1.0 s；之後 `check` 0.7 s、沒變的 backup 2.2 s 與 3.2 s；翻一個
   bit 之後 `check --read-data` 以非 0 結束並指名那個 pack；峰值 RSS 216 MiB（v3：157 s／35 s／213 s／2 s／28 s／
   242 MiB）。
-- 沒變的 backup 在真的 S3（MinIO）上的請求數（`mc admin trace --json` 數，依 API 分類）：pack 只在 delta 裡（prune 之前）9 個：6 GET（config、金鑰槽、head、parent snapshot…）、2 HEAD、1 PUT
-  （snapshot）；prune 寫了新的一代之後的第一次 74 個：其中 72 個 GET 是新一代的 72 個 map 分片第一次進本地快取
-  （78 個 pack 散在 256 片裡的 72 片；`mc admin trace` 的 path 逐一對過）；快取有這一代之後 6 個：4 GET、1 HEAD、
-  1 PUT。都與目錄數（1 102）無關；新一代的一次性成本上限是 256 片加 head。
+- 沒變的 backup 在真的 S3（MinIO）上的請求數（`mc admin trace --json` 數，依 API 分類）：**這一項的數字錯了，2026-10-19
+  更正**——計數只看 trace 的 path 裡有沒有 repo 的前綴，LIST 的 path 是 bucket 本身、前綴在 query，所以 4 個 LIST
+  都沒數到；原本寫的「74 個裡的 72 個 GET 是 72 片 map 分片、path 逐一對過」也不對：每次 backup 都有 config、金鑰槽、
+  head、parent snapshot 4 個 GET（10-19 的 trace 逐一看過），所以那一代是 68 片——由 72 減 4 推得，那一代的分片已經
+  不在、沒有數。原本記的是 prune 之前 9 個（6 GET、2 HEAD、1 PUT）、新的一代
+  第一次 74 個、之後 6 個；修正後重量的是 13／76／10（「實作第七段之二」）。都與目錄數（1 102）無關；新一代的一次性
+  成本上限是 256 片加 head。
   第 4 段在記憶體後端上數的是 11（收錄進 map 之後 8）；v2 時代同一份資料在 MinIO 上 35 秒。
 - V21（2000 個 root，`--files-from`，本機後端，release build，機器閒置）：2000 個 root 0.23 s（三次：0.34、0.23、0.23），同樣的檔案放在一個目錄裡 0.17 s；20 000 個 root
   1.01 s 對 0.69 s；兩種都是 1 個 pack、1 個 mpack（加 `.r1`）、1 個 delta；strace 數到 24 次 fsync。
@@ -1093,7 +1097,7 @@ bench 的 backup／prune／check 是 `2e6b20b` 的程式碼（第 7 項之後的
 **偏離建議的**：沒有。第 7 段清單裡「ChunkIndex 的跳段讀」（第五段延後的）沒有做：它是讀取端的最佳化、不改格式，
 第五段已記為「沒做」，這一段只量不改。
 
-**留給負責人的**：
+**留給負責人的**（2026-10-19 的決定與結果見下一節「實作第七段之二」）：
 - prune 與 restore 的記憶體：100 萬個 chunk 的 repo 上 prune 要 ~640 MiB，512 MiB 的 M5 門檻只訂給 backup，但 prune 在同一台
   小機器上跑的話一樣會被殺。看 dhat 的歸因，不改格式就能省掉大半：`canon` 與 `referenced` 改用 ID 表的列號（u32）而不是
   32 bytes 的 ID 當鍵（195＋68 → 約 10 MiB），並預先配置容量避免 rehash 的雙份；記錄集合只留一份（`base`、`map`、
@@ -1112,3 +1116,109 @@ kist-mount／kist-cli，與 kist-cli 單獨）乾淨；nextest 659 個通過、9
 advisories／bans／licenses／sources 都 ok。MinIO、SFTP、rclone、FUSE 全開的 nextest 在第 8 項的樹（`f24675b`）跑過：
 657 個全過；之後的程式碼改動只有第 10 項（讀取端）與第 11 項（init 的選項），它們的測試不需要環境變數。這份文件的
 commit 只有文件、驗收腳本與 GC 的 log。
+
+## 實作第七段之二：負責人的決定與後續（2026-10-19）
+
+**負責人的決定**（回第七段的「還有什麼疑問」）：「都做，如果需要改格式也可以」。逐項：prune 的記憶體——做；512 MiB 的
+門檻也訂給 prune 與 restore——是；restore 單一目錄 100 萬項——做；`init` 的四個選項（第七段第 11 項，為了 GC 驗收加的）
+——「都做」解讀為四個都留，沒有改動；`s3:if-none-match` 與 Linux 以外的 E——查證、能測的實測；第二次 backup 2.8 s
+對 v3 的 0.8 s——profile、找到原因就修。**格式沒有改**：每一項都在 client 端，golden-v4 與凍結的 v4 fixture（第七段
+第 7 項）的測試照過。
+
+**每一步**（一步一個 commit，gate 寫在 commit 訊息裡；編號接第七段）：
+- `8807849` 測試：`keep_daily_keeps_the_newest_of_each_day` 以「現在減 400 天」當起點、加幾個小時，保留政策以 UTC
+  分天，UTC 15 點之後就跨日——第十二步在 UTC 21 點（本地 05 點）跑 gate 時失敗（原碼也失敗），改從 UTC 零點起算。
+- `668c02c` 第十二步 prune 的記憶體：記錄只留一份（`Repo::load_map_records` 不建 ID 表、move 進 `map`）；基礎世代的
+  記錄集合換成 256 片明文的 BLAKE3（`Shard::encode_borrowed` 借用記錄編碼，bytes 與 `encode` 相同）；P5 建一次位置
+  索引（每個項目一列、依 (ID, §10 的順序) 排好，dead／referenced／canon 三張依 (記錄, 項目) 的 bool 表），取代以 32
+  bytes 的 ID 當鍵的 `referenced` 與 `canon` 兩張 HashMap 與每個階段各 clone 一份記錄集合建的 `MapView`；不實的項目
+  先標 dead、P8 之前才移除（索引的位置才一直有效）；repack 一項一項打開寫進新 pack。
+- `479871b` 第十三步 restore 一段一段讀目錄：`Reader::dir_segments`／`segment_entries`，root 的落點、`restore_dir`、
+  dry run 的 `plan_children` 都改成一段一段取（§7 一段最多 2 MiB 的 CBOR）。
+- `a5118b7` 第十四步 macOS 上 E 的單調時鐘改用 `CLOCK_MONOTONIC`。查證：安裝的 std 原始碼的平台表——Darwin 的
+  `Instant` 是 `CLOCK_UPTIME_RAW`、Windows 是 QueryPerformanceCounter；Apple 的 clock_gettime(3)：`CLOCK_UPTIME_RAW`
+  「does not increment while the system is asleep」、`CLOCK_MONOTONIC`「will continue to increment while the system is
+  asleep」；Microsoft〈Acquiring high-resolution time stamps〉：QPC「including the time when the machine was in a sleep
+  state such as standby, hibernate, or connected standby」。所以 macOS 原本的那一半在休眠時停住（牆鐘同時被往回調才
+  會少算），Windows 本來就對。兩個 macOS 目標的 `cargo-zigbuild check` 過，探針（macOS 分支換成不存在的 ClockId）證明
+  編到的是那個分支。
+- `3131598` 第十五步 `s3:if-none-match`：AWS 的寫法（`"Null": {"s3:if-none-match": "false"}`）在 MinIO
+  RELEASE.2025-09-07 上 `mc admin policy create` 回「invalid condition key 's3:if-none-match'」——MinIO 上只能靠前綴與
+  沒有 Delete，覆寫同名物件擋不住。minio-setup.sh 試建 kistcond、建不起來就不 export；新測試在支援的 S3 上才跑。
+- `4c06772` 第十六步 沒變的 backup：`try_reuse` 每個檔案一次 `spawn_blocking` 的來回（只為了候選不可信時要
+  `block_on` 取回驗證），改成先在 async 端以 `Dedup::decide_cached` 判斷，回 `NeedFetch` 才換執行緒。
+- `b48e007` 第十七步 本機來源每個條目只 lstat 一次：`SortedItems::posix()` 交出列舉時同一次 lstat 的 metadata
+  （SourceItem 不加欄位：遠端來源的清單常駐記憶體）。
+- 這份文件的 commit：ADR、README、PLAN、`bench/memory/README.md`、`tests/acceptance`（`run_s3.py` 的 LIST 計數、
+  10-19 的 M1／M2 log、README）。
+
+**量測**（release build、同一台機器；binary 都是 `b48e007`，`~/kist-acceptance-m1/kist-b48e007`）：
+- 記憶體 bench（`bench/memory/run-v4.sh` 一次跑完兩個測試集，log `~/kist-bench/run-v4-2026-10-19.log`；數字是量測跑法的
+  `sampled_max_ex_file_slab`，括號是 512 MiB 門檻跑法的同一個數字）：
+
+  | 命令 | A 集（1000 dir × 1000 檔） | B 集（單一平面 1M 檔） |
+  | --- | --- | --- |
+  | backup，第一次 | 264 MiB（292），54 s | 314 MiB（394），63 s |
+  | backup，第二次（快速路徑） | 143 MiB（149），12 s | 285 MiB（285），20 s |
+  | prune，第一輪（收錄全部 pack）／第二輪；門檻跑法是第三輪 | 233／161 MiB（159），7／6 s | 236／171 MiB（168），6／5 s |
+  | `check` | 229 MiB（230），6 s | 240 MiB（271），5 s |
+  | `check --read-data` | 441 MiB（440），10 s | 436 MiB（432），10 s |
+  | `restore latest` | 151 MiB（156），79 s | 151 MiB（161），98 s |
+
+  26 次全部 exit 0、沒有 OOM。
+
+  修之前：prune A 676 MiB（`9acbafb`，10-19 修改之前在同一個 repo 上量的基準）、B 587–638 MiB（第七段，`2e6b20b`），
+  門檻下都被殺；restore B 529 MiB（`9acbafb`，10-19 的基準），門檻下被殺。
+- 沒變的 backup（M1 的資料集、另建的 repo、同樣的 backup 連跑，取第一次之後的——第一次較慢，1.5–2.3 s；user＋sys ≈
+  wall，CPU 綁住；計數是 `strace -f -c`，第一列的計數是 `9acbafb` 的 binary 量的，它與 `3131598` 之間只有 prune、restore
+  與時鐘的改動，不碰走訪；perf 在 `perf_event_paranoid=2` 下只取得到 user 的樣本）：
+
+  | 樹 | wall | user | sys | futex | statx |
+  | --- | --- | --- | --- | --- | --- |
+  | 第十五步（`3131598`） | 1.77 s | 1.05 s | 0.75 s | 421 132 | 202 288 |
+  | 第十六步（`4c06772`） | 1.15 s | 0.72 s | 0.41 s | 9 374 | 202 342 |
+  | 第十七步（`b48e007`） | 0.92 s | 0.57 s | 0.34 s | 9 249 | 101 272 |
+
+  report 三次都一樣（files_reused 100 000、subtrees 1 102、chunks_new 0、verified 0）。第十七步之後剩下的 user time（perf 的 user 樣本，line-tables 的 release build）：parent 樹的 CBOR 解碼約 24%、`Deltas::holders`（B2 每個 chunk 查持有者；這個 repo 沒有 prune 過，pack 還只在 delta 裡）14%、libc 的複製約 10%、argon2（開 repo 的 KDF）9%——沒有單一的大項。
+- M1 重跑（`run.py`，`tests/acceptance/m1-acceptance-v4-2026-10-19.log`，與 10-18 同一份腳本與順序）：第一次 backup
+  33 s（10-18 是 57 s；來源這次在 page cache 裡，不歸因於程式）、**第二次 backup 1.1 s**（10-18 是 2.8 s，v3 0.8 s）、
+  restore 31 s、`check` 0.7 s、`check --read-data` 17.4 s、峰值 RSS 192 MiB。
+- M2 重跑（`run_s3.py`，`tests/acceptance/m2-acceptance-s3-v4-2026-10-19.log`）：第一次 backup 30 s、第二次 1.1 s、
+  restore 88 s（同一天前一次 99 s）、`check` 0.5 s、`check --read-data` 9.5 s、prune 0.7 s、峰值 RSS 188 MiB。沒變的
+  backup 的請求數（含 LIST）：prune 之前 13 個（6 GET、2 HEAD、4 LIST、1 PUT）；prune 寫了新的一代之後第一次 76 個（70
+  GET：66 片 map 分片第一次進本地快取，加每次都有的 config、金鑰槽、head、parent snapshot；1 HEAD、4 LIST、1 PUT；分片數
+  另以 `mc ls` 數過）；快取有了之後 10 個（4 GET、1 HEAD、4 LIST、1 PUT）。4 個 LIST 是 B1 的 head 與 delta、找 parent
+  的自己的 snapshot、B4 的 head。
+
+**找到的**：
+- 第七段自己的量測錯誤：`run_s3.py` 漏數 LIST（LIST 的 trace 記錄裡 path 是 bucket，前綴在 query），第七段的 9／74／6
+  都少了 4 個；「74 個裡的 72 個 GET 是 72 片分片、path 逐一對過」也不對（那一代由 72 減 4 推得是 68 片）。成本一節與第七段
+  的量測一節已就地更正。
+- 實作的問題：prune 與 restore 的記憶體（第七段量到、這裡修）；macOS 上 E 的單調時鐘休眠時停住（查證找到）；沒變的
+  backup 每個檔案一次執行緒的來回（profile 找到；v3 也是每個條目兩次 lstat、一次 llistxattr，差在這個來回）。
+- 測試的問題：`keep_daily` 的測試依當下的時刻。
+
+**剩下的**：
+- `check --read-data` 是現在離 512 MiB 門檻最近的命令：這一輪量測 441／436 MiB、門檻跑法 440／432 MiB（第十三步那一輪
+  量到的 B 集門檻跑法是 464 MiB）。dhat 的歸因在第七段（正在驗的 pack 在記憶體裡兩份、走過的 chunk ID 的 HashSet、
+  map 分片解碼與記錄的 clone）；負責人的決定沒有包含它，沒改。
+- mount 的 opendir 對單一目錄仍整份解碼（`Reader::entries`，FUSE 的 readdir 以 handle 保存整份清單才能依 offset 續讀）；
+  單一目錄 100 萬項的 mount 沒有量（UNVERIFIED）。
+- 每個條目一次 llistxattr（10 萬檔 101 100 次，v3 也是）：快速路徑可以沿用 parent 的 xattr，前提是「改 xattr 一定改
+  ctime」——Linux 的本機檔案系統的 setxattr 會更新 ctime，macOS 沒有查證；第十七步拿掉同樣多的 statx 省了 0.23 s，
+  這一項的量級應該相近（沒有量）。多一個沒驗證的前提換不到與 v3 對等以外的東西，沒做。
+- macOS 與 Windows 的 E 依據是廠商文件，沒有在實機上休眠驗證（UNVERIFIED，環境：沒有那兩種機器）。
+- `s3_conditional_write_policy_blocks_plain_puts` 沒有在支援這個條件的 S3 上跑過（UNVERIFIED，環境）。
+- restore 對 S3 比本機慢（88 s 對 31 s），沒有 profile。
+- 沒有 push（等明確的指示）。
+
+**gate**（這份文件的 commit 之前在最終的樹上，第一手）：程式碼的最終樹是 `b48e007`：fmt、clippy、windows-gnu clippy（cargo-zigbuild，workspace 不含 kist-mount／kist-cli，與
+kist-cli 單獨）乾淨；MinIO、SFTP、rclone、FUSE 全開（四個 setup 腳本 export 了 14 個 `KIST_TEST_` 變數）的 nextest 664 個
+通過、9 個略過（`#[ignore]` 的）。env 沒設的測試會提早 return、照樣算通過，所以 SFTP、rclone、FUSE 的那幾個另外帶輸出
+重跑：`sftp_v4_backup_round_trips`、`rclone_v4_backup_round_trips`、`rclone_bridge_meets_the_v4_contract`、kist-cli 的
+`mount_round_trip` 與 `one_file_system_keeps_mount_points_empty`、kist-mount 的
+`snapshots_written_after_mounting_are_readable` 都真的跑了（1.2–13.9 s，沒有略過的訊息）；
+`s3_conditional_write_policy_blocks_plain_puts` 照設計略過。`cargo deny check` 的 advisories／bans／licenses／sources
+都 ok。這份文件的 commit 只有文件、`tests/acceptance/run_s3.py` 與 10-19 的 M1／M2 log。setup 腳本的雜訊（第七段之前
+就有、無害、沒改）：`rclone-setup.sh` 與 `fuse-setup.sh` 把 `rclone version`、`fusermount3 --version` 印到 stdout，
+被 `eval` 當成命令跑（`unknown command "v1.75.2"`、`fusermount3: extra arguments after the mountpoint`）。

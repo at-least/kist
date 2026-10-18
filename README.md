@@ -457,45 +457,48 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 格式規格：[docs/format-v4.md](docs/format-v4.md)（v3 的 `docs/format.md` 已刪，`git show 0b3d425:docs/format.md`
 取回）。設計決策：[docs/decisions/](docs/decisions/)。
 
-## 驗收數據（v4，2026-10-18）
+## 驗收數據（v4，2026-10-18／19）
 
 同一台機器（Ryzen 7 7700、NVMe/ext4）、與 v3 時代同一份資料集（100 000 個檔案、9.75 GiB，一半亂數一半可壓縮，
-`tests/acceptance/gen.py`）、release build（程式碼是 `2e6b20b`；之後的 `55f8e56` 只少了 restore 的記憶體，不影響這裡的
-時間）。腳本與完整 log 在 `tests/acceptance/`
-（`*-v4-2026-10-18.log`）；100 萬檔的記憶體 bench 在 `bench/memory/README.md`（v4 的 prune 與單一平面目錄的
-restore 超過 512 MiB 門檻，見該處與 ADR 026「實作第七段」）。對照欄是下一節 v3 時代的數字。
+`tests/acceptance/gen.py`）、release build。M1 與 M2 的表是 2026-10-19 以 `b48e007`（沒變的 backup 不再每個檔案換一次
+執行緒、每個條目只 lstat 一次之後）重跑的，log 是 `tests/acceptance/*-v4-2026-10-19.log`；10-18 以 `2e6b20b` 跑的
+`*-v4-2026-10-18.log` 也留著。M3 的 GC 是 10-18 以 `9acbafb` 跑的。100 萬檔的記憶體 bench 在 `bench/memory/README.md`：
+backup、prune、check、restore 在兩個 100 萬檔的測試集上都在 512 MiB 門檻內（2026-10-19，`b48e007`；prune 與單一平面
+目錄的 restore 原本超過，那天修掉，見該處與 ADR 026「實作第七段之二」），最高的是 `check --read-data`（441 MiB）。對照欄是下一節 v3 時代的數字。
 
 ### M1（本機目錄後端）
 
 | 項目 | v4 | v3（2026-09-05） |
 | --- | --- | --- |
-| 第一次 backup | 57 s；77 個 pack、2 個 mpack 物件（repo 4.90 GiB） | 54 s；77 個 pack |
-| 第二次 backup（內容未變） | 2.8 s；**0 個新 pack、0 個新 chunk、0 個新 mpack**（`--json`：100 000 個檔案全走快速路徑，1 102 個目錄全沿用 parent 的子樹） | 0.8 s |
-| restore | 30 s；`diff -r` **完全相同** | 41 s |
+| 第一次 backup | 33 s；77 個 pack、2 個 mpack 物件（repo 4.90 GiB）。10-18 是 57 s；這次來源在 page cache 裡（前面在同一份資料上量過幾次），差距不歸因於程式 | 54 s；77 個 pack |
+| 第二次 backup（內容未變） | **1.1 s**；**0 個新 pack、0 個新 chunk、0 個新 mpack**（100 000 個檔案全走快速路徑，1 102 個目錄全沿用 parent 的子樹）。10-18 是 2.8 s：每個檔案一次執行緒的來回與兩次 lstat（ADR 026「實作第七段之二」） | 0.8 s |
+| restore | 31 s；`diff -r` **完全相同** | 41 s |
 | `check` | 0.7 s | 0.3 s |
-| `check --read-data` | 20.5 s | 17 s |
+| `check --read-data` | 17.4 s | 17 s |
 | 人為翻轉 pack 中一個 bit | `check --read-data` 以非 0 結束並指名該 pack | 同 |
-| 峰值 RSS（backup 期間） | 236 MiB | 186 MiB |
+| 峰值 RSS（backup 期間） | 192 MiB | 186 MiB |
 
 ### M2（S3 / MinIO）
 
 repo 放在本機 Docker 裡的 MinIO（`minio/minio:RELEASE.2025-09-07`，HTTP），腳本 `tests/acceptance/run_s3.py`；
-請求數由容器內的 `mc admin trace --json` 數、依 API 分類。
+請求數由容器內的 `mc admin trace --json` 數、依 API 分類，含 LIST（10-18 記的 9／74／6 漏數了 LIST：trace 裡 LIST 的
+path 是 bucket 本身、repo 的前綴在 query，10-19 修正）。
 
 | 項目 | v4 | v3 |
 | --- | --- | --- |
-| 第一次 backup | 42 s；77 個 pack、1 個 mpack 物件（S3 上 mpack 預設不寫 `.r1`） | 157 s |
-| 第二次 backup（內容未變，pack 還只在 delta 裡） | 2.1 s；0 個新 pack；**9 個 S3 請求**（6 GET、2 HEAD、1 PUT） | 35 s（每次重新 put 1 102 個 tree） |
-| restore | 121 s；`diff -r` **完全相同** | 213 s |
+| 第一次 backup | 30 s；77 個 pack、1 個 mpack 物件（S3 上 mpack 預設不寫 `.r1`） | 157 s |
+| 第二次 backup（內容未變，pack 還只在 delta 裡） | 1.1 s；0 個新 pack；**13 個 S3 請求**（6 GET、2 HEAD、4 LIST、1 PUT） | 35 s（每次重新 put 1 102 個 tree） |
+| restore | 88 s；`diff -r` **完全相同** | 213 s |
 | `check` | 0.5 s | 2 s |
-| `check --read-data` | 12.8 s | 28 s |
-| `prune` 第一輪（收錄 78 個 pack 進 map，不刪東西） | 1.0 s；之後 `check` 0.7 s | `rebuild-index` 0.4 s |
-| 收錄進 map 之後、內容未變的 backup | 新的一代第一次 74 個請求（其中 72 個 GET 是那一代的 72 個 map 分片第一次進本地快取）；快取有了之後 **6 個**（4 GET、1 HEAD、1 PUT） | — |
+| `check --read-data` | 9.5 s | 28 s |
+| `prune` 第一輪（收錄 78 個 pack 進 map，不刪東西） | 0.7 s；之後 `check` 0.5 s | `rebuild-index` 0.4 s |
+| 收錄進 map 之後、內容未變的 backup | 新的一代第一次 76 個請求（70 GET：那一代的 66 片 map 分片第一次進本地快取，加每次都有的 config、金鑰槽、head、parent snapshot；1 HEAD、4 LIST、1 PUT）；快取有了之後 **10 個**（4 GET、1 HEAD、4 LIST、1 PUT） | — |
 | 人為翻轉 pack 中一個 bit（透過 `mc` 上傳） | `check --read-data` 以非 0 結束並指名該 pack | 同 |
-| 峰值 RSS（backup 期間） | 216 MiB | 242 MiB |
+| 峰值 RSS（backup 期間） | 188 MiB | 242 MiB |
 
-內容未變的 backup 的請求數與目錄數無關；新的一代的一次性成本上限是 256 片分片加 head。restore 對 S3 仍比本機慢
-（121 s 對 30 s），差距的原因沒有 profile（UNVERIFIED）。
+內容未變的 backup 的請求數與目錄數無關；新的一代的一次性成本上限是 256 片分片加 head。4 個 LIST 是 B1 的 head 與
+delta、找 parent 的自己的 snapshot、B4 的 head。restore 對 S3 仍比本機慢（88 s 對 31 s；10-19 的前一次跑是 99 s），差距
+的原因沒有 profile（UNVERIFIED）。
 
 ### M3（GC，真實時鐘）
 

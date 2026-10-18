@@ -434,7 +434,7 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
   455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
-## M12：v4 格式（2026-10-10 設計已確認；第 1–6 段完成 2026-10-11，第 7 段完成 2026-10-18）
+## M12：v4 格式（2026-10-10 設計已確認；第 1–6 段完成 2026-10-11，第 7 段完成 2026-10-18，負責人的後續決定 2026-10-19 完成）
 
 起因：ADR 017 的 v4 草稿，加上 ADR 025 留下要改格式的 V19、V21。負責人說明系統還沒上線、相容性
 不重要、不需要支援上一代。第一版草稿（`054c7e1`，v3 加樹進 pack）負責人要求重新設計。
@@ -495,6 +495,13 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
      （587–638 MiB；v3 的 dry run 也是 550 MiB）、**restore 單一目錄 100 萬項也超過**（538 MiB：整個目錄一次解進
      記憶體）；backup、check 都在門檻內。兩個都有 dhat 歸因與修法的估計，要不要做留給負責人（ADR 026「留給負責人
      的」）。沒有 push。
+  8. 負責人的後續決定——**完成**（2026-10-19，負責人：「都做，如果需要改格式也可以」；格式沒有改，`8807849`…這份
+     文件的 commit）：prune 的記憶體（記錄只留一份、以位置索引取代以 ID 當鍵的 HashMap：100 萬個 chunk 676 → 161 MiB、收錄全部 pack 的第一輪 233 MiB，
+     門檻內）；restore 一段一段讀目錄（單一目錄 100 萬項 529 → 151 MiB，門檻內）；512 MiB 的門檻也訂給 prune 與
+     restore；macOS 上 E 的單調時鐘改用 `CLOCK_MONOTONIC`（`Instant` 在 macOS 休眠時不走；Windows 的 QPC 計入休眠，
+     依廠商文件，沒有實機驗證）；`s3:if-none-match` 的政策條件在 MinIO 上不支援（實測）；沒變的 backup 不再每個檔案
+     換一次執行緒、每個條目只 lstat 一次（M1 的第二次 backup 2.8 → 1.1 s，v3 0.8 s）；`init` 的四個選項留著。量測也
+     抓到第七段自己的錯：M2 的請求數漏了 LIST（更正為 13／76／10）。見 ADR 026「實作第七段之二」。沒有 push。
 
 ## 已接受的限制（非待辦）
 

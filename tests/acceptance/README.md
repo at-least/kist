@@ -10,11 +10,14 @@ python3 -u run.py /path/to/kist      # backup → 第二次 backup（0 個新 pa
 ```
 
 S3 版：先 `eval "$(sh tests/minio-setup.sh)"` 起 MinIO，再 `python3 -u run_s3.py /path/to/kist`
-（物件計數與破壞 pack 都經由容器內的 `mc`；第二次 backup 與 `rebuild` 之後再一次沒變的 backup 都包在
-`mc admin trace --json` 裡數 S3 請求，依 API 分類印出）。
+（物件計數與破壞 pack 都經由容器內的 `mc`；第二次 backup、`prune` 收錄進 map 之後的兩次沒變的 backup 都包在
+`mc admin trace --json` 裡數 S3 請求，依 API 分類印出。LIST 的 trace 記錄裡 path 是 bucket 本身、repo 的前綴在
+query 的 `prefix`，計數兩個都看；2026-10-19 之前只看 path，漏了 LIST）。
 
 `run.py` 每一步都有斷言，任何一步失敗就非 0 結束。`rss.py` 可以單獨包住一個命令量它的峰值 RSS。
-`m1-acceptance-2026-09-04.log` 是 M1 驗收當天的完整輸出；`m1-acceptance-2026-09-05.log` 是審查修正後（commit `26637f0`）的重跑；`m2-acceptance-s3-2026-09-05.log` 是 M2 對 MinIO 的驗收。
+`m1-acceptance-2026-09-04.log` 是 M1 驗收當天的完整輸出；`m1-acceptance-2026-09-05.log` 是審查修正後（commit `26637f0`）的重跑；`m2-acceptance-s3-2026-09-05.log` 是 M2 對 MinIO 的驗收（以上 v3）。
+v4：`m1-acceptance-v4-2026-10-18.log`、`m2-acceptance-s3-v4-2026-10-18.log` 是 `2e6b20b`（後者的請求數漏了 LIST）；
+`m1-acceptance-v4-2026-10-19.log`、`m2-acceptance-s3-v4-2026-10-19.log` 是 `b48e007`（沒變的 backup 加速之後；LIST 有數）。
 
 M3（GC）：`python3 -u run_gc.py /path/to/kist` —— `init --grace 2h`（v4 的 grace 最低 2 小時、沒有 `--grace 0s`；
 要在 init 給：init 之後再調低是排空，72 小時內的標記都照 72 小時算）→ backup → 刪掉一成的目錄再 backup → forget 舊的
