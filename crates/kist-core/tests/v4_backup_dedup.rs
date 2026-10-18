@@ -71,6 +71,49 @@ async fn another_clients_copy_is_verified_once_and_then_trusted_from_the_cache()
     assert!(third.report.verified > 0, "{:?}", third.report);
 }
 
+/// 快速路徑的 B2（第 7 段第十六步：可信的候選在 async 端判斷，不可信的才換到 blocking 執行緒取回驗證）：沒變的
+/// 檔案，chunk 只在別台的 pack 裡、這台又沒有快取記得驗證過——第一個候選不可信，要先取回驗證；之後照常沿用、
+/// 不重讀內容，snapshot 還原得出來。
+#[tokio::test]
+async fn an_unchanged_file_held_only_by_another_client_is_verified_on_the_fast_path() {
+    let h = HookedRepo::new(init_options(0)).await;
+    let mine = h.open_as("c1").await;
+    mine.backup(&[copy_of_sample(&h, "one")], opts(1))
+        .await
+        .unwrap();
+    // client 2 第一次：同樣的內容，沿用 client 1 的副本（新來源，走切塊的路徑）
+    let src = copy_of_sample(&h, "two");
+    let theirs = h.open_as("c2").await;
+    let first = theirs
+        .backup(std::slice::from_ref(&src), opts(2))
+        .await
+        .unwrap();
+    assert_eq!(first.report.chunks_new, 0, "{:?}", first.report);
+    // 沒有快取的 client 2、同一個來源：parent 是上一次，每個檔案走快速路徑，候選全是 client 1 的 pack
+    let forgetful = kist_core::v4::Repo::open(h.backend.clone(), PASSWORD, None)
+        .await
+        .unwrap();
+    let second = forgetful
+        .backup(std::slice::from_ref(&src), opts(2))
+        .await
+        .unwrap();
+    let r = &second.report;
+    assert_eq!(second.parent.as_deref(), Some(first.snapshot.as_str()));
+    assert_eq!(
+        r.files_reused, second.stats.files,
+        "every file is reused on the fast path, none is read again: {r:?}"
+    );
+    assert!(
+        r.verified > 0,
+        "the other client's copies were fetched and verified: {r:?}"
+    );
+    assert_eq!((r.chunks_new, r.packs_new), (0, 0), "{r:?}");
+    assert!(read_tree(&forgetful, &second.snapshot)
+        .await
+        .values()
+        .any(|n| *n == Node::File(data("big", 300 * 1024))));
+}
+
 /// B2：取回驗證失敗的副本不沿用，這台 client 自己重寫一份；還原讀到的是自己這份。
 #[tokio::test]
 async fn a_copy_that_fails_verification_is_not_reused() {

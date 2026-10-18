@@ -435,7 +435,29 @@ struct Dedup {
     verified: u64,
 }
 
+/// [`Dedup::decide_cached`] 判斷不了：第一個候選不可信，要取回驗證（只能在 blocking 執行緒上做）。
+struct NeedFetch;
+
 impl Dedup {
+    /// 不取回就判斷得了的 B2（async 端也能用）：這次寫過、沒有候選、第一個候選可信——與 [`Dedup::decide`] 的結果
+    /// 相同；第一個候選不可信時 `decide` 會先取回它驗證，這裡回 [`NeedFetch`]。
+    fn decide_cached(&self, id: ItemId, kind: Kind) -> std::result::Result<Decision, NeedFetch> {
+        if self.written.contains(&id) {
+            return Ok(Decision::InRun);
+        }
+        match self
+            .reader
+            .state
+            .reuse_candidates(&id, kind)
+            .into_iter()
+            .next()
+        {
+            None => Ok(Decision::Write),
+            Some(h) if self.reader.trusted(&id, &h) => Ok(Decision::Reuse(h)),
+            Some(_) => Err(NeedFetch),
+        }
+    }
+
     fn decide(&mut self, id: ItemId, kind: Kind) -> Decision {
         if self.written.contains(&id) {
             return Decision::InRun;
@@ -476,6 +498,38 @@ struct Work {
 }
 
 impl Work {
+    /// 快速路徑的一個檔案照 B2 判斷內容（`decide` 是取回驗證的 [`Dedup::decide`] 或不取回的
+    /// [`Dedup::decide_cached`]）：`ct=0` 每個 chunk 都要能沿用；`ct=1` 只判斷清單的根（沿用 parent 的子樹）。
+    /// `Ok(None)` 是不能沿用（重讀）；`Ok(Some((used, subtree)))` 是沿用。
+    fn reuse_file<E>(
+        &mut self,
+        c: &FileContent,
+        mut decide: impl FnMut(&mut Dedup, ItemId, Kind) -> std::result::Result<Decision, E>,
+    ) -> std::result::Result<Option<(Used, bool)>, E> {
+        let mut used = Used::new();
+        if c.ct == content_type::DIRECT {
+            for id in &c.chunks {
+                match decide(&mut self.dedup, *id, Kind::Data)? {
+                    Decision::InRun => {}
+                    Decision::Reuse(h) => used.push((*id, self.packs.intern(&h))),
+                    Decision::Write => return Ok(None),
+                }
+            }
+            return Ok(Some((used, false)));
+        }
+        let Some(id) = c.chunks.first() else {
+            return Ok(None);
+        };
+        Ok(match decide(&mut self.dedup, *id, Kind::Meta)? {
+            Decision::InRun => Some((used, false)),
+            Decision::Reuse(h) => {
+                used.push((*id, self.packs.intern(&h)));
+                Some((used, true))
+            }
+            Decision::Write => None,
+        })
+    }
+
     /// 照 B2 放一批 metadata item：沿用的記進 `used`，要寫的加進 mpack。回傳每一項的結果與寫滿的 mpack。
     fn place(
         &mut self,
@@ -1712,42 +1766,30 @@ impl Walk {
             ct: pe.ct,
             chunks: pe.chunks.clone(),
         };
-        let mut work = self.take_work()?;
-        let check = content.clone();
-        let (work, decided) = blocking(move || {
-            let mut used = Used::new();
-            let mut subtree = false;
-            let ok = if check.ct == content_type::DIRECT {
-                check
-                    .chunks
-                    .iter()
-                    .all(|id| match work.dedup.decide(*id, Kind::Data) {
-                        Decision::InRun => true,
-                        Decision::Reuse(h) => {
-                            used.push((*id, work.packs.intern(&h)));
-                            true
-                        }
-                        Decision::Write => false,
-                    })
-            } else {
-                match check
-                    .chunks
-                    .first()
-                    .map(|id| (*id, work.dedup.decide(*id, Kind::Meta)))
-                {
-                    Some((_, Decision::InRun)) => true,
-                    Some((id, Decision::Reuse(h))) => {
-                        used.push((id, work.packs.intern(&h)));
-                        subtree = true;
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            Ok((work, ok.then_some((used, subtree))))
-        })
-        .await?;
-        self.work = Some(work);
+        // 不必取回驗證（候選是自己的或 prune 的 pack、這次寫過、沒有候選）就在 async 端判斷：每個檔案一次
+        // spawn_blocking 的來回在 10 萬個沒變的檔案上是 42 萬次 futex、大半的 system time（第 7 段第十六步）。
+        // 要取回驗證才換到 blocking 執行緒（`block_on` 等後端），從頭再判斷一次。
+        let fast = self
+            .work
+            .as_mut()
+            .ok_or_else(|| CoreError::Join("backup state missing".into()))?
+            .reuse_file(&content, |d, id, kind| d.decide_cached(id, kind));
+        let decided = match fast {
+            Ok(decided) => decided,
+            Err(NeedFetch) => {
+                let mut work = self.take_work()?;
+                let check = content.clone();
+                let (work, decided) = blocking(move || {
+                    let Ok(decided) = work.reuse_file(&check, |d, id, kind| {
+                        Ok::<_, std::convert::Infallible>(d.decide(id, kind))
+                    });
+                    Ok((work, decided))
+                })
+                .await?;
+                self.work = Some(work);
+                decided
+            }
+        };
         let Some((used, subtree)) = decided else {
             return Ok(None);
         };
