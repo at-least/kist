@@ -1134,7 +1134,8 @@ commit 只有文件、驗收腳本與 GC 的 log。
   bytes 的 ID 當鍵的 `referenced` 與 `canon` 兩張 HashMap 與每個階段各 clone 一份記錄集合建的 `MapView`；不實的項目
   先標 dead、P8 之前才移除（索引的位置才一直有效）；repack 一項一項打開寫進新 pack。
 - `479871b` 第十三步 restore 一段一段讀目錄：`Reader::dir_segments`／`segment_entries`，root 的落點、`restore_dir`、
-  dry run 的 `plan_children` 都改成一段一段取（§7 一段最多 2 MiB 的 CBOR）。
+  dry run 的 `plan_children` 都改成一段一段取（§7 一段最多 2 MiB 的 CBOR）。它的 commit 訊息說「某一段讀不了與原本
+  整份讀不了一樣」，不對——見第十八步。
 - `a5118b7` 第十四步 macOS 上 E 的單調時鐘改用 `CLOCK_MONOTONIC`。查證：安裝的 std 原始碼的平台表——Darwin 的
   `Instant` 是 `CLOCK_UPTIME_RAW`、Windows 是 QueryPerformanceCounter；Apple 的 clock_gettime(3)：`CLOCK_UPTIME_RAW`
   「does not increment while the system is asleep」、`CLOCK_MONOTONIC`「will continue to increment while the system is
@@ -1149,10 +1150,18 @@ commit 只有文件、驗收腳本與 GC 的 log。
   `block_on` 取回驗證），改成先在 async 端以 `Dedup::decide_cached` 判斷，回 `NeedFetch` 才換執行緒。
 - `b48e007` 第十七步 本機來源每個條目只 lstat 一次：`SortedItems::posix()` 交出列舉時同一次 lstat 的 metadata
   （SourceItem 不加欄位：遠端來源的清單常駐記憶體）。
-- 這份文件的 commit：ADR、README、PLAN、`bench/memory/README.md`、`tests/acceptance`（`run_s3.py` 的 LIST 計數、
-  10-19 的 M1／M2 log、README）。
+- `728532c` 文件：ADR、README、PLAN、`bench/memory/README.md`、`tests/acceptance`（`run_s3.py` 的 LIST 計數、10-19 的
+  M1／M2 log、README）。
+- `8430af6` 第十八步 第十三步的回歸（審查在文件之後抓到）：`restore_dir` 的 `segments.next(...).await?` 在走訪的迴圈裡，
+  第一段之後的某一段讀不了時，在前面的子項目寫了之後 return——既有的唯讀目錄已被暫時加上擁有者寫入權，收尾沒跑，
+  目錄留成可寫（原本整份 `entries()` 在寫任何子項目之前就讀完，沒有這個路徑）。改成停止讀、照常收尾、最後回錯。先紅
+  後綠：唯讀的多段目錄還原兩次、第二次讓第二段的 mpack 讀兩次都失敗，原碼的 mode 是 0o755、改後回到 0o555。最上層
+  （root 的落點）同樣的 `?` 不放寬權限（落點沒有 metadata），但現在是寫了一部分之後整個 restore 回錯（原本是寫任何
+  東西之前）。
+- 這一節的更新（第十八步、gate）：這份文件的下一個 commit。
 
-**量測**（release build、同一台機器；binary 都是 `b48e007`，`~/kist-acceptance-m1/kist-b48e007`）：
+**量測**（release build、同一台機器；binary 都是 `b48e007`，`~/kist-acceptance-m1/kist-b48e007`；之後的 `8430af6` 只改了
+讀不了某一段時的錯誤路徑，沒有重量）：
 - 記憶體 bench（`bench/memory/run-v4.sh` 一次跑完兩個測試集，log `~/kist-bench/run-v4-2026-10-19.log`；數字是量測跑法的
   `sampled_max_ex_file_slab`，括號是 512 MiB 門檻跑法的同一個數字）：
 
@@ -1196,6 +1205,7 @@ commit 只有文件、驗收腳本與 GC 的 log。
   的量測一節已就地更正。
 - 實作的問題：prune 與 restore 的記憶體（第七段量到、這裡修）；macOS 上 E 的單調時鐘休眠時停住（查證找到）；沒變的
   backup 每個檔案一次執行緒的來回（profile 找到；v3 也是每個條目兩次 lstat、一次 llistxattr，差在這個來回）。
+- 我在第十三步自己引入的回歸：讀不了目錄的某一段時唯讀目錄留成可寫（審查抓到，第十八步修）。
 - 測試的問題：`keep_daily` 的測試依當下的時刻。
 
 **剩下的**：
@@ -1212,13 +1222,15 @@ commit 只有文件、驗收腳本與 GC 的 log。
 - restore 對 S3 比本機慢（88 s 對 31 s），沒有 profile。
 - 沒有 push（等明確的指示）。
 
-**gate**（這份文件的 commit 之前在最終的樹上，第一手）：程式碼的最終樹是 `b48e007`：fmt、clippy、windows-gnu clippy（cargo-zigbuild，workspace 不含 kist-mount／kist-cli，與
+**gate**（第一手）：程式碼的最終樹是 `8430af6`（第十八步）：fmt、clippy、windows-gnu clippy 乾淨，nextest 665 個通過、
+9 個略過（沒設整合的環境變數；第十八步的測試不需要）。以下是 `b48e007` 上的整合全開與 cargo deny——`b48e007`：fmt、clippy、windows-gnu clippy（cargo-zigbuild，workspace 不含 kist-mount／kist-cli，與
 kist-cli 單獨）乾淨；MinIO、SFTP、rclone、FUSE 全開（四個 setup 腳本 export 了 14 個 `KIST_TEST_` 變數）的 nextest 664 個
 通過、9 個略過（`#[ignore]` 的）。env 沒設的測試會提早 return、照樣算通過，所以 SFTP、rclone、FUSE 的那幾個另外帶輸出
 重跑：`sftp_v4_backup_round_trips`、`rclone_v4_backup_round_trips`、`rclone_bridge_meets_the_v4_contract`、kist-cli 的
 `mount_round_trip` 與 `one_file_system_keeps_mount_points_empty`、kist-mount 的
 `snapshots_written_after_mounting_are_readable` 都真的跑了（1.2–13.9 s，沒有略過的訊息）；
 `s3_conditional_write_policy_blocks_plain_puts` 照設計略過。`cargo deny check` 的 advisories／bans／licenses／sources
-都 ok。這份文件的 commit 只有文件、`tests/acceptance/run_s3.py` 與 10-19 的 M1／M2 log。setup 腳本的雜訊（第七段之前
+都 ok。文件的兩個 commit（`728532c` 與這一節的更新）只有文件、`tests/acceptance/run_s3.py` 與 10-19 的 M1／M2 log。
+setup 腳本的雜訊（第七段之前
 就有、無害、沒改）：`rclone-setup.sh` 與 `fuse-setup.sh` 把 `rclone version`、`fusermount3 --version` 印到 stdout，
 被 `eval` 當成命令跑（`unknown command "v1.75.2"`、`fusermount3: extra arguments after the mountpoint`）。

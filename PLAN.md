@@ -501,7 +501,8 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
      restore；macOS 上 E 的單調時鐘改用 `CLOCK_MONOTONIC`（`Instant` 在 macOS 休眠時不走；Windows 的 QPC 計入休眠，
      依廠商文件，沒有實機驗證）；`s3:if-none-match` 的政策條件在 MinIO 上不支援（實測）；沒變的 backup 不再每個檔案
      換一次執行緒、每個條目只 lstat 一次（M1 的第二次 backup 2.8 → 1.1 s，v3 0.8 s）；`init` 的四個選項留著。量測也
-     抓到第七段自己的錯：M2 的請求數漏了 LIST（更正為 13／76／10）。見 ADR 026「實作第七段之二」。沒有 push。
+     抓到第七段自己的錯：M2 的請求數漏了 LIST（更正為 13／76／10）。審查抓到第十三步（一段一段讀）自己引入的回歸：
+     讀不了目錄的某一段時唯讀目錄留成可寫，第十八步（`8430af6`）修。見 ADR 026「實作第七段之二」。沒有 push。
 
 ## 已接受的限制（非待辦）
 
