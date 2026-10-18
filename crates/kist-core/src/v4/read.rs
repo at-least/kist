@@ -367,6 +367,34 @@ impl Reader {
         self.dir(tree).await?.rest(self).await
     }
 
+    /// 一個目錄的段（restore 一段一段讀，記憶體裡同時只有一段；單一目錄 100 萬項整份是 336 MiB）：`tree` 是 Seg
+    /// 時第一個值就是它的全部 entry、第二個是空的；是 Dir 時第一個是空的、第二個是展開後第一層的 (Dir, 第 i 段)，
+    /// 每一段再以 [`Reader::segment_entries`] 讀。
+    pub async fn dir_segments(
+        &self,
+        tree: &MetaId,
+    ) -> Result<(Vec<Entry>, VecDeque<(Arc<Dir>, usize)>)> {
+        match self.item(tree).await? {
+            Item::Seg(s) => Ok((s.entries, VecDeque::new())),
+            Item::Dir(d) => Ok((Vec::new(), self.expand(d, kind::SEG).await?)),
+            _ => Err(CoreError::corrupt(
+                format!("{tree}"),
+                "a directory tree must be a segment or a directory index",
+            )),
+        }
+    }
+
+    /// Dir 的第 i 段的 entry（照 §7 檢查）。
+    pub async fn segment_entries(&self, dir: &Dir, i: usize) -> Result<Vec<Entry>> {
+        match self.segment(dir, i, kind::SEG).await? {
+            Item::Seg(s) => Ok(s.entries),
+            _ => Err(CoreError::corrupt(
+                format!("{}", dir.segs[i].id),
+                "expected a directory segment",
+            )),
+        }
+    }
+
     /// 目錄裡名稱等於 `name` 的 entry：沿 Dir 的索引只讀涵蓋它的那一段（§7 的查找；mount 的 lookup 與
     /// SNAPSHOT:PATH 用）。
     pub async fn lookup(&self, tree: &MetaId, name: &[u8]) -> Result<Option<Entry>> {

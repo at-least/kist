@@ -223,6 +223,71 @@ async fn parent_reuse_across_tree_segments_in_one_dir() {
     assert_same_tree(&src, &restored);
 }
 
+/// 子目錄也切成多段時，restore（`restore_dir`）與 dry run（`plan_children`）都一段一段讀（第 7 段第十三步：整份讀的
+/// `entries` 在單一目錄 100 萬項的 restore 裡一次配置 336 MiB）：還原逐 byte 相同、沒有錯誤，dry run 的計數與真的
+/// 還原一致。root 本身切成多段的情形由上一個測試蓋。
+#[tokio::test]
+async fn a_nested_dir_with_several_segments_restores_and_plans_segment_by_segment() {
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("nested");
+    let big = src.join("inner").join("big");
+    std::fs::create_dir_all(&big).unwrap();
+    std::fs::write(src.join("top.txt"), "top\n").unwrap();
+    let repo = t.open().await;
+    let names = names_with_cuts(&repo, 3);
+    for (i, n) in names.iter().enumerate() {
+        std::fs::write(big.join(n), format!("{i}\n")).unwrap();
+    }
+    let s = repo
+        .backup(std::slice::from_ref(&src), backup_options())
+        .await
+        .unwrap();
+    // inner/big 真的是多段的 Dir
+    let reader = repo.reader(None).await.unwrap();
+    let snap = repo.read_snapshot(&skey(&s.snapshot)).await.unwrap();
+    let roots = reader.roots(&snap.roots).await.unwrap();
+    let inner = reader
+        .lookup(&roots[0].tree.unwrap(), b"inner")
+        .await
+        .unwrap()
+        .unwrap();
+    let big_entry = reader
+        .lookup(&inner.tree.unwrap(), b"big")
+        .await
+        .unwrap()
+        .unwrap();
+    let Item::Dir(dir) = reader.item(&big_entry.tree.unwrap()).await.unwrap() else {
+        panic!(
+            "{} names chosen to cut should need several segments",
+            names.len()
+        );
+    };
+    assert!(dir.segs.len() >= 3, "{} segments", dir.segs.len());
+
+    let target = t.dir.path().join("out");
+    let done = repo
+        .restore(&skey(&s.snapshot), &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(done.errors.is_empty(), "{:?}", done.errors);
+    assert_same_tree(&src, &target.join(src.strip_prefix("/").unwrap_or(&src)));
+    assert_eq!(done.files, names.len() as u64 + 1);
+
+    let mut seen = 0u64;
+    let plan = repo
+        .plan_restore(
+            &skey(&s.snapshot),
+            &t.dir.path().join("plan"),
+            RestoreOptions::default(),
+            &mut |_, _| seen += 1,
+        )
+        .await
+        .unwrap();
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert_eq!((plan.files, plan.dirs), (done.files, done.dirs));
+    assert_eq!(seen, plan.files + plan.dirs);
+}
+
 /// stats 的口徑（format-v4.md §9）：`dirs` 是目錄 entry 數（root 本身是 path、不是 entry）；`files` 依名字計
 /// （hard link 各算一個）；`bytes` 同一份 hard link 內容只算一次。
 #[cfg(unix)]

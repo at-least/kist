@@ -8,14 +8,15 @@
 //! 檔案系統這一層（暫存檔加 rename、擋路的東西、目錄 handle、硬連結、唯讀目錄、選取、metadata 的順序）在
 //! `crate::restore`（ADR 019；原本與 v3 共用，v3 移除後留在 crate 的根）；這裡只有走訪。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kist_format::v4::ids::MetaId;
 use kist_format::v4::keys::Key;
-use kist_format::v4::meta::{node_type, Entry};
+use kist_format::v4::meta::{node_type, Dir, Entry};
 use kist_format::v4::snapshot::{split_locator, Root};
 use serde_bytes::ByteBuf;
 
@@ -69,6 +70,43 @@ impl RestoreEntry for Entry {
             dev: self.dev.unwrap_or(0),
             nlink: self.nlink.unwrap_or(0),
         }
+    }
+}
+
+/// 一個目錄的 entry，一段一段讀（第 7 段第十三步）：同時只有一段在記憶體裡。整份讀的 `Reader::entries` 在單一
+/// 目錄 100 萬項的 restore 裡一次配置 336 MiB（dhat），超過 512 MiB 的門檻。
+struct Segments {
+    first: Option<Vec<Entry>>,
+    pending: VecDeque<(Arc<Dir>, usize)>,
+}
+
+impl Segments {
+    async fn open(live: &Live, tree: MetaId) -> Result<Self> {
+        let (first, pending) = live.run(async |r| r.dir_segments(&tree).await).await?;
+        Ok(Self {
+            first: Some(first),
+            pending,
+        })
+    }
+
+    fn one(entry: Entry) -> Self {
+        Self {
+            first: Some(vec![entry]),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// 下一段的 entry（依名稱）；讀完是 `None`。
+    async fn next(&mut self, live: &Live) -> Result<Option<Vec<Entry>>> {
+        if let Some(first) = self.first.take() {
+            return Ok(Some(first));
+        }
+        let Some((dir, i)) = self.pending.pop_front() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            live.run(async |r| r.segment_entries(&dir, i).await).await?,
+        ))
     }
 }
 
@@ -157,32 +195,34 @@ impl Repo {
             select,
         };
         for placement in placements {
-            let (rel, pos, entries) = open_placement(&live, placement, &mut w.select).await?;
+            let (rel, pos, mut segments) = open_placement(&live, placement, &mut w.select).await?;
             // 落點建不起來（例如擋著符號連結）：整個 restore 回錯，不是某一項的錯。沒被選到的落點等到底下真的
             // 有東西要寫才建。
             let mut base = PendingDir::base(&mut top, &rel);
             if pos.selected {
                 base.create()?;
             }
-            for entry in entries {
-                // 名稱在解碼時已照 §8 檢查；會到這裡的只有 Windows 上帶反斜線的名字。記錯、其他照常。
-                if let Err(e) = fsmeta::validate_child_name(&entry.n) {
-                    w.summary
-                        .errors
-                        .push(format!("{}: {e}", base.location().display()));
-                    continue;
-                }
-                let Some(child) = w.select.visit(&pos, &entry) else {
-                    continue;
-                };
-                let name = fsmeta::bytes_to_name(&entry.n)?;
-                if child.selected {
-                    base.open()?;
-                }
-                restore_node(&mut w, &mut base, &entry, &name, 1, child).await;
-                // 落點在更深處才建、建不起來時，與一開始就建不起來一樣整個回錯；再建一次拿到它自己的錯誤。
-                if base.create_failed {
-                    base.create()?;
+            while let Some(entries) = segments.next(&live).await? {
+                for entry in entries {
+                    // 名稱在解碼時已照 §8 檢查；會到這裡的只有 Windows 上帶反斜線的名字。記錯、其他照常。
+                    if let Err(e) = fsmeta::validate_child_name(&entry.n) {
+                        w.summary
+                            .errors
+                            .push(format!("{}: {e}", base.location().display()));
+                        continue;
+                    }
+                    let Some(child) = w.select.visit(&pos, &entry) else {
+                        continue;
+                    };
+                    let name = fsmeta::bytes_to_name(&entry.n)?;
+                    if child.selected {
+                        base.open()?;
+                    }
+                    restore_node(&mut w, &mut base, &entry, &name, 1, child).await;
+                    // 落點在更深處才建、建不起來時，與一開始就建不起來一樣整個回錯；再建一次拿到它自己的錯誤。
+                    if base.create_failed {
+                        base.create()?;
+                    }
                 }
             }
         }
@@ -213,7 +253,7 @@ impl Repo {
             levels: Vec::new(),
         };
         for placement in placements {
-            let (rel, pos, entries) = open_placement(&live, placement, &mut p.select).await?;
+            let (rel, pos, mut segments) = open_placement(&live, placement, &mut p.select).await?;
             let base = target.join(&rel);
             p.levels.push(PlanLevel {
                 path: base.clone(),
@@ -223,19 +263,21 @@ impl Repo {
             if pos.selected {
                 p.open();
             }
-            for entry in entries {
-                if let Err(e) = fsmeta::validate_child_name(&entry.n) {
-                    p.summary.errors.push(format!("{}: {e}", base.display()));
-                    continue;
+            while let Some(entries) = segments.next(&live).await? {
+                for entry in entries {
+                    if let Err(e) = fsmeta::validate_child_name(&entry.n) {
+                        p.summary.errors.push(format!("{}: {e}", base.display()));
+                        continue;
+                    }
+                    let Some(child) = p.select.visit(&pos, &entry) else {
+                        continue;
+                    };
+                    let path = base.join(fsmeta::bytes_to_name(&entry.n)?);
+                    if child.selected {
+                        p.open();
+                    }
+                    plan_node(&live, &mut p, &entry, path, 1, child).await;
                 }
-                let Some(child) = p.select.visit(&pos, &entry) else {
-                    continue;
-                };
-                let path = base.join(fsmeta::bytes_to_name(&entry.n)?);
-                if child.selected {
-                    p.open();
-                }
-                plan_node(&live, &mut p, &entry, path, 1, child).await;
             }
             p.levels.pop();
         }
@@ -370,13 +412,13 @@ async fn open_placement(
     live: &Live,
     placement: Placement,
     select: &mut Select<'_>,
-) -> Result<(PathBuf, Pos, Vec<Entry>)> {
-    let entries = match placement.content {
-        Content::Tree(id) => live.run(async |r| r.entries(&id).await).await?,
-        Content::Entry(e) => vec![*e],
+) -> Result<(PathBuf, Pos, Segments)> {
+    let segments = match placement.content {
+        Content::Tree(id) => Segments::open(live, id).await?,
+        Content::Entry(e) => Segments::one(*e),
     };
     select.credit(&placement.pos);
-    Ok((placement.rel, placement.pos, entries))
+    Ok((placement.rel, placement.pos, segments))
 }
 
 /// dry run 的一個節點，對應 [`restore_node`]（同樣的分派與錯誤記錄）。
@@ -447,20 +489,22 @@ async fn plan_children(
     pos: &Pos,
 ) -> Result<()> {
     let tree = dir_tree(node, path)?;
-    let children = live.run(async |r| r.entries(&tree).await).await?;
-    for child in children {
-        if let Err(e) = fsmeta::validate_child_name(&child.n) {
-            p.summary.errors.push(format!("{}: {e}", path.display()));
-            continue;
+    let mut segments = Segments::open(live, tree).await?;
+    while let Some(children) = segments.next(live).await? {
+        for child in children {
+            if let Err(e) = fsmeta::validate_child_name(&child.n) {
+                p.summary.errors.push(format!("{}: {e}", path.display()));
+                continue;
+            }
+            let Some(child_pos) = p.select.visit(pos, &child) else {
+                continue;
+            };
+            let child_path = path.join(fsmeta::bytes_to_name(&child.n)?);
+            if child_pos.selected {
+                p.open();
+            }
+            plan_node(live, p, &child, child_path, depth + 1, child_pos).await;
         }
-        let Some(child_pos) = p.select.visit(pos, &child) else {
-            continue;
-        };
-        let child_path = path.join(fsmeta::bytes_to_name(&child.n)?);
-        if child_pos.selected {
-            p.open();
-        }
-        plan_node(live, p, &child, child_path, depth + 1, child_pos).await;
     }
     Ok(())
 }
@@ -563,24 +607,26 @@ async fn restore_dir(
         dir.create()?;
     }
     let tree = dir_tree(node, dir.location())?;
-    let children = w.live.run(async |r| r.entries(&tree).await).await?;
+    let mut segments = Segments::open(w.live, tree).await?;
     // 既有的唯讀目錄在第一個子項目寫進去之前暫時加上擁有者寫入權（PendingDir::open）。在讀完子目錄之後：從那裡
-    // 到下面重新套 mode 之間沒有提早 return。
-    for child in children {
-        if let Err(e) = fsmeta::validate_child_name(&child.n) {
-            w.summary
-                .errors
-                .push(format!("{}: {e}", dir.location().display()));
-            continue;
+    // 到下面重新套 mode 之間沒有提早 return。一段一段讀：某一段讀不了就與整份讀不了一樣，這個目錄記錯。
+    while let Some(children) = segments.next(w.live).await? {
+        for child in children {
+            if let Err(e) = fsmeta::validate_child_name(&child.n) {
+                w.summary
+                    .errors
+                    .push(format!("{}: {e}", dir.location().display()));
+                continue;
+            }
+            let Some(child_pos) = w.select.visit(&pos, &child) else {
+                continue;
+            };
+            let child_name = fsmeta::bytes_to_name(&child.n)?;
+            if child_pos.selected {
+                dir.open()?;
+            }
+            restore_node(w, &mut dir, &child, &child_name, depth + 1, child_pos).await;
         }
-        let Some(child_pos) = w.select.visit(&pos, &child) else {
-            continue;
-        };
-        let child_name = fsmeta::bytes_to_name(&child.n)?;
-        if child_pos.selected {
-            dir.open()?;
-        }
-        restore_node(w, &mut dir, &child, &child_name, depth + 1, child_pos).await;
     }
     // 套 metadata 之前，既有的唯讀目錄也要先暫時加寫入權（設 user.* xattr 要寫入權）：一個子項目都沒寫進去時
     // 還沒加過。
