@@ -342,7 +342,9 @@ async fn forget_needs_something_to_do_and_no_zero_counts() {
 #[tokio::test]
 async fn keep_daily_keeps_the_newest_of_each_day() {
     let (_t, repo) = setup().await;
-    let base = hours_from_now(-24 * 400);
+    // 從 UTC 零點起算：以「現在」當起點時，UTC 15 點之後 +9 小時跨到隔天，桶就不一樣了（第 7 段第十二步在
+    // 21 點跑 gate 時失敗，與改動無關）
+    let base = utc_midnight_days_ago(400);
     let mut keys = Vec::new();
     for (day, hour) in [(1, 1), (1, 5), (2, 1), (2, 9), (3, 2)] {
         let at = base + day * DAY + hour * 3_600_000_000_000;

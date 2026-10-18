@@ -1090,3 +1090,9 @@ pub fn hours_from_now(hours: i64) -> i64 {
     i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap()
         + hours * 3_600_000_000_000
 }
+
+/// `days` 天前那一天的 UTC 零點（奈秒）：再加不到 24 小時仍是同一個 UTC 日曆日（保留政策以 UTC 分天）。
+pub fn utc_midnight_days_ago(days: i64) -> i64 {
+    let day = (time::OffsetDateTime::now_utc() - time::Duration::days(days)).date();
+    i64::try_from(day.midnight().assume_utc().unix_timestamp_nanos()).unwrap()
+}
