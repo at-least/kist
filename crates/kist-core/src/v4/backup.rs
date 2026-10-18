@@ -198,18 +198,28 @@ impl std::fmt::Debug for Clock {
     }
 }
 
-/// Linux：`CLOCK_BOOTTIME`，計入休眠（clock_gettime(2)）。
-#[cfg(target_os = "linux")]
+/// 含休眠的單調時鐘（§11.1）。Linux：`CLOCK_BOOTTIME`（clock_gettime(2)：「includes any time that the system is
+/// suspended」）。macOS：`CLOCK_MONOTONIC`——Apple 的 clock_gettime(3)：「will continue to increment while the system
+/// is asleep」；不能用 `Instant`：它在 macOS 是 `CLOCK_UPTIME_RAW`（std 的 time.rs），同一份 man page 說它「does not
+/// increment while the system is asleep」。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn boot_time() -> Duration {
-    let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    #[cfg(target_os = "linux")]
+    let id = rustix::time::ClockId::Boottime;
+    #[cfg(target_os = "macos")]
+    let id = rustix::time::ClockId::Monotonic;
+    let t = rustix::time::clock_gettime(id);
     Duration::new(
         u64::try_from(t.tv_sec).unwrap_or(0),
         u32::try_from(t.tv_nsec).unwrap_or(0),
     )
 }
 
-/// 其他平台：`Instant` 是否計入休眠沒有驗證過（§11.1 的 UNVERIFIED）；E 另外取牆鐘的經過，取大。
-#[cfg(not(target_os = "linux"))]
+/// Windows：`Instant` 是 QueryPerformanceCounter（std 的 time.rs），Microsoft 的〈Acquiring high-resolution time
+/// stamps〉：「returns the total number of ticks that have occurred since the Windows operating system was started,
+/// including the time when the machine was in a sleep state such as standby, hibernate, or connected standby」。
+/// 其他平台（不在發行的目標裡）沒有查證；E 另外取牆鐘的經過，取大。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn boot_time() -> Duration {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     BASE.get_or_init(std::time::Instant::now).elapsed()

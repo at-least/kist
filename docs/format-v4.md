@@ -392,8 +392,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 - `T(g)`、`w(g)`：head g 的後端時間與寫入者時間。`grace` 取自 head 的 settings（預設 72 小時，至少
   2 小時）。`M` ＝ 1 小時。
-- backup 的經過時間 `E` ＝ max(牆鐘經過, 含休眠的單調時鐘經過)。Linux 用 `CLOCK_BOOTTIME`；其他平台的
-  對應時鐘未驗證（UNVERIFIED）。
+- backup 的經過時間 `E` ＝ max(牆鐘經過, 含休眠的單調時鐘經過)。Linux 用 `CLOCK_BOOTTIME`；macOS 用
+  `CLOCK_MONOTONIC`（Apple 的 clock_gettime(3)：休眠時仍遞增；Rust 的 `Instant` 在 macOS 是 `CLOCK_UPTIME_RAW`，
+  休眠時不走，所以不用它）；Windows 用 QueryPerformanceCounter（Microsoft：計入 standby、hibernate 與 connected
+  standby）。macOS 與 Windows 的依據是廠商文件，沒有在實機上休眠驗證過（實作第七段）。
 - prune 的整輪（P0 到 P9 結束）必須在 `grace − M` 內完成，以同樣的時鐘計；超過就停止，不再寫 head、
   不再刪任何東西。
 - **兩個時鐘的規則**：任何「自某個世代起已過一個 grace」的判斷，後端時間 `T` 與寫入者時間 `w` 都要成立
