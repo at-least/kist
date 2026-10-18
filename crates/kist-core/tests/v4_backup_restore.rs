@@ -288,6 +288,125 @@ async fn a_nested_dir_with_several_segments_restores_and_plans_segment_by_segmen
     assert_eq!(seen, plan.files + plan.dirs);
 }
 
+/// 第十三步（一段一段讀目錄）的回歸，第十八步修：目錄的第一段之後某一段讀不了時，前面的子項目已經寫了——既有的
+/// 唯讀目錄這時被暫時加上擁有者寫入權（`PendingDir::open`），不能提早 return：要照常套回記錄的 mode，再記下讀不了的錯。
+/// 第二段所在的 mpack 讀兩次都失敗（讀取本身與 `Live` 重新載入之後的再試）。
+#[cfg(unix)]
+#[tokio::test]
+async fn a_segment_that_cannot_be_read_still_puts_back_the_dirs_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let h = HookedRepo::new(init_options(0)).await;
+    let repo = h.open_as("c1").await;
+    let src = h.dir.path().join("src");
+    let big = src.join("big");
+    std::fs::create_dir_all(&big).unwrap();
+    // 壓不動的長名稱讓每一段（至少 1024 項）壓縮後仍超過 mpack 的 64 KiB 目標、各自在一個 mpack 裡（mpack 的大小
+    // 算的是壓縮後的 bytes：重複的字元壓得只剩幾個 byte）；前面是補零的序號，產生的順序就是排序的順序，切點同
+    // names_with_cuts
+    let mut names = Vec::new();
+    let (mut in_seg, mut cuts) = (0usize, 0usize);
+    while cuts < 2 || in_seg == 0 {
+        let i = names.len();
+        let name = format!(
+            "{i:06}{}{}",
+            blake3::hash(format!("a{i}").as_bytes()).to_hex(),
+            blake3::hash(format!("b{i}").as_bytes()).to_hex()
+        );
+        let cut =
+            in_seg >= kist_format::v4::meta::MIN_SEG_ITEMS && repo.keys().is_cut(name.as_bytes());
+        names.push(name);
+        in_seg += 1;
+        if cut {
+            cuts += 1;
+            in_seg = 0;
+        }
+    }
+    for (i, n) in names.iter().enumerate() {
+        std::fs::write(big.join(n), format!("{i}\n")).unwrap();
+    }
+    std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let s = repo
+        .backup(std::slice::from_ref(&src), opts(1))
+        .await
+        .unwrap();
+    std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // big 是多段的 Dir；第二段單獨在一個 mpack 裡（不與索引、第一段同一個）
+    let reader = repo.reader(None).await.unwrap();
+    let snap = repo.read_snapshot(&skey(&s.snapshot)).await.unwrap();
+    let roots = reader.roots(&snap.roots).await.unwrap();
+    let entry = reader
+        .lookup(&roots[0].tree.unwrap(), b"big")
+        .await
+        .unwrap()
+        .unwrap();
+    let index = entry.tree.unwrap();
+    let Item::Dir(dir) = reader.item(&index).await.unwrap() else {
+        panic!(
+            "{} names chosen to cut should need several segments",
+            names.len()
+        );
+    };
+    assert!(dir.segs.len() >= 3, "{} segments", dir.segs.len());
+    let records = index_everything(&repo, &std::collections::BTreeMap::new()).await;
+    let holder = |id: kist_format::v4::ids::MetaId| {
+        let item: kist_format::v4::ids::ItemId = id.into();
+        records
+            .iter()
+            .find(|r| r.entries.iter().any(|e| e.i == item))
+            .unwrap()
+    };
+    let second = holder(dir.segs[1].id);
+    assert!(
+        second.id != holder(dir.segs[0].id).id && second.id != holder(index).id,
+        "the second segment needs its own mpack for this test"
+    );
+
+    // 第一次還原：目錄建出來、最後套回 0o555
+    let target = h.dir.path().join("out");
+    let plain = kist_core::v4::Repo::open(h.backend.clone(), PASSWORD, None)
+        .await
+        .unwrap();
+    let done = plain
+        .restore(&skey(&s.snapshot), &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(done.errors.is_empty(), "{:?}", done.errors);
+    let restored = target
+        .join(src.strip_prefix("/").unwrap_or(&src))
+        .join("big");
+    assert_eq!(mode(&restored), 0o555);
+
+    // 第二次還原到同一個目標：既有的唯讀目錄，第二段讀不了
+    let key = kist_format::v4::keys::Key::Mpack {
+        client: second.client,
+        id: second.id,
+        replica: false,
+    }
+    .path();
+    h.store
+        .fail_get
+        .lock()
+        .unwrap()
+        .extend([key.clone(), key.clone()]);
+    let again = kist_core::v4::Repo::open(h.backend.clone(), PASSWORD, None)
+        .await
+        .unwrap();
+    let summary = again
+        .restore(&skey(&s.snapshot), &target, RestoreOptions::default())
+        .await
+        .unwrap();
+    let failed = mode(&restored);
+    std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        summary.errors.iter().any(|e| e.contains("/big:")),
+        "the unreadable segment is recorded: {:?}",
+        summary.errors
+    );
+    assert_eq!(failed, 0o555, "the read-only dir is not left writable");
+}
+
 /// stats 的口徑（format-v4.md §9）：`dirs` 是目錄 entry 數（root 本身是 path、不是 entry）；`files` 依名字計
 /// （hard link 各算一個）；`bytes` 同一份 hard link 內容只算一次。
 #[cfg(unix)]

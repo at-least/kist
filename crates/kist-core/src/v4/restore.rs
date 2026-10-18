@@ -608,9 +608,19 @@ async fn restore_dir(
     }
     let tree = dir_tree(node, dir.location())?;
     let mut segments = Segments::open(w.live, tree).await?;
-    // 既有的唯讀目錄在第一個子項目寫進去之前暫時加上擁有者寫入權（PendingDir::open）。在讀完子目錄之後：從那裡
-    // 到下面重新套 mode 之間沒有提早 return。一段一段讀：某一段讀不了就與整份讀不了一樣，這個目錄記錯。
-    while let Some(children) = segments.next(w.live).await? {
+    // 既有的唯讀目錄在第一個子項目寫進去之前暫時加上擁有者寫入權（PendingDir::open）：從那裡到收尾重新套 mode 之間
+    // 沒有提早 return。一段一段讀時，第一段之後的某一段讀不了，前面的子項目已經寫了——所以這裡也不 return：停止讀、
+    // 照常收尾（套回記錄的 mode），最後才回讀不了的錯（restore_node 記下）。
+    let mut unread = None;
+    loop {
+        let children = match segments.next(w.live).await {
+            Ok(Some(children)) => children,
+            Ok(None) => break,
+            Err(e) => {
+                unread = Some(e);
+                break;
+            }
+        };
         for child in children {
             if let Err(e) = fsmeta::validate_child_name(&child.n) {
                 w.summary
@@ -628,6 +638,20 @@ async fn restore_dir(
             restore_node(w, &mut dir, &child, &child_name, depth + 1, child_pos).await;
         }
     }
+    let Some(e) = unread else {
+        return finish_dir(w, dir, node, true);
+    };
+    // 讀不了的錯優先回報；收尾也失敗的話另外記下
+    let path = dir.location().to_path_buf();
+    if let Err(m) = finish_dir(w, dir, node, false) {
+        w.summary.errors.push(format!("{}: {m}", path.display()));
+    }
+    Err(e)
+}
+
+/// [`restore_dir`] 的收尾：子項目都處理完之後套目錄的 metadata、拿掉暫時加的寫入權。`count`：計進 `dirs`（有一段讀
+/// 不了的目錄不計，同 dry run）。
+fn finish_dir(w: &mut Walk<'_>, mut dir: PendingDir<'_>, node: &Entry, count: bool) -> Result<()> {
     // 套 metadata 之前，既有的唯讀目錄也要先暫時加寫入權（設 user.* xattr 要寫入權）：一個子項目都沒寫進去時
     // 還沒加過。
     if dir.handle.is_some() {
@@ -639,7 +663,9 @@ async fn restore_dir(
     let Some(dir) = handle else {
         return Ok(());
     };
-    w.summary.dirs += 1;
+    if count {
+        w.summary.dirs += 1;
+    }
     #[cfg(all(test, unix))]
     meta_via_handle_tests::before_meta(dir.path(), dir.path());
     // 子項目都寫完後才設目錄的 mtime；沒有要套的 metadata（s3／generic 來源的目錄）就不動。
