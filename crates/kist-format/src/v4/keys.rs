@@ -61,16 +61,43 @@ impl SnapTs {
         Ok(Self { nanos, text })
     }
 
-    /// 解析 key 裡的時間戳；必須是規範寫法（重新格式化後完全相同）。
+    /// 解析 key 裡的時間戳；必須是規範寫法：恰好 `YYYYMMDDTHHMMSSnnnnnnnnnZ` 的 25 個 ASCII 字元（§1），
+    /// 重新格式化後完全相同。先驗形狀、數字自己讀，不把任意字串交給 `time` 的 parser：fuzz 找到它對
+    /// `20260904T1200000[0000.1Z` 這類輸入在 debug 下減法溢位（time 0.3.55），而讀取端不該因為一個壞掉的
+    /// `parent` 欄位 panic。
     pub fn parse(s: &str) -> Result<Self> {
-        let t = time::PrimitiveDateTime::parse(s, TS_FORMAT)
-            .map_err(|e| corrupt("snapshot time", format!("{s:?}: {e}")))?
-            .assume_utc();
-        let nanos = i64::try_from(t.unix_timestamp_nanos())
-            .map_err(|_| corrupt("snapshot time", format!("{s:?} is out of range")))?;
+        let bad = |why: String| corrupt("snapshot time", format!("{s:?}: {why}"));
+        let b = s.as_bytes();
+        if b.len() != 25 || b[8] != b'T' || b[24] != b'Z' {
+            return Err(bad("not YYYYMMDDTHHMMSSnnnnnnnnnZ".to_owned()));
+        }
+        let digits = |range: std::ops::Range<usize>| -> Result<u32> {
+            let mut n: u32 = 0;
+            for &c in &b[range] {
+                if !c.is_ascii_digit() {
+                    return Err(bad("not YYYYMMDDTHHMMSSnnnnnnnnnZ".to_owned()));
+                }
+                n = n * 10 + u32::from(c - b'0');
+            }
+            Ok(n)
+        };
+        let (year, month, day) = (digits(0..4)?, digits(4..6)?, digits(6..8)?);
+        let (hour, minute, second) = (digits(9..11)?, digits(11..13)?, digits(13..15)?);
+        let subsec = digits(15..24)?;
+        let month = u8::try_from(month)
+            .ok()
+            .and_then(|m| time::Month::try_from(m).ok())
+            .ok_or_else(|| bad(format!("month {month}")))?;
+        let date = time::Date::from_calendar_date(year as i32, month, day as u8)
+            .map_err(|e| bad(e.to_string()))?;
+        let time_of_day = time::Time::from_hms_nano(hour as u8, minute as u8, second as u8, subsec)
+            .map_err(|e| bad(e.to_string()))?;
+        let t = date.with_time(time_of_day).assume_utc();
+        let nanos =
+            i64::try_from(t.unix_timestamp_nanos()).map_err(|_| bad("out of range".to_owned()))?;
         let ts = Self::from_nanos(nanos)?;
         if ts.text != s {
-            return Err(corrupt("snapshot time", format!("{s:?} is not canonical")));
+            return Err(bad("not canonical".to_owned()));
         }
         Ok(ts)
     }
@@ -379,6 +406,33 @@ mod tests {
                 "{}",
                 ts.as_str()
             );
+        }
+    }
+
+    /// 不是規範寫法的時間戳一律是錯誤、不能 panic：fuzz（cbor target）找到 `20260904T1200000[0000.1Z` 讓
+    /// `time` 的 parser 在 debug 下減法溢位（time 0.3.55 parsing/combinator）；現在先驗形狀，不把任意字串
+    /// 交給它。
+    #[test]
+    fn malformed_snapshot_times_are_errors_not_panics() {
+        for s in [
+            "20260904T1200000[0000.1Z",
+            "",
+            "Z",
+            "20260904T120000000000000",
+            "20260904T120000000000000ZZ",
+            "2026090aT120000000000000Z",
+            "20261304T120000000000000Z",
+            "20260931T120000000000000Z",
+            "20260904T240000000000000Z",
+            "20260904T120060000000000Z",
+            "+0260904T120000000000000Z",
+            "20260904t120000000000000Z",
+            "20260904T120000000000000z",
+            "20260904T12000000000000Z",
+            "２0260904T120000000000000Z",
+            "99999999T120000000000000Z",
+        ] {
+            assert!(SnapTs::parse(s).is_err(), "{s:?} must be rejected");
         }
     }
 }
