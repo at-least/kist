@@ -1016,7 +1016,7 @@ Windows 或非 unix 上編譯）；`KIST_TEST_FUSE=1` 的 `mount_round_trip` 在
     的刪除階段永遠刪不到——新 repo 要用短的 grace 在命令列上沒有辦法（core 的 `InitOptions.settings` 早就有）。先紅後綠：
     `cli.rs` 的 init_takes_the_settings_of_generation_0_without_a_drain（含 `--grace 1h` 被擋且沒寫 config、init 之後調低的
     對照）。規格 §4 加一句。
-12. 這份文件的 commit：ADR、PLAN、README 的驗收數據、`format-v4.md` §15、`tests/README.md`、`bench/memory/README.md`、
+12. 這份文件的 commit：ADR、PLAN、README 的驗收數據、`format-v4.md` §15、`bench/memory/README.md`、
     `tests/acceptance/README.md` 與 `run_gc.py`（三次跑的教訓）、GC 的 log。
 
 **量測**（release build；16 核／62 GiB／ext4；詳細的命令與 log 在各目錄。binary 的來歷有三種：M1、M2、V21、請求數與
