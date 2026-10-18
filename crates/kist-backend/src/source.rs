@@ -1,12 +1,12 @@
-//! 備份**來源**抽象（v3）：backup 走訪的對象不必是本機目錄——SFTP、S3
+//! 備份**來源**抽象：backup 走訪的對象不必是本機目錄——SFTP、S3
 //! 都能當來源，client 當轉運（切塊、加密都在 client，金鑰不出機器）。
 //!
 //! 與 [`crate::Backend`]（repo 端）的分工：Backend 寫入的是 kist 格式物件
 //! （conditional put、range read）；Source 提供的是「檔案系統形狀」的讀取
 //! （列目錄、串流讀檔），metadata 依來源種類遞減——格式的 metadata 聯集
-//! （docs/format.md §8）就是為此設計：「來源能證明什麼就記什麼」。
+//! （docs/format-v4.md §8）就是為此設計：「來源能證明什麼就記什麼」。
 //!
-//! 快速路徑合約（§8.2）：posix 來源用 ctime/inode（kernel 背書）；s3 來源
+//! 快速路徑合約（§8.1）：posix 來源用 ctime/inode（kernel 背書）；s3 來源
 //! 用 etag（來源計算的內容指紋）；sftp/generic **沒有**安全快速路徑——
 //! mtime 是來源聲稱的，不是可證明的。
 //!
@@ -70,7 +70,7 @@ pub trait SortedItems: Send {
 pub trait Source: Send + Sync + 'static {
     /// 掛進 `Root.path` 的來源定位字串。
     fn locator(&self) -> &[u8];
-    /// [`kist_format::tree::meta_kind`] 的值。
+    /// [`kist_format::v4::meta::meta_kind`] 的值。
     fn meta_kind(&self) -> u8;
     /// 列一個目錄（`[]` = 根）；回傳名稱排序的惰性條目迭代器。
     fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError>;
@@ -169,7 +169,7 @@ impl Source for LocalSource {
     }
 
     fn meta_kind(&self) -> u8 {
-        kist_format::tree::meta_kind::POSIX
+        kist_format::v4::meta::meta_kind::POSIX
     }
 
     fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError> {
@@ -302,7 +302,7 @@ impl ObjectStoreSource {
             (
                 Arc::new(store) as Arc<dyn ObjectStore>,
                 root,
-                kist_format::tree::meta_kind::SFTP,
+                kist_format::v4::meta::meta_kind::SFTP,
             )
         } else if let Some(rest) = spec.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -311,7 +311,7 @@ impl ObjectStoreSource {
             // PrefixStore 會雙重前綴（實機 E2E 抓到：讀檔變成 prefix/prefix/key）。
             let store = crate::s3_store(bucket, "", None)?;
             let root = s3_source_root(spec, prefix)?;
-            (store, root, kist_format::tree::meta_kind::S3)
+            (store, root, kist_format::v4::meta::meta_kind::S3)
         } else {
             return Err(BackendError::Source(format!(
                 "{spec}: unsupported source scheme (want sftp:// or s3://)"
@@ -547,7 +547,7 @@ mod tests {
         std::fs::write(dir.join("m.bin"), vec![0u8; 10]).unwrap();
         let src = LocalSource::new(dir.clone()).unwrap();
         assert!(src.locator().starts_with(b"/"), "locator 是絕對路徑");
-        assert_eq!(src.meta_kind(), kist_format::tree::meta_kind::POSIX);
+        assert_eq!(src.meta_kind(), kist_format::v4::meta::meta_kind::POSIX);
 
         let mut items = src.list(b"").unwrap();
         let mut names: Vec<Vec<u8>> = Vec::new();
@@ -655,7 +655,7 @@ mod tests {
                 b"fake://x"
             }
             fn meta_kind(&self) -> u8 {
-                kist_format::tree::meta_kind::GENERIC
+                kist_format::v4::meta::meta_kind::GENERIC
             }
             fn list(
                 &self,
@@ -743,7 +743,7 @@ mod s3_root_probe_tests {
             store: Arc::new(store),
             root: StorePath::from("data"),
             locator: b"s3://bucket/data/".to_vec(),
-            meta_kind: kist_format::tree::meta_kind::S3,
+            meta_kind: kist_format::v4::meta::meta_kind::S3,
             handle: tokio::runtime::Handle::current(),
         };
         // 生產端是從 blocking 執行緒呼叫 list（list 內部 block_on）；
@@ -833,7 +833,7 @@ mod store_path_tests {
             store: Arc::new(store),
             root: StorePath::default(),
             locator: b"s3://bucket".to_vec(),
-            meta_kind: kist_format::tree::meta_kind::S3,
+            meta_kind: kist_format::v4::meta::meta_kind::S3,
             handle: tokio::runtime::Handle::current(),
         };
         // list 與讀取的橋接內部都 block_on：照生產端在 blocking 執行緒上跑。
@@ -874,7 +874,7 @@ mod store_path_tests {
             store: Arc::new(object_store::memory::InMemory::new()),
             root: StorePath::default(),
             locator: b"s3://bucket".to_vec(),
-            meta_kind: kist_format::tree::meta_kind::S3,
+            meta_kind: kist_format::v4::meta::meta_kind::S3,
             handle: tokio::runtime::Handle::current(),
         };
         let (read, list) = tokio::task::spawn_blocking(move || {

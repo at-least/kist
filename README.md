@@ -437,7 +437,7 @@ fixture 不會；它只在格式升版時換（見 [ADR 018](docs/decisions/018-
 
 | crate | 職責 |
 | --- | --- |
-| `kist-format` | on-disk 格式：結構定義、CBOR 序列化、golden files（改動需負責人確認）；`v4` 模組是現行格式，根下的 v3 模組 M12 第 7 段整理 |
+| `kist-format` | on-disk 格式：結構定義、CBOR 序列化、golden files（改動需負責人確認）；`v4` 模組是現行格式，根下只剩版本無關的 cbor、ids、chunker、parity |
 | `kist-crypto` | 金鑰階層（Argon2id → KEK → master key → 派生子金鑰）與 XChaCha20-Poly1305 封裝 |
 | `kist-chunker` | 內容定義切塊（FastCDC，512 KiB / 2 MiB / 8 MiB） |
 | `kist-backend` | 儲存後端（本機、S3、SFTP、rclone 橋接）與遠端來源（Source 抽象）|
@@ -446,8 +446,8 @@ fixture 不會；它只在格式升版時換（見 [ADR 018](docs/decisions/018-
 | `kist-mount` | 唯讀 FUSE 掛載（`kist mount`） |
 | `kist-cli` | `kist` 執行檔（clap） |
 
-格式規格：[docs/format-v4.md](docs/format-v4.md)（[docs/format.md](docs/format.md) 是 v3 的，只描述還沒移除的
-v3 模組）。設計決策：[docs/decisions/](docs/decisions/)。
+格式規格：[docs/format-v4.md](docs/format-v4.md)（v3 的 `docs/format.md` 已刪，`git show 0b3d425:docs/format.md`
+取回）。設計決策：[docs/decisions/](docs/decisions/)。
 
 ## 驗收數據（v2／v3 時代）
 

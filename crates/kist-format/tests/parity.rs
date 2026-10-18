@@ -1,9 +1,9 @@
-//! parity sidecar 的測試。golden 向量（`parity-golden.txt`）已凍結
-//! （原為與已移除的 Go 實作共用的跨語言向量）：pack 由 BLAKE3 XOF 流
-//! （"kist/test/<seed>"）確定性產生，parity 必須逐 byte 等於向量；只有
-//! 格式版本升級時才可重錄。
+//! parity 的測試（`docs/format-v4.md` §13）：編碼的確定性與輸入驗證、各種尺寸的修復、m 片的上限、偽造的
+//! parity 修不出「成功」、header 自相矛盾的拒絕，與 proptest。凍結的向量（v3 錄的 `parity-golden.txt`
+//! 只差 `v` 一個 byte，與 `golden-v4/parity.cbor`）在 `golden_v4.rs` 比對。
 
-use kist_format::parity::{self, Object, DATA_SHARDS, MAX_PARITY_SHARDS};
+use kist_format::v4::parity::{self, Object, DATA_SHARDS, MAX_PARITY_SHARDS};
+use kist_format::v4::{Error as V4Error, VERSION};
 use kist_format::{FormatError, ObjectId};
 use proptest::prelude::*;
 
@@ -25,55 +25,13 @@ fn encode(pack: &[u8], m: usize) -> (ObjectId, Vec<u8>) {
 }
 
 #[test]
-fn golden_go_parity_repairs_rust_side() {
-    let text = std::fs::read_to_string("tests/testdata/parity-golden.txt").unwrap();
-    let mut lines = text.lines();
-    let id = ObjectId::from_hex(lines.next().unwrap().strip_prefix("pack ").unwrap()).unwrap();
-    let raw = hex::decode(lines.next().unwrap().strip_prefix("parity ").unwrap()).unwrap();
-
-    let pack = fake_pack("golden", 4321);
-    assert_eq!(
-        ObjectId::of(&pack),
-        id,
-        "pack stream diverged from the frozen golden"
-    );
-
-    // 向量以 UPDATE_VECTOR=1 錄製；凍結 golden，只在格式版本升級時重錄。
-    // 只認 "1"（UPDATE_VECTOR=0 是「想關掉」，不是「要重錄」）。
-    if std::env::var_os("UPDATE_VECTOR").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        let ours = parity::encode(&id, &pack, 2).unwrap();
-        std::fs::write(
-            "tests/testdata/parity-golden.txt",
-            format!("pack {id}\nparity {}\n", hex::encode(&ours)),
-        )
-        .unwrap();
-        return;
-    }
-
-    let obj = parity::parse(&raw).unwrap();
-    assert_eq!(obj.v, kist_format::FORMAT_VERSION);
-    assert_eq!(obj.parity_shards(), 2);
-    assert_eq!(obj.pack_size, 4321);
-
-    // 同一個 pack、同一個 m，必須編出與 golden 相同的 bytes（RS 矩陣未漂移 +
-    // CBOR 欄位順序未變的共同證明）。
-    let ours = parity::encode(&id, &pack, 2).unwrap();
-    assert_eq!(ours, raw, "encode differs from the frozen golden");
-
-    let mut bad = pack.clone();
-    bad[100] ^= 0x5a;
-    bad[4000] ^= 0x5a;
-    assert_eq!(obj.repair(&id, &bad).unwrap(), pack);
-    assert_eq!(obj.repair(&id, &pack).unwrap(), pack);
-}
-
-#[test]
 fn encode_is_deterministic_and_validates_inputs() {
     let pack = fake_pack("pack", 1000);
     let (id, raw) = encode(&pack, 2);
     assert_eq!(encode(&pack, 2).1, raw, "encoding is not deterministic");
 
     let obj = parity::parse(&raw).unwrap();
+    assert_eq!(obj.v, VERSION);
     assert_eq!(obj.parity_shards(), 2);
     assert_eq!(obj.pack_size, 1000);
     assert_eq!(obj.shard_len, 63);
@@ -81,7 +39,7 @@ fn encode_is_deterministic_and_validates_inputs() {
     let wrong = ObjectId::from_hex(&"1".repeat(64)).unwrap();
     assert!(matches!(
         parity::encode(&wrong, &pack, 2),
-        Err(FormatError::ParityCorrupt(_))
+        Err(V4Error::Format(FormatError::ParityCorrupt(_)))
     ));
     for m in [0, MAX_PARITY_SHARDS + 1] {
         assert!(parity::encode(&id, &pack, m).is_err(), "accepted m={m}");
@@ -213,7 +171,7 @@ fn parse_rejects_inconsistent_headers() {
     let mutate = |f: &dyn Fn(&mut Wire)| {
         let shard_len = obj.shard_len;
         let mut w = Wire {
-            v: 2,
+            v: VERSION,
             k: DATA_SHARDS as u8,
             m: 1,
             pack_size: pack.len() as u64,
@@ -227,10 +185,8 @@ fn parse_rejects_inconsistent_headers() {
         kist_format::cbor::encode(&w).unwrap()
     };
     let cases: Vec<(&str, Vec<u8>)> = vec![
-        (
-            "version",
-            mutate(&|w| w.v = kist_format::FORMAT_VERSION + 1),
-        ),
+        ("version", mutate(&|w| w.v = VERSION + 1)),
+        ("v3", mutate(&|w| w.v = 3)),
         ("k", mutate(&|w| w.k = 8)),
         ("m zero", mutate(&|w| w.m = 0)),
         ("m too big", mutate(&|w| w.m = 9)),
@@ -244,14 +200,17 @@ fn parse_rejects_inconsistent_headers() {
     ];
     for (name, raw) in cases {
         assert!(
-            matches!(parity::parse(&raw), Err(FormatError::ParityCorrupt(_))),
+            matches!(
+                parity::parse(&raw),
+                Err(V4Error::Format(FormatError::ParityCorrupt(_)))
+            ),
             "{name}: parse accepted an inconsistent header"
         );
     }
     for garbage in [&b"not cbor"[..], &[], &[0xa1, 0x61, 0x7a, 0x01][..]] {
         assert!(parity::parse(garbage).is_err());
     }
-    assert_eq!(parity::key(&id), format!("parity/{id}"));
+    let _ = id;
 }
 
 proptest! {

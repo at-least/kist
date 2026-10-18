@@ -1233,7 +1233,7 @@ impl ObjectStore for SftpStore {
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
         // 一次讀全檔再切片：kist 的 range 讀（trailer、多段）都落在同一個
-        // repo 物件上（pack 上限見 docs/format.md §7：parity=0 最多 4 GiB；
+        // repo 物件上（pack 上限見 docs/format-v4.md §10：pack_target 最多 4 GiB；
         // 整讀換程式直白）。
         let inner = &*self.0;
         let full = inner.full(location);

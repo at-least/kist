@@ -1,14 +1,11 @@
-//! 三種 32-byte 識別碼。
+//! 兩種 32-byte 識別碼（`docs/format-v4.md` §2；其他的在 [`crate::v4::ids`]）。
 //!
-//! - [`ChunkId`]：chunk 的身分 = keyed BLAKE3(hash key, chunk 明文)。
+//! - [`ChunkId`]：chunk 的身分 = keyed BLAKE3(`K_chunk_id`, chunk 明文)。
 //!   只出現在加密內容裡，**絕不**當作 repo 裡的物件名稱。
-//! - [`TreeId`]：tree 的名稱 = keyed BLAKE3(hash key, tree 明文 CBOR)。
-//!   與 ChunkId 同函式同金鑰。以**明文**而不是密文 hash 命名：壓縮器版本
-//!   會改變密文、連帶改變名稱，破壞去重。
-//! - [`ObjectId`]：pack 與 index blob 的名稱 = 一般 BLAKE3(密文 bytes)。
+//! - [`ObjectId`]：pack、mpack、delta、map 分片的名稱 = 一般 BLAKE3(寫進 repo 的 bytes)。
 //!   不持金鑰也能驗證物件完整性。
 //!
-//! 三者在 CBOR 裡都是 32-byte 的 byte string（major type 2），
+//! 兩者在 CBOR 裡都是 32-byte 的 byte string（major type 2），
 //! 在 repo 路徑裡都是小寫 hex。
 
 use std::fmt;
@@ -88,18 +85,14 @@ macro_rules! id_type {
     };
 }
 
-id_type!(ChunkId, "chunk 的身分：keyed BLAKE3(hash key, 明文)。");
-id_type!(
-    TreeId,
-    "tree 的名稱：keyed BLAKE3(hash key, tree 明文 CBOR)。"
-);
+id_type!(ChunkId, "chunk 的身分：keyed BLAKE3(K_chunk_id, 明文)。");
 id_type!(
     ObjectId,
-    "pack / index blob 的名稱：BLAKE3(密文 bytes)，無 key。"
+    "pack、mpack、delta、map 分片的名稱：BLAKE3(寫進 repo 的 bytes)，無 key。"
 );
 
 impl ObjectId {
-    /// pack / index 的名稱：對「要寫進 repo 的完整 bytes」做一般 BLAKE3。
+    /// 物件的名稱：對「要寫進 repo 的完整 bytes」做一般 BLAKE3。
     pub fn of(object_bytes: &[u8]) -> Self {
         Self(*blake3::hash(object_bytes).as_bytes())
     }

@@ -1,4 +1,4 @@
-//! 所有 metadata 共用的 CBOR 編解碼（規範編碼，`docs/format.md` §4）。
+//! 所有 metadata 共用的 CBOR 編解碼（規範編碼，`docs/format-v4.md` §4）。
 //!
 //! 規則：
 //! - struct 依「規格中各結構的欄位表順序」輸出——serde 的欄位宣告順序
@@ -9,8 +9,8 @@
 //! - **絕不回寫**：讀出的物件不得重新編碼後寫回；寫入端一律從事實來源
 //!   重新構造。
 //!
-//! 守則：**struct 欄位的宣告順序是格式**。重排欄位 = 改變 tree ID 等所有
-//! 內容定址；golden 測試與凍結向量（`tests/testdata/tree-canonical.hex`）會抓到。
+//! 守則：**struct 欄位的宣告順序是格式**。重排欄位 = 改變 meta ID 等所有
+//! 內容定址；golden 測試（`tests/golden-v4/`，其中 config 與槽的向量由獨立的程式產生）會抓到。
 
 use serde::{de::DeserializeOwned, Serialize};
 

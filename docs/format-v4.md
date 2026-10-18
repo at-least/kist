@@ -5,8 +5,8 @@
 > （實作第 2 段）、kist-backend 的 v4 契約（第 3 段）、kist-core 的 `v4` 模組（init、open 與 backup，第 4 段；
 > restore 與 check，第 5 段；forget、prune、重建、settings、key、`remove-unknown-packs`，第 6 段）、kist-mount 的
 > `v4` 模組（第 5 段）與 CLI、kist-app（第 6 段）照它實作；改動格式必須同時改程式碼、向量與本文件。v3 的
-> kist-core、kist-mount 模組與 fixture 已移除；kist-format 與 kist-crypto 根下的 v3 模組還在，`docs/format.md`
-> 只描述它們，第 7 段整理時一併刪除。
+> 程式碼與 fixture 已全部移除（第 6、7 段）；v3 的規格 `docs/format.md` 也已刪除，v4 仍沿用的部分（切塊、
+> 快速路徑合約、硬連結與深度、parity 的矩陣）已搬進本文件，原文以 `git show 0b3d425:docs/format.md` 取回。
 > v4 不支援 v3：config 的 `v` 不是 4 就拒絕，沒有遷移（負責人：「不需要支援上一代，目前都還在內部開發
 > 階段」）。
 > 第一版草稿（commit `054c7e1`，「v3 加樹進 pack」）已被否決；本版從需求與 bug 歷史重新推導，
@@ -191,6 +191,28 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 - 名稱＝BLAKE3(整檔)。寫滿 `settings.pack_target`（資料，預設 64 MiB）或 `settings.mpack_target`
   （metadata，預設 8 MiB）時寫出，backup 結束時寫出剩下的。
 
+### 6.1 切塊（FastCDC）
+
+檔案內容以 FastCDC（Xia et al., USENIX ATC '16）normalized level 2 切塊。邊界函式是凍結的格式：同一份 bytes 與
+同一組參數在任何實作上都必須切出完全相同的邊界（v2 起凍結，v4 沿用，原文從 v3 規格搬到這裡）。
+
+- gear 表 ＝ fastcdc-go v0.2.0 的 256 × u64 表，逐 byte 凍結：各 entry 以 little-endian 串接後的 SHA-256 ＝
+  `a98fa4184eb747cd769328307242285f9d4b25afeb28f71ef3fe437a4c278e28`。實作內嵌同一張表，並以 digest 測試釘死
+  （`kist_chunker::GEAR_TABLE`）。
+- 參數 `min`、`avg`、`max` 來自 config（§3；讀取端驗範圍：min 64 到 1 MiB、avg 256 到 16 MiB、max 1 KiB 到
+  64 MiB、min ≤ avg ≤ max），不是寫死的；同一個 repo 的所有 client 用同樣的參數，去重才一致。預設
+  512 KiB／2 MiB／8 MiB。
+- mask 由 avg 以整數運算推導（不用浮點數）：`bits = round(log2(avg))`、`mask_s = (1 << (bits + 2)) − 1`、
+  `mask_l = (1 << (bits − 2)) − 1`（avg ＝ 2 MiB 時 bits ＝ 21：`0x00ff_ffff`／`0x0007_ffff`）。
+- 邊界函式（回傳從目前位置起下一個 chunk 的長度）：剩餘輸入不超過 `min` 就整段一塊；否則
+  `limit = min(剩餘, max)`、`normal = min(limit, avg)`，指紋 `fp` 從 0 起、從第 `min` 個 byte 開始逐 byte
+  `fp = (fp << 1) + gear[byte]`（wrapping）：位置未滿 `normal` 時 `fp & mask_s == 0` 就在這個 byte 之後切，
+  之後到 `limit` 之前用 `mask_l`；都沒切到就在 `limit` 切（硬邊界 `max`，或輸入耗盡）。
+- 緩衝無關性：讀取器在決定邊界前保證掃描位置之後至少 `max` bytes（除非輸入已耗盡），所以邊界與 reader 的分塊
+  方式無關。
+- 凍結向量：`crates/kist-chunker/tests/testdata/` 的固定輸入邊界清單（原本與已移除的 Go 實作互驗）與 gear 表的
+  digest 測試；只在格式升版時重錄。
+
 ## 7. Metadata items
 
 每個 item 是 `alg byte ‖ CBOR`，以 `K_meta` 封、AAD 是自己的 meta ID。`k` 標示種類，在受認證的明文裡。
@@ -223,7 +245,7 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 
 ## 8. Entry（metadata 聯集）
 
-與 v3 相同（欄位、per-kind 規則、快速路徑合約、硬連結範圍、深度上限），只差 `tree` 的意義：
+欄位、per-kind 規則、快速路徑合約、硬連結範圍、深度上限與 v3 相同（原文搬進 §8.1、§8.2），只差 `tree` 的意義：
 
 - `tree`：子目錄內容的 meta ID，指向一個 Seg（只有一段）或 Dir（多段）。
 - `ct=1`：`chunks` 恰好一個元素，是 ChunkList（只有一段）或 ChunkIndex（多段）的 meta ID。
@@ -237,6 +259,31 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 
 快速路徑：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 與 generic 一律重讀。只看 mtime
 一律非法。硬連結以 `(dev, ino)` 在整個 snapshot（跨 roots）內判定。DIR 巢狀的實作上限 256 層。
+
+### 8.1 快速路徑合約（內容可證明 > kernel 可證明 > 來源聲稱）
+
+backup 把來源的一個項目與 parent snapshot 裡同一條路徑的 Entry 比較，條件成立就沿用它的內容（chunk 清單）、
+不重讀：
+
+| 來源 | 沿用條件 | 依據 |
+| --- | --- | --- |
+| mk=0 posix | size、mtime、ctime、inode 都沒變（dev 只在 `nlink>1` 時記錄，供硬連結識別，不參與快速路徑比較） | kernel 維護，使用者改不了（size 在實作的外層判斷比較） |
+| mk=2 s3 | etag 相同 + size 相同 | etag 是來源**計算並保證**的內容指紋（單段上傳＝MD5；多段／KMS 的 etag 仍是來源定義的確定性指紋） |
+| mk=1 sftp、mk=3 generic | **無安全快速路徑**——一律重讀，靠 chunk 去重吸收 | mtime 與 size 都是 client 可設的（`cp -p` 陷阱） |
+
+只看 mtime 的沿用**非法**（任何來源）。`etag`／`vern` 存在 Entry 裡就是為了下一次 backup 能做這個比較——
+這是格式欄位，不是 client 的記憶體狀態（不同機器、不同版本的 client 都要能比）。parent 必須一直存在
+（§9 的 forget 規則、B4 的 HEAD）：沿用子樹時不查子樹裡每個 item 的持有者。
+
+### 8.2 硬連結與巢狀深度
+
+- 硬連結：`(dev, ino)` 的同一性判定範圍＝**整個 snapshot（跨 roots）**：兩個 root 裡共用 (dev, ino) 的條目是
+  同一份內容——`bytes` 只算一次、restore 重建為一個 hard link（第一個出現的位置建立，其餘 link；失敗降級成
+  複本＋警告）。
+- 巢狀深度：DIR 的巢狀**沒有格式上的深度限制**，但實作設有上限 256 層。來源路徑允許的巢狀其實可以超過它
+  （ext4 單元件可以短到 2 bytes，PATH_MAX 內疊得出約 2000 層），所以 backup 的寫入端套同一把尺——超過上限的
+  來源子目錄跳過並記警告，寫出的樹因此永不超限。restore、mount、check、prune 把超過上限的鏈當腐壞或敵意
+  repo 乾淨回錯，而不是把走訪遞迴墊進 stack overflow；同一目錄的多段（Dir 索引）用迴圈走，不計深度。
 
 ## 9. Snapshot
 
@@ -580,7 +627,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   backup 以選項決定片數（0 不寫），寫失敗只警告：pack 本身已安全，少的只是冗餘。
 - parity 的排版（沿用 v3，`v` 是 4）：明文 CBOR `{v, k, m, pack_size, shard_len, hashes, parity}`。整個寫進
   repo 的 pack bytes 切成 `k` ＝ 16 片、每片 `shard_len` ＝ ⌈`pack_size` / 16⌉ bytes（最後一片補零），以
-  Reed-Solomon（GF(2^8)，與 v3 相同的矩陣）算出 `m` 片同位，`m` 在 1 到 8；`hashes` 是 16 + `m` 片各自的
+  Reed-Solomon（GF(2^8)，`reed-solomon-erasure` 的 Vandermonde 矩陣，即 Backblaze JavaReedSolomon／
+  klauspost/reedsolomon 的矩陣，曾以固定向量驗證逐 byte 相容；與 v3 相同）算出 `m` 片同位，`m` 在 1 到 8；`hashes` 是 16 + `m` 片各自的
   BLAKE3（資料片在前），`parity` 是 `m` 個 byte string。讀取端拒絕：`v` 不是 4、`k` 不是 16、`m` 越界、
   `shard_len` 是 0 或超過 64 MiB、與 `pack_size` 不符、片數或長度不對——都在依 header 配置記憶體之前檢查。
   明文的理由：同位是密文的線性組合，不洩漏內容；偽造或損壞的 parity 最多讓修復失敗，修復的結果以重算 BLAKE3

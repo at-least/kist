@@ -1,5 +1,5 @@
-//! §13：parity。排版沿用 v3（[`crate::parity`]：明文 CBOR `{v, k, m, pack_size, shard_len, hashes,
-//! parity}`，k=16 個資料片、m 1..=8 片 Reed-Solomon 同位，對整個寫進 repo 的 pack bytes 計算），只有 `v`
+//! §13：parity。排版與 v3 相同（[`crate::parity`]：明文 CBOR `{v, k, m, pack_size, shard_len, hashes,
+//! parity}`，k=16 個資料片、m 1..=8 片 Reed-Solomon 同位，對整個寫進 repo 的 pack bytes 計算），`v`
 //! 是 4。key 是 `parity/<c>/<hex>`，與它對應的 pack 或 mpack 同名（[`super::keys::Key::Parity`]）。
 //!
 //! 明文的理由與 v3 相同：同位是密文的線性組合，偽造或損壞的 parity 最多讓修復失敗，修復結果以重算
@@ -33,11 +33,11 @@ mod tests {
         let obj = parse(&v4).unwrap();
         assert_eq!(obj.v, 4);
         assert_eq!(obj.repair(&id, &pack).unwrap(), pack);
-        let v3 = crate::parity::encode(&id, &pack, 2).unwrap();
+        let v3 = crate::parity::encode_version(&id, &pack, 2, 3).unwrap();
         assert!(
             parse(&v3).is_err(),
             "a v3 parity object must not pass as v4"
         );
-        assert!(crate::parity::parse(&v4).is_err());
+        assert!(crate::parity::parse_version(&v4, 3).is_err());
     }
 }

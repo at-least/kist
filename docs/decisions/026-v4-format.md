@@ -2,9 +2,9 @@
 
 日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作第 1–6 段完成
 （2026-10-11），第 7 段（收尾）待負責人確認後開始。** 規格全文在 `docs/format-v4.md`；kist-core、kist-mount、CLI
-與 kist-app 全部是 v4，v3 的 kist-core／kist-mount 模組、測試與 fixture 已在第 6 段移除；kist-format 與 kist-crypto
-根下的 v3 模組還在（第 7 段整理，`docs/format.md` 到時一併刪除）。本 ADR 取代同編號的第一版草稿
-（commit `054c7e1`）。
+與 kist-app 全部是 v4，v3 的 kist-core／kist-mount 模組、測試與 fixture 已在第 6 段移除，kist-format 與 kist-crypto
+根下的 v3 模組與 v3 的規格 `docs/format.md` 在第 7 段移除（`git show 0b3d425:docs/format.md` 取回）。本 ADR 取代
+同編號的第一版草稿（commit `054c7e1`）。
 
 ## 一頁白話
 

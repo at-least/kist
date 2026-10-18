@@ -3,7 +3,7 @@
 //! 歷史：v2 草案曾採「map keys 排序」的 Core Deterministic（P1 驗證過
 //! ciborium Value 層排序可與 fxamacker/cbor CoreDet 逐 byte 相同），但排序
 //! 要 Rust 付 20 倍 encode 成本。2026-09-05 修訂為規格釘死欄位順序；編碼
-//! 一致性由 `tests/interop.rs` 的凍結 tree 向量承擔。
+//! 一致性由 `tests/golden-v4/` 的凍結向量承擔（config 與槽的向量由獨立的 Go 程式產生）。
 
 use serde::{Deserialize, Serialize};
 

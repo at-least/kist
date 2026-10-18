@@ -9,9 +9,9 @@
 設計目標依序：資料安全性 > 還原可靠性 > 抗勒索 > 效能 > 功能數量。
 
 **本 repo 只有一份實作：根目錄的 Rust 工作區，是正式產品與格式標竿。**
-`docs/format-v4.md`（v4，M12）是權威規格；`docs/format.md` 只描述 kist-format／kist-crypto 根下還沒移除的
-v3 模組（M12 第 7 段刪）。格式相容性由凍結的 fixture repo（永不重生、只在格式升版時換）把關：v3 的已隨 v3 移除，
-v4 的在 M12 第 7 段凍結。
+`docs/format-v4.md`（v4，M12）是權威規格；v3 的 `docs/format.md` 與 v3 的程式碼已全部移除（M12 第 6、7 段，
+`git show 0b3d425:docs/format.md` 取回）。格式相容性由凍結的 fixture repo（永不重生、只在格式升版時換）把關：
+v3 的已隨 v3 移除，v4 的在 M12 第 7 段凍結。
 原本的 Go 參考實作已於 2026-09-27 移除（見下方 M9 與 ADR 018）；需要時
 可從 commit `80b89ed` 取回：`git checkout 80b89ed -- go`。
 
@@ -30,7 +30,7 @@ v4 的在 M12 第 7 段凍結。
 - 壓縮：`zstd`，預設 level 3；先做不可壓縮偵測。
 - 加密：`chacha20poly1305`（XChaCha20-Poly1305）；KDF：`argon2`（Argon2id）；隨機：`rand` + OS RNG。全部來自 RustCrypto，不自己實作原語。
 - 序列化：CBOR（`ciborium` + `serde`），所有 metadata 都帶 `version` 欄位。
-  規範編碼 = 規格釘死的欄位表順序（`docs/format.md` §4；不做 key 排序）。
+  規範編碼 = 規格釘死的欄位表順序（`docs/format-v4.md` §4；不做 key 排序）。
 - 後端：`object_store` crate 統一抽象（local / S3 / GCS / Azure 一次涵蓋），SFTP 後期另做。
 - 糾錯碼（後期）：`reed-solomon-erasure`。
 - 日誌：`tracing`；測試：內建 `#[test]` + `proptest` 做屬性測試 + `cargo-fuzz` 做 fuzz。
@@ -93,7 +93,7 @@ kist/
     kist-cli/           clap 命令列，產出 `kist` binary
   fuzz/                 cargo-fuzz targets
   tests/                跨 crate 整合測試（含 MinIO 容器）
-  docs/format-v4.md     格式規格（與程式碼同步更新；format.md 是 v3 的，M12 第 7 段刪）
+  docs/format-v4.md     格式規格（與程式碼同步更新）
   docs/decisions/       ADR
 ```
 

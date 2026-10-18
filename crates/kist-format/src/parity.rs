@@ -1,7 +1,8 @@
-//! parity sidecar（選配；`docs/format.md` §14）：Reed-Solomon 對**整個
-//! sealed pack** 的同位，讓壞掉的 pack 能就地修復。
+//! parity（選配；`docs/format-v4.md` §13）：Reed-Solomon 對**整個寫進 repo 的 pack 或 mpack**
+//! 的同位，讓壞掉的 pack 能在記憶體裡修回來（v4 不覆寫，修好的 bytes 由 prune 寫進新的 pack）。
+//! 排版與版本無關，`v` 由呼叫端給（[`crate::v4::parity`] 給 4）。
 //!
-//! 物件是明文 CBOR（`parity/<pack hex>`），欄位表順序：
+//! 物件是明文 CBOR，欄位表順序：
 //! `{v, k, m, pack_size, shard_len, hashes, parity}`。明文是有意的：
 //! RS 對密文做線性組合不洩漏資訊，shard hash 是密文的 hash，而偽造或
 //! 損壞的 parity 最多讓修復**失敗**、不可能修**錯**——修復結果的證明是
@@ -10,9 +11,10 @@
 //! k=16 是固定的（m 片同位的開銷固定是 pack 的 m/16，讀取端無需協商）；
 //! m 1..=8。shard hash 用無 key 的 BLAKE3-256（與 pack 名稱同一函式）。
 //!
-//! RS 數學用 `reed-solomon-erasure`（Backblaze JavaReedSolomon 的移植）；
+//! RS 數學用 `reed-solomon-erasure`（Backblaze JavaReedSolomon 的移植，GF(2^8)、Vandermonde 矩陣）；
 //! 曾以固定向量驗證與 klauspost/reedsolomon 逐 byte 相容。編碼輸出由凍結
-//! golden `tests/testdata/parity-golden.txt` 釘住，矩陣漂移會讓測試變紅。
+//! golden `tests/testdata/parity-golden.txt`（v3 錄的，v4 只差 `v` 那一個 byte）與 `tests/golden-v4/parity.cbor`
+//! 釘住，矩陣漂移會讓測試變紅。
 
 use reed_solomon_erasure::galois_8::Field;
 use reed_solomon_erasure::ReedSolomon;
@@ -21,9 +23,6 @@ use serde::{Deserialize, Serialize};
 use crate::cbor;
 use crate::ids::ObjectId;
 use crate::{FormatError, Result};
-
-/// prefix：parity 物件在 repo 裡的命名空間。
-pub const PREFIX: &str = "parity";
 
 /// 固定的資料 shard 數（見模組文件）。
 pub const DATA_SHARDS: usize = 16;
@@ -37,11 +36,6 @@ pub const MAX_PARITY_SHARDS: usize = 8;
 /// 注意：parse 層面偽造 header 仍可要求 pack_size 到 16 × MAX_SHARD_LEN，
 /// repair 的瞬時分配上界約 3 GiB——fuzz 時要知道。
 const MAX_SHARD_LEN: usize = 64 << 20;
-
-/// parity 物件的 key（`parity/<pack hex>`）。
-pub fn key(pack_id: &ObjectId) -> String {
-    format!("{PREFIX}/{}", pack_id.to_hex())
-}
 
 /// parity sidecar 物件。欄位宣告順序 = 規格欄位表順序（= CBOR 輸出順序）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,19 +51,9 @@ pub struct Object {
     pub parity: Vec<serde_bytes::ByteBuf>,
 }
 
-/// 對一個完整的 pack（`pack` 的 BLAKE3 必須等於 `pack_id`）算出 m 片同位的
-/// sidecar bytes。確定性：同樣的 pack 與 m 永遠得到同樣的物件。
-pub fn encode(pack_id: &ObjectId, pack: &[u8], m: usize) -> Result<Vec<u8>> {
-    encode_version(pack_id, pack, m, crate::FORMAT_VERSION)
-}
-
-/// [`encode`]，`v` 由呼叫端給：v4 沿用同一個排版、只有 `v` 不同（[`crate::v4::parity`]）。
-pub(crate) fn encode_version(
-    pack_id: &ObjectId,
-    pack: &[u8],
-    m: usize,
-    version: u32,
-) -> Result<Vec<u8>> {
+/// 對一個完整的 pack（`pack` 的 BLAKE3 必須等於 `pack_id`）算出 m 片同位的物件 bytes，`v` 填
+/// `version`。確定性：同樣的 pack、m 與版本永遠得到同樣的物件。呼叫端是 [`crate::v4::parity::encode`]。
+pub fn encode_version(pack_id: &ObjectId, pack: &[u8], m: usize, version: u32) -> Result<Vec<u8>> {
     let corrupt = |msg: String| FormatError::ParityCorrupt(msg);
     if !(1..=MAX_PARITY_SHARDS).contains(&m) {
         return Err(corrupt(format!(
@@ -116,13 +100,9 @@ pub(crate) fn encode_version(
     cbor::encode(&obj)
 }
 
-/// 解碼並驗證 parity 物件。每個 bound 都在依 header 配置記憶體**之前**檢查。
-pub fn parse(data: &[u8]) -> Result<Object> {
-    parse_version(data, crate::FORMAT_VERSION)
-}
-
-/// [`parse`]，`v` 必須等於 `version`（v4 見 [`crate::v4::parity`]）。
-pub(crate) fn parse_version(data: &[u8], version: u32) -> Result<Object> {
+/// 解碼並驗證 parity 物件，`v` 必須等於 `version`。每個 bound 都在依 header 配置記憶體**之前**檢查。
+/// 呼叫端是 [`crate::v4::parity::parse`]。
+pub fn parse_version(data: &[u8], version: u32) -> Result<Object> {
     let obj: Object = cbor::decode(data)?;
     obj.validate(version)?;
     Ok(obj)

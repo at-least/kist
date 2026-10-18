@@ -1920,7 +1920,6 @@ dependencies = [
  "kist-format",
  "thiserror",
  "zeroize",
- "zstd",
 ]
 
 [[package]]

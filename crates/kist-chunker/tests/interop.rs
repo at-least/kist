@@ -3,7 +3,7 @@
 //! 的切塊邊界或金鑰就對不上。
 
 use kist_chunker::Chunker;
-use kist_format::config::ChunkerParams;
+use kist_format::chunker::ChunkerParams;
 
 /// 測試輸入：xorshift64* 產生的 bytes。產生器本身就是 corpus；進 repo
 /// 的只有邊界清單，所以產生器與清單一樣是凍結的。

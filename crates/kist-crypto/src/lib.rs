@@ -1,18 +1,12 @@
-//! kist 的金鑰階層（password → KEK → master key → 派生子金鑰）與 AEAD 封裝（v3）。
+//! kist 的 AEAD 封裝與 master key；金鑰階層（password → KEK → master → 子金鑰）在 [`v4`]。
 //!
 //! 所有密碼學原語都來自 RustCrypto（`argon2`、`chacha20poly1305`、`blake3`），
 //! 這裡只做組合，不自己實作任何原語。金鑰型別離開作用域時會被清零（`zeroize`）。
 //!
-//! v3 重點（`docs/format.md` §3、§5）：
-//! - 子金鑰 = BLAKE3 DeriveKey，context 為 `kist/v3/{hash,chunk,meta,index}`；
-//!   **沒有 nonce key**——沒有任何決定性 nonce，全部用 OS 亂數。
-//! - sealed 物件沒有 header：`nonce(24) ‖ 密文 ‖ tag(16)`，AAD 依角色
-//!   （tree = 自己的 ID、snapshot = 完整 key、trailer/index = 角色常數）。
-//! - master key 封裝的**認證密文裡帶不變式**（`master(32) ‖ Invariants CBOR`）：
-//!   解鎖即取得權威的 repo_id/chunker 參數，與明文 config 比對（v2 把欄位
-//!   列舉進 AAD，每加不變式都要改排版；AAD 現在是常數 [`kist_format::AAD_MASTER`]）。
+//! sealed 物件沒有 header：`nonce(24) ‖ 密文 ‖ tag(16)`（`docs/format-v4.md` §5），全部用 OS 亂數
+//! nonce——沒有任何決定性 nonce。AAD 依角色由呼叫端給。
 //!
-//! 金鑰推導的凍結測試向量見 `tests/poc_keys.rs`。
+//! v3 的金鑰階層（wrapped master 帶不變式、`RepoKeys`）已隨 v3 移除（ADR 026 實作第七段）。
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
@@ -21,61 +15,35 @@ pub mod v4;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use kist_format::config::{ChunkerParams, Invariants, KdfParams, KeySlot, KDF_ARGON2ID};
-use kist_format::pack::{CHUNK_NONCE_LEN, TAG_LEN};
-use kist_format::{ChunkId, TreeId};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// XChaCha20-Poly1305 的 nonce 長度（sealed 物件用）。
 pub const NONCE_LEN: usize = 24;
-
-/// KDF 參數上限：config 是明文，超過這些值的參數視為竄改，不真的去跑。
-pub const MAX_KDF_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
-pub const MAX_KDF_T_COST: u32 = 64;
-pub const MAX_KDF_P_COST: u32 = 64;
-
-const CTX_HASH_KEY: &str = "kist/v3/hash";
-const CTX_CHUNK_KEY: &str = "kist/v3/chunk";
-const CTX_META_KEY: &str = "kist/v3/meta";
-const CTX_INDEX_KEY: &str = "kist/v3/index";
-const CTX_CACHE_ID: &str = "kist/v3/cache";
+/// Poly1305 tag 的長度。
+pub const TAG_LEN: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("wrong password (or the repository config was tampered with)")]
     WrongPassword,
-    #[error("key slot version {actual} is not supported, want {expected}")]
-    UnsupportedSlotVersion { actual: u64, expected: u64 },
     #[error("the operating system's random number generator failed: {0}")]
     Rng(String),
     #[error("authentication failed: data is corrupt or was encrypted with a different key")]
     AuthFailed,
-    #[error("unsupported KDF {0:?}")]
-    UnsupportedKdf(String),
     #[error("invalid KDF parameters: {0}")]
     BadKdfParams(String),
-    #[error("wrapped master payload is malformed: {0}")]
-    BadWrappedPayload(String),
     #[error("{what} has wrong length: {actual} bytes, expected {expected}")]
     BadLength {
         what: &'static str,
         expected: usize,
         actual: usize,
     },
-    #[error("compression failed: {0}")]
-    Compression(String),
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
 
-impl From<kist_format::FormatError> for CryptoError {
-    fn from(e: kist_format::FormatError) -> Self {
-        CryptoError::BadWrappedPayload(format!("{e}"))
-    }
-}
-
 /// Argon2id 的成本參數。`Default` = 64 MiB / t=3 / p=4（RFC 9106 第二組建議），
-/// 即 `docs/format.md` §3 的預設值（凍結向量見 tests/poc_keys.rs）。
+/// 即 `docs/format-v4.md` §3 的預設值（向量見 `tests/golden-v4/`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfCost {
     pub m_cost_kib: u32,
@@ -90,19 +58,6 @@ impl Default for KdfCost {
             t_cost: 3,
             p_cost: 4,
         }
-    }
-}
-
-/// 綁進 wrapped master 密文的不變式（[`Invariants`] 的輸入形狀）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyBinding {
-    pub repo_id: Vec<u8>,
-    pub chunker: ChunkerParams,
-}
-
-impl KeyBinding {
-    fn invariants(&self) -> Invariants {
-        Invariants::new(self.repo_id.clone(), self.chunker)
     }
 }
 
@@ -137,124 +92,8 @@ pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     Ok(b)
 }
 
-fn kdf(password: &[u8], params: &KdfParams) -> Result<Zeroizing<[u8; 32]>> {
-    if params.algorithm != KDF_ARGON2ID {
-        return Err(CryptoError::UnsupportedKdf(params.algorithm.clone()));
-    }
-    if params.m_cost_kib > MAX_KDF_M_COST_KIB
-        || params.t_cost > MAX_KDF_T_COST
-        || params.p_cost > MAX_KDF_P_COST
-        || params.salt.len() != 16
-    {
-        return Err(CryptoError::BadKdfParams(format!(
-            "m={} KiB t={} p={} salt={} bytes exceeds the allowed limits (config tampered?)",
-            params.m_cost_kib,
-            params.t_cost,
-            params.p_cost,
-            params.salt.len()
-        )));
-    }
-    let argon_params =
-        argon2::Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(32))
-            .map_err(|e| CryptoError::BadKdfParams(e.to_string()))?;
-    let argon = argon2::Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        argon_params,
-    );
-    let mut kek = Zeroizing::new([0u8; 32]);
-    argon
-        .hash_password_into(password, &params.salt, kek.as_mut())
-        .map_err(|e| CryptoError::BadKdfParams(e.to_string()))?;
-    Ok(kek)
-}
-
 fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new(key.into())
-}
-
-/// 產生新的 master key，並用密碼包成一個 key slot（`init` 用）。
-pub fn create_key_slot(
-    password: &[u8],
-    name: &str,
-    created_ns: i64,
-    cost: KdfCost,
-    binding: &KeyBinding,
-) -> Result<(KeySlot, MasterKey)> {
-    let master = MasterKey::generate()?;
-    let slot = wrap_master_key(&master, password, name, created_ns, cost, binding)?;
-    Ok((slot, master))
-}
-
-/// 用一組（新的）密碼把既有的 master key 包成 key slot（加密碼 / 換密碼用）。
-/// wrapped 的認證密文 = `master(32) ‖ Invariants CBOR`，AAD = 常數。
-pub fn wrap_master_key(
-    master: &MasterKey,
-    password: &[u8],
-    name: &str,
-    created_ns: i64,
-    cost: KdfCost,
-    binding: &KeyBinding,
-) -> Result<KeySlot> {
-    let params = KdfParams {
-        algorithm: KDF_ARGON2ID.to_owned(),
-        m_cost_kib: cost.m_cost_kib,
-        t_cost: cost.t_cost,
-        p_cost: cost.p_cost,
-        salt: random_bytes::<16>()?.to_vec(),
-    };
-    let kek = kdf(password, &params)?;
-    // payload 帶 master key bytes：與其他金鑰材料同一紀律，離開作用域清零。
-    let mut payload = Zeroizing::new(Vec::with_capacity(32 + 64));
-    payload.extend_from_slice(master.as_bytes());
-    payload.extend_from_slice(&kist_format::cbor::encode(&binding.invariants())?);
-    let sealed = seal(&kek, kist_format::AAD_MASTER, &payload)?;
-    Ok(KeySlot {
-        version: kist_format::FORMAT_VERSION,
-        name: name.to_owned(),
-        created_ns,
-        kdf: params,
-        wrapped: sealed,
-    })
-}
-
-/// 解開 key slot 的結果：master key ＋ 從**認證密文**取出的不變式。
-/// 呼叫端必須以 [`Invariants::check_matches`] 與明文 config 比對。
-#[derive(Debug)]
-pub struct UnlockedMaster {
-    pub master: MasterKey,
-    pub invariants: Invariants,
-}
-
-/// 用密碼解開 key slot：master key 與認證過的不變式。
-pub fn unlock_key_slot(password: &[u8], slot: &KeySlot) -> Result<UnlockedMaster> {
-    // 版本捲動的絆線：解密前先硬拒，不能讓版本錯落進
-    // AEAD 開失敗被謊報成密碼錯。
-    if slot.version != kist_format::config::KEY_SLOT_VERSION {
-        return Err(CryptoError::UnsupportedSlotVersion {
-            actual: u64::from(slot.version),
-            expected: u64::from(kist_format::config::KEY_SLOT_VERSION),
-        });
-    }
-    let kek = kdf(password, &slot.kdf)?;
-    // plain 就是 master key 明文：用 Zeroizing 包住，drop 時清零（kek、
-    // MasterKey 都已如此；模組文件的清零紀律不含例外）。
-    let plain = Zeroizing::new(
-        open(&kek, kist_format::AAD_MASTER, &slot.wrapped)
-            .map_err(|_| CryptoError::WrongPassword)?,
-    );
-    let Some((key, rest)) = plain.split_first_chunk::<32>() else {
-        return Err(CryptoError::BadLength {
-            what: "unwrapped master payload",
-            expected: 32,
-            actual: plain.len(),
-        });
-    };
-    let invariants: Invariants = kist_format::cbor::decode(rest)?;
-    Ok(UnlockedMaster {
-        master: MasterKey(*key),
-        invariants,
-    })
 }
 
 fn nonce_from_slice(bytes: &[u8]) -> Result<[u8; NONCE_LEN]> {
@@ -304,159 +143,30 @@ fn open(key: &[u8; 32], aad: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| CryptoError::AuthFailed)
 }
 
-/// 由 master key 派生的四把子金鑰（hash / chunk / meta / index）。
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct RepoKeys {
-    hash_key: [u8; 32],
-    chunk_key: [u8; 32],
-    meta_key: [u8; 32],
-    index_key: [u8; 32],
-}
-
-impl std::fmt::Debug for RepoKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RepoKeys(..)")
-    }
-}
-
-impl RepoKeys {
-    pub fn from_master(master: &MasterKey) -> Self {
-        let m = master.as_bytes();
-        Self {
-            hash_key: blake3::derive_key(CTX_HASH_KEY, m),
-            chunk_key: blake3::derive_key(CTX_CHUNK_KEY, m),
-            meta_key: blake3::derive_key(CTX_META_KEY, m),
-            index_key: blake3::derive_key(CTX_INDEX_KEY, m),
-        }
-    }
-
-    /// 本機快取用來識別「這是哪個 repo」的 ID。從 master key 派生而不是用
-    /// 明文 config 裡的 `repo_id`：明文可以被換掉，換掉後 client 會信任錯的
-    /// 快取、以為 chunk 已存在而不上傳。
-    pub fn cache_id(&self) -> [u8; 16] {
-        let full = blake3::derive_key(CTX_CACHE_ID, &self.hash_key);
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&full[..16]);
-        id
-    }
-
-    /// chunk ID = keyed BLAKE3(hash key, 明文)。
-    pub fn chunk_id(&self, plaintext: &[u8]) -> ChunkId {
-        ChunkId::from_bytes(*blake3::keyed_hash(&self.hash_key, plaintext).as_bytes())
-    }
-
-    /// tree ID = keyed BLAKE3(hash key, tree 明文 CBOR)——與 chunk ID 同函式。
-    pub fn tree_id(&self, tree_plaintext: &[u8]) -> TreeId {
-        TreeId::from_bytes(*blake3::keyed_hash(&self.hash_key, tree_plaintext).as_bytes())
-    }
-
-    /// 加密一個 chunk 的 payload（明文或已壓縮），回傳 pack entry bytes：nonce ‖ 密文 ‖ tag。
-    pub fn seal_chunk(&self, id: &ChunkId, payload: &[u8]) -> Result<Vec<u8>> {
-        seal(&self.chunk_key, id.as_bytes(), payload)
-    }
-
-    /// 解開 pack entry，回傳 payload（algorithm byte 在裡面，呼叫端處理）。
-    pub fn open_chunk(&self, id: &ChunkId, entry: &[u8]) -> Result<Vec<u8>> {
-        if entry.len() < CHUNK_NONCE_LEN + TAG_LEN {
-            return Err(CryptoError::BadLength {
-                what: "chunk entry",
-                expected: CHUNK_NONCE_LEN + TAG_LEN,
-                actual: entry.len(),
-            });
-        }
-        let nonce = nonce_from_slice(&entry[..CHUNK_NONCE_LEN])?;
-        cipher(&self.chunk_key)
-            .decrypt(
-                &XNonce::from(nonce),
-                Payload {
-                    msg: &entry[CHUNK_NONCE_LEN..],
-                    aad: id.as_bytes(),
-                },
-            )
-            .map_err(|_| CryptoError::AuthFailed)
-    }
-
-    /// 密封 tree：meta key，AAD = tree 自己的 ID。
-    pub fn seal_tree(&self, id: &TreeId, plaintext: &[u8]) -> Result<Vec<u8>> {
-        seal(&self.meta_key, id.as_bytes(), plaintext)
-    }
-
-    /// 解開 tree（AAD = ID；呼叫端解開後重算 hash 對名稱）。
-    pub fn open_tree(&self, id: &TreeId, bytes: &[u8]) -> Result<Vec<u8>> {
-        open(&self.meta_key, id.as_bytes(), bytes)
-    }
-
-    /// 密封 snapshot：meta key，AAD = 完整 key 路徑。
-    pub fn seal_snapshot(&self, key_path: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-        seal(&self.meta_key, key_path.as_bytes(), plaintext)
-    }
-
-    /// 解開 snapshot（AAD = key 路徑；路徑不對就解不開）。
-    pub fn open_snapshot(&self, key_path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
-        open(&self.meta_key, key_path.as_bytes(), bytes)
-    }
-
-    /// 密封 pack trailer：index key，AAD = 角色常數。
-    pub fn seal_pack_trailer(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        seal(&self.index_key, kist_format::AAD_PACK_TRAILER, plaintext)
-    }
-
-    /// 解開 pack trailer。
-    pub fn open_pack_trailer(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        open(&self.index_key, kist_format::AAD_PACK_TRAILER, bytes)
-    }
-
-    /// 密封 index blob：index key，AAD = 角色常數；**吃掉**明文 buffer、就地加密（tag 附加在後），
-    /// 回傳 `nonce ‖ ct ‖ tag`（與 [`Self::open_index_blob`] 對應）。
-    /// index blob 是 repo 裡最大的 meta（100 萬 chunk 的明文 ≈ 56 MiB），
-    /// 就地加密省掉 `encrypt` 的整份密文拷貝。呼叫端先 `reserve(TAG_LEN)`
-    /// 就不會在附加 tag 時觸發重配。
-    pub fn seal_index_blob_in_place(&self, mut buf: Vec<u8>) -> Result<Vec<u8>> {
-        use chacha20poly1305::aead::AeadInOut;
-        let nonce = random_bytes::<NONCE_LEN>()?;
-        cipher(&self.index_key)
-            .encrypt_in_place(&XNonce::from(nonce), kist_format::AAD_INDEX, &mut buf)
-            .map_err(|_| CryptoError::AuthFailed)?;
-        let mut out = Vec::with_capacity(NONCE_LEN + buf.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&buf);
-        Ok(out)
-    }
-
-    /// 解開 index blob。
-    pub fn open_index_blob(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        open(&self.index_key, kist_format::AAD_INDEX, bytes)
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
-    /// 密碼對、AEAD 也過，但解開的 payload 不到 master key 的 32 bytes：
-    /// 要回長度錯，不能 panic、也不能謊報成密碼錯。
     #[test]
-    fn short_unwrapped_payload_is_a_length_error() {
-        let binding = KeyBinding {
-            repo_id: vec![9; 16],
-            chunker: kist_format::config::ChunkerParams::default(),
-        };
-        let cost = KdfCost {
-            m_cost_kib: 8,
-            t_cost: 1,
-            p_cost: 1,
-        };
-        let (mut slot, _) = create_key_slot(b"pw", "d", 0, cost, &binding).unwrap();
-        let kek = kdf(b"pw", &slot.kdf).unwrap();
-        slot.wrapped = seal(&kek, kist_format::AAD_MASTER, &[7; 31]).unwrap();
-        match unlock_key_slot(b"pw", &slot) {
-            Err(CryptoError::BadLength {
-                what: "unwrapped master payload",
-                expected: 32,
-                actual: 31,
-            }) => {}
-            other => panic!("want BadLength for a 31-byte payload, got {other:?}"),
-        }
+    fn seal_and_open_round_trip_and_reject_tampering() {
+        let key = [7u8; 32];
+        let sealed = seal(&key, b"aad", b"hello").unwrap();
+        assert_eq!(sealed.len(), NONCE_LEN + 5 + TAG_LEN);
+        assert_eq!(open(&key, b"aad", &sealed).unwrap(), b"hello");
+        assert!(matches!(
+            open(&key, b"other", &sealed),
+            Err(CryptoError::AuthFailed)
+        ));
+        let mut bad = sealed.clone();
+        bad[NONCE_LEN + 1] ^= 1;
+        assert!(matches!(
+            open(&key, b"aad", &bad),
+            Err(CryptoError::AuthFailed)
+        ));
+        assert!(matches!(
+            open(&key, b"aad", &sealed[..NONCE_LEN + TAG_LEN - 1]),
+            Err(CryptoError::BadLength { .. })
+        ));
     }
 }

@@ -3,7 +3,7 @@
 use std::io::Cursor;
 
 use kist_chunker::Chunker;
-use kist_format::config::ChunkerParams;
+use kist_format::chunker::ChunkerParams;
 use proptest::prelude::*;
 use rand::{Rng, SeedableRng};
 

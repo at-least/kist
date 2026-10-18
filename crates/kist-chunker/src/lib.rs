@@ -1,5 +1,5 @@
 //! kist 的內容定義切塊：FastCDC（Xia et al., USENIX ATC '16，normalized
-//! level 2），**邊界逐 byte 依 `docs/format.md` §12 凍結**。
+//! level 2），**邊界逐 byte 依 `docs/format-v4.md` §6.1 凍結**。
 //!
 //! 邊界函式是凍結的儲存格式：gear 表 = fastcdc-go v0.2.0 的表（以
 //! digest 測試釘死），mask 由 `avg` 以整數運算推導（避免浮點誤差：mask
@@ -14,7 +14,7 @@
 
 use std::io::Read;
 
-use kist_format::config::ChunkerParams;
+use kist_format::chunker::ChunkerParams;
 
 /// gear 表：每個可能的輸入 byte 一個 64-bit 值。逐 byte 取自
 /// fastcdc-go v0.2.0，是凍結的格式常數（見模組說明）。
@@ -349,7 +349,7 @@ fn round_log2(v: u32) -> u32 {
 }
 
 /// 邊界函式：回傳從 data[0] 開始的下一個 chunk 長度。凍結格式
-/// （`docs/format.md` §12）：
+/// （`docs/format-v4.md` §6.1）：
 /// 前 `min` bytes 不參與 hash；未滿 `avg` 用較嚴的 mask、超過用較鬆的；
 /// 硬邊界 `max`；尾巴不足 `min` 就整段。
 fn boundary(

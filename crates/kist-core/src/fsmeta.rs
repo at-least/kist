@@ -47,8 +47,8 @@ pub fn path_to_bytes(path: &Path) -> Result<Vec<u8>> {
     name_to_bytes(path.as_os_str())
 }
 
-/// v3 的 root 定位字串（`Root.path`）→ 路徑組件：restore 與 mount 共用的
-/// 切段規則（docs/format.md §9）——去掉 `scheme://`、以 `/` 切段、空與 `.`
+/// root 的定位字串（`Root.path`）→ 路徑組件：restore 與 mount 共用的
+/// 切段規則（docs/format-v4.md §9）——去掉 `scheme://`、以 `/` 切段、空與 `.`
 /// 組件丟掉、`..` 映射成 `__parent__`（restore 不往目標之外走；字面 `..` 在
 /// FUSE 目錄裡是核心自己的東西）；組件含 NUL 就拒：NUL 不是路徑元件
 /// （Unix 的 bytes_to_name 什麼都收），也不是合法的 FUSE 目錄項位元組。

@@ -21,7 +21,7 @@ until curl -sf "http://127.0.0.1:$PORT/minio/health/live" >/dev/null; do
 done
 
 # backup 需要的最小權限：PutObject + GetObject + ListBucket，沒有 DeleteObject。
-# （S3 沒有「只能 Put」還能開 repo 的組合：開 repo 要讀 config 與 index，見 docs/format.md §7。）
+# （S3 沒有「只能 Put」還能開 repo 的組合：開 repo 要讀 config、金鑰槽與 head，見 docs/format-v4.md §1。）
 POLICY='{"Version":"2012-10-17","Statement":[
   {"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::'"$BUCKET"'/*"]},
   {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::'"$BUCKET"'"]}

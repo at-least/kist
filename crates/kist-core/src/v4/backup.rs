@@ -25,7 +25,7 @@ use std::time::Duration;
 use kist_backend::source::{LocalSource, Source, SourceItem, SourceItemKind};
 use kist_backend::{Backend, BackendError};
 use kist_crypto::v4::Keys;
-use kist_format::config::ChunkerParams;
+use kist_format::chunker::ChunkerParams;
 use kist_format::v4::ids::{ChunkId, ClientId, ItemId, MetaId, ObjectId};
 use kist_format::v4::index::{status, Delta, DeltaPack, Settings};
 use kist_format::v4::keys::{Gen, Key, SnapTs, SNAPSHOTS};
