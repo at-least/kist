@@ -1688,7 +1688,7 @@ impl Walk {
                 return Ok(Some((hit.clone(), Used::new())));
             }
         }
-        let reader = match ctx.source.read(rel) {
+        let reader = match ctx.source.read_sized(rel, f.size) {
             Ok(r) => r,
             Err(e) => {
                 self.skip(&ctx.display_path(rel), &e.to_string());

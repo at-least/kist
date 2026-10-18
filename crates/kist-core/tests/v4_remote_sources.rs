@@ -9,6 +9,7 @@
 mod v4_common;
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
 
 use kist_backend::Backend;
@@ -130,6 +131,48 @@ async fn sftp_source_backs_up_and_rereads_unchanged_files() {
     for (rel, _) in &files {
         writer.delete(rel).await.unwrap();
     }
+}
+
+/// SFTP 來源依呼叫端給的（列表的）大小讀，不經 get 的 stat（第三步）：給的比檔案小就只讀那麼多。`Source` 預設的
+/// `read_sized` 照 `read`（stat 之後讀 stat 到的大小），會讀整個檔案。
+#[tokio::test]
+async fn sftp_source_reads_up_to_the_listed_size() {
+    let Some((mut cfg, auth)) = sftp_env() else {
+        eprintln!("SFTP listed-size source test skipped (tests/sftp-setup.sh 未跑)");
+        return;
+    };
+    cfg.path = format!(
+        "{}/sized-{}",
+        cfg.path.trim_matches('/'),
+        std::process::id()
+    );
+    let writer = Backend::sftp(&cfg, auth).await.unwrap();
+    let content = data("sized", 600 * 1024);
+    writer
+        .put_if_absent("f.bin", content.clone())
+        .await
+        .unwrap();
+    let source = kist_backend::source::open_source(&sftp_url(&cfg))
+        .await
+        .unwrap();
+    let listed = 100 * 1024;
+    let got = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        source
+            .read_sized(b"f.bin", listed as u64)
+            .unwrap()
+            .read_to_end(&mut out)
+            .map(|_| out)
+    })
+    .await
+    .unwrap();
+    writer.delete("f.bin").await.unwrap();
+    let got = got.unwrap();
+    assert!(
+        got == content[..listed],
+        "read {} bytes, want the listed {listed}",
+        got.len()
+    );
 }
 
 /// S3 來源：讀回的樹與寫進去的相同；沒變的第二次 backup 每個物件都以 etag 與大小走快速路徑，不重讀。

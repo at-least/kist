@@ -629,14 +629,23 @@ fn is_unsupported(e: &SftpError) -> bool {
     )
 }
 
+/// 讀到的比要的少時（[`stream_range`]）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Short {
+    /// 錯誤（get：長度是剛 stat 到的，同 [`SftpInner::read_whole`]）。
+    Error,
+    /// 讀到的就是全部（來源依列表的大小讀：檔案在列表之後變短了）。
+    End,
+}
+
 /// 來源模式的讀取（M12 第 7 段之三第二步）：`location` 從 `start` 起的 `len` bytes，一次一個 SFTP READ、一塊一塊交出，
-/// 不整份放進記憶體。一次要求 1 MiB，`File::read` 再依伺服器的上限截短（OpenSSH 255 KiB）。少送是錯誤，同
-/// [`SftpInner::read_whole`]。
+/// 不整份放進記憶體。一次要求 1 MiB，`File::read` 再依伺服器的上限截短（OpenSSH 255 KiB）。少送照 `short`。
 fn stream_range(
     inner: Arc<SftpInner>,
     location: StorePath,
     start: u64,
     len: u64,
+    short: Short,
 ) -> BoxStream<'static, object_store::Result<Bytes>> {
     const CHUNK: u64 = 1024 * 1024;
     struct Reading {
@@ -646,6 +655,7 @@ fn stream_range(
         start: u64,
         done: u64,
         len: u64,
+        short: Short,
     }
     let state = Reading {
         inner,
@@ -654,6 +664,7 @@ fn stream_range(
         start,
         done: 0,
         len,
+        short,
     };
     futures::stream::try_unfold(state, |mut st| async move {
         use tokio::io::AsyncSeekExt as _;
@@ -689,6 +700,7 @@ fn stream_range(
                 st.done += buf.len() as u64;
                 Ok(Some((buf.freeze(), st)))
             }
+            _ if st.short == Short::End => Ok(None),
             _ => Err(generic(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
@@ -963,6 +975,16 @@ impl SftpStore {
     /// [`SftpInner::list_all`]）。連線參數與 [`SftpStore::open`] 相同。
     pub async fn open_source(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
         Self::open_ssh(cfg, auth, true).await
+    }
+
+    /// 來源依列表的大小讀一個檔案（M12 第 7 段之三第三步）：不先 stat，開檔就讀，讀到 `size` 為止；先到檔尾就是
+    /// 全部（[`Short::End`]）。
+    pub(crate) fn stream_listed(
+        &self,
+        location: &StorePath,
+        size: u64,
+    ) -> BoxStream<'static, object_store::Result<Bytes>> {
+        stream_range(Arc::clone(&self.0), location.clone(), 0, size, Short::End)
     }
 
     /// `open` 與 `open_source` 的共同本體：只差 `list_all`。
@@ -1295,6 +1317,7 @@ impl ObjectStore for SftpStore {
                 location.clone(),
                 range.start,
                 range.end - range.start,
+                Short::Error,
             );
             return Ok(GetResult {
                 payload: GetResultPayload::Stream(stream),
@@ -1666,5 +1689,64 @@ mod source_mode_tests {
             sizes[0]
         );
         assert!(sizes.iter().all(|s| *s <= 1024 * 1024), "{sizes:?}");
+    }
+
+    async fn collect(
+        mut stream: BoxStream<'static, object_store::Result<Bytes>>,
+    ) -> object_store::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk?);
+        }
+        Ok(out)
+    }
+
+    /// 來源依列表的大小讀（第三步，不先 stat）：列表之後變長的檔案讀到列表的大小為止；變短的讀到現在的檔尾、不算錯
+    /// （同本機檔案）；不在了是 NotFound。
+    #[tokio::test]
+    async fn listed_size_bounds_the_read_and_a_shorter_file_is_not_an_error() {
+        let Some((mut cfg, auth)) = env() else {
+            eprintln!("SFTP listed-size read test skipped (tests/sftp-setup.sh 未跑)");
+            return;
+        };
+        cfg.path = format!(
+            "{}/listed-{}",
+            cfg.path.trim_matches('/'),
+            std::process::id()
+        );
+        let writer = SftpStore::open(&cfg, &auth).await.unwrap();
+        let content: Vec<u8> = (0..3 * 1024 * 1024 + 5).map(|i| (i % 251) as u8).collect();
+        let path = StorePath::from("f.bin");
+        writer
+            .put_opts(
+                &path,
+                PutPayload::from(content.clone()),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let source = SftpStore::open_source(&cfg, &auth).await.unwrap();
+        let listed_smaller = 1024 * 1024 + 3;
+        let grew = collect(source.stream_listed(&path, listed_smaller as u64)).await;
+        let shrank = collect(source.stream_listed(&path, content.len() as u64 + 4096)).await;
+        let gone = collect(source.stream_listed(&StorePath::from("missing.bin"), 10)).await;
+        writer.delete(&path).await.unwrap();
+        let grew = grew.unwrap();
+        assert!(
+            grew == content[..listed_smaller],
+            "grew: read {} bytes, want the listed {listed_smaller}",
+            grew.len()
+        );
+        let shrank = shrank.unwrap();
+        assert!(
+            shrank == content,
+            "shrank: read {} bytes, want the whole {}",
+            shrank.len(),
+            content.len()
+        );
+        assert!(matches!(gone, Err(StoreError::NotFound { .. })), "{gone:?}");
     }
 }

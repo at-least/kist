@@ -80,6 +80,16 @@ pub trait Source: Send + Sync + 'static {
     fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError>;
     /// 串流讀取一個檔案。
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError>;
+    /// [`Source::read`]，呼叫端已經從列表知道它的大小（M12 第 7 段之三第三步）：遠端來源可以省掉再問一次大小的
+    /// 來回。預設照 `read`；SFTP 來源讀到列表的大小為止（見 [`ObjectStoreSource`]）。
+    fn read_sized(
+        &self,
+        file: &[u8],
+        size: u64,
+    ) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
+        let _ = size;
+        self.read(file)
+    }
     /// rel 路徑 → 本機檔案系統路徑。只有本機來源會有（走訪端處理條目時
     /// 對路徑 lstat 取得 posix metadata、讀 xattr）；遠端來源回 None。
     fn local_path(&self, _rel: &[u8]) -> Option<std::path::PathBuf> {
@@ -287,6 +297,8 @@ impl SortedItems for LocalListing {
 ///（`list_with_delimiter`）；讀取把 async 串流橋接成 blocking Read。
 pub struct ObjectStoreSource {
     store: Arc<dyn ObjectStore>,
+    /// SFTP 來源的同一個 store（[`Source::read_sized`] 不經 object_store 的 get：get 要先 stat 才有 meta）。
+    sftp: Option<Arc<sftp::SftpStore>>,
     /// 來源 root 的 store 路徑（空 = bucket 根）。
     root: object_store::path::Path,
     locator: Vec<u8>,
@@ -303,19 +315,20 @@ impl ObjectStoreSource {
             ))
         })?;
         let locator = spec.as_bytes().to_vec();
-        let (store, root, meta_kind) = if spec.starts_with("sftp://") {
+        let (store, root, meta_kind, sftp_store) = if spec.starts_with("sftp://") {
             let cfg = sftp::parse_sftp_url(spec)
                 .map_err(|e| BackendError::Source(format!("{spec}: {e}")))?;
             // 來源模式：listing 不做 dot-skip——列的是使用者的資料，
             // 不是 repo 命名空間（`.bashrc` 是內容，本地/s3 來源也列）。
-            let store = sftp::SftpStore::open_source(&cfg, &sftp::auth_from_env()).await?;
+            let store = Arc::new(sftp::SftpStore::open_source(&cfg, &sftp::auth_from_env()).await?);
             // SftpStore 內部已把 cfg.root（URL 的 path）當根：key 相對於它。
             // 來源的 root 因此是空（避免雙重前綴；rel 直接是 store key）。
             let root = object_store::path::Path::default();
             (
-                Arc::new(store) as Arc<dyn ObjectStore>,
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
                 root,
                 kist_format::v4::meta::meta_kind::SFTP,
+                Some(store),
             )
         } else if let Some(rest) = spec.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -324,7 +337,7 @@ impl ObjectStoreSource {
             // PrefixStore 會雙重前綴（實機 E2E 抓到：讀檔變成 prefix/prefix/key）。
             let store = crate::s3_store(bucket, "", None)?;
             let root = s3_source_root(spec, prefix)?;
-            (store, root, kist_format::v4::meta::meta_kind::S3)
+            (store, root, kist_format::v4::meta::meta_kind::S3, None)
         } else {
             return Err(BackendError::Source(format!(
                 "{spec}: unsupported source scheme (want sftp:// or s3://)"
@@ -332,6 +345,7 @@ impl ObjectStoreSource {
         };
         Ok(Self {
             store,
+            sftp: sftp_store,
             root,
             locator,
             meta_kind,
@@ -411,6 +425,20 @@ impl Source for ObjectStoreSource {
         &self.locator
     }
 
+    /// SFTP：開檔就讀、讀到列表的大小為止，不先 stat（每個檔案少一次來回）。檔案在列表之後變短，讀到的是現在的
+    /// 內容、不算錯（同本機檔案）；變長，讀到列表的大小為止。S3：照 `read`（GET 的回應本身就帶大小）。
+    fn read_sized(
+        &self,
+        file: &[u8],
+        size: u64,
+    ) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
+        let Some(sftp) = &self.sftp else {
+            return self.read(file);
+        };
+        let path = self.to_store_path(file)?;
+        Ok(self.bridge(sftp.stream_listed(&path, size)))
+    }
+
     fn meta_kind(&self) -> u8 {
         self.meta_kind
     }
@@ -462,19 +490,29 @@ impl Source for ObjectStoreSource {
     }
 
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
+        use futures::{StreamExt, TryStreamExt};
         let path = self.to_store_path(file)?;
         let store = Arc::clone(&self.store);
+        let stream =
+            futures::stream::once(
+                async move { store.get(&path).await.map(|get| get.into_stream()) },
+            )
+            .try_flatten()
+            .boxed();
+        Ok(self.bridge(stream))
+    }
+}
+
+impl ObjectStoreSource {
+    /// spawn 一個 task 把串流推進 4 格的 channel，交出在 blocking thread 上讀的 [`StreamBridge`]。
+    fn bridge(
+        &self,
+        stream: futures::stream::BoxStream<'static, object_store::Result<bytes::Bytes>>,
+    ) -> Box<dyn Read + Send> {
+        use futures::StreamExt;
         let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
         self.handle.spawn(async move {
-            let get = match store.get(&path).await {
-                Ok(g) => g,
-                Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                    return;
-                }
-            };
-            use futures::StreamExt;
-            let mut stream = std::pin::pin!(get.into_stream());
+            let mut stream = stream;
             while let Some(chunk) = stream.next().await {
                 let msg = chunk.map_err(|e| std::io::Error::other(e.to_string()));
                 if tx.send(msg).await.is_err() {
@@ -482,12 +520,12 @@ impl Source for ObjectStoreSource {
                 }
             }
         });
-        Ok(Box::new(StreamBridge {
+        Box::new(StreamBridge {
             handle: self.handle.clone(),
             rx,
             buf: bytes::Bytes::new(),
             pos: 0,
-        }))
+        })
     }
 }
 
@@ -790,6 +828,7 @@ mod s3_root_probe_tests {
             .unwrap();
         let src = ObjectStoreSource {
             store: Arc::new(store),
+            sftp: None,
             root: StorePath::from("data"),
             locator: b"s3://bucket/data/".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
@@ -880,6 +919,7 @@ mod store_path_tests {
             .unwrap();
         let src = ObjectStoreSource {
             store: Arc::new(store),
+            sftp: None,
             root: StorePath::default(),
             locator: b"s3://bucket".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
@@ -921,6 +961,7 @@ mod store_path_tests {
     async fn unrepresentable_name_is_a_source_error() {
         let src = ObjectStoreSource {
             store: Arc::new(object_store::memory::InMemory::new()),
+            sftp: None,
             root: StorePath::default(),
             locator: b"s3://bucket".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
