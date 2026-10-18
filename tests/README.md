@@ -15,7 +15,10 @@ docker rm -f kist-minio             # 用完關掉
 帳號，以及依 client 分前綴的 `kistclient` 帳號：`KIST_TEST_S3_CLIENT_KEY` / `_SECRET` / `_ID`，政策只允許在
 `*/{packs,mpacks,parity,deltas,snapshots}/<client id>/` 底下 PutObject、讀全部、列 bucket——format-v4.md §1
 建議的部署；`v4_backup_backends.rs` 的 `s3_client_prefix_credentials_confine_a_client` 驗它備得了份、寫別處與刪除
-都被擋、prune 在 P0 就失敗）。每個測試用隨機 prefix，同一個 bucket 可以重複跑。（CI workflow
+都被擋、prune 在 P0 就失敗）。腳本另外試建一個只放行帶 `If-None-Match` 的 PutObject 的 `kistcond` 帳號（§1 的
+`s3:if-none-match` 條件，AWS 的 `Null` 寫法）：MinIO RELEASE.2025-09-07 不認得這個條件 key（`invalid condition key`），
+建不起來就印一行說明、不 export `KIST_TEST_S3_COND_KEY` / `_SECRET`，`s3_conditional_write_policy_blocks_plain_puts`
+略過；換成支援的 S3 時它會跑。每個測試用隨機 prefix，同一個 bucket 可以重複跑。（CI workflow
 只手動觸發；平時以本機 gate 為準。）
 
 ## SFTP

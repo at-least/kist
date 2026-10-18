@@ -202,6 +202,91 @@ async fn rclone_v4_backup_round_trips() {
     round_trip(b).await;
 }
 
+/// 強制條件寫入（format-v4.md §1 的 `s3:if-none-match`）：tests/minio-setup.sh 的 kistcond 只放行帶 `If-None-Match`
+/// 的 PutObject（AWS 的 `Null` 條件）。kist 的寫入全是「只在不存在時建立」，init 與 backup 都成；同一組憑證沒有
+/// 條件的 PUT（object_store 直接送——kist 自己沒有這種寫法）被擋、物件不變；同名再建一次是 AlreadyExists。MinIO
+/// RELEASE.2025-09-07 不認得這個條件 key，政策建不起來、環境變數沒有設就略過：實作第七段只量到這裡，這個測試
+/// 沒有在支援的 S3 上跑過（UNVERIFIED）。
+#[tokio::test]
+async fn s3_conditional_write_policy_blocks_plain_puts() {
+    use object_store::ObjectStoreExt;
+
+    let (Some(endpoint), Some(bucket)) = (
+        std::env::var("KIST_TEST_S3_ENDPOINT").ok(),
+        std::env::var("KIST_TEST_S3_BUCKET").ok(),
+    ) else {
+        eprintln!("S3 conditional-write test skipped");
+        return;
+    };
+    let (Some(key), Some(secret)) = (
+        std::env::var("KIST_TEST_S3_COND_KEY").ok(),
+        std::env::var("KIST_TEST_S3_COND_SECRET").ok(),
+    ) else {
+        eprintln!(
+            "KIST_TEST_S3_COND_KEY / _SECRET not set (this S3 rejects the s3:if-none-match \
+             policy condition, see tests/minio-setup.sh); skipped"
+        );
+        return;
+    };
+    std::env::set_var("AWS_ENDPOINT", endpoint);
+    std::env::set_var("AWS_ALLOW_HTTP", "true");
+    if std::env::var("AWS_DEFAULT_REGION").is_err() {
+        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+    }
+    let prefix = format!("cond-{}", std::process::id());
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Backend::s3_with_credentials(&bucket, &prefix, &key, &secret).unwrap();
+    // 只在不存在時建立：init 與 backup 都過
+    Repo::init(backend.clone(), PASSWORD, init_options(0))
+        .await
+        .unwrap();
+    let repo = Repo::open(backend.clone(), PASSWORD, Some(&dir.path().join("cache")))
+        .await
+        .unwrap();
+    let src = dir.path().join("src");
+    sample_source(&src);
+    let s = repo
+        .backup(std::slice::from_ref(&src), opts(1))
+        .await
+        .unwrap();
+    let original = backend.get(&s.snapshot).await.unwrap();
+    // 同一組憑證、沒有條件的 PUT：被政策擋下
+    let plain = object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(&bucket)
+        .with_access_key_id(&key)
+        .with_secret_access_key(&secret)
+        .build()
+        .unwrap();
+    let path = object_store::path::Path::from(format!("{prefix}/{}", s.snapshot));
+    let err = plain
+        .put(&path, object_store::PutPayload::from_static(b"overwrite"))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("403") || msg.contains("AccessDenied") || msg.contains("Forbidden"),
+        "{msg}"
+    );
+    assert_eq!(backend.get(&s.snapshot).await.unwrap(), original);
+    // 有條件的同名再建：AlreadyExists，不覆寫
+    let err = backend
+        .put_if_absent(&s.snapshot, b"x".to_vec())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, kist_backend::BackendError::AlreadyExists(_)),
+        "{err}"
+    );
+    assert_eq!(backend.get(&s.snapshot).await.unwrap(), original);
+    // 清掉（root 的憑證）
+    let root = Backend::from_url(&format!("s3://{bucket}/{prefix}"))
+        .await
+        .unwrap();
+    for o in root.list("").await.unwrap() {
+        root.delete(&o.key).await.unwrap();
+    }
+}
+
 /// 依 client 分前綴的憑證（format-v4.md §1 的建議部署，負責人決定 1）：tests/minio-setup.sh 的 kistclient 只能在
 /// `*/{packs,mpacks,parity,deltas,snapshots}/<client id>/` 底下建立物件、讀全部、列 bucket。它備得了份；寫別台
 /// client 的前綴、`maint/`、`keys/`、刪除都被擋；以另一個 client id 備份失敗（pack 寫不進去）；prune 在 P0 就

@@ -64,7 +64,10 @@ repo 是 key → bytes 的命名空間。**每一次寫入都是一次只在不�
 
 建議的權限（S3）：每台備份主機的憑證只能在自己的 `packs/<c>/`、`mpacks/<c>/`、`parity/<c>/`、
 `deltas/<c>/`、`snapshots/<c>/` 底下建立物件，可以讀全部；`config`、`keys/`、`maint/` 與全零 client
-的前綴只給 init 與維護角色；刪除只給維護角色。bucket policy 以 `s3:if-none-match` 強制條件寫入。
+的前綴只給 init 與維護角色；刪除只給維護角色。bucket policy 以 `s3:if-none-match` 強制條件寫入（AWS 2024-11 起的
+條件 key：`"Null": {"s3:if-none-match": "false"}` 只放行帶 `If-None-Match` 的 PutObject；MinIO
+RELEASE.2025-09-07 不認得這個 key，`mc admin policy create` 回 `invalid condition key 's3:if-none-match'`——實作第七段
+實測；在 MinIO 上只能靠前綴與沒有 Delete 的權限，覆寫同名物件擋不住）。
 
 ## 2. 識別碼
 

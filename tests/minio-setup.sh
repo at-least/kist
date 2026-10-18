@@ -43,6 +43,17 @@ CLIENT_POLICY='{"Version":"2012-10-17","Statement":[
   {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::'"$BUCKET"'/*"]},
   {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::'"$BUCKET"'"]}
 ]}'
+# 強制條件寫入（format-v4.md §1 的 `s3:if-none-match`，AWS 的 Null 條件）：MinIO RELEASE.2025-09-07 不認得這個
+# 條件 key（`invalid condition key`），政策建不起來就不建這個使用者、不 export KIST_TEST_S3_COND_*，測試略過；
+# 換成支援的 S3 時測試就會跑。
+COND_USER=kistcond
+COND_PASS=kistcondsecret
+COND_POLICY='{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::'"$BUCKET"'/*"],
+   "Condition":{"Null":{"s3:if-none-match":"false"}}},
+  {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::'"$BUCKET"'/*"]},
+  {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::'"$BUCKET"'"]}
+]}'
 docker exec "$NAME" sh -c "
   mc alias set local http://127.0.0.1:9000 $ROOT_USER $ROOT_PASS >/dev/null &&
   mc mb -p local/$BUCKET >/dev/null &&
@@ -55,6 +66,18 @@ docker exec "$NAME" sh -c "
   mc admin user add local $CLIENT_USER $CLIENT_PASS >/dev/null &&
   mc admin policy attach local kist-client --user $CLIENT_USER >/dev/null
 "
+COND=""
+if docker exec "$NAME" sh -c "
+  printf '%s' '$COND_POLICY' > /tmp/cond.json &&
+  mc admin policy create local kist-cond /tmp/cond.json >/dev/null 2>&1 &&
+  mc admin user add local $COND_USER $COND_PASS >/dev/null &&
+  mc admin policy attach local kist-cond --user $COND_USER >/dev/null
+"; then
+  COND="export KIST_TEST_S3_COND_KEY=$COND_USER
+export KIST_TEST_S3_COND_SECRET=$COND_PASS"
+else
+  echo "# note: this MinIO rejects the s3:if-none-match policy condition; the conditional-write test is skipped" >&2
+fi
 cat <<ENV
 export KIST_TEST_S3_ENDPOINT=http://127.0.0.1:$PORT
 export KIST_TEST_S3_BUCKET=$BUCKET
@@ -65,4 +88,5 @@ export KIST_TEST_S3_PUTONLY_SECRET=$PUTONLY_PASS
 export KIST_TEST_S3_CLIENT_KEY=$CLIENT_USER
 export KIST_TEST_S3_CLIENT_SECRET=$CLIENT_PASS
 export KIST_TEST_S3_CLIENT_ID=$CLIENT_ID
+$COND
 ENV
