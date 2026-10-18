@@ -333,11 +333,9 @@ async fn an_unreadable_head_in_the_range_is_refused() {
     t.prune().await;
     lose_all_maps(&t).await;
     for replica in [false, true] {
-        t.repo
-            .backend()
-            .put(&Key::Head { g: 1, replica }.path(), b"garbage".to_vec())
-            .await
-            .unwrap();
+        t.hooked
+            .overwrite(&Key::Head { g: 1, replica }.path(), b"garbage".to_vec())
+            .await;
     }
     let err = try_rebuild(&t).await.unwrap_err();
     assert!(matches!(err, CoreError::Generation(_)), "{err}");

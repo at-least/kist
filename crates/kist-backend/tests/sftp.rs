@@ -34,17 +34,16 @@ async fn password_auth_put_get_round_trip() {
     };
     let b = kist_backend::Backend::sftp(&cfg, auth).await.unwrap();
 
-    b.put("packs/aa", b"payload".to_vec()).await.unwrap();
+    b.put_if_absent("packs/aa", b"payload".to_vec())
+        .await
+        .unwrap();
     assert_eq!(b.get("packs/aa").await.unwrap(), b"payload");
-    // 覆蓋（posix-rename）
-    b.put("packs/aa", b"payload-2".to_vec()).await.unwrap();
-    assert_eq!(b.get("packs/aa").await.unwrap(), b"payload-2");
     // put_if_absent：已存在要 AlreadyExists，而且**內容不變**（不是「換新」）
     match b.put_if_absent("packs/aa", b"other".to_vec()).await {
         Err(kist_backend::BackendError::AlreadyExists(_)) => {}
         other => panic!("expected AlreadyExists, got {other:?}"),
     }
-    assert_eq!(b.get("packs/aa").await.unwrap(), b"payload-2");
+    assert_eq!(b.get("packs/aa").await.unwrap(), b"payload");
     // put_if_absent：不存在的 key 要成功
     b.put_if_absent("packs/bb", b"first".to_vec())
         .await
@@ -71,7 +70,9 @@ async fn key_auth_connects_and_round_trips() {
         password: None, // 故意不給密碼：證明 key 認證自己成立
     };
     let b = kist_backend::Backend::sftp(&cfg, auth).await.unwrap();
-    b.put("trees/tt", b"key-auth".to_vec()).await.unwrap();
+    b.put_if_absent("trees/tt", b"key-auth".to_vec())
+        .await
+        .unwrap();
     assert_eq!(b.get("trees/tt").await.unwrap(), b"key-auth");
     b.delete("trees/tt").await.unwrap();
 }
@@ -168,7 +169,9 @@ async fn repo_listing_rejects_absurd_directory_depth() {
 
     // 20 層深的目錄鏈＋一個物件。寫入端照常成功（建目錄本來就行）。
     let key = vec!["d"; 20].join("/");
-    b.put(&format!("{key}/x"), vec![1u8]).await.unwrap();
+    b.put_if_absent(&format!("{key}/x"), vec![1u8])
+        .await
+        .unwrap();
 
     let err = b.list("").await;
     assert!(
@@ -178,6 +181,6 @@ async fn repo_listing_rejects_absurd_directory_depth() {
     );
 
     // 對照：正常深度的 prefix 照常可列。
-    b.put("packs/normal", vec![2u8]).await.unwrap();
+    b.put_if_absent("packs/normal", vec![2u8]).await.unwrap();
     assert!(b.list("packs").await.is_ok(), "正常深度的 list 不能被連坐");
 }

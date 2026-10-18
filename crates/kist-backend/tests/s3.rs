@@ -41,8 +41,8 @@ async fn prefix_is_applied_and_basic_ops_work() {
     let Some((b, root, prefix)) = s3_backends("prefix").await else {
         return;
     };
-    b.put("config", vec![1, 2, 3]).await.unwrap();
-    b.put("packs/aa", vec![9; 100]).await.unwrap();
+    b.put_if_absent("config", vec![1, 2, 3]).await.unwrap();
+    b.put_if_absent("packs/aa", vec![9; 100]).await.unwrap();
     // 從 bucket 根看：物件必須在 <prefix>/ 底下，不是 bucket 根
     assert!(
         root.exists(&format!("{prefix}/config")).await.unwrap(),
@@ -102,7 +102,7 @@ async fn large_single_put() {
         return;
     };
     let data = vec![7u8; 64 * 1024 * 1024];
-    b.put("packs/big", data.clone()).await.unwrap();
+    b.put_if_absent("packs/big", data.clone()).await.unwrap();
     assert_eq!(b.size("packs/big").await.unwrap(), data.len() as u64);
     assert_eq!(
         b.get_range("packs/big", (64 * 1024 * 1024 - 5)..(64 * 1024 * 1024))
@@ -142,7 +142,7 @@ async fn put_only_user_can_write_and_read_but_not_delete() {
     )
     .unwrap();
 
-    b.put("config", vec![1]).await.unwrap();
+    b.put_if_absent("config", vec![1]).await.unwrap();
     b.put_if_absent("snapshots/c/1", vec![2]).await.unwrap();
     assert!(matches!(
         b.put_if_absent("snapshots/c/1", vec![3]).await,

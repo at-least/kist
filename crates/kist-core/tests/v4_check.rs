@@ -56,11 +56,12 @@ fn clean(r: &CheckReport) {
     assert!(r.warnings.is_empty(), "warnings: {:#?}", r.warnings);
 }
 
-async fn flip(repo: &Repo, path: &str, at: usize) {
+/// 翻一個 byte（位元損壞；`Backend` 沒有覆寫的 API，直接改本機 repo 的檔案）。
+async fn flip(t: &TestRepo, repo: &Repo, path: &str, at: usize) {
     let mut bytes = repo.backend().get(path).await.unwrap();
     let i = at.min(bytes.len() - 1);
     bytes[i] ^= 1;
-    repo.backend().put(path, bytes).await.unwrap();
+    t.overwrite(path, &bytes);
 }
 
 /// client 前綴下的第一個 key（`prefix` 是 `packs`、`mpacks` 之類）。
@@ -175,9 +176,9 @@ async fn a_missing_generation_is_reported() {
 
 #[tokio::test]
 async fn an_unreadable_newest_generation_is_reported_and_readers_fall_back() {
-    let (_t, repo, _) = indexed(0).await;
+    let (t, repo, _) = indexed(0).await;
     for replica in [false, true] {
-        flip(&repo, &Key::Head { g: 1, replica }.path(), 50).await;
+        flip(&t, &repo, &Key::Head { g: 1, replica }.path(), 50).await;
     }
     let r = repo.check(PLAIN).await.unwrap();
     assert!(has(&r.errors, "generation 1 is unreadable"), "{r:?}");
@@ -264,7 +265,7 @@ async fn a_damaged_shard_body_is_repairable_but_not_rewritten() {
     let gen = repo.read_head(1).await.unwrap();
     let id = gen.head.shards.iter().flatten().next().copied().unwrap();
     let body = Key::Shard { id, replica: false }.path();
-    flip(&repo, &body, 40).await;
+    flip(&t, &repo, &body, 40).await;
     let damaged = repo.backend().get(&body).await.unwrap();
     let r = repo.check(REPAIR).await.unwrap();
     assert!(
@@ -502,7 +503,7 @@ async fn an_item_with_no_holder_is_an_error() {
 async fn a_damaged_mpack_body_with_an_intact_r1_is_repairable() {
     let (t, repo, _) = indexed(1).await;
     let mpack = first(&t, "mpacks", 1).await;
-    flip(&repo, &mpack, 40).await;
+    flip(&t, &repo, &mpack, 40).await;
     let damaged = t.backend.get(&mpack).await.unwrap();
     clean(&repo.check(PLAIN).await.unwrap());
     let r = repo.check(REPAIR).await.unwrap();
@@ -561,7 +562,7 @@ async fn a_holder_that_fails_verification_is_reported_even_when_another_works() 
     }
     write_generation(&repo, records, false).await;
     let mine = first(&t, "mpacks", 1).await;
-    flip(&repo, &mine, 40).await;
+    flip(&t, &repo, &mine, 40).await;
     let r = repo.check(PLAIN).await.unwrap();
     assert!(
         has(
@@ -604,8 +605,8 @@ async fn a_missing_snapshot_r1_is_repaired_when_replicas_is_one() {
 
 #[tokio::test]
 async fn a_damaged_snapshot_body_with_an_intact_r1_is_repairable() {
-    let (_t, repo, snap) = indexed(1).await;
-    flip(&repo, &snap, 30).await;
+    let (t, repo, snap) = indexed(1).await;
+    flip(&t, &repo, &snap, 30).await;
     let r = repo.check(REPAIR).await.unwrap();
     assert!(has(&r.errors, &format!("{snap}: ")), "{r:?}");
     assert!(
@@ -726,7 +727,7 @@ async fn read_data_finds_a_damaged_pack_and_proves_the_parity_repair() {
         o.parity = parity;
         repo.backup(std::slice::from_ref(&src), o).await.unwrap();
         let pack = first(&t, "packs", 1).await;
-        flip(&repo, &pack, 200).await;
+        flip(&t, &repo, &pack, 200).await;
         let damaged = t.backend.get(&pack).await.unwrap();
         let plain = repo.check(PLAIN).await.unwrap();
         assert!(

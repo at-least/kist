@@ -72,15 +72,15 @@ async fn only_pack(repo: &Repo, c: ClientId) -> Key {
     keys.into_iter().next().unwrap()
 }
 
-/// 翻掉 pack 裡每一項密文的一個 byte（名稱不變）。
-async fn damage(repo: &Repo, key: &Key) {
+/// 翻掉 pack 裡每一項密文的一個 byte（名稱不變），回傳改過的 bytes；呼叫端以 `overwrite` 寫回。
+async fn damaged(repo: &Repo, key: &Key) -> Vec<u8> {
     let reader = repo.reader(None).await.unwrap();
     let trailer = reader.trailer(key).await.unwrap();
     let mut bytes = repo.backend().get(&key.path()).await.unwrap();
     for e in &trailer.entries {
         bytes[(e.o + 30) as usize] ^= 1;
     }
-    repo.backend().put(&key.path(), bytes).await.unwrap();
+    bytes
 }
 
 fn tombstone() -> Status {
@@ -120,7 +120,8 @@ async fn a_holder_that_fails_verification_falls_through_to_the_next() {
 
     let reader = repo.reader(None).await.unwrap();
     assert_eq!(order(&reader, &id), [client(1), ClientId::MAINT]);
-    damage(&repo, &only_pack(&repo, client(1)).await).await;
+    let mine = only_pack(&repo, client(1)).await;
+    t.overwrite(&mine.path(), &damaged(&repo, &mine).await);
     let reader = repo.reader(None).await.unwrap();
     assert_eq!(reader.chunk(&id).await.unwrap(), content);
 }
@@ -153,14 +154,12 @@ async fn a_tombstoned_holder_is_read_only_when_every_other_holder_fails() {
         "the tombstoned pack is not read while a live holder works"
     );
 
-    damage(
-        &repo,
-        &Key::Pack {
-            client: ClientId::MAINT,
-            id: maint,
-        },
-    )
-    .await;
+    let maint_key = Key::Pack {
+        client: ClientId::MAINT,
+        id: maint,
+    };
+    h.overwrite(&maint_key.path(), damaged(&repo, &maint_key).await)
+        .await;
     let reader = repo.reader(None).await.unwrap();
     assert_eq!(reader.chunk(&id).await.unwrap(), content, "last resort");
 }
@@ -254,7 +253,7 @@ async fn readers_fall_back_to_an_older_generation_and_backup_refuses() {
         let mut bytes = repo.backend().get(&key).await.unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
-        repo.backend().put(&key, bytes).await.unwrap();
+        t.overwrite(&key, &bytes);
     }
     let (state, skipped) = repo.usable_state().await.unwrap();
     assert_eq!(state.gen.g, 1);
@@ -326,7 +325,7 @@ async fn a_snapshot_whose_body_is_damaged_is_read_from_its_r1() {
     let key = Key::parse(&s.snapshot).unwrap();
     let mut bytes = repo.backend().get(&s.snapshot).await.unwrap();
     bytes[30] ^= 1;
-    repo.backend().put(&s.snapshot, bytes).await.unwrap();
+    t.overwrite(&s.snapshot, &bytes);
     let back = repo.read_snapshot(&key).await.unwrap();
     assert_eq!(back.parent, None);
     assert_eq!(back.client, client(1));

@@ -2,14 +2,14 @@
 //!
 //! 語意要點：
 //! - **寫入一律走暫存檔**：同目錄下 `.tmp-<16hex>`（O_EXCL 建檔）→ 寫完 `fsync`
-//!   （伺服器支援 `fsync@openssh.com` 時）→
-//!   - `put`（覆蓋）：`posix-rename@openssh.com` 原子換名；
-//!   - `put_if_absent`：`hardlink@openssh.com`——link 對已存在的目標會失敗，這就是
-//!     「只在不存在時寫入」的原子保證。SFTP 沒有「已存在」的狀態碼（OpenSSH 回泛用的
-//!     FAILURE），所以 link 被拒後再用 stat 判別是「已存在」還是別種錯誤。
-//!     當機最壞只會留下暫存檔殘骸，正式 key 底下不會出現寫一半的物件。
+//!   （伺服器支援 `fsync@openssh.com` 時）→ `hardlink@openssh.com` 到正式名——link 對已存在的目標會
+//!   失敗，這就是「只在不存在時寫入」的原子保證。SFTP 沒有「已存在」的狀態碼（OpenSSH 回泛用的
+//!   FAILURE），所以 link 被拒後再用 stat 判別是「已存在」還是別種錯誤。
+//!   當機最壞只會留下暫存檔殘骸，正式 key 底下不會出現寫一半的物件。沒有覆寫（v4 不覆寫任何物件，
+//!   `Backend` 沒有這個 API）。
 //! - **伺服器需求**：`hardlink@openssh.com` 與 `posix-rename@openssh.com` 缺一拒絕
-//!   （連線時就檢查，給出明確訊息）；`fsync@openssh.com` 有就同步、沒有就略過。
+//!   （連線時就檢查，給出明確訊息；posix-rename 只有 rclone 橋接的寬鬆模式會用到，嚴格模式仍一併
+//!   要求，OpenSSH 的 sftp-server 都有）；`fsync@openssh.com` 有就同步、沒有就略過。
 //! - **host key 嚴格驗證**：只接受 known_hosts（預設 `~/.ssh/known_hosts`，可用
 //!   `KIST_SFTP_KNOWN_HOSTS` 指定）裡有的 key；不在裡面一律拒絕連線（不做 TOFU）。
 //!   連線前先從 known_hosts 取該主機的 key 類型做演算法預選——OpenSSH 伺服器只會
@@ -1165,20 +1165,7 @@ impl ObjectStore for SftpStore {
                     }
                 }
             }
-            PutMode::Overwrite => {
-                let scratch = inner.spool(dir_of(&full), &bytes).await?;
-                let mut fs = inner.sftp.fs();
-                let renamed = fs.rename(&scratch, &full).await;
-                drop(fs);
-                // posix-rename 成功時暫存名已經不存在；失敗時清掉殘骸。
-                inner.remove_quiet(&scratch).await;
-                renamed.map_err(generic)?;
-                Ok(PutResult {
-                    e_tag: None,
-                    version: None,
-                    extensions: Default::default(),
-                })
-            }
+            // 覆寫沒有使用者（v4 不覆寫任何物件，`Backend` 沒有這個 API），不實作。
             other => Err(StoreError::NotImplemented {
                 operation: format!("put_opts with mode {other:?}"),
                 implementer: "sftp".to_owned(),

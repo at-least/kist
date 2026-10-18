@@ -2,7 +2,7 @@
 
 ## S3 / MinIO
 
-S3 相關的測試（`crates/kist-backend/tests/s3.rs`、`contract.rs` 與 `contract_v4.rs` 裡的 `s3_*`、
+S3 相關的測試（`crates/kist-backend/tests/s3.rs`、`contract_v4.rs` 裡的 `s3_*`、
 `crates/kist-core/tests/v4_backup_backends.rs` 與 `crates/kist-cli/tests/cli.rs` 裡的 `s3_*`）預設略過，設了環境變數才會跑：
 
 ```sh
@@ -17,7 +17,7 @@ docker rm -f kist-minio             # 用完關掉
 
 ## SFTP
 
-SFTP 相關的測試（`crates/kist-backend/tests/sftp.rs`、`contract.rs` 與 `contract_v4.rs` 裡的
+SFTP 相關的測試（`crates/kist-backend/tests/sftp.rs`、`contract_v4.rs` 裡的
 `sftp_*`、`crates/kist-core/tests/v4_backup_backends.rs` 裡的 `sftp_*`）預設略過，設了環境變數才會跑：
 
 ```sh
@@ -44,9 +44,9 @@ cargo test --workspace
 ```
 
 stdio 模式不用起伺服器：`rclone://` 會讓 kist 自己 spawn `rclone serve sftp --stdio`。
-這些測試同時驗證 rclone 的擴充「宣稱支援但實際行為」——`put` 走 O_EXCL fallback +
-posix-rename、`put_if_absent` 走 stat + posix-rename（rclone 不實做 hardlink 與
-O_EXCL 建檔，寬鬆語意的理由見 `docs/decisions/014-rclone-bridge.md`）。
+這些測試同時驗證 rclone 的擴充「宣稱支援但實際行為」——`put_if_absent` 走暫存檔的 O_EXCL
+fallback、stat 與 posix-rename（rclone 不實做 hardlink 與 O_EXCL 建檔，寬鬆語意的理由見
+`docs/decisions/014-rclone-bridge.md`；`Backend` 沒有覆寫的 API）。
 
 ## FUSE 掛載
 

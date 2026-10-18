@@ -88,7 +88,7 @@ async fn a_copy_that_fails_verification_is_not_reused() {
         for e in &trailer.entries {
             bytes[(e.o + 30) as usize] ^= 1;
         }
-        h.backend.put(&key, bytes).await.unwrap();
+        h.overwrite(&key, bytes).await;
     }
     let theirs = h.open_as("c2").await;
     let s = theirs

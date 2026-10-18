@@ -186,7 +186,7 @@ async fn from_url_local_round_trip() {
     let b = Backend::from_url(dir.path().join("repo").to_str().unwrap())
         .await
         .unwrap();
-    b.put("config", vec![1]).await.unwrap();
+    b.put_if_absent("config", vec![1]).await.unwrap();
     assert!(dir.path().join("repo/config").is_file());
     assert_eq!(
         b.location().to_string(),

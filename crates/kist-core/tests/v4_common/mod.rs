@@ -96,6 +96,11 @@ impl TestRepo {
         self.dir.path().join("repo")
     }
 
+    /// 測試用：覆寫 repo 裡的一個物件（造出損壞的物件）。`Backend` 沒有覆寫的 API，直接改檔案。
+    pub fn overwrite(&self, key: &str, bytes: &[u8]) {
+        std::fs::write(self.repo_path().join(key), bytes).unwrap();
+    }
+
     /// 某個前綴底下的物件數（本機 repo 的檔案數）。
     pub fn count(&self, prefix: &str) -> usize {
         let p = self.repo_path().join(prefix);
@@ -467,6 +472,15 @@ pub mod hooked {
             *self.counts.lock().unwrap().entry(what).or_default() += 1;
         }
 
+        /// 測試用：覆寫一個物件，造出損壞的物件。`Backend` 沒有覆寫的 API（v4 不覆寫任何物件），所以直接動
+        /// 底下的 store；不計入請求數、不動修改時間。
+        pub async fn overwrite(&self, key: &str, bytes: Vec<u8>) {
+            self.inner
+                .put(&StorePath::from(key), PutPayload::from(bytes))
+                .await
+                .unwrap();
+        }
+
         /// 每一種請求的次數（`put`、`get`、`range`、`head`、`list`、`delete`）。
         pub fn counts(&self) -> BTreeMap<&'static str, usize> {
             self.counts.lock().unwrap().clone()
@@ -831,6 +845,11 @@ impl HookedRepo {
         Repo::open(self.backend.clone(), PASSWORD, None)
             .await
             .unwrap()
+    }
+
+    /// 測試用：覆寫一個物件（造出損壞的物件），見 [`hooked::Hooked::overwrite`]。
+    pub async fn overwrite(&self, key: &str, bytes: Vec<u8>) {
+        self.store.overwrite(key, bytes).await;
     }
 
     pub async fn open_as(&self, cache: &str) -> Repo {

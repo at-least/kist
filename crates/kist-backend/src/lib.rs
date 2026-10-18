@@ -5,7 +5,8 @@
 //! - 讀取用 `get`、`get_range`、`head`、`list`，`maint/gen/` 從上次看過的世代起 [`Backend::list_after`]；
 //! - `delete` 與 P0 的 [`Backend::probe`] 只有維護角色（prune 與其他維護命令）會用。
 //!
-//! 覆寫（[`Backend::put`]）沒有正式的使用者了（v3 已移除）：只剩測試以它造出損壞的物件與後端自己的合約測試。
+//! 沒有覆寫：`Backend` 不提供覆寫的 API（v3 移除後拿掉），kist 的任何角色都發不出會覆寫的請求；測試要造出
+//! 損壞的物件時直接動儲存層（本機 repo 改檔案、記憶體 store 直接寫）。
 //!
 //! 支援四種位置（見 [`RepoLocation`]）：本機目錄、`s3://bucket[/prefix]`（AWS S3 與
 //! MinIO 等相容服務）、`sftp://[user@]host[:port]/path` 與 rclone 橋接
@@ -217,7 +218,7 @@ impl Backend {
         })?;
         // with_fsync(true)：object_store 的 local 預設**不** fsync（remote 的 ack
         // 隱含 durability），斷電時 rename 進去的 pack／index 內容可能還沒落盤。
-        // snapshot 最後寫的 commit 規則（docs/format.md）依賴 put 回報成功即
+        // snapshot 最後寫的 commit 規則（docs/format-v4.md §9）依賴 put_if_absent 回報成功即
         // durable——S3 ack 即 durable、SFTP 有 fsync（ADR 013），本機不能是例外。
         let store = object_store::local::LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
         Ok(Self {
@@ -291,16 +292,6 @@ impl Backend {
             }
             other => BackendError::Store(other),
         }
-    }
-
-    /// 寫入（覆蓋既有物件）。v4 不覆寫任何物件（format-v4.md §1），一律
-    /// [`put_if_absent`](Self::put_if_absent)；這個只剩測試在用（造出損壞的物件、後端的合約測試）。
-    pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
-        self.store
-            .put(&Self::path(key)?, bytes.into())
-            .await
-            .map_err(|e| Self::map_err(key, e))?;
-        Ok(())
     }
 
     /// 只在物件不存在時寫入；已存在回 [`BackendError::AlreadyExists`]。一次 PUT（S3 帶

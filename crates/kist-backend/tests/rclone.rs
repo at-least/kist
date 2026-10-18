@@ -2,8 +2,8 @@
 //! 啟動失敗的錯誤訊息。需要 PATH 上有 rclone 且 `KIST_TEST_RCLONE=1`
 //! （`eval "$(sh tests/rclone-setup.sh)"`）；沒設就跳過。
 //!
-//! 這些測試同時是「rclone 宣稱支援的擴充真的會動」的驗證：`put` 會踩到
-//! O_EXCL fallback + posix-rename、`put_if_absent` 會踩到 stat + posix-rename。
+//! 這些測試同時是「rclone 宣稱支援的擴充真的會動」的驗證：`put_if_absent` 會踩到暫存檔的
+//! O_EXCL fallback、stat 與 posix-rename。
 
 use kist_backend::BackendError;
 
@@ -22,13 +22,13 @@ async fn stdio_bridge_round_trip() {
     let url = format!("rclone://{}", dir.path().display());
     let b = kist_backend::Backend::from_url(&url).await.unwrap();
 
-    // put（覆蓋）：O_EXCL fallback → posix-rename publish
-    b.put("packs/aa", b"payload".to_vec()).await.unwrap();
-    assert_eq!(b.get("packs/aa").await.unwrap(), b"payload");
-    b.put("packs/aa", b"payload-2".to_vec()).await.unwrap();
+    // put_if_absent（寬鬆）：O_EXCL fallback 的暫存檔 → stat → posix-rename publish
+    b.put_if_absent("packs/aa", b"payload-2".to_vec())
+        .await
+        .unwrap();
     assert_eq!(b.get("packs/aa").await.unwrap(), b"payload-2");
 
-    // put_if_absent（寬鬆）：已存在要 AlreadyExists，而且內容不變
+    // 已存在要 AlreadyExists，而且內容不變
     match b.put_if_absent("packs/aa", b"other".to_vec()).await {
         Err(BackendError::AlreadyExists(_)) => {}
         other => panic!("expected AlreadyExists, got {other:?}"),
@@ -43,7 +43,7 @@ async fn stdio_bridge_round_trip() {
     assert_eq!(b.get_range("packs/aa", 7..9).await.unwrap(), b"-2".to_vec());
 
     // list（含子目錄遞迴）與 head
-    b.put("trees/tt", b"tree".to_vec()).await.unwrap();
+    b.put_if_absent("trees/tt", b"tree".to_vec()).await.unwrap();
     let mut keys: Vec<String> = b
         .list("packs")
         .await
@@ -77,7 +77,7 @@ async fn stdio_bridge_survives_repeated_ops() {
     let b = kist_backend::Backend::from_url(&url).await.unwrap();
     for i in 0..10u8 {
         let key = format!("packs/p{i}");
-        b.put(&key, vec![i; 4096]).await.unwrap();
+        b.put_if_absent(&key, vec![i; 4096]).await.unwrap();
     }
     for i in 0..10u8 {
         let key = format!("packs/p{i}");

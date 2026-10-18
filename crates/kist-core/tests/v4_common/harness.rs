@@ -332,7 +332,7 @@ pub async fn condemn(t: &T, ids: &[ObjectId]) {
 pub async fn damage(t: &T, key: &Key, entry: &PackEntry) {
     let mut bytes = t.repo.backend().get(&key.path()).await.unwrap();
     bytes[(entry.o + 30) as usize] ^= 0x55;
-    t.repo.backend().put(&key.path(), bytes).await.unwrap();
+    t.hooked.overwrite(&key.path(), bytes).await;
 }
 
 pub fn file_root(name: &str, chunk: kist_format::v4::ids::ChunkId, len: u64) -> Root {

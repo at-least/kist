@@ -7,7 +7,7 @@
 //! 5. 刪除：之後讀不到；刪除不存在的物件也成功（P9 依序刪 `.r1`、parity、主體，前兩個常常不存在）；
 //! 6. P0 的探針：本機、S3、SFTP 通過，rclone 橋接拒絕（它的條件建立是先 stat 再 rename），都不留下探針。
 //!
-//! v3 的契約（重寫會刷新修改時間）在 contract.rs，`touch/` 移除時一起移除。
+//! v3 的契約（重寫會刷新修改時間）已隨 v3 與 `Backend::put` 一起移除。
 //! 本機一定跑；S3、SFTP、rclone 有環境變數才跑（tests/README.md）。
 
 use kist_backend::{Backend, BackendError};

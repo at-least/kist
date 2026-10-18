@@ -11,9 +11,11 @@ async fn temp_backend() -> (tempfile::TempDir, Backend) {
 #[tokio::test]
 async fn put_get_head_list_round_trip() {
     let (_dir, b) = temp_backend().await;
-    b.put("packs/aa", vec![1, 2, 3, 4, 5]).await.unwrap();
-    b.put("packs/bb", vec![9]).await.unwrap();
-    b.put("trees/cc", vec![7, 7]).await.unwrap();
+    b.put_if_absent("packs/aa", vec![1, 2, 3, 4, 5])
+        .await
+        .unwrap();
+    b.put_if_absent("packs/bb", vec![9]).await.unwrap();
+    b.put_if_absent("trees/cc", vec![7, 7]).await.unwrap();
 
     assert_eq!(b.get("packs/aa").await.unwrap(), vec![1, 2, 3, 4, 5]);
     assert_eq!(b.get_range("packs/aa", 1..4).await.unwrap(), vec![2, 3, 4]);
@@ -80,17 +82,9 @@ async fn put_if_absent_never_overwrites() {
 }
 
 #[tokio::test]
-async fn put_overwrites() {
-    let (_dir, b) = temp_backend().await;
-    b.put("config", vec![1]).await.unwrap();
-    b.put("config", vec![2]).await.unwrap();
-    assert_eq!(b.get("config").await.unwrap(), vec![2]);
-}
-
-#[tokio::test]
 async fn delete_removes_key() {
     let (_dir, b) = temp_backend().await;
-    b.put("gc/x", vec![1]).await.unwrap();
+    b.put_if_absent("gc/x", vec![1]).await.unwrap();
     b.delete("gc/x").await.unwrap();
     assert!(!b.exists("gc/x").await.unwrap());
 }
@@ -100,6 +94,6 @@ async fn local_creates_directory_if_missing() {
     let dir = tempfile::tempdir().unwrap();
     let nested = dir.path().join("a").join("b");
     let b = Backend::local(&nested).unwrap();
-    b.put("config", vec![1]).await.unwrap();
+    b.put_if_absent("config", vec![1]).await.unwrap();
     assert!(nested.join("config").is_file());
 }
