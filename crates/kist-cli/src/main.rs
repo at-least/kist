@@ -129,6 +129,21 @@ enum Command {
         chunker_avg: u32,
         #[arg(long, value_name = "BYTES", default_value_t = 8 * 1024 * 1024)]
         chunker_max: u32,
+        /// Grace of generation 0 (at least 2h; default 3d). Set it here rather than lowering it
+        /// with `settings` afterwards: lowering drains for one old grace, during which new marks
+        /// still age by the old one.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        grace: Option<std::time::Duration>,
+        /// 1 also writes a `.r1` copy of every mpack, snapshot and map shard (default: 1 for a
+        /// local repository, 0 for S3, SFTP and rclone).
+        #[arg(long, value_name = "0|1", value_parser = clap::value_parser!(u8).range(0..=1))]
+        replicas: Option<u8>,
+        /// Size at which a data pack is written out (64k to 4g; default 64m).
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        pack_target: Option<u64>,
+        /// Size at which a metadata pack is written out (64k to 4g; default 8m).
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        mpack_target: Option<u64>,
     },
     /// Back up one or more paths into a new snapshot. A single `sftp://` or
     /// `s3://` URL backs up that remote source directly (the client reads,
@@ -725,15 +740,30 @@ async fn run(cli: Cli) -> Result<()> {
             chunker_min,
             chunker_avg,
             chunker_max,
+            grace,
+            replicas,
+            pack_target,
+            mpack_target,
         } => {
             let backend = open_backend(&repo).await?;
             let password = password::obtain(&repo.password_file, true)?;
+            // head 0 的 settings：沒給的用預設（replicas 看後端）。範圍由 Head::encode 檢查，不合就什麼都不寫。
+            let defaults = kist_format::v4::index::Settings::defaults(
+                kist_core::v4::default_replicas(backend.location()),
+            );
+            let settings = kist_format::v4::index::Settings {
+                grace: grace.map_or(defaults.grace, |d| d.as_secs()),
+                replicas: replicas.unwrap_or(defaults.replicas),
+                pack_target: pack_target.unwrap_or(defaults.pack_target),
+                mpack_target: mpack_target.unwrap_or(defaults.mpack_target),
+            };
             let opts = InitOptions {
                 chunker: kist_format::v4::config::Chunker {
                     min: chunker_min,
                     avg: chunker_avg,
                     max: chunker_max,
                 },
+                settings: Some(settings),
                 ..InitOptions::default()
             };
             Repo::init(backend, password.as_bytes(), opts).await?;

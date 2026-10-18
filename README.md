@@ -32,6 +32,7 @@ export KIST_REPO=/path/to/repo          # 或每個命令加 --repo
 export KIST_PASSWORD=...                # 或 --password-file，或互動輸入
 
 kist init                               # 建立 repo
+kist init --grace 48h                   # 建 repo 時就定 settings（之後調低 grace 要排空一個舊的，見「空間回收」）
 kist backup ~/Documents ~/Photos        # 備份，產生一個 snapshot
 kist backup ~ --exclude node_modules --exclude '*.tmp'   # 排除規則，見「排除規則」一節
 kist backup sftp://nas.local/srv/data   # 遠端來源也能備：讀遠端、本機切塊加密後上傳
@@ -330,7 +331,8 @@ grace（預設 72 小時）、再經過刪前驗證，下一輪才真的刪；�
 
 - grace 存在 repo 裡（`kist settings --grace`，至少 2h），不是命令列或設定檔的選項。每個 backup 必須在 grace
   減一小時內做完，否則不寫 snapshot、以錯誤結束（重跑即可）。調高立刻生效；調低要「排空」一個舊的 grace
-  才完全生效（期間新的標記仍以舊的 grace 計）。
+  才完全生效（期間新的標記仍以舊的 grace 計）。新 repo 要用較短的 grace，在 `kist init --grace` 給（`--replicas`、
+  `--pack-target`、`--mpack-target` 也可以在 init 給）：init 之後再調低就是排空，72 小時內的標記都照 72 小時算。
 - `prune` 的選項：`--repack-below`（預設 50%）：活資料比例低於它的舊 pack 會被重新打包；損壞而 parity 修得回
   的 pack 一律重新打包，壞的那份之後照常刪掉。`--read-data`：另外把每個活的資料 pack 整份讀回、逐一驗證它持有
   的 chunk（慢：下載整個 repo 的資料），壞而 parity 修得回的重新打包、修不回的從記錄移除並回報（它若是唯一的

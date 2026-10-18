@@ -1641,3 +1641,58 @@ fn backup_reads_source_paths_from_files() {
     let snapshots: Value = serde_json::from_str(&env.ok(&["snapshots", "--json"])).unwrap();
     assert_eq!(snapshots.as_array().unwrap().len(), 3);
 }
+
+/// init 可以直接指定 head 0 的 settings（M12 第 7 段第十步）。真實時鐘的 GC 驗收發現：init 之後再
+/// `settings --grace 2h` 是調低，會開始一個 72 小時的 drain（format-v4.md §11.4），期間新的標記都以舊的 grace
+/// 當 age——新 repo 想用短的 grace 只能在 init 時給。範圍同 `settings`，不合的什麼都不寫。
+#[test]
+fn init_takes_the_settings_of_generation_0_without_a_drain() {
+    use serde_json::Value;
+
+    let env = Env::new();
+    env.ok(&[
+        "init",
+        "--grace",
+        "2h",
+        "--replicas",
+        "0",
+        "--pack-target",
+        "1m",
+        "--mpack-target",
+        "64k",
+    ]);
+    let v: Value = serde_json::from_str(&env.ok(&["settings", "--json"])).unwrap();
+    assert_eq!(v["generation"], 0);
+    assert_eq!(v["settings"]["grace"], 2 * 3600);
+    assert_eq!(v["settings"]["replicas"], 0);
+    assert_eq!(v["settings"]["pack_target"], 1024 * 1024);
+    assert_eq!(v["settings"]["mpack_target"], 64 * 1024);
+    assert!(v["drain"].is_null(), "nothing was lowered: {v}");
+
+    // 沒給的用預設（本機 replicas 1）
+    let plain = Env::new();
+    plain.ok(&["init", "--grace", "3h"]);
+    let v: Value = serde_json::from_str(&plain.ok(&["settings", "--json"])).unwrap();
+    assert_eq!(v["settings"]["grace"], 3 * 3600);
+    assert_eq!(v["settings"]["replicas"], 1);
+    assert_eq!(v["settings"]["pack_target"], 64 * 1024 * 1024);
+    assert_eq!(v["settings"]["mpack_target"], 8 * 1024 * 1024);
+
+    // 範圍同 settings：grace 低於 2 小時被擋在寫任何東西之前
+    let bad = Env::new();
+    let stderr = bad.fails(&["init", "--grace", "1h"]);
+    assert!(stderr.contains("grace"), "{stderr}");
+    assert!(
+        !bad.repo().join("config").exists(),
+        "a refused init writes nothing"
+    );
+
+    // 對照：init 之後調低才是 drain
+    let later = Env::new();
+    later.ok(&["init"]);
+    let v: Value =
+        serde_json::from_str(&later.ok(&["settings", "--json", "--grace", "2h"])).unwrap();
+    assert_eq!(v["generation"], 1);
+    assert_eq!(v["drain"]["from"], 1);
+    assert_eq!(v["drain"]["old_grace"], 72 * 3600);
+}

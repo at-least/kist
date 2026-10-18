@@ -334,7 +334,9 @@ Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head
 - `parent` 是 head g−1 寫進 repo 的（密封後的）bytes 的 BLAKE3，主體與 `.r1` 相同；g > 0 必填。
 - `T(g)` ＝ head g 的後端修改時間（讀到的那一份：主體，主體讀不了時是 `.r1`），截到秒。head 永不刪除，所以每個世代的 `T` 與 `w` 永遠查得到。
 - init 寫 head 0：空的 map、預設 settings（grace 72 小時；replicas 本機 1、S3 與 SFTP 0，同 v3；
-  pack_target 64 MiB；mpack_target 8 MiB）。改 settings 是一個不刪任何東西的世代（§11.4）。
+  pack_target 64 MiB；mpack_target 8 MiB），或 init 時指定的值（範圍同下；head 0 裡的值不是調低，沒有
+  drain——新 repo 要用較短的 grace 在這裡給，init 之後再調低就要排空一個 72 小時的舊 grace，實作第七段的
+  GC 驗收發現）。改 settings 是一個不刪任何東西的世代（§11.4）。
 - settings 的範圍：grace 至少 2 小時；replicas 0 或 1；pack_target 與 mpack_target 在 64 KiB 到 4 GiB
   （同 v3 的 pack_target）。v3 的「`chunker.max` ≤ pack_target」不保留：target 只是寫出的門檻（§6），比它
   大的 chunk 照樣放得進一個 pack，而且 target 在可以改的 head 裡、chunker 在不可變的 config 裡。
