@@ -1,10 +1,12 @@
 # kist repo 格式（v4）
 
-> **狀態：設計已確認（2026-10-10，見 ADR 026），實作中。** 本文件是 v4 的唯一權威副本：`kist_format::v4`
-> 與 `kist_crypto::v4`（實作第 2 段）、kist-backend 的 v4 契約（第 3 段）、kist-core 的 `v4` 模組（init、open
-> 與 backup，第 4 段；restore 與 check，第 5 段）與 kist-mount 的 `v4` 模組（mount 的核心，第 5 段）照它實作，
-> 之後各段的程式碼也照它寫；改動格式必須同時改程式碼、向量與本文件。CLI、kist-app、kist-mount 的 FUSE 介面與
-> kist-core 的其他命令在第 6 段遷移之前仍用 v3，`docs/format.md` 繼續描述它們，v3 的模組移除時一併刪除。
+> **狀態：設計已確認（2026-10-10，見 ADR 026），實作第 1–6 段完成（2026-10-11），第 7 段（收尾：凍結 v4
+> fixture、fuzz、bench、量測）待開始。** 本文件是 v4 的唯一權威副本：`kist_format::v4` 與 `kist_crypto::v4`
+> （實作第 2 段）、kist-backend 的 v4 契約（第 3 段）、kist-core 的 `v4` 模組（init、open 與 backup，第 4 段；
+> restore 與 check，第 5 段；forget、prune、重建、settings、key、`remove-unknown-packs`，第 6 段）、kist-mount 的
+> `v4` 模組（第 5 段）與 CLI、kist-app（第 6 段）照它實作；改動格式必須同時改程式碼、向量與本文件。v3 的
+> kist-core、kist-mount 模組與 fixture 已移除；kist-format 與 kist-crypto 根下的 v3 模組還在，`docs/format.md`
+> 只描述它們，第 7 段整理時一併刪除。
 > v4 不支援 v3：config 的 `v` 不是 4 就拒絕，沒有遷移（負責人：「不需要支援上一代，目前都還在內部開發
 > 階段」）。
 > 第一版草稿（commit `054c7e1`，「v3 加樹進 pack」）已被否決；本版從需求與 bug 歷史重新推導，
@@ -95,8 +97,11 @@ master ─DeriveKey─▶ K_chunk_id "kist/v4/chunk-id"   K_meta_id "kist/v4/met
   KDF 參數只來自不可變的 config，所以塞進大量槽或極大參數的槽都卡不住開啟。
 - config 被換掉（任何一個 byte）→ 所有槽的 AAD 都對不上 → 開不起來，訊息是「密碼錯誤或 config 被竄改」。
   不會出現 v3 早期那種「認錯 repo、以為 chunk 已存在」的無聲遺失。
-- 換密碼：`key add` 建一個新槽；`key remove`（維護角色）只在同一個程序內另一個槽成功開啟、而且仍在列表
-  裡時才刪，最後一個槽刪不掉。
+- 換密碼：`key add` 以新密碼推導 KEK 與槽的名稱，把 master 包進新槽 `keys/<名稱>`（只在不存在時建立；這個
+  密碼已有槽就拒絕）；`key remove`（維護角色）只在同一個程序開啟時用的槽仍在列表裡、而且不是要刪的那一個
+  時才刪，最後一個槽刪不掉。`key remove` 拿同一台主機的維護檔案鎖（§11.3），不走柵欄、不需要 P0；不同主機
+  同時互刪對方的槽仍可能兩個都刪掉——這個命令很少用，接受這個風險（實作第 6 段）。槽的 AAD 綁 config 原樣
+  的 bytes，所以實作存著讀到的 config bytes、不重新編碼（重新編碼可能丟掉未知的欄位）。
 - 代價：KDF 參數在 init 時決定，之後不能調高；要更強的參數就開新 repo。
 - 本地 index 快取的目錄名稱 ＝ hex(keyed BLAKE3(`K_cache`, repo 位置)[..16])：換 repo 位置就不共用（同 v3，
   ADR 004：複製到第二個地方的 repo 可能少了東西）。
@@ -260,9 +265,13 @@ Root     { path: byte string, t: u8, tree: meta ID（t=1）, entry: Entry（t=0 
   才是撞名，時間戳 +1 奈秒、重新密封（AAD 與 `time` 都帶著時間戳），`replicas=1` 時連 `.r1` 一起重寫。讀回
   失敗就是 commit 與否不明，以錯誤結束。每次密封都用亂數 nonce，所以 bytes 相同幾乎只可能是自己那一份。
 - forget：不刪任何 client 在同一組 roots 上最新的那一份 snapshot（那是下一次 backup 的 parent）；刪除時先
-  刪 `.r1` 再刪主體。強制刪除那一份等於讓這個 client 的這組 roots 退役，只能在它沒有進行中的 backup 時
+  刪 `.r1` 再刪主體（主體＝commit，中途停下留下的是一個完整的 snapshot）。強制刪除那一份等於讓這個 client 的這組 roots 退役，只能在它沒有進行中的 backup 時
   做，刪除完成之前也不能開始新的 backup：backup 沿用 parent 的子樹時不查子樹裡每個 item 的持有者，靠的是 parent 一直存在（B4 的 HEAD 只能
-  縮小、不能消除這個空窗）。
+  縮小、不能消除這個空窗）。「同一組 roots」是 (client, 每個 root 的 `path` 與 `t`)，與 B1 找 parent 的條件
+  相同；保留政策在每一組裡套用。roots 讀不出來的 snapshot 分不了組：政策不碰它、只回報，它也不會是 parent
+  （backup 跳過讀不了的）。明確指定接受 `latest`、完整的 key、`<client>/<時間戳>`、時間戳或它的前綴；完整的
+  key 照列表找主體或 `.r1`、不解密，所以只有 `.r1` 的、兩份都解不開的 snapshot 都刪得掉（P5 停住時維護角色的
+  解除方法）。forget 不建立任何物件、不走柵欄、不需要 P0（§12）。
 
 ## 10. Index：map 與 delta
 
@@ -276,7 +285,7 @@ Head { v: 4, g, w: 寫入者的牆鐘時間（i64 奈秒）, parent: BLAKE3(head
 ```
 
 - `parent` 是 head g−1 寫進 repo 的（密封後的）bytes 的 BLAKE3，主體與 `.r1` 相同；g > 0 必填。
-- `T(g)` ＝ head g 的後端修改時間，截到秒。head 永不刪除，所以每個世代的 `T` 與 `w` 永遠查得到。
+- `T(g)` ＝ head g 的後端修改時間（讀到的那一份：主體，主體讀不了時是 `.r1`），截到秒。head 永不刪除，所以每個世代的 `T` 與 `w` 永遠查得到。
 - init 寫 head 0：空的 map、預設 settings（grace 72 小時；replicas 本機 1、S3 與 SFTP 0，同 v3；
   pack_target 64 MiB；mpack_target 8 MiB）。改 settings 是一個不刪任何東西的世代（§11.4）。
 - settings 的範圍：grace 至少 2 小時；replicas 0 或 1；pack_target 與 mpack_target 在 64 KiB 到 4 GiB
@@ -379,7 +388,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 
 ### 11.3 prune
 
-只在通過條件寫入探針的後端上執行。同一台主機以檔案鎖保證一次一個。
+只在通過條件寫入探針的後端上執行。同一台主機以檔案鎖保證一次一個維護命令：鎖檔在這個 repo 的本地快取目錄裡
+（`maint.lock`），沒有快取時在系統的暫存目錄、以快取目錄的名稱（§3）區分 repo；prune、重建、改 settings、
+`remove-unknown-packs` 與 `key remove` 用同一把鎖。維護命令一律讀後端、不用本地快取：它們依讀到的內容決定刪
+什麼，快取裡的那一份證明不了後端還在。
 
 - **P0** 後端的條件建立不是原子的（`rclone://`，§12）→ 拒絕，什麼都不寫。否則建立 `maint/probe-<亂數>`，
   再以同名建立一次，必須得到「已存在」；HEAD 它，後端時間與讀完之後的本機牆鐘相差超過 5 分鐘 → 拒絕。
@@ -412,20 +424,32 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   P0 的時間、不是 `T(g)`，因為等待期間每一輪都停在這裡、不寫新的 head，`T(g)` 不會前進（GC 模型找到的
   死結）。維護角色可以直接 `forget <key>` 立刻解除，不需要解密。解得開但版本不認得 → 拒絕。列表之後
   兩份都消失 → 視為已 forget，略過。某個 ID 沒有任何可讀、非 tombstone、種類相符的持有者 → 先重新列出
-  `maint/gen/`（同 P3），沒有更新的 head 才拒絕。
+  `maint/gen/`（同 P3），沒有更新的 head 才拒絕。被引用的 metadata item 照持有者的順序取回驗證（mpack 主體
+  不行試 `.r1`），走進它引用的 ID（每個 ID 一次，明確的堆疊）；內容正確但結構不合法的 item 也拒絕（不知道它
+  引用什麼）。某個持有者的副本驗證失敗（解不開或 ID 不符）：先整份讀那個 pack，名稱與內容不符（位元損壞）
+  而有 parity 就以 parity 在記憶體裡修復，重算 BLAKE3 等於名稱才算數，修好的 bytes 裡這一項解得開就是修得回
+  的副本——不從記錄移除、照樣走訪，那個 pack 在 P7c 一律 repack；修不回（沒有 parity、修了名稱仍不符，或名稱
+  本來就相符——某一項本來就是假的）才把項目從記錄移除並回報、換下一個持有者（規格錯誤第 17 項的修法 D，
+  實作第 6 段）。
 - **P6** 一個 ID 的正本＝它可讀、非 tombstone、種類相符的持有者中排序最前的那個。
 - **P7** 建 `Map(g+1)`（`age` 是目前的 grace；正在 drain 時是舊的 grace；重建後的 hold 期間不做 c 與 d）：
   - a) condemned 而且是某個 ID 的正本 → live（hold 期間 held 的記錄除外）；
   - b) live、不是任何 ID 的正本、pack 修改時間 + grace ≤ `T(g)` → condemned（`at = g+1`）。比對 pack
     的修改時間只是為了不去標剛寫入、snapshot 還沒 commit 的 pack，安全性不靠它；
-  - c) repack：live、是正本、比 grace 老、有效比例低 → 把它當正本的 item 逐一解密驗證（發現不實的項目
-    就從記錄移除並回報），寫進全零 client 前綴下的新 pack，**讀回驗證**後記為 `by_prune` 的 live；舊的
-    → condemned，保留全部項目。讀回驗證失敗：新 pack 記為 unreadable（`since = g+1`），舊的維持 live，
-    回報；
+  - c) repack：live、是正本、比 grace 老、當正本的項目（sealed bytes）不到 `repack_below`（CLI 的
+    `--repack-below`，預設 50%；0 不依比例 repack）的 pack，以及這一輪以 parity 修好的 pack（不論新舊與
+    比例）→ 把它當正本的 item 逐一解密驗證（發現不實的項目就從記錄移除並回報；驗證失敗先照 P5 試
+    parity），寫進全零 client 前綴下的新 pack（一個舊的對一個新的；mpack 在 `replicas=1` 時連 `.r1`；舊的
+    有 parity 就以同樣的片數為新的寫 parity，§13），**讀回驗證**（名稱、trailer、每一項）後記為 `by_prune`
+    的 live；舊的（損壞而修好的那個也是）→ condemned，保留全部項目，之後照常兩階段刪除——不覆寫任何東西、
+    只有 P9 會刪。讀回驗證失敗：新 pack 記為 unreadable（`since = g+1`），舊的維持 live，回報；寫入失敗只
+    回報，舊的維持 live；
   - d) condemned（`at = c`、`age`）、不是任何 ID 的正本、`T(c) + age` ≤ 現在的 `T` **而且** `w(c) + age`
     ≤ 現在的 `w`（§11.1 的現在）→ 刪前驗證：它宣稱持有的每個被引用 ID，正本必須是 `by_prune`，或現在在正本那裡解密、重算 ID 成功；
     驗證失敗就把那個項目從正本的記錄移除並回報，這個 pack 留在 condemned；全部通過 → tombstone
-    （`at = g+1`）；
+    （`at = g+1`）。驗證反覆到沒有變動（移除一個不實的項目可能換出新的正本）。正本的副本驗證失敗時同樣先
+    照 P5 試 parity：修得回就不移除，但這一輪不憑修好的副本把這個 condemned 的持有者標成 tombstone——它留
+    在 condemned，repack 寫出 `by_prune` 的新 pack 之後，下一輪以那一份驗證；
   - e) unreadable：主體與 `.r1` 都不在 → 移除記錄；否則 `since = s`、`T(s) + grace ≤ T(g)` →
     condemned；
   - f) tombstone、仍在列表裡 → tombstone（`at = g+1`，刷新）；
@@ -474,7 +498,15 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
 - **grace**：調高立刻生效。調低開始 drain：持續一個舊的 grace，在兩個時鐘上都過了才結束（現在的 `T` ≥
   `T(調低的世代)` + 舊 grace，而且現在的 `w` ≥ `w(調低的世代)` + 舊 grace，§11.1 的現在；原本只比 `T`，
   後端時鐘在寫調低的 head 時偏慢就提早結束，外部審查），期間新的 condemned 記錄用舊的 `age`，也不接受其他 grace 變更。
+  「現在」是最新 head 的時間（與這一輪 P0 的讀數取小），所以調低之後要有更新的世代（平常是 prune 每一輪寫的）
+  drain 才會結束；drain 期間其他 settings 照改、drain 留著，結束之後的下一次改動拿掉它。沒有改變就不寫 head。
   backup 一律用 `min(grace(g_s), grace(g_c))`。
+- **移除版本不認得的 pack**（`remove-unknown-packs`，ADR 026 負責人決定 10；實作第 6 段）：維護命令，維護角色
+  明確下令。P0、P1 之後以柵欄寫 head g+1，把 map 裡 unknown 的記錄改成 condemned（`at` 是新的世代，`age` 是
+  目前的 age，drain 中是舊的 grace），其他不變；沒有 unknown 的記錄就不寫。之後照一般的兩階段刪除（過了 age
+  的 prune 標成 tombstone、P9 刪除），不另外多一個刪除者。unknown 的記錄沒有項目，不會是任何 ID 的正本；較新
+  的 kist 的 snapshot 若引用它們，prune 在 P5 就停住（版本不認得，或沒有可讀的持有者），走不到刪除——只在沒有
+  較新的 kist 使用這個 repo 時下令。
 
 ### 11.5 不變式與論證（概要）
 
@@ -522,7 +554,10 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   start-after 列出（S3 送 `start-after`；本機與 SFTP 列出整個 prefix 再過濾，結果相同）。
 - 不需要：覆寫、分段上傳、條件刪除。
 - 寬鬆後端（`rclone://`、條件寫入沒有文件的 B2 與 Wasabi）：backup 可以用（pack、delta 以內容命名，
-  snapshot 以 client 分前綴、本機鎖保證同一個 client 一次一個）；prune 與其他維護命令不能用。
+  snapshot 以 client 分前綴、本機鎖保證同一個 client 一次一個）；prune、重建、改 settings 與
+  `remove-unknown-packs`（都要 P0 與柵欄）與 `check --repair`（以只在不存在時建立的寫入修復）不能用；forget 與
+  `key add`／`key list`／`key remove` 可以用：它們不建立由柵欄保護的物件、不需要 P0（實作第 6 段；原文把 forget
+  也擋掉了，ADR 026 規格錯誤第 18 項）。
   `rclone://` 依後端的種類拒絕（P0）：橋接的條件建立是先 stat 再 rename，兩個寫入者同時通過 stat 時後寫的
   蓋掉先寫的，但依序建立兩次照樣得到「已存在」，P0 的雙重建立看不出來（實作第 3 段在真的 rclone 上
   重現）。S3 相容服務靠 P0 的雙重建立：忽略 `If-None-Match` 的服務會讓第二次建立成功。
@@ -540,7 +575,8 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   讀到時補寫（P1），backup 不拿它決定沿用（B1）。
 - `replicas=1`（本機預設）：mpack、snapshot、map 分片也寫 `.r1`。mpack 與 head 先寫主體再寫 `.r1`
   （head 的主體是柵欄）；snapshot 先寫 `.r1` 再寫主體（主體是 commit）。資料 pack 不寫副本。
-- parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity。parity 與它對應的 pack 同名（§1）。
+- parity 選配，資料 pack 與 mpack 都可用；repack 為新 pack 寫 parity，片數與舊 pack 的 parity 相同（舊的沒有
+  就不寫；settings 沒有 parity 的欄位，這是實作上的選擇）。parity 與它對應的 pack 同名（§1）。
   backup 以選項決定片數（0 不寫），寫失敗只警告：pack 本身已安全，少的只是冗餘。
 - parity 的排版（沿用 v3，`v` 是 4）：明文 CBOR `{v, k, m, pack_size, shard_len, hashes, parity}`。整個寫進
   repo 的 pack bytes 切成 `k` ＝ 16 片、每片 `shard_len` ＝ ⌈`pack_size` / 16⌉ bytes（最後一片補零），以
@@ -556,9 +592,12 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   可能是 commit 前中斷：prune 照樣當成起點（P5）、`check` 回報，不自動補主體，由使用者 `forget` 或
   決定補回。
 - 在的、但損壞的物件（名稱與內容不符，或解不開）：v4 不覆寫，所以 `check` 只證明修得回——parity 修出的
-  bytes 重算 BLAKE3 等於名稱，或 `.r1` 完好——不寫回。P7c、P7d 也不用 parity：驗證失敗的項目照樣從記錄
-  移除；它若是那個 ID 唯一的持有者，P5 就一直拒絕，直到有人 forget。損壞的副本怎麼修回來還沒有定義（ADR 026
-  規格錯誤第 17 項）。
+  bytes 重算 BLAKE3 等於名稱，或 `.r1` 完好——不寫回。修回的路徑是 prune（ADR 026 規格錯誤第 17 項的修法
+  D，實作第 6 段）：P5、P7c、P7d 讀到驗證失敗的副本時先以 parity 在記憶體裡修復，修好的 pack 一律 repack
+  寫進新的 pack，損壞的那個走兩階段刪除（§11.3）。restore 與 mount 不用 parity：損壞的副本換下一個持有者，
+  全部失敗就報錯（§10），直到 prune 修好它。只有 prune 讀到的項目會被修（被引用的 metadata item、repack
+  候選與刪前驗證的正本）；稠密、live 的資料 pack 裡損壞的 chunk 不會，restore 讀不到那一份（修法 C 沒做，
+  見 ADR 026「實作第六段」）。
 
 ### 13.1 check
 
@@ -569,7 +608,9 @@ Record { id, client, kind, size, entries: [{i, o, l, r}], by_prune: bool, since:
   （head 永不刪除）。
 - 讀取端用的那一代（§10）：比它新卻被跳過的世代是錯誤；它的分片都在、名稱相符，`replicas=1` 時 `.r1` 也是。
 - 記錄與列表（P3）：live 與 condemned 的 pack 都在、大小等於記錄；`by_prune` 的記錄在全零前綴下；mpack 的
-  主體不在而 `.r1` 在、或 `replicas=1` 而 `.r1` 不在，照下面的修復處理。警告（不是錯誤）：unreadable 與
+  主體不在而 `.r1` 在、或 `replicas=1` 而 `.r1` 不在，照下面的修復處理。當下 delta 提到、map 還沒收錄的
+  mpack 的兩份也照這一條檢查與修復（第一次 prune 之前每個 mpack 都只在 delta 裡；實作原本漏了，第 6 段換
+  CLI 時的測試發現）；delta 提到卻完全不在列表裡的 pack 仍只是警告（下一句）。警告（不是錯誤）：unreadable 與
   unknown 的記錄、列表裡有而 map 與 delta 都沒提到的 pack（中斷的 backup 留下的，下一次 prune 收錄；mpack 的
   主體與 `.r1` 只回報一次）、解不開的 delta、delta 提到卻不在列表裡的 pack、對應的 pack 已不在的 parity、
   只有 `.r1` 的 snapshot。
@@ -612,7 +653,7 @@ mpack 的 `.r1` 與主體 bytes 相同；有 parity 的修得回自己。損壞�
 重建、grace 調低再調高、晚到的 delta、沿用被 forget 的 parent 子樹、不實的 trailer、讀不了的物件）；讀取端
 （持有者的順序、驗證失敗換下一份、重新載入與限流、退回較舊的世代、restore 依 `Root.t` 的落點）；§13.1 的
 每一條 check 規則與每一種修復。
-v3 的 fixture 移除，凍結一份 v4 的。
+v3 的 fixture 已移除（實作第 6 段）；v4 的在第 7 段凍結。
 
 ## 16. 設計決定 × 教訓
 

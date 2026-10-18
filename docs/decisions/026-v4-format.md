@@ -1,10 +1,10 @@
 # ADR 026：v4 格式——從需求重新推導
 
-日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作中。** 規格全文
-在 `docs/format-v4.md`；kist-core 的 `v4` 模組在第 4 段有了 init、open 與 backup，第 5 段有了 restore 與 check，
-kist-mount 的 `v4` 模組有了 mount 的核心；CLI、kist-app、kist-mount 的 FUSE 介面與 kist-core 的其他命令在第 6 段
-遷移之前仍是 v3，`docs/format.md` 繼續描述它們。本 ADR 取代同編號的第一版
-草稿（commit `054c7e1`）。
+日期：2026-10-10　狀態：**設計已確認（2026-10-10，負責人：「全部按照你的推薦」），實作第 1–6 段完成
+（2026-10-11），第 7 段（收尾）待負責人確認後開始。** 規格全文在 `docs/format-v4.md`；kist-core、kist-mount、CLI
+與 kist-app 全部是 v4，v3 的 kist-core／kist-mount 模組、測試與 fixture 已在第 6 段移除；kist-format 與 kist-crypto
+根下的 v3 模組還在（第 7 段整理，`docs/format.md` 到時一併刪除）。本 ADR 取代同編號的第一版草稿
+（commit `054c7e1`）。
 
 ## 一頁白話
 
@@ -798,3 +798,135 @@ rclone 的環境變數也是 643 個通過。
 
 **gate**：fmt、clippy、windows-gnu clippy 乾淨；nextest 從 691 增加到 792 個通過，9 個略過；帶 S3、SFTP、rclone
 的環境變數也是 792 個通過，`v4_backup_backends` 的 3 個在 MinIO、SFTP、rclone 上都過。
+
+## 實作第六段：prune 與維護、前端換成 v4、移除 v3（2026-10-11）
+
+負責人：「繼續」（第五段的回報之後；規格錯誤第 17 項照建議採修法 D、不做 C，也是這一句）。
+
+**內容**（commit `168d8aa`：第 12–19 步；`0b3d425`：第 20–22 步；與這份文件的 commit。逐步的歷史在標籤
+`v4-steps-archive`）：
+- 維護角色的共用步驟（`kist_core::v4::maint`）：同一台主機一次一個維護命令的檔案鎖（repo 的本地快取目錄裡的
+  `maint.lock`，沒有快取時在系統暫存目錄、以快取目錄的名稱區分 repo）；P0 的探針以命令自己的時鐘讀本機牆鐘
+  （kist-backend 新加 `Backend::probe_with`）；P1 讀列出來的最大世代，`T(g)` 取讀到的那一份的修改時間，`T(g)`
+  比本機時鐘晚超過 M 就回報、以本機時鐘 + M 當作現在，列表裡有主體沒有 `.r1` 就補寫；柵欄（先 HEAD 下一代的
+  `.r1`，再只在不存在時建立主體，成功後寫 `.r1`，失敗就停止、什麼都不刪）；兩個時鐘的 `window_passed` 與
+  「現在」取小。維護命令一律讀後端、不用本地快取。
+- 改 settings（§11.4）：P0、P1 之後以柵欄寫 head g+1，分片、bad、hold 照抄；範圍照 §10（kist-format 的
+  `Settings::check`）；grace 調低開始 drain，drain 期間不接受 grace 的變更、其他 settings 照改；沒有改變不寫。
+- forget（§9，`kist_core::v4::forget`）：分組 (client, roots 的 `path` 與 `t`)，每一組最新的一份是下一次 backup
+  的 parent、不刪，明確指定它要 `--retire`；完整的 key 不解密也刪得掉（只有 `.r1` 的、兩份都解不開的，P5 停住時
+  的解除方法）；先刪 `.r1` 再主體。保留政策搬到與版本無關的 `crate::retention`。
+- prune（§11.3，`kist_core::v4::prune`）：P0–P9 照 GC 模型逐段實作；P3、P5 拒絕前先重新列出世代；P4 讀 trailer
+  時後端的暫時錯誤停止這一輪，不把好的 pack 記成 unreadable；P7c 的 repack（一個舊的對一個新的、讀回驗證、舊的
+  保留全部項目）與第 17 項的修法 D（見下）；P8 只寫有變動的分片；P9 刪不掉的回報、記錄留在 tombstone 下一輪
+  再試，超過整輪時限就停止並回報沒做完（已寫的世代有效）。kist-format 的 trailer 與 snapshot 解碼先只讀 `v`
+  （`peek_version`），版本不認得時不論其他欄位都回 Version 錯誤，P4 才分得出「看不懂」與「壞掉」。
+- 重建（§11.4，`kist_core::v4::rebuild`）：照模型的 Rebuild；沿用條件只看 `w`；已有 hold 時合併；分片全部重寫、
+  補寫 `g_lost` 缺的 `.r1`。prune 的「列出 pack」與「新進者的記錄」抽成共用。
+- key add／list／remove（§3，`kist_core::v4::repo`）：Repo 記著 master（離開時清零）、config 原樣的 bytes（槽的
+  AAD 綁 BLAKE3(config)，重新編碼可能丟掉未知的欄位）與開啟時用的槽；`key remove` 拿維護鎖、不走柵欄。
+- 移除版本不認得的 pack（負責人決定 10，`Repo::condemn_unknown`，CLI 的 `remove-unknown-packs`）：維護角色明確
+  下令，以柵欄寫一代把 unknown 的記錄改成 condemned，之後照一般的兩階段刪除，不另外多一個刪除者；寫進 §11.4。
+- backup 的進度回報（`BackupOptions::progress`，事件與 v3 的 `BackupProgress` 相同），kist-app 的網頁要顯示。
+- 前端（第 20 步）：CLI 每個命令開 v4 的 Repo；`rebuild-index` 改名 `rebuild`；新加 `settings`（不帶選項是顯示）、
+  `key add／list／remove`、`remove-unknown-packs`；`prune` 只剩 `--repack-below`（v3 的 `--grace`、`--dry-run`、
+  `--inactive-after`、`--clock-skew` 不再接受），刪不掉的或沒做完的以結束碼 3 回報；`backup` 拿掉 `--gc-grace`；
+  `forget` 新加 `--retire`，`--prune` 與 `--dry-run` 互斥；`--json` 的欄位改成 v4 的形（backup 的 `snapshot`、
+  `generation`、roots 是 `{path, type}`；prune 與 rebuild 印 PruneReport／RebuildReport；settings 與 key list 也有
+  `--json`）。kist-app：工作、daemon 與網頁走 v4；設定拿掉 `backup.gc_grace`、`prune.grace`、`prune.clock_skew`、
+  `prune.inactive_after`（現在是 unknown field 錯誤），`prune.repack_below` 對應到 `PruneOptions`；`cache_dir` 沒設
+  時改用使用者的快取目錄（同 CLI：維護鎖在 repo 的快取目錄裡，預設不同就不是同一個鎖檔；v3 時沒設就不用快取）。
+  kist-mount 的 mount 收 v4 的 Repo。kist-core 為前端補的：`list_snapshots_with_roots`、`Repo::settings`、
+  可序列化的 `BackupSummary`、`Live::run_send`、轉出 `ClientId`。
+- v3 的測試搬進 v4（第 21 步）：移除 v3 之前，先把「v3 移除後仍在的程式碼、卻只有 v3 的測試覆蓋」的測試搬過來
+  （v4 的走訪是 v3 的複製；共用的排除規則、fsmeta 與保留政策原本只由 v3 的測試覆蓋）：`v4_backup_exclude.rs`
+  （14）、`v4_source_backup.rs`（9）、`v4_backup_robustness.rs`（8；大檔快速路徑的兩個不搬，v4 沿用 chunk 清單時
+  把它當成沿用的子樹）、`v4_backup_restore.rs`（8；跨段的那個改用依這個 repo 的 K_cut 挑的名稱）、`retention.rs`
+  （6），`v4_restore.rs` 與 `v4_forget.rs` 各加一個；不搬的是 v3 才有的機制（index、trees、touch）。反向檢查 13
+  項，每一項都讓對應的測試失敗；其中搬過來的 `fast_path_uses_parent_start_time` 原本抓不到快速路徑用錯時間
+  （整個 kist-core 沒有任何測試抓得到），補上前半：第一個 backup 的時鐘撥早一小時，第二個一個都不能沿用。
+- 移除 v3（第 22 步）：kist-core 刪掉 v3 的 backup、cache、check、forget、index、pack、prune、reach、rebuild、
+  repo、snapshots，kist-mount 刪掉 `corefs` 的 FsCore 與 vpath，連同 v3 的測試、`tests/common` 與凍結的 v3
+  fixture。留下的共用部分：來源與排除規則的型別（`SourceSpec`、`Exclusions`、`Marker`）搬進 v4 的 backup；
+  restore 的檔案系統那一層留在 `crate::restore`；`fsmeta`、`filter`、`retention`；mount 介面的型別搬進 kist-mount
+  的 v4。`CoreError` 拿掉只有 v3 用的變體。restore 的三個單元測試（ADR 019 A2、A3）原本只測 v3 的走訪，測試接縫
+  加進 v4 的走訪、測試搬過去，三項反向檢查各自讓對應的測試失敗。
+- 測試：`v4_settings.rs`（19）、`v4_forget.rs`（12）、`v4_prune.rs`（44）、`v4_rebuild.rs`（11）、`v4_keys.rs`
+  （6）；`v4_backup_backends.rs` 在 MinIO 與 SFTP 上多跑 prune（寫出下一代、沒有到期的東西就不刪、之後
+  `check --read-data` 乾淨），rclone 上 P0 拒絕、什麼都不寫（時間不能快轉，刪除的路徑只在虛擬時鐘的測試裡跑）；
+  CLI 的 7 個改成 v4 的語意、kist-app 拿掉 v3 grace 的 6 個、設定新加 2 個。測試的虛擬時鐘（`tests/v4_common`
+  的 VClock）：hooked 後端的修改時間是寫入當下的虛擬後端時間，維護命令與 backup 的兩個時鐘也從它讀，兩邊各有
+  自己的偏差。反向檢查（scratchpad 的 mutate6.py，對照 GC 模型的 `Mutations`）：settings 12、forget 6、prune
+  43、repack 與修法 D 12、重建 10、key 3、unknown 1，合計 87 項，每一項都讓對應的測試失敗；其中 5 項原本照樣
+  通過，測試改過才抓得到（第 14 步的 commit 列出）。第五段 restore 與 mount 的 11 項反向檢查在移除 v3 之後重跑，
+  全部仍讓測試失敗。
+
+**找到的規格錯誤**（接續第五段的編號；第 17 項在這一段修）：
+
+| # | 誰找到的 | 問題 | 嚴重度 | 修正 |
+| --- | --- | --- | --- | --- |
+| 17（修法） | 第五段的回報，負責人「繼續」 | 在的、但損壞的 pack 沒有合規的方法修回去；P7c、P7d 驗證失敗就移除項目 | 見第五段 | **修法 D**（第 15 步）：prune 讀到的副本驗證失敗時（P5 的 metadata item、P7c 的候選、P7d 的正本）先整份讀那個 pack，名稱與內容不符而有 parity 就在記憶體裡修復，重算 BLAKE3 等於名稱才算數；修得回的副本不移除、照樣走訪，修好的 pack 一律 repack 寫進新的 pack，損壞的那個 condemned、之後照常兩階段刪除——不覆寫任何東西、只有 P9 會刪。P7d 不憑修好的副本把 condemned 的持有者標成 tombstone，留一輪。名稱相符的 pack（某一項本來就是假的）parity 救不了，照樣移除。修法 C（restore 以 parity 在記憶體修復）沒做（見「留給負責人的」） |
+| 18 | 實作 forget 時（第 13 步） | §12 寫寬鬆後端上「prune 與其他維護命令不能用」，理由是柵欄需要原子的條件建立；forget 不建立物件、不走柵欄、不需要 P0，照原文會把一個安全的操作擋掉（`rclone://` 上的 repo 永遠刪不了 snapshot，壞 snapshot 讓 prune 停住時也解不了） | 低：只是過度限制，沒有資料遺失方向 | §12 改成：prune、重建、改 settings、`remove-unknown-packs`（都要 P0 與柵欄）與 `check --repair` 不能用；forget 與 `key add／list／remove` 可以用 |
+
+**實作的漏洞**（不是規格錯誤）：check 對只在 delta 裡、map 還沒收錄的 mpack 不檢查兩份（第一次 prune 之前每個
+mpack 都是這種）：`.r1` 不見不回報、`--repair` 不補、主體不見也不回報。換 CLI 時的測試發現（第 20 步），改成
+delta 提到的 mpack 的兩份照記錄的方式檢查與修復（delta 提到卻完全不在列表裡的 pack 仍只是警告），`v4_check.rs`
+加一個（修之前在 `has no .r1` 的斷言失敗）；§13.1 補一句。
+
+**對規格的其他修改**（format-v4.md）：
+1. §11.3 P5、P7c、P7d：修法 D 的規則；§13 的「損壞的副本怎麼修回來還沒有定義」改成指向它，並寫明 restore 與
+   mount 不用 parity、稠密的 live 資料 pack 裡損壞的 chunk 不會被修（C 沒做）。
+2. §11.3 P7c：候選的條件寫成 `repack_below`（預設 50%、0 不依比例）；修好的 pack 不論比例一律 repack；一個舊的
+   對一個新的；寫入失敗只回報。§13：repack 為新 pack 寫 parity 的片數取自舊 pack 的 parity（settings 沒有 parity
+   的欄位，實作上的選擇）。
+3. §11.3 P7d：驗證反覆到沒有變動；修好的副本那一輪不讓 tombstone 成立。
+4. §11.4：drain 的「現在」是最新 head 的時間，所以調低之後要有更新的世代 drain 才會結束；drain 期間其他 settings
+   照改；沒有改變不寫 head。新的「移除版本不認得的 pack」命令（負責人決定 10）。
+5. §10、§11.3 P1：`T(g)` 是讀到的那一份（主體，不行就 `.r1`）的修改時間。§11.3 開頭：檔案鎖的位置、哪些命令
+   共用它、維護命令不用快取。
+6. §3：`key add` 的規則；`key remove` 不走柵欄、拿維護鎖，不同主機同時互刪時可能兩個都刪掉（接受）；config
+   原樣的 bytes。
+7. §9：forget 的分組、roots 讀不出來的 snapshot、明確指定的寫法、完整的 key 不解密也刪得掉、不走柵欄。
+8. §12：第 18 項。§13.1：delta 提到的 mpack 的兩份照記錄的方式檢查與修復。§15：v3 的 fixture 已移除。
+9. 開頭的狀態。
+
+**與「實作階段」第 6 項的偏離與實作上的選擇**：
+- 第 6 項的清單多了前端切換、v3 的測試搬進 v4、移除 v3：第四、五段都寫「v3 移除時（第 6 段）一起換」。
+- restore 的檔案系統那一層留在 `crate::restore`，不是第五段寫的「搬進 v4」：它與 `filter`、`fsmeta`、`retention`
+  一樣不屬於某個格式版本；實際只刪掉 v3 的走訪與 `ReloadableIndex`，路徑不變。
+- 數值與選擇：`--repack-below` 預設 50（同 v3）；D 只修 prune 讀到的項目；parity 的片數沿用舊 pack；unknown 改成
+  condemned 時 `age` 用目前的 age；kist-app 的 `cache_dir` 預設改變（見上）。
+- `check --repair` 不做 P0、只建立物件（不需要刪除權限）；`forget`、`key add`、`key list` 不拿維護鎖；`key remove`
+  拿鎖但不走 P0 與柵欄。
+- `Backend::put` 不再有正式的使用者，只剩測試（造出損壞的物件、後端的合約測試）；要不要移除放進「留給負責人的」。
+- `fuzz/` 編不過（第 22 步之前就是：pack 與 parity 兩個 target 跟不上之前的改動），四個 target 都用 v3；第 7 段
+  重新播種時改成 v4。
+- kist-format 與 kist-crypto 根下的 v3 模組還在：v4 與其他 crate 還用到其中的 `cbor`、`config::ChunkerParams`、
+  `tree::meta_kind`，以及 kist-crypto 根的共用型別（`MasterKey`、`KdfCost`、`CryptoError`、`random_bytes`；
+  以 grep 逐一查過使用者）；v3 才有的（`index`、`keys`、`snapshot`、`tree` 的結構、v3 的 `pack` 排版與 `parity`、
+  v3 的金鑰綁定 `KeyBinding`、v3 的 golden 與向量測試）第 7 段整理：留下共用的、移除其餘，`docs/format.md` 同時
+  刪除。第 2 段寫的「`format-v4.md` 取代 `format.md`」到那時才完成。
+- 搬過來的排除規則測試有 2 個只在 Windows 或非 unix 上編譯，Linux 上跑不到，只由 windows-gnu clippy 型別檢查。
+- kist-app 的 prune metrics：`kist_prune_marked_objects` 與 `kist_prune_live_packs` 從工作結果的 JSON 讀 `marked` 與
+  `live_packs`，v4 的 `PruneReport` 沒有這兩個欄位（只讀碼，UNVERIFIED：沒有跑 daemon 確認），所以 v4 之後它們不會
+  更新；`kist_prune_deleted_bytes_total` 讀的 `deleted_bytes` 還在。寫這份文件時發現，放進第 7 段。
+
+**留給負責人的**：
+- 修法 C 要不要做：D 只修 prune 讀到的項目（被引用的 metadata item、repack 候選、刪前驗證的正本），稠密、live
+  的資料 pack 損壞時 restore 仍讀不到那一份；要修它要嘛 restore 自己以 parity 在記憶體修復（C：每次失敗下載整個
+  pack 與 parity），要嘛另加一個整份讀每個 pack 的 prune 模式。
+- `Backend::put` 要不要移除（只剩測試在用）。
+- 第 7 段的清單（PLAN M12）要不要調整。
+
+**環境**：同第五段（MinIO 用本機快取的映像以 `docker tag` 標成腳本釘的名稱，腳本沒有改）。
+
+**延到後面的（第 7 段）**：凍結 v4 fixture；fuzz 改成 v4 並重新播種；記憶體 bench（持有者表、驗證過的 (item, pack)
+集合、這次寫過的 ID 集合、check 的成本與記憶體）；MinIO 與 SFTP 整合重跑、S3 依 client 分前綴的權限在 MinIO 上
+實測（`tests/minio-setup.sh` 加使用者與政策）；重量 V21 與 M2 的請求數、真的 S3 上的請求數；ChunkIndex 的跳段讀；
+kist-format／kist-crypto 的 v3 根模組與 golden、`docs/format.md`；README 的驗收數據重量；`Backend::put`；
+kist-app 的 prune metrics；Linux 以外的 E（§11.1 的 UNVERIFIED）。
+
+**gate**（這份文件的 commit 之前在 `0b3d425` 的樹上重跑，第一手）：fmt、clippy 乾淨；windows-gnu clippy
+（cargo-zigbuild，workspace 不含 kist-mount／kist-cli，與 kist-cli 單獨）乾淨；nextest 700 個通過、8 個略過
+（第五段 792＋9 → 第 19 步 884＋9 → 第 21 步 927＋9 → 移除 v3 後 700＋8：刪掉的檔案裡 230 個，其中 2 個只在
+Windows 或非 unix 上編譯）；`KIST_TEST_FUSE=1` 的 `mount_round_trip` 在第 20、22 步過（這份文件的 commit 沒有重跑）。

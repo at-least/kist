@@ -9,8 +9,9 @@
 設計目標依序：資料安全性 > 還原可靠性 > 抗勒索 > 效能 > 功能數量。
 
 **本 repo 只有一份實作：根目錄的 Rust 工作區，是正式產品與格式標竿。**
-`docs/format.md`（v3）是權威規格；格式相容性由凍結的 v3 fixture repo
-（`crates/kist-core/tests/fixtures/`，永不重生、只在格式升版時換）把關。
+`docs/format-v4.md`（v4，M12）是權威規格；`docs/format.md` 只描述 kist-format／kist-crypto 根下還沒移除的
+v3 模組（M12 第 7 段刪）。格式相容性由凍結的 fixture repo（永不重生、只在格式升版時換）把關：v3 的已隨 v3 移除，
+v4 的在 M12 第 7 段凍結。
 原本的 Go 參考實作已於 2026-09-27 移除（見下方 M9 與 ADR 018）；需要時
 可從 commit `80b89ed` 取回：`git checkout 80b89ed -- go`。
 
@@ -36,7 +37,7 @@
 - 記憶體：index 用本地磁碟快取（sorted table，`pread` 逐筆讀——不用 mmap，
   所有 crate `forbid(unsafe_code)`）；tree 物件 streaming 處理。
 
-## 儲存格式（v2 — 與 Go 參考實作統一；權威規格見 `docs/format.md`）
+## 儲存格式（v2 的原始設計，歷史；現行格式是 v4，權威規格見 `docs/format-v4.md`，M12）
 repo 是一個 key-value 命名空間，所有物件不可變、以內容 hash 命名：
 
 ```
@@ -61,7 +62,7 @@ parity/<packID>             選配 Reed-Solomon sidecar（他端忽略）
   snapshot=完整 key、trailer/index=角色常數）。
 - 所有格式結構定義集中在 `kist-format` crate，其他 crate 只能透過它讀寫。
 
-## 無鎖 GC（two-phase, grace period；詳見 format.md §13）
+## 無鎖 GC（v2／v3 的 two-phase, grace period，歷史；v4 改成世代柵欄，見 format-v4.md §11）
 1. `prune` 找出不再被任何 snapshot「解析到」的 pack（正本 = 未標記優先、
    其次名稱最小），寫 `gc/<名稱>` **無資訊**標記（pack/tree/index 共用命名
    空間），**不刪**。標記的年齡 = 後端修改時間（一律截秒）。
@@ -92,7 +93,7 @@ kist/
     kist-cli/           clap 命令列，產出 `kist` binary
   fuzz/                 cargo-fuzz targets
   tests/                跨 crate 整合測試（含 MinIO 容器）
-  docs/format.md        格式規格（與程式碼同步更新）
+  docs/format-v4.md     格式規格（與程式碼同步更新；format.md 是 v3 的，M12 第 7 段刪）
   docs/decisions/       ADR
 ```
 
@@ -181,7 +182,7 @@ kist/
 - `#![forbid(unsafe_code)]`、`#![deny(clippy::unwrap_used, clippy::expect_used)]` 在所有 lib crate。
 - 每個 crate 有 `lib.rs` 頂端文件說明職責；公開 API 有 doc comment。
 - 任何寫入 repo 的操作都要先寫測試再實作。
-- `kist-format` 的變更必須附 golden files 更新與 `docs/format.md` 更新。
+- `kist-format` 的變更必須附 golden files 更新與 `docs/format-v4.md` 更新。
 - 不做的事：不支援非加密 repo、不做原生 GUI、不自己實作加密原語。
 - 每階段結束產出 `docs/decisions/NNN-*.md`（ADR），用白話解釋為什麼這樣設計。
 - 每階段結束開一個新的 review session：只給格式文件和程式碼，請 Claude Code 以審查者身分找 bug 與設計漏洞，重點是 GC、加密、pack 解析。
@@ -433,7 +434,7 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
   455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
-## M12：v4 格式（2026-10-10 設計已確認，實作中）
+## M12：v4 格式（2026-10-10 設計已確認；第 1–6 段完成 2026-10-11，第 7 段待確認）
 
 起因：ADR 017 的 v4 草稿，加上 ADR 025 留下要改格式的 V19、V21。負責人說明系統還沒上線、相容性
 不重要、不需要支援上一代。第一版草稿（`054c7e1`，v3 加樹進 pack）負責人要求重新設計。
@@ -471,7 +472,20 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
      不回去，P7c、P7d 也不用 parity，parity 在現在的規格裡救不回任何東西；這一段只證明修得回，修法待負責人決定
      （建議在第 6 段的 P7c、P7d 先以 parity 修復）。順手修了第四段一個約 1% 會失敗的測試。CLI 的 `restore`、
      `mount`、`check` 與 FUSE 介面還是 v3，v3 移除時一起換。見 ADR 026「實作第五段」。等負責人確認後開始第 6 段。
-  6. prune 與維護（包括移除版本不認得的 pack 的維護命令，ADR 026 負責人決定 10）。7. 收尾。
+  6. prune 與維護、前端換成 v4、移除 v3——**完成**（2026-10-11，`168d8aa`、`0b3d425`；逐步歷史在標籤
+     `v4-steps-archive`）：維護角色的共用步驟（檔案鎖、P0、P1、柵欄、兩個時鐘）、settings、forget（保留政策搬到
+     與版本無關的 `retention`）、prune 的 P0–P9 與 P7c 的 repack（規格錯誤第 17 項採修法 D：prune 讀到的損壞副本
+     先以 parity 在記憶體修復、修好的 pack 一律 repack，不覆寫任何東西）、重建、`key add／list／remove`、
+     `remove-unknown-packs`（負責人決定 10）、backup 的進度回報；CLI、kist-app、kist-mount 換成 v4（`rebuild-index`
+     改名 `rebuild`，新加 `settings`、`key`、`remove-unknown-packs`，prune 只剩 `--repack-below`，forget 新加
+     `--retire`，設定檔拿掉 v3 的 grace 等欄位）；v3 的測試搬進 v4、移除 v3 的 kist-core／kist-mount 模組與
+     fixture。找到一個規格錯誤（第 18 項：§12 把 forget 也擋在寬鬆後端之外）與 check 的一個漏洞（只在 delta 裡的
+     mpack 不檢查兩份）。見 ADR 026「實作第六段」。等負責人確認後開始第 7 段。
+  7. 收尾——待確認：凍結 v4 fixture；fuzz 改成 v4 並重新播種（目前編不過）；記憶體 bench；MinIO 與 SFTP 整合
+     重跑、S3 依 client 分前綴的權限實測；重量 V21 與 M2 的請求數、check 的成本與記憶體；kist-format／kist-crypto
+     根下的 v3 模組與 golden 整理、刪 `docs/format.md`；`Backend::put` 要不要移除；kist-app 的 prune metrics
+     （`kist_prune_marked_objects`、`kist_prune_live_packs` 讀的是 v3 report 的欄位，v4 之後不會更新——只讀碼，
+     UNVERIFIED）；修法 C 要不要做。
 
 ## 已接受的限制（非待辦）
 

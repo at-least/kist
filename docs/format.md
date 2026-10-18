@@ -1,8 +1,11 @@
 # kist repo 格式（v3）
 
-> **狀態：v3，只描述還沒遷移到 v4 的程式碼（kist-core、kist-mount、kist-cli 與 `kist_format` 根下的 v3
-> 模組）。** v4 的權威副本是 `docs/format-v4.md`；v4 實作第 3–6 段遷移完、v3 的模組移除時，本文件一併
-> 刪除。以下是 v3 原本的狀態說明。
+> **狀態：v3，只描述 kist-format 與 kist-crypto 根下還沒移除的 v3 模組**（`kist_format` 的 `config`、`ids`、
+> `index`、`keys`、`pack`、`parity`、`snapshot`、`tree` 與 `kist_crypto` 根的 v3 金鑰綁定，含它們的 golden）。
+> kist-core、kist-mount、CLI 與 kist-app 已全部是 v4（ADR 026 實作第 6 段，2026-10-11），v3 的 fixture 已移除；
+> v4 的權威副本是 `docs/format-v4.md`。這些模組裡與版本無關、v4 也在用的部分（`cbor`、`config::ChunkerParams`、
+> `tree::meta_kind`、kist-crypto 的共用型別）留下，其餘在實作第 7 段移除，本文件到時一併刪除。以下是 v3 原本的
+> 狀態說明。
 >
 > v3，2026-09-09 定案。本文件是 v3 的唯一權威副本。2026-09-27 起只有
 > 一份實作（Rust）；原本的 Go 參考實作已移除（ADR 018），格式相容性改由

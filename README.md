@@ -2,18 +2,20 @@
 
 去重、加密、可多台機器共用 repo 的備份工具（Rust）。
 
-> 目前狀態：**路線圖全數完成（2026-09-09，格式 v3）**。`init` / `backup` / `snapshots` / `restore` /
-> `check` / `rebuild-index` / `forget` / `prune` 可用；多台機器可同時備份到同一個 repo，GC 不需要鎖；
-> on-disk 格式 v3 已凍結（[docs/format.md](docs/format.md)）。備份來源可以是本機路徑，也可以是
-> `sftp://` / `s3://` 的**遠端來源**——client 當轉運：讀遠端、本機切塊加密後上傳，金鑰不出機器
-> （[ADR 016](docs/decisions/016-v3-remote-sources.md)）。儲存後端：本機、S3（含 MinIO）、SFTP
-> （[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接（[ADR 014](docs/decisions/014-rclone-bridge.md)）。
+> 目前狀態：**格式 v4（2026-10-11，[ADR 026](docs/decisions/026-v4-format.md)；實作第 1–6 段完成，第 7 段
+> 收尾待開始）**。`init` / `backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild` /
+> `settings` / `key` / `remove-unknown-packs` 可用；多台機器可同時備份到同一個 repo，GC 不需要鎖（世代柵欄：
+> 只有建立下一個世代成功的 prune 能刪東西，刪除只看 prune 自己驗證過的資料，任何物件都不覆寫；規格
+> [docs/format-v4.md](docs/format-v4.md)）。v4 不讀 v3 的 repo、沒有遷移（系統還沒上線，負責人決定）。
+> 備份來源可以是本機路徑，也可以是 `sftp://` / `s3://` 的**遠端來源**——client 當轉運：讀遠端、本機切塊
+> 加密後上傳，金鑰不出機器（[ADR 016](docs/decisions/016-v3-remote-sources.md)）。儲存後端：本機、S3（含
+> MinIO）、SFTP（[ADR 013](docs/decisions/013-sftp-backend.md)）、rclone 橋接
+> （[ADR 014](docs/decisions/014-rclone-bridge.md)；能 backup、restore、forget，不能 prune）。
 > 另有：唯讀 FUSE 掛載（[ADR 015](docs/decisions/015-mount-fuse.md)）、選配 Reed-Solomon parity
 > （[ADR 009](docs/decisions/009-m5-parity.md)）、設定檔／排程／webhook（`kist run`）、`--json`、
-> Prometheus metrics 與 Web UI（`kist serve`）。格式相容性由一份凍結的 v3 fixture repo 把關
-> （`crates/kist-core/tests/fixtures/`；原本的 Go 參考實作已移除，見
-> [ADR 018](docs/decisions/018-remove-go-reference.md)）。拿掉 Go 之後的 Rust 端盤點與修正清單見
-> [ADR 019](docs/decisions/019-rust-after-go.md)。
+> Prometheus metrics 與 Web UI（`kist serve`）。v3 的凍結 fixture 已隨 v3 移除，v4 的 fixture 在 M12 第 7 段
+> 凍結（原本的 Go 參考實作已移除，見 [ADR 018](docs/decisions/018-remove-go-reference.md)；拿掉 Go 之後的
+> Rust 端盤點與修正清單見 [ADR 019](docs/decisions/019-rust-after-go.md)）。
 > 已接受的限制：Windows VSS（不在路線圖上，見 [PLAN.md](PLAN.md)）。
 
 ## 建置
@@ -37,16 +39,21 @@ kist snapshots                          # 列出 snapshot
 kist restore latest /tmp/out            # 還原到 /tmp/out/<原本的絕對路徑>
 kist restore latest /tmp/out --include ~/Documents/report.pdf   # 部分還原，見「部分還原」一節
 kist check                              # 檢查一致性（不下載資料）
-kist check --read-data                  # 下載並驗證每個 chunk
-kist rebuild-index                      # index 物件遺失或損壞時，從 pack 重建
+kist check --read-data                  # 下載並驗證每個 pack 的每一項
+kist check --repair                     # 補回遺失的副本（只建立、不覆寫；維護角色）
 kist forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12   # 依保留政策刪 snapshot
 kist forget latest                      # 或指定 snapshot（id、時間戳前綴、latest）
-kist prune                              # 回收空間（兩階段，見下）
+kist forget latest --retire             # 每台機器每組路徑最新的一份是下一次 backup 的 parent，要刪得明說
+kist prune                              # 回收空間（每跑一輪寫一個世代；見「空間回收」）
 kist forget --keep-last 10 --prune      # 一次做完
+kist settings                           # 看 repo 的 settings（grace、replicas、pack 大小）
+kist settings --grace 48h               # 改 settings：寫一個新世代，不刪任何東西
+kist rebuild                            # 最新世代的 map 分片遺失或壞掉時重建（不刪任何東西）
+kist key add                            # 多一個密碼；`key list` / `key remove <slot>` 管理槽
 ```
 
 結束碼：0 成功；1 失敗；3 完成但有項目被略過（backup）、還原失敗或 `--include` 沒選到東西（restore）、
-或刪不掉（prune）——請看警告。
+刪不掉或刪除沒做完（prune）——請看警告。
 
 `restore` 先把每個檔寫進同目錄的隱藏暫存檔 `.kist-restore-*`，完整寫好才 rename 成正式名：還原失敗
 時目標處原有的檔不動（以前會被刪掉），擋路的 symlink、目錄或特殊檔回報錯誤、不動它；再還原到先前
@@ -192,12 +199,15 @@ kist restore --dry-run latest /tmp/out --include '*.pdf'          # 只列出會
 
 ### `--json`
 
-`backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild-index` / `run` 都支援
-`--json`：結果以 JSON 印到 stdout（錯誤照舊在 stderr、結束碼不變），給腳本和監控消費。
+`backup` / `snapshots` / `restore` / `check` / `forget` / `prune` / `rebuild` / `settings` / `key list` /
+`run` 都支援 `--json`：結果以 JSON 印到 stdout（錯誤照舊在 stderr、結束碼不變），給腳本和監控消費。
 
-- 內容 id（`root` 等）在 JSON 裡是 hex 字串（repo 格式不受影響，仍是 bytes）。
+- `backup` 印 `snapshot`（寫下的 snapshot 的 key）、`parent`、`generation`（backup 開始時的世代）、`stats`、
+  `report`（過程計數）與 `roots`（每個來源的 `path` 與 `type`：`file` / `dir` / `symlink`）。`snapshots`
+  每筆有 `key`、`client`、`timestamp`、`time`、`paths`、`roots`、`parent`、`stats`。
 - snapshot 的 `paths` 原本是 OS bytes，JSON 裡以 UTF-8 呈現，非 UTF-8 的位元組會換成 U+FFFD。
-- `forget` / `prune` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個。
+- `forget` 的輸出帶 `dry_run` 欄位——「removed」是已刪還是會刪，看這個；`prune` 沒有 dry run，印的是
+  這一輪的報告（寫出的世代、標記／復活／待刪／已刪的數量、repack、刪不掉的、沒做完的原因、警告）。
 - `backup` 的 `report.excluded`：被排除樣式比對到的項目數；`restore` 的 `unmatched_includes`：沒選到
   東西的 include 樣式（定義見上面的部分還原），`dry_run`：是不是 `--dry-run`（是的話計數是「會還原」的）。
 - `run --once --json` 印出 JobOutcome 陣列；常駐模式下每件工作結束印一行 JSON（NDJSON）。
@@ -231,6 +241,7 @@ keep_monthly = 12
 schedule = "0 4 * * *"
 [prune]
 schedule = "0 5 * * *"
+repack_below = 50                         # 選填；同 `prune --repack-below`
 ```
 
 ```sh
@@ -246,16 +257,11 @@ kist serve --config /etc/kist/backup.toml        # 同 run，另外開 HTTP 端�
 
 `[forget]` / `[prune]` 刻意跟 `[backup]` 分開放：backup 主機的憑證不該有 Delete 權限（抗勒索）。
 
-grace（見「空間回收（GC）」一節）：`[backup] gc_grace` 沒寫時，backup 取**同一份設定**的 `[prune] grace`，
-兩個都沒寫才是 72h。`[backup] gc_grace` 不得比 `[prune] grace` 長（載入設定時就報錯）；比它短可以。
-backup 與 prune 分在兩台主機時，兩份設定互相看不到，grace 要自己設成一致。
-
-> **行為變更**：以前 `kist run` 的 backup 只看 `[backup] gc_grace`、沒寫就是 72h。現在只把
-> `[prune] grace` 設短的設定，backup 也會用那個較短的 grace：跑得比它久的 backup 會以
-> BackupTooLong 結束、不寫 snapshot（重跑即可，已上傳的資料會沿用）。真的有這麼長的 backup，
-> 就把 `[prune] grace` 調長。另外，`[backup] gc_grace` 比 prune 實際採用的 grace 長的設定（包括有
-> `[prune]` 段但沒寫 `grace`、`gc_grace` 卻超過 72h）以前載入得了，現在載入時就報錯，`kist run`／
-> `kist serve` 不會啟動。
+grace（prune 標記之後等多久才刪，見「空間回收（GC）」一節）不在設定檔裡：它存在 repo 的 settings 裡
+（`kist settings --grace`，預設 72h），backup 與 prune 自動用同一個值，分在兩台主機也不必對齊。backup 必須在
+grace 減一小時內做完，超過就不寫 snapshot、以錯誤結束（重跑即可，已上傳的資料會沿用）。v3 的
+`[backup] gc_grace`、`[prune] grace`、`clock_skew`、`inactive_after` 不再接受：寫了設定就載入失敗，`kist run`／
+`kist serve` 不會啟動。`cache_dir` 沒寫時用使用者的快取目錄（同 CLI）。
 
 ### Prometheus metrics（`kist serve`）
 
@@ -276,7 +282,7 @@ backup 與 prune 分在兩台主機時，兩份設定互相看不到，grace 要
 | `kist_backup_bytes_new` / `kist_backup_chunks_new` | 最後一次 backup 上傳的量 |
 | `kist_backup_skipped_items` | 最後一次 backup 略過的項目數 |
 | `kist_prune_deleted_bytes_total` | prune 自 daemon 啟動以來刪掉的 bytes |
-| `kist_prune_marked_objects` / `kist_prune_live_packs` | 最後一次 prune 的標記數 / 活 pack 數 |
+| `kist_prune_marked_objects` / `kist_prune_live_packs` | v3 時代的欄位：v4 的 prune 報告沒有這兩個數字，目前停在 0（讀碼，UNVERIFIED；M12 第 7 段處理） |
 
 告警請用「多久沒看到成功」（例如 `time() - kist_job_last_success_timestamp_seconds{job="backup"} > 90000`），
 不要用「有沒有成功過」；incomplete（有項目被略過/刪不掉）不算成功，所以要另外對
@@ -313,24 +319,33 @@ UI 密碼走明文 HTTP：預設只綁 loopback，要遠端存取請放在有 TL
 
 ### 空間回收（GC）
 
-`forget` 只刪 snapshot；`prune` 才回收資料，而且分兩階段：第一次執行把沒人引用的 pack / tree / index
-**標記**起來，等超過 grace（預設 72 小時）而且每台活躍的機器在標記後都又備份過一次，
-第二次執行才真的刪。中間任何一台機器重新用到那些資料，標記就撤銷。所以 `prune` 可以跟 backup
-同時跑、可以排程每天跑，不需要鎖；剛 forget 完馬上 prune 不會釋放空間，那是設計。
+`forget` 只刪 snapshot；`prune` 才回收資料。v4 的 prune 是**世代鏈**（[docs/format-v4.md §11](docs/format-v4.md)、
+[ADR 026](docs/decisions/026-v4-format.md)）：每跑一輪，prune 讀全部 snapshot 與每個 pack 的 trailer，算出一份
+新的 map，以「只在不存在時建立」寫下一個世代的 head；寫得成的那一輪才能刪東西，兩個 prune 重疊時輸的那個
+什麼都不刪。沒人引用的 pack 先被**標記**（condemned），等它的標記在後端時間與寫入者時間**兩個時鐘上**都超過
+grace（預設 72 小時）、再經過刪前驗證，下一輪才真的刪；中間任何一台機器重新用到它，標記就撤銷。所以
+`prune` 可以跟 backup 同時跑、可以排程每天跑，不需要鎖；剛 forget 完馬上 prune 不會釋放空間，那是設計——
+沒人用的資料最多約兩個 grace 加 prune 的間隔才刪。
 
-- `--grace` 必須長於你最長的一次 backup（預設 72h；`backup --gc-grace` 要用同一個值；設定檔的寫法見「設定檔與排程」）。
-  跑得更久的 backup 不會悄悄壞掉，會在最後以錯誤結束，重跑即可。
-- 超過 `--inactive-after`（預設 30 天）沒備份的機器不再擋住刪除；它回來備份時若用到已刪的資料，
-  同樣會在最後失敗、重跑。
-- 活資料比例低於 `--repack-below`（預設 50%）的 pack 會被重新打包。
-- `--dry-run` 只報告。刪不掉的物件（S3 Object Lock、權限）會回報並保留標記，結束碼 3。
-- 同一台機器同時只能跑一個 backup（client id 檔旁邊有鎖）。
+- grace 存在 repo 裡（`kist settings --grace`，至少 2h），不是命令列或設定檔的選項。每個 backup 必須在 grace
+  減一小時內做完，否則不寫 snapshot、以錯誤結束（重跑即可）。調高立刻生效；調低要「排空」一個舊的 grace
+  才完全生效（期間新的標記仍以舊的 grace 計）。
+- `prune` 只有 `--repack-below`（預設 50%）：活資料比例低於它的舊 pack 會被重新打包；損壞而 parity 修得回的
+  pack 一律重新打包，壞的那份之後照常刪掉。沒有 `--dry-run`。
+- 刪除只看 prune 自己讀過、驗證過的東西：備份主機寫的提示（delta）只用來加速去重，左右不了刪什麼。
+- 刪不掉的物件（S3 Object Lock、權限）會回報並留到下一輪再試；一輪超過時限也會停下來、下一輪接著做。
+  兩種都是結束碼 3。
+- 同一台機器同時只能跑一個 backup（client id 檔旁邊有鎖），也一次只能跑一個維護命令（prune、rebuild、
+  settings、remove-unknown-packs、key remove；鎖檔在 repo 的本地快取目錄裡）。
+- 最新世代的 map 分片遺失或壞掉時用 `kist rebuild`：重建一份 map、不刪任何東西，之後一段時間（hold）不刪。
+- 較新版本的 kist 寫的、這一版看不懂的 pack，prune 不使用也不刪（每輪回報）；確定沒有較新的 kist 在用這個
+  repo 時，`kist remove-unknown-packs` 把它們標成待刪，之後照常兩階段刪除。
+- `rclone://` 的後端不能跑 prune、rebuild、settings、remove-unknown-packs 與 `check --repair`（條件建立不是
+  原子的，柵欄靠不住）；backup、restore、forget、key 照常。
 - bucket 有 versioning 時，真的釋放空間還需要 lifecycle 規則清掉舊版本。
 
-細節與安全性論證：[docs/format.md §13](docs/format.md)、[ADR 005](docs/decisions/005-m3-gc.md)。
-
 本地 index 快取放在使用者快取目錄（Linux：`~/.cache/kist/`），可用 `--cache-dir` /
-`KIST_CACHE_DIR` 指定、`--no-cache` 關閉。`check` 永遠不用快取。
+`KIST_CACHE_DIR` 指定、`--no-cache` 關閉。`check` 與維護命令永遠不用快取。
 
 ### S3 / MinIO
 
@@ -342,10 +357,13 @@ export AWS_ENDPOINT=http://minio.local:9000 AWS_ALLOW_HTTP=true
 kist init
 ```
 
-`config` 是 repo 裡唯一可覆寫的物件，被蓋掉就打不開 repo：請對 bucket 開 versioning 或
-Object Lock，並把 `config` 另存一份。backup 需要的權限是 `PutObject`、`GetObject`、
-`ListBucket`（不需要 `DeleteObject`）；`forget` / `prune` 另外需要 `DeleteObject`，
-建議用另一組憑證在別台機器跑。
+v4 不覆寫任何物件，`config` 也只在 `init` 時寫一次：bucket policy 可以對備份角色只開「新增」。backup 需要的
+權限是 `PutObject`（建議以 `s3:if-none-match` 強制只在不存在時建立）、`GetObject`、`ListBucket`（不需要
+`DeleteObject`）；每台備份主機的物件都在自己的前綴下（`packs/<client>/`、`mpacks/<client>/`、
+`snapshots/<client>/`……），可以讓每台主機的憑證只能寫自己的前綴、讀全部。寫 `config`、`keys/`、`maint/` 與
+`DeleteObject` 只給 `init` 與維護角色的憑證（`prune`、`forget`、`key remove` 要刪；`rebuild`、`settings`、
+`remove-unknown-packs` 要寫 `maint/`；`check --repair` 要寫遺失的副本），建議用另一組憑證在別台機器跑。建議的
+policy 見 [docs/format-v4.md §1](docs/format-v4.md)。
 
 每台機器第一次 backup 時會產生一個 client id（`~/.local/share/kist/client-id`，
 可用 `--client-id-file` 或 `KIST_CLIENT_ID_FILE` 指定）。
@@ -392,7 +410,9 @@ TCP port、不用 known_hosts，rclone 的設定就是全部。`KIST_RCLONE_BIN`
 路徑。**語意比 `sftp://` 寬鬆**：rclone 不實做 hardlink 與 O_EXCL 建檔，`put_if_absent`
 退化成「先 stat 再 posix-rename」；kist 用它的 key 都是「同 key 必同內容」或一次性寫入
 （init 另有讀回驗證擋雙重 init），風險分析見
-[ADR 014](docs/decisions/014-rclone-bridge.md)。`sftp://` 維持嚴格語意不變。
+[ADR 014](docs/decisions/014-rclone-bridge.md)。`sftp://` 維持嚴格語意不變。v4 的維護命令（prune、rebuild、
+settings、remove-unknown-packs、`check --repair`）在 `rclone://` 上直接拒絕：世代柵欄要靠原子的條件建立；
+backup、restore、forget、key 照常。
 
 ## 開發
 
@@ -408,25 +428,31 @@ cargo deny check          # 需先 cargo install --locked cargo-deny
 
 S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑（見 `tests/README.md`）。
 
-格式相容性：`cargo test` 會跑 `crates/kist-core/tests/fixture_v3.rs`，讀一份提交在 git 裡、
-**永不重生**的 v3 repo（開啟、`check --read-data`、還原比對、重新編碼逐 byte 比對、
-同內容再備份零新 chunk）。golden 與向量會隨程式重錄，這份不會；它只在格式升版時換
-（見 [ADR 018](docs/decisions/018-remove-go-reference.md)）。
+格式相容性：v3 的凍結 fixture（`fixture_v3.rs`）已隨 v3 移除；v4 的 fixture repo（提交在 git 裡、**永不重生**）
+在 M12 第 7 段凍結。golden 與向量（`crates/kist-format/tests/golden_v4.rs`、`scripts/v4-vectors`）會隨程式重錄，
+fixture 不會；它只在格式升版時換（見 [ADR 018](docs/decisions/018-remove-go-reference.md)）。`fuzz/` 目前
+編不過（四個 target 都對準 v3），第 7 段改成 v4。
 
 ## Workspace 結構
 
 | crate | 職責 |
 | --- | --- |
-| `kist-format` | on-disk 格式：結構定義、CBOR 序列化、golden files（改動需負責人確認） |
+| `kist-format` | on-disk 格式：結構定義、CBOR 序列化、golden files（改動需負責人確認）；`v4` 模組是現行格式，根下的 v3 模組 M12 第 7 段整理 |
 | `kist-crypto` | 金鑰階層（Argon2id → KEK → master key → 派生子金鑰）與 XChaCha20-Poly1305 封裝 |
 | `kist-chunker` | 內容定義切塊（FastCDC，512 KiB / 2 MiB / 8 MiB） |
 | `kist-backend` | 儲存後端（本機、S3、SFTP、rclone 橋接）與遠端來源（Source 抽象）|
-| `kist-core` | backup / restore / check / snapshots 流程 |
+| `kist-core` | backup / restore / check / forget / prune / rebuild / settings / key 流程（`kist_core::v4`）與本地快取 |
 | `kist-app` | 應用層：設定檔、排程、工作執行、通知、Prometheus metrics 與 Web UI |
 | `kist-mount` | 唯讀 FUSE 掛載（`kist mount`） |
 | `kist-cli` | `kist` 執行檔（clap） |
 
-格式規格：[docs/format.md](docs/format.md)。設計決策：[docs/decisions/](docs/decisions/)。
+格式規格：[docs/format-v4.md](docs/format-v4.md)（[docs/format.md](docs/format.md) 是 v3 的，只描述還沒移除的
+v3 模組）。設計決策：[docs/decisions/](docs/decisions/)。
+
+## 驗收數據（v2／v3 時代）
+
+以下三節的數字量的是 2026-09-05 的 v2／v3 實作（`rebuild-index`、tree 物件、`prune --grace` 都已不存在）；
+v4 的重量在 M12 第 7 段。
 
 ## M1 驗收數據
 

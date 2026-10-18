@@ -1,5 +1,9 @@
 # Fuzzing（M5 硬化）
 
+> **狀態（2026-10-11，v4 實作第 6 段）：目前編不過。** 四個 target 都對準 v3：`pack` 走的 `kist-core::pack` 已隨
+> v3 移除，`cbor` 與 `parity` 吃 v3 的結構與 golden，而且 v3 移除之前 `pack` 與 `parity` 就已跟不上先前的改動。
+> M12 第 7 段改成 v4 並重新播種（ADR 026「實作第六段」的「延到後面的」）；以下描述的是 v3 時代的狀態。
+
 `cargo-fuzz` + libFuzzer，target 對準所有吃外部 bytes 的解析路徑。
 fuzz crate 獨立於主 workspace（自己的 lockfile），seed corpus 進版控、
 長出來的 corpus 與 artifacts 不進（見 `.gitignore`）。

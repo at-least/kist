@@ -3,7 +3,7 @@
 ## S3 / MinIO
 
 S3 相關的測試（`crates/kist-backend/tests/s3.rs`、`contract.rs` 與 `contract_v4.rs` 裡的 `s3_*`、
-`crates/kist-core/tests/s3_end_to_end.rs`、`v4_backup_backends.rs` 與 `crates/kist-cli/tests/cli.rs` 裡的 `s3_*`）預設略過，設了環境變數才會跑：
+`crates/kist-core/tests/v4_backup_backends.rs` 與 `crates/kist-cli/tests/cli.rs` 裡的 `s3_*`）預設略過，設了環境變數才會跑：
 
 ```sh
 eval "$(sh tests/minio-setup.sh)"   # 起容器、建 bucket、建 Put-only 使用者，並設好環境變數
@@ -59,13 +59,16 @@ eval "$(sh tests/fuse-setup.sh)"    # 確認 /dev/fuse 與 fusermount3，export 
 cargo test --workspace
 ```
 
-`crates/kist-mount` 的其他測試（純邏輯與 `FsCore` 對真 repo 的讀取）不需要 FUSE，
-`cargo test --workspace` 就會跑。
+`crates/kist-mount` 的其他測試（純邏輯與 v4 的 `FsCore` 對真 repo 的讀取，`tests/v4_fs_read.rs`）不需要
+FUSE，`cargo test --workspace` 就會跑。
 
 ## 驗收
 
 見 `tests/acceptance/README.md`。
 
-## 競態測試（M3）
+## GC 模型（M12）
 
-`crates/kist-core/tests/gc_race.rs` 用 proptest 隨機交錯兩台 client 的 backup（拆成 prepare / commit）、forget、prune 與時鐘推進，每一步驗 repo 一致。預設 24 個案例；`PROPTEST_CASES=200 cargo test -p kist-core --test gc_race` 跑更多。
+`crates/kist-gcmodel` 是 v4 GC 協定（format-v4.md §11）的可執行模型（ADR 026 實作第一段）：確定情境
+（`tests/scenarios.rs`）、三種設定的隨機交錯（`tests/random.rs`，各 512 case 進 `cargo test`；5000 case 的深度版與
+探索工具標成 ignored）、兩輪外部審查的測試（`tests/review.rs`、`tests/review2.rs`）與突變搜尋固定下來的交錯
+（`tests/found.rs`）。v3 的競態測試 `gc_race.rs` 已隨 v3 移除。
