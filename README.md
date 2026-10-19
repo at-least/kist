@@ -535,14 +535,16 @@ delta、找 parent 的自己的 snapshot、B4 的 head。restore 對 S3 仍比�
 
 | 項目 | SFTP 來源 | S3 來源 |
 | --- | --- | --- |
-| 第一次 backup | 50.5 s，峰值 RSS 275 MiB | 42.7 s，231 MiB；來源 100 000 個 GET、1 102 個 LIST |
-| 沒變的第二次 | 45.8 s：預設每次整份重讀（去重，0 個新 pack） | 17.7 s：etag 與大小，全部沿用；1 102 個 LIST |
+| 第一次 backup | 50.5 s，峰值 RSS 275 MiB | 42.7 s，231 MiB；來源 100 000 個 GET、1 102 個 LIST（`392eb54` 起 1 101：root 原本列兩次） |
+| 沒變的第二次 | 45.8 s：預設每次整份重讀（去重，0 個新 pack） | 17.7 s：etag 與大小，全部沿用；1 102 個 LIST（`392eb54` 起 1 101） |
 | 沒變的，`--trust-mtime` | **2.9 s**：大小與 mtime，全部沿用 | — |
 | restore 到本機 | 86.5 s，`diff -r` **完全相同** | 79.5 s，`diff -r` **完全相同** |
 | 沒變的 backup 對 repo 的請求 | 13 | 13 |
 
 平面 100 萬項（記憶體 bench 的 B 集）的第一次 backup 在 512 MiB 的門檻內：SFTP 398 MiB、S3 465 MiB（本機路徑 394 MiB；
-`bench/memory/run-remote.sh`，數字是門檻跑法；見 ADR 026「實作第七段之三」）。S3 的那一個離門檻最近。
+`bench/memory/run-remote.sh`，數字是門檻跑法；見 ADR 026「實作第七段之三」）。S3 的那一個離門檻最近。第十三步之後
+（`392eb54`）重跑的 remote-to-remote 驗收全部通過（log `tests/acceptance/r2r-acceptance-392eb54-2026-10-19.log`；時間比
+`7cf9e2d` 那次慢 8–62%，與 `7cf9e2d` 交替跑看不出是程式碼的，見 ADR）；平面的門檻跑法（`b368982`）SFTP 384 MiB、S3 477 MiB。
 
 ### M3（GC，真實時鐘）
 

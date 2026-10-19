@@ -1274,6 +1274,11 @@ mtime，至少每隔一段時間整份讀一次。負責人：「都按你的建
   列的時候 STAT 一次，目標是檔案就記它的大小與 mtime，不是檔案或 STAT 不了就是一個略過的條目。
 - 文件：這一節、README、規格、PLAN、`bench/memory/README.md`、`tests/acceptance/README.md`、`run_r2r.py`、
   `run-remote.sh`、M1 的 remote-to-remote log。
+- 之後（push 之後，負責人：「繼續」，做這一節「找到的」與「剩下的」裡的三項，再量分配器）：
+  - `aed8f5a` 驗收：`run_s3.py` 也在容器裡停自己的 trace，重跑 M2 的請求數（「找到的」）。
+  - `b368982` 第十二步 遠端 root 只列一次：`plan_roots` 為了分辨 root 是檔案還是目錄列過的根交給 walk（取走的第一項先
+    交出），walk 不再列一次。
+  - `392eb54` 第十三步 SFTP 的伺服器沒給大小是錯誤（同缺 mtime）：`to_meta` 原本當成 0。
 
 **量測**（release build、同一台機器、兩個容器都在本機：SFTP 是 OpenSSH 10.3p1，S3 是 MinIO RELEASE.2025-09-07T16-13-09Z；
 網路的延遲幾乎是零，真實網路上的表現沒有量，UNVERIFIED；每一步與前一步的 binary 交替跑，數字是範圍；這台機器同時有別的
@@ -1290,18 +1295,24 @@ mtime，至少每隔一段時間整份讀一次。負責人：「都按你的建
 | SFTP 來源，2 000 個檔案（96 MiB），第一次 | 2.14–2.53 s | 0.78–1.04 s | 第九步 |
 | S3 來源，同一組，第一次 | 1.11–1.28 s | 0.48–0.50 s | 第九步 |
 | SFTP 來源，同一組，沒變的第二次 | 3.08 s（整份讀） | 0.28–0.29 s（`--trust-mtime`） | 第八步 |
+| S3 來源，同一組（21 個目錄），來源的 LIST | 22 個（root 兩次） | 21 個 | 第十二步 |
 
 對照：同樣 20 個 4 MiB 的檔案從本機路徑備份 0.28–0.31 s；OpenSSH 自己的 sftp 用戶端下載 0.43–0.46 s（約 180 MiB/s）。
 
 平面 100 萬項（記憶體 bench 的 B 集放進兩個容器，`bench/memory/run-remote.sh`，進一個新的本機 repo；
-`sampled_max_ex_file_slab`，括號是 512 MiB 門檻跑法；最後一欄是這一節最後的 binary `7cf9e2d`）：
+`sampled_max_ex_file_slab`，括號是 512 MiB 門檻跑法；第十一步是 `7cf9e2d`，第十二步是 `b368982`——第十二步的時候兩個
+binary 交替又各量兩次，範圍包含那兩次）：
 
-| 來源與 backup | 第九步 | 第十一步 |
-| --- | --- | --- |
-| SFTP，第一次 | 499 MiB（被殺） | 398 MiB（398） |
-| SFTP，第二次（全部重讀，去重） | 381 MiB | 262 MiB（276） |
-| S3，第一次 | 350 MiB（被殺：取樣漏了尖峰） | 468 MiB（465） |
-| S3，第二次（全部以 etag 沿用） | 430 MiB（被殺） | 324 MiB（318） |
+| 來源與 backup | 第九步 | 第十一步 | 第十二步 |
+| --- | --- | --- | --- |
+| SFTP，第一次 | 499 MiB（被殺） | 389–403 MiB（398） | 370–413 MiB（384） |
+| SFTP，第二次（全部重讀，去重） | 381 MiB | 256–276 MiB（276） | 277 MiB（272） |
+| S3，第一次 | 350 MiB（被殺：取樣漏了尖峰） | 378–468 MiB（465） | 383–455 MiB（477） |
+| S3，第二次（全部以 etag 沿用） | 430 MiB（被殺） | 306–325 MiB（318） | 295–309 MiB（287） |
+
+第十二步把 root 的列表從 plan 留到 B1 之後，峰值在同一個 binary 的變異之內。時間（交替的兩輪，每一輪第十一步先跑）：
+SFTP 第一次 83、120 s 對 75、48 s，第二次 103、61 s 對 74、52 s，四對都是第十二步快，但順序可能有利於後跑的；S3 同一個
+binary 第一次 85–431 s、第二次 23–282 s，看不出差別。
 
 同一組檔案從本機路徑：314 MiB（394）。S3 的時間在同樣的 backup 之間跳：第一次 2 到 7 分鐘、第二次 23 s 到 8 分鐘，由
 MinIO 決定（`mc ls` 列這個前綴一次 162 s），不列；量 S3 的那幾次，容器裡還有前一份驗收腳本留下、沒停掉的 `mc admin trace`（見「找到的」）。
@@ -1323,6 +1334,13 @@ log `tests/acceptance/r2r-acceptance-2026-10-19.log`，binary `7cf9e2d`；峰值
 兩個 repo 的 `check` 都過。同一份資料從本機路徑備份進本機 repo（README 的 M1）：第一次 33 s、沒變的 1.1 s。M1 有 1 101 個
 目錄、每個不到 1 000 項：1 102 個 LIST 是 root 列了兩次（見「找到的」）。
 
+第十三步之後重跑（`392eb54`，log `tests/acceptance/r2r-acceptance-392eb54-2026-10-19.log`）：全部斷言過，兩邊 `diff -r`
+相同、`check` 過；S3 來源的 LIST 第一次與沒變的都是 **1 101**（每個目錄一次）。這次的時間都比 `7cf9e2d` 那次慢 8–62%
+（SFTP 沒變的 45.8 → 74.2 s；restore 也慢，它不經過這兩步改的程式碼）。第十一步與第十三步的 binary 對 SFTP 上的同一份
+資料做沒變的 backup（進同一個本機 repo），ABBA 交替 3 輪、各 6 次：牆鐘 45–68 s 對 49–69 s（中位數 48.1 對 51.0 s），
+三輪裡一輪一樣、一輪第十三步慢、一輪第十一步慢——看不出這兩步讓它變慢；慢的原因沒有找（UNVERIFIED：這台機器同時有
+別的工作）。
+
 **找到的**：
 - 第三步自己引入的兩個錯，都只在還沒 push 的這幾個 commit 裡：伺服器少送時跳過資料（`File::read` 的 offset，第四步修）、
   符號連結只讀到目標的前幾個 bytes（第十一步修）。第二個是看 B 集在 SFTP 為什麼多一個檔案找到的。
@@ -1333,7 +1351,8 @@ log `tests/acceptance/r2r-acceptance-2026-10-19.log`，binary `7cf9e2d`；峰值
   索引 35 MiB、去重的集合 33 MiB、沿用的清單 33 MiB、清單本身 67 MiB），量到的 465–497 MiB 比它多約 150 MiB，是 glibc
   的分配器留著的；SFTP 也一樣（第九步：活著 329 MiB、量到 499 MiB）。
 - 遠端 root 的目錄列兩次：`plan_roots` 為了分辨 root 是檔案還是目錄，把整個 root 列一次、只看第一項，walk 再列一次
-  （S3 來源 21 個目錄的 trace 是 22 個 LIST）。100 萬項的平面 root 就是兩次完整的列舉；沒有改。
+  （S3 來源 21 個目錄的 trace 是 22 個 LIST）。100 萬項的平面 root 就是兩次完整的列舉。第十二步修：同一個 trace 21 個
+  LIST、沒有列兩次的 prefix；平面的 root 少的那一次 S3 約 1 001 個 LIST（一頁 1 000 個 key，算的、沒有 trace）。
 - 驗收腳本的 trace：殺掉本機的 `docker exec` 不會停容器裡的 `mc admin trace`（沒有 tty，訊號不轉過去），留下來的訂閱者
   一個佔 MinIO 約 12% 的 CPU，累積之後新的 trace 收不到東西。`run_r2r.py` 改成在容器裡記下 PID、結束時 kill，
   `run_s3.py` 之後也改了。改了之後重跑 M2（`tests/acceptance/m2-acceptance-s3-v4-recount-2026-10-19.log`）：請求數
@@ -1341,19 +1360,43 @@ log `tests/acceptance/r2r-acceptance-2026-10-19.log`，binary `7cf9e2d`；峰值
   不同），引用的數字沒有受留下來的 trace 影響。
 - SFTP 來源把符號連結跟過去讀、不記成符號連結（ADR 016 的已知限制）；連到目錄的與斷掉的是略過的條目。
 - `to_meta` 在伺服器沒給大小時當成 0（`unwrap_or(0)`）：那樣的伺服器的檔案會記成空檔。第三步之前 stat 走同一個轉換，
-  不是新的；OpenSSH 都會給大小，沒有改。
+  不是新的；OpenSSH 都會給大小。第十三步改成錯誤（同缺 mtime；只有單元測試，沒有不給大小的伺服器可以端到端試）。
 
 **剩下的**：
 - 真實網路（延遲、頻寬、russh 的 window）上的表現沒有量，UNVERIFIED；這一輪的容器都在本機。
 - 沒有 limits@openssh.com 的伺服器：用戶端一次要 20 480 bytes，2 MiB 的上限是約 100 個 READ 在等——只在假伺服器上跑過，
   真實的這種伺服器沒有試，UNVERIFIED。會少送的真實伺服器或檔案系統也沒有找到。
-- 分配器多留的約 150 MiB（上面）：沒有換分配器、沒有調 glibc 的參數。一個探針（SFTP 的平面 100 萬項、第一次 backup、`7cf9e2d`，交替各兩次）：預設 337、402 MiB，`MALLOC_ARENA_MAX=2` 326、340 MiB——最高的與變異都小一些，但次數太少，沒有據此改什麼。S3 的平面 100 萬項第一次離門檻只剩 30 到 47 MiB（第十步的 binary 482 MiB、最後的 465 MiB）。
-- 遠端 root 列兩次（上面）。
+- 分配器多留的約 150 MiB（上面）：沒有換分配器、沒有調 glibc 的參數，**等負責人決定**。量了（`b368982` 的 release
+  build，平面 100 萬項的第一次 backup，每次新的本機 repo，預設與 `MALLOC_ARENA_MAX=2` 交替各 5 次、每一輪先跑的輪流；
+  `sampled_max_ex_file_slab`，CPU 是 bash 的 `time` 的 user + sys）：
+
+  | 來源 | 預設 | `MALLOC_ARENA_MAX=2` | 同一輪的差 | 5 次的 CPU 合計 |
+  | --- | --- | --- | --- | --- |
+  | SFTP | 320–393 MiB（中位數 367） | 293–313 MiB（301） | 低 27–89 MiB，5 輪都低 | 363 s 對 369 s |
+  | 本機路徑 | 302–387 MiB（370） | 271–339 MiB（323） | 低 21–64 MiB，5 輪都低 | 189 s 對 185 s |
+  | S3 | 322–464 MiB（中位數 441） | 248–348 MiB（279） | 低 74–185 MiB，5 輪都低 | 663 s 對 686 s |
+
+  牆鐘的變異比兩個設定的差大（SFTP 同一個設定 48–185 s、本機路徑 32–62 s），不拿來比；S3 的牆鐘由 MinIO 決定，不比，
+  S3 那 10 次的時候這台機器很忙（load average 7–70）。建議與它依賴的假設在這一節的末尾（「分配器：建議」）。
 - rclone 的 stdio 連線沒有改 `flush_interval`（沒量）。
 - `--trust-mtime` 的 racy 判斷比的是伺服器的 mtime 與這台的時鐘：伺服器慢多少，判斷就弱多少；文件與 help 都寫了。
 - 往遠端還原沒有做（上面）。
-- 沒有 push（等明確的指示）。
+- `b870705` 為止的 39 個 commit 已 push（負責人：「push」）；之後的（`aed8f5a` 起）沒有 push。
 
 **gate**：每一步的 commit 訊息裡（fmt、clippy、windows-gnu clippy 的 workspace 與 kist-cli、MinIO 與 SFTP 的環境變數開著的
 nextest）。程式碼的最終樹 `7cf9e2d`：fmt、clippy、windows-gnu clippy 乾淨，nextest 689 個通過、9 個略過。這一節的
-commit 只有文件與驗收的腳本、log。
+commit 只有文件與驗收的腳本、log。之後的 `392eb54`：同樣的 gate 乾淨，nextest 693 個通過、9 個略過。
+
+**分配器：建議（等負責人決定，沒有做）**：`main` 建 tokio runtime 之前呼叫一次 `mallopt(M_ARENA_MAX, 2)`，只在
+`target_os = "linux"`、`target_env = "gnu"`（`libc` 已經在依賴圖裡，0.2.189 有 `mallopt` 與 `M_ARENA_MAX`；環境變數
+`MALLOC_ARENA_MAX` 有設就不蓋過它）。理由同 `main` 裡把 blocking pool 收到 4 條的那段註解：每個 glibc arena 留著自己的
+高水位；工作執行緒是預設的一核一條（這台 16 條），預設的 arena 上限是 8 × 核心數。它依賴的：
+- 量到的：平面 100 萬項的第一次 backup，SFTP 與本機路徑 5 輪都低（上面的表），SFTP 的變異也小（293–313 對 320–393 MiB）；
+  CPU 合計 SFTP 多 1.7%、本機路徑少 2.5%（S3 多 3.5%，量的時候這台機器很忙）。
+- 量到的：最靠近門檻的 S3 平面 100 萬項第一次，5 輪都低 74–185 MiB；這 5 次的最高從 464 降到 348 MiB（預設在門檻
+  跑法量過 477 MiB，離 512 MiB 只剩 35 MiB）。
+- 猜的：核心更多、同時配置記憶體的執行緒更多的機器上，兩個 arena 的鎖不會變成時間；2 與 1、4 沒有比；prune、restore、
+  check 沒有量。
+- 已知：musl 與 Windows 的 build 不受影響（cfg 之外），dhat 的 build 不經過 glibc 的 malloc。
+不改程式碼的另一個選擇：README 寫明 `MALLOC_ARENA_MAX=2`，讓用的人自己設（排程的 backup 要寫進 systemd unit 或 cron
+的環境）。
