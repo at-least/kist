@@ -1381,13 +1381,13 @@ log `tests/acceptance/r2r-acceptance-2026-10-19.log`，binary `7cf9e2d`；峰值
 - rclone 的 stdio 連線沒有改 `flush_interval`（沒量）。
 - `--trust-mtime` 的 racy 判斷比的是伺服器的 mtime 與這台的時鐘：伺服器慢多少，判斷就弱多少；文件與 help 都寫了。
 - 往遠端還原沒有做（上面）。
-- `b870705` 為止的 39 個 commit 已 push（負責人：「push」）；之後的（`aed8f5a` 起）沒有 push。
+- `0895a8f` 為止已 push（負責人：「push」，兩次）。
 
 **gate**：每一步的 commit 訊息裡（fmt、clippy、windows-gnu clippy 的 workspace 與 kist-cli、MinIO 與 SFTP 的環境變數開著的
 nextest）。程式碼的最終樹 `7cf9e2d`：fmt、clippy、windows-gnu clippy 乾淨，nextest 689 個通過、9 個略過。這一節的
 commit 只有文件與驗收的腳本、log。之後的 `392eb54`：同樣的 gate 乾淨，nextest 693 個通過、9 個略過。
 
-**分配器：建議（等負責人決定，沒有做）**：`main` 建 tokio runtime 之前呼叫一次 `mallopt(M_ARENA_MAX, 2)`，只在
+**分配器：建議（等負責人決定，沒有做；2026-10-20 更正：這個建議不成立——發佈的 Linux binary 不經過 glibc，`kist-cli` 是 `forbid(unsafe_code)`，負責人也不要只在一個平台有效的做法；見「實作第七段之四」）**：`main` 建 tokio runtime 之前呼叫一次 `mallopt(M_ARENA_MAX, 2)`，只在
 `target_os = "linux"`、`target_env = "gnu"`（`libc` 已經在依賴圖裡，0.2.189 有 `mallopt` 與 `M_ARENA_MAX`；環境變數
 `MALLOC_ARENA_MAX` 有設就不蓋過它）。理由同 `main` 裡把 blocking pool 收到 4 條的那段註解：每個 glibc arena 留著自己的
 高水位；工作執行緒是預設的一核一條（這台 16 條），預設的 arena 上限是 8 × 核心數。它依賴的：
@@ -1400,3 +1400,95 @@ commit 只有文件與驗收的腳本、log。之後的 `392eb54`：同樣的 ga
 - 已知：musl 與 Windows 的 build 不受影響（cfg 之外），dhat 的 build 不經過 glibc 的 malloc。
 不改程式碼的另一個選擇：README 寫明 `MALLOC_ARENA_MAX=2`，讓用的人自己設（排程的 backup 要寫進 systemd unit 或 cron
 的環境）。
+
+## 實作第七段之四：發佈的 binary 與每個檔案的配置（2026-10-19 至 10-20）
+
+**起因**：負責人「繼續」，接著做第七段之三的分配器建議。核對前提時發現**發佈的 Linux binary 不是量過的那個 build**：`dist.sh`
+以 cargo-zigbuild 編 musl，zig 0.16.0 連結時用它自己的 `malloc`（`lib/c/malloc.zig`，包著 `std.heap.SmpAllocator`；不 strip 的
+build 的 `nm` 看得到 `c.malloc.malloc`、`heap.SmpAllocator.alloc`，沒有 musl 的 mallocng）。到這裡為止 README、這份 ADR、記憶體
+bench 的數字都是 glibc 的 build（`cargo build --release`，host 的 target）。同一份程式碼（`392eb54`）的發佈設定：平面 100 萬項的
+第一次 backup 在 512 MiB 門檻下 SFTP 與 S3 的第一次、第二次 4 次都被 OOM 殺掉（journal：「The kernel OOM killer killed some
+processes in this unit」），量測跑法 SFTP 553–894 MiB、400–449 s（glibc 345–391 MiB、68–83 s），本機路徑 227–317 MiB、352–382 s
+（glibc 364–365 MiB、45–63 s）。**負責人**：mallopt、`MALLOC_ARENA_MAX`、只在 Linux 用 mimalloc（mimalloc v3 的 C 原始碼在 zig cc
+的 windows-gnu 下 `-Werror=date-time` 編不過）都「不能跨平台，只能 linux only，不適合我們」；「分配器根本跟這件事情無關」「先專注
+在重用 buffer」；「為什麼不直接換方法，不要把所有 index 讀進記憶體？」；SQLite「做個實驗」、「寫不用函式庫的作法測試」；選
+「pack 寫到本機暫存檔」、從檔案上傳；「做到完」。**格式沒有改**：都是 client 的做法（壓縮的 bytes 逐 byte 相同、delta 可以寫中間的、
+暫存檔在本機）。
+
+**原因**（strace 數 2 000 個檔案的 backup 的 mmap：glibc 80 次、發佈設定 4 556 次）：zig 的 malloc 對超過 32 KiB 的配置每次一個
+mmap、free 時 munmap（`slab_len` 64 KiB、最大的 size class 32 KiB）；每個檔案兩個這樣的配置——`zstd::encode_all` 每一項新建一個
+encoder，zstd 以 C 的 malloc 配 3 658 105 bytes 的 workspace（gdb：`ZSTD_resetCCtx_internal` → `ZSTD_cwksp_create`，2 047 次
+3 661 824 bytes 的 mmap），`zstd::stream::write::Encoder` 的 wrapper 為輸出另配 32 KiB（dhat：2 025 次，36 864 bytes 的 mmap）。
+遠端來源的記憶體另有一個原因：每個檔案的資料 buffer 在 async 那一側配、在 blocking 那一側放，zig 的 malloc 把放掉的小塊留在放掉
+它的那條執行緒（dhat：峰值時活著的照 zig 的 size class 換算 157.5 MiB、實際 156.9 MiB，多出來的不是活著的資料；SFTP 10 萬檔
+musl 206–228 MiB、glibc 118–135；TOKIO_WORKER_THREADS 1／4／16 沒有差別）。
+
+**每一步**（一步一個 commit，gate 在 commit 訊息裡）：
+- `25ce3b7` 第一步 每條執行緒重用一個 zstd context（壓縮與解壓）；輸出與每次新建的 `encode_all` 逐 byte 相同（測試，等級改掉時
+  失敗）。2 000 個檔案的 mmap：musl 4 548 → 2 504。
+- `743859b` 第二步 壓縮以 `compress_stream2` 直接寫進交出去的 Vec（先 continue 再 end，同 `encode_all`）。musl 2 504 → 454。
+- `0ac1c1d` 第三步 遠端來源不大於 1 MiB 的檔案由讀的 task 整份讀完、以 oneshot 一次交出（`WholeRead`），不經過每個檔案一個 4 格的
+  channel；task 沒送結果是錯誤（`bridge` 在 channel 關掉時當成檔尾）。SFTP 100 萬項 musl 1 511 → 702 MiB。
+- `3b3319f` 第四步 B2 的「這次寫過」改成外部排序（`spill.rs` 的 `WrittenSet`：記憶體裡最多 229 376 個，滿了排好寫成一段暫存檔加
+  bloom filter；原本的 `HashSet` 100 萬個 chunk 33 MiB、跟檔案數成正比）。實驗（scratchpad，100 萬／1 000 萬個 chunk）：記憶體內
+  82／1 184 MiB 0.2／4.3 s、外部排序 42／52 MiB 0.5／28.8 s、SQLite 32／32 MiB 3.3／85.7 s（C 依賴）、redb 4.4 36／44 MiB 7.6／
+  85.5 s（檔案 128／1 028 MiB）、fjall 3.1 102 MiB 39.6 s／900 s 內沒跑完。三個函式庫在 windows-gnu、aarch64 macOS 都編得過（只在
+  Linux 跑過）。
+- `f0b761f` 第五步 backup 的資料 pack 一邊累積一邊寫進本機暫存檔（`SpoolWriter`，BLAKE3 邊寫邊算）；讀回前等上傳的空位（第一版
+  `finish` 之後馬上讀，前一個還在上傳，峰值照樣兩個）。dhat 峰值時活著的 267.7 → 232.2 MiB，新的峰值是寫 delta 的那一刻。
+- `8ad7eb1` 第六步 delta 也依項目數寫（`DELTA_ENTRIES` 128 Ki；原本只看 16 個 pack，100 萬個 1 KB 的 chunk 就是一份 delta 列出
+  全部，CBOR 64 MiB、加密 42 + 42 MiB）。一個 pack 的項目不拆到兩份 delta。dhat 232.2 → 162.5 MiB。
+- `c2b3217` 第七步 `Backend::put_file_if_absent`：只在不存在時建立、內容從本機檔案讀。S3 用 object_store 的 `Signer::signed_url`
+  簽好的 PUT URL、body 從檔案串流、帶 `If-None-Match: *`（object_store 0.14 的上傳只收記憶體裡的 `PutPayload`，公開的分段上傳只能
+  覆寫地完成）；本機同 object_store 的 `PutMode::Create`；SFTP 與 rclone 的遠端暫存檔從本機檔案寫（`bytes_of` 的那一份也沒了）。
+  契約測試四個後端都過，三個突變各自失敗。
+- `6efc6f0` 第八步 B3 的資料 pack 從暫存檔上傳，上傳前一段一段重算名稱（`FinishedSpool::verify`）。dhat 162.5 → 123.8 MiB。
+- `10c1eac` 第九步 遠端來源整份讀的小檔案複製進一個重用的 buffer（`BufPool`，最多 32 個），收到的每一段當場在 async 那一側放掉，
+  資料的 buffer 不再跨執行緒放掉。SFTP 100 萬項 musl 608／789 → 327／357 MiB、S3 809／869 → 382／403。
+- 文件：這一節、README、PLAN、`bench/memory/README.md`、`tests/acceptance/README.md`、M1 的 remote-to-remote log。
+
+**量測**（`10c1eac`，release build，16 核 / 62 GiB / ext4，兩個容器在本機；發佈設定是 `cargo zigbuild --target
+x86_64-unknown-linux-musl`，同 `dist.sh`）：
+
+| 512 MiB 門檻，平面 100 萬項（第一次／第二次） | `392eb54` 發佈設定 | `10c1eac` 發佈設定 |
+| --- | --- | --- |
+| SFTP 來源 | 被殺／被殺 | 292／346 MiB |
+| S3 來源 | 被殺／被殺 | 351／292 MiB |
+| 本機 B 集 | （量測跑法 227–317 MiB、352–382 s） | 190／247 MiB |
+
+本機的整套（`run-v4.sh`，量測跑法；括號是門檻跑法；兩個 build 的 26 次都 exit 0）：
+
+| 命令 | 發佈設定（musl） | glibc |
+| --- | --- | --- |
+| backup 第一次 A／B | 140／223 MiB（137／186），42／42 s | 179／208 MiB（161／238），34／33 s |
+| backup 第二次 A／B | 148／247（146／246），9／11 s | 156／279（157／284），10／10 s |
+| prune 第一輪 A／B | 218／233（153／163），6／7 s | 243／270（159／169），6／5 s |
+| `check` A／B | 239／220（220／219），5／5 s | 234／272（257／239），5／5 s |
+| `check --read-data` A／B | 399／374（393／381），11／11 s | 431／432（423／430），10／10 s |
+| `restore latest` A／B | 179／164（162／160），69／78 s | 158／168（206／162），71／78 s |
+
+第七段之二（`b48e007`，glibc）同一張表：backup 第一次 264／314 MiB、`check --read-data` 441／436 MiB。
+
+remote-to-remote 驗收（M1，發佈設定，`tests/acceptance/r2r-acceptance-10c1eac-musl-2026-10-20.log`）：全部通過，兩邊 `diff -r`
+相同；SFTP 第一次 79.0 s 162 MiB、沒變的 60.8 s、`--trust-mtime` 2.2 s；S3 第一次 62.3 s 147 MiB、沒變的 20.1 s；repo 的請求數
+91／13／13（同 `392eb54`）。
+
+**找到的**：
+- 發佈的 Linux binary 的分配器是 zig 0.16 的，不是 musl 的、也不是量過的 glibc；發佈的 binary 從來沒有量過（ADR 012 只跑過 300 KiB
+  的煙霧）。到 `10c1eac` 為止的修正都在 kist 的程式碼裡（少配、重用），每個平台都一樣。
+- 第三步之後的 dhat：峰值時活著的照 zig 的 size class 換算幾乎沒有變大——放大不是 size class，是放掉的塊留著。
+- macOS 的發佈 build 在 HEAD 編不出來：`kist-mount` 的 `fuse.rs:329` 用 `Errno::ENODATA`（fuser 0.18 在 macOS 上沒有；平台中立的
+  是 `Errno::NO_XATTR`），換掉之後連結找不到 macFUSE 的 libfuse（SDK 裡沒有）。gate 只跨編 windows-gnu，沒有抓到。依日期推測是
+  kist-mount 加進 unix 的依賴（ADR 015，2026-09-07）之後，沒有逐 commit 找。**沒有修，等負責人決定**（macOS 不帶 mount，或連 macFUSE）。
+- 第五步的第一版量到沒變：讀回的時機在上傳的空位之前。第六步之前的峰值是寫 delta，dhat 才看得出來（RSS 每次差 10–50 MiB）。
+
+**剩下的**：
+- AWS 的 S3 上，沒簽進去的 `If-None-Match` 會不會照樣檢查：只在 MinIO 上驗證過，UNVERIFIED；HTTPS 與 session token 的憑證也沒有試。
+  `put_file_if_absent` 的 S3 PUT 不重試（同 `put_if_absent` 的說明）。
+- 開了 parity 的 repo 照舊把上傳的那一個資料 pack 讀回記憶體（要整份編碼）。
+- 一份 delta 最多是一個 pack 的項目加上 128 Ki：極小的檔案時一個 64 MiB 的 pack 可以有上百萬項，那時一份 delta 仍然大。
+- 1 000 萬個檔案沒有跑過；外部排序的「1 000 萬省約 300 MiB」是推算。目錄的清單（一個目錄的項目數）與 mpack 的 bytes 仍在記憶體裡。
+- 發佈設定的 macOS、Windows binary 沒有量（這台機器只能跑 Linux 的；macOS 的 build 編不出來，見上）。
+
+**gate**：每一步的 commit 訊息裡（fmt、clippy、windows-gnu clippy 的 workspace 與 kist-cli、MinIO 與 SFTP 的環境變數開著的 nextest）。
+程式碼的最終樹 `10c1eac`：同樣的 gate 乾淨，nextest 702 個通過、9 個略過；rclone 的契約測試另外以 `KIST_TEST_RCLONE=1` 跑過（第七步）。

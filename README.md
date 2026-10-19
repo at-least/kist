@@ -492,6 +492,12 @@ S3 整合測試預設略過；起一個 MinIO 容器並設環境變數就會跑�
 backup、prune、check、restore 在兩個 100 萬檔的測試集上都在 512 MiB 門檻內（2026-10-19，`b48e007`；prune 與單一平面
 目錄的 restore 原本超過，那天修掉，見該處與 ADR 026「實作第七段之二」），最高的是 `check --read-data`（441 MiB）。對照欄是下一節 v3 時代的數字。
 
+**這一節的數字都是 glibc 的 build**（`cargo build --release`，host 的 target）。`./dist.sh` 的 Linux 發佈檔是 musl，連結的是 zig 0.16
+的 malloc，2026-10-19 第一次量：同一份程式碼（`392eb54`）在遠端來源的平面 100 萬項 512 MiB 門檻下被殺、本機路徑慢 5–8 倍。
+`10c1eac` 起（每個檔案的配置減少、資料 pack 寫到本機暫存檔並從檔案上傳，ADR 026「實作第七段之四」）發佈設定的門檻跑法 SFTP
+292／346 MiB、S3 351／292 MiB、本機 190／247 MiB，記憶體 bench 的整套與 remote-to-remote 驗收也以發佈設定跑過（數字在
+`bench/memory/README.md` 與 ADR）。發佈設定的 macOS 與 Windows binary 沒有量；macOS 的發佈 build 在 HEAD 編不出來（kist-mount）。
+
 ### M1（本機目錄後端）
 
 | 項目 | v4 | v3（2026-09-05） |
@@ -544,7 +550,9 @@ delta、找 parent 的自己的 snapshot、B4 的 head。restore 對 S3 仍比�
 平面 100 萬項（記憶體 bench 的 B 集）的第一次 backup 在 512 MiB 的門檻內：SFTP 398 MiB、S3 465 MiB（本機路徑 394 MiB；
 `bench/memory/run-remote.sh`，數字是門檻跑法；見 ADR 026「實作第七段之三」）。S3 的那一個離門檻最近。第十三步之後
 （`392eb54`）重跑的 remote-to-remote 驗收全部通過（log `tests/acceptance/r2r-acceptance-392eb54-2026-10-19.log`；時間比
-`7cf9e2d` 那次慢 8–62%，與 `7cf9e2d` 交替跑看不出是程式碼的，見 ADR）；平面的門檻跑法（`b368982`）SFTP 384 MiB、S3 477 MiB。
+`7cf9e2d` 那次慢 8–62%，與 `7cf9e2d` 交替跑看不出是程式碼的，見 ADR）；平面的門檻跑法（`b368982`）SFTP 384 MiB、S3 477 MiB。`10c1eac` 以發佈設定（musl）重跑的驗收全部通過
+（`tests/acceptance/r2r-acceptance-10c1eac-musl-2026-10-20.log`：SFTP 第一次 79.0 s、沒變的 60.8 s、`--trust-mtime` 2.2 s，S3 第一次
+62.3 s、沒變的 20.1 s；兩邊 `diff -r` 相同）。
 
 ### M3（GC，真實時鐘）
 

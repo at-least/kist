@@ -32,7 +32,9 @@ S3 repo：第一次、沒變的第二次（S3 要全部以 etag 沿用、SFTP �
 v4：`m1-acceptance-v4-2026-10-18.log`、`m2-acceptance-s3-v4-2026-10-18.log` 是 `2e6b20b`（後者的請求數漏了 LIST）；
 `m1-acceptance-v4-2026-10-19.log`、`m2-acceptance-s3-v4-2026-10-19.log` 是 `b48e007`（沒變的 backup 加速之後；LIST 有數）。
 `r2r-acceptance-2026-10-19.log` 是 remote-to-remote 版（`7cf9e2d`），`r2r-acceptance-392eb54-2026-10-19.log` 是第十三步之後的
-重跑（S3 來源的 LIST 1 101：root 不再列兩次）。`run_s3.py` 與 `run_r2r.py` 在容器裡記下
+重跑（S3 來源的 LIST 1 101：root 不再列兩次），`r2r-acceptance-10c1eac-musl-2026-10-20.log` 是以發佈設定（`cargo zigbuild
+--target x86_64-unknown-linux-musl`，同 `dist.sh`）跑的（M12 第 7 段之四）。`run_r2r.py` 要在放著 `src` 的目錄旁跑（它以腳本所在
+的目錄找 `src`：從 repo 裡的 `tests/acceptance` 跑會數到 0 個檔案）。`run_s3.py` 與 `run_r2r.py` 在容器裡記下
 `mc admin trace` 的 PID、數完就在容器裡 kill（殺掉本機的 `docker exec` 停不了它，留下來的會讓之後的 trace 收不到東西）。
 `run_s3.py` 改了之後重跑的 M2 是 `m2-acceptance-s3-v4-recount-2026-10-19.log`（`7cf9e2d`）：請求數 13／77／10，與
 `b48e007` 那次的 13／76／10 只差 prune 之後那一次的 map 分片數（分片依 pack 名稱的第一個 byte，每次不同；這次 67 片）。

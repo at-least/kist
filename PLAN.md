@@ -434,7 +434,7 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
 - gate：fmt／clippy／windows-gnu clippy（不含 kist-mount／kist-cli；kist-cli 另外單獨跑過）乾淨、nextest
   455 過 1 略過（原 395）。依賴沒變，cargo deny 沒重跑。Windows 與 macOS 沒有實機跑過（UNVERIFIED）。
 
-## M12：v4 格式（2026-10-10 設計已確認；第 1–6 段完成 2026-10-11，第 7 段完成 2026-10-18，負責人的後續決定與 remote-to-remote 2026-10-19 完成）
+## M12：v4 格式（2026-10-10 設計已確認；第 1–6 段完成 2026-10-11，第 7 段完成 2026-10-18，負責人的後續決定與 remote-to-remote 2026-10-19 完成，發佈的 binary 的記憶體 2026-10-20 完成）
 
 起因：ADR 017 的 v4 草稿，加上 ADR 025 留下要改格式的 V19、V21。負責人說明系統還沒上線、相容性
 不重要、不需要支援上一代。第一版草稿（`054c7e1`，v3 加樹進 pack）負責人要求重新設計。
@@ -511,8 +511,15 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
      512 MiB 的門檻下被殺）；真的遠端來源的測試、M1 的 remote-to-remote 驗收（`run_r2r.py`）與記憶體 bench
      （`run-remote.sh`）。修掉兩個第三步自己引入的錯（伺服器少送時跳過資料、符號連結只讀到目標的前幾個 bytes）。往遠端
      還原沒有做。之後（`aed8f5a`、`b368982`、`392eb54`）：`run_s3.py` 自己停 trace、遠端 root 只列一次、SFTP 的伺服器沒給大小
-     是錯誤；分配器多留約 150 MiB 量了（`MALLOC_ARENA_MAX=2` 的峰值每一輪都低、CPU 差 3.5% 以內），改不改等負責人決定。見 ADR
-     026「實作第七段之三」。`b870705` 為止已 push，之後的沒有。
+     是錯誤；分配器多留約 150 MiB 量了（`MALLOC_ARENA_MAX=2` 的峰值每一輪都低、CPU 差 3.5% 以內）——這個建議後來更正為不成立
+     （第 10 項）。見 ADR 026「實作第七段之三」。`0895a8f` 為止已 push。
+  10. 發佈的 binary 與每個檔案的配置——**完成**（2026-10-20，負責人：「繼續」、只要跨平台的做法、「先專注在重用 buffer」、「做到完」；
+     格式沒有改，`25ce3b7`…這份文件的 commit）：`dist.sh` 的 Linux 發佈檔（musl）連的是 zig 0.16 的 malloc，之前的數字都是 glibc
+     的 build；同一份程式碼的發佈設定在遠端來源的平面 100 萬項 512 MiB 門檻下 4 次都被殺、本機慢 5–8 倍。修正都在 kist 的程式碼裡：
+     zstd context 重用、壓縮不另配 buffer、遠端小檔案整份交出並重用 buffer、「這次寫過」改外部排序（SQLite、redb、fjall 一起比過）、
+     資料 pack 寫到本機暫存檔並從檔案上傳（S3 以簽好的 PUT URL 串流、帶 `If-None-Match`）、delta 也依項目數寫。發佈設定的門檻跑法
+     SFTP 292／346、S3 351／292、本機 190／247 MiB，全過；整套與 remote-to-remote 驗收全過。找到 macOS 的發佈 build 在 HEAD 編不出來
+     （kist-mount），沒有修、等負責人決定。見 ADR 026「實作第七段之四」。沒有 push。
 
 ## 已接受的限制（非待辦）
 
@@ -591,7 +598,8 @@ subtree 合併保留（merge commit 5a67394 + 重排 commit）。位置慣例：
   ① 伺服器**明送** mtime=0 時 `to_meta` 仍會得到 epoch——協議上
   伺服器斷言了時間，尊重它，但這是「無限老」進 GC 的最後一條路；
   ② `size` 缺送仍代換 0（不在 GC 時間軸上，無嚴重度，但與剛移除
-  的 mtime 模式同型）。
+  的 mtime 模式同型）。（2026-10-19 後記：② 已改成錯誤，M12 第七段之三第十三步 `392eb54`；prune 的「標記後重寫」也看大小，
+  「無嚴重度」不對。）
   s3 job 的 `docker: pull access denied
   for minio/minio` 是 runner 端 Docker Hub 拉取限制（暫時性環境問題）。
   ubuntu/macos 全綠。】

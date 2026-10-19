@@ -57,7 +57,26 @@ sh bench/memory/run-v4.sh target/release/kist /path/work /path/set-a /path/set-b
 跑完在 cwd 寫 `dhat-heap.json`（Total / t-gmax live / t-end 三個數字加
 allocation site 樹）。歸因用，量測數字一律以 dhat **關閉**的 build 為準。
 
-## 結果（v4，2026-10-19，16 核 / 62 GiB / ext4，release build，M12 第 7 段之二）
+## 結果（v4，2026-10-20，`10c1eac`，發佈設定與 glibc，M12 第 7 段之四）
+
+**發佈的 Linux binary 與 `cargo build --release` 不是同一個分配器**：`./dist.sh` 以 cargo-zigbuild 編 musl，zig 0.16 連結時用它自己的
+malloc。量發佈的行為要用同樣的編法：`cargo zigbuild --release --target x86_64-unknown-linux-musl -p kist-cli`。下表兩種都量（`run-v4.sh`，
+log 在 `~/kist-bench/run-v4-{musl,glibc}-10c1eac-2026-10-20.log`，不進版控）；數字是量測跑法，括號是門檻跑法；52 次都 exit 0。
+
+| 命令 | 發佈設定 A／B | glibc A／B |
+|---|---|---|
+| backup，第一次 | 140／223 MiB（137／186），42／42 s | 179／208 MiB（161／238），34／33 s |
+| backup，第二次 | 148／247（146／246），9／11 s | 156／279（157／284），10／10 s |
+| prune，第一輪 | 218／233（153／163），6／7 s | 243／270（159／169），6／5 s |
+| `check` | 239／220（220／219），5／5 s | 234／272（257／239），5／5 s |
+| `check --read-data` | 399／374（393／381），11／11 s | 431／432（423／430），10／10 s |
+| `restore latest` | 179／164（162／160），69／78 s | 158／168（206／162），71／78 s |
+
+遠端來源（`run-remote.sh`，發佈設定的門檻跑法，第一次／第二次）：SFTP 292／346 MiB、S3 351／292 MiB（`392eb54` 的發佈設定 4 次都被
+殺）。backup 的資料 pack 現在寫在本地快取目錄的暫存檔裡（`kist-pack-*`，傳完刪掉），「這次寫過」的集合滿了也寫到那裡
+（`kist-written-*`）：cgroup 的 `file` 欄算這些 page cache，`sampled_max_ex_file_slab` 不算它們。
+
+## 結果（v4，2026-10-19，16 核 / 62 GiB / ext4，release build（glibc），M12 第 7 段之二）
 
 `run-v4.sh` 以 `b48e007` 的 binary 一次跑完（log 在 `~/kist-bench/run-v4-2026-10-19.log`，不進版控）。數字是量測跑法的
 `sampled_max_ex_file_slab`，括號是 `MemoryMax=512M` 門檻跑法的同一個數字；這一輪 26 次全部 exit 0、沒有 OOM。兩個測試集
