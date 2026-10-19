@@ -395,6 +395,9 @@ enum Keepalive {
         /// Windows 擋下 `-D warnings`。
         _child: Box<Child>,
     },
+    /// 測試用的假伺服器（`fake`）：沒有連線要留著。
+    #[cfg(test)]
+    Test,
 }
 
 /// rclone 的 stderr 尾巴緩衝：背景任務永久讀、只留最後 4 KiB。不清 stderr 的話
@@ -630,7 +633,7 @@ fn is_unsupported(e: &SftpError) -> bool {
 }
 
 /// 讀到的比要的少時（[`stream_range`]）。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Short {
     /// 錯誤（get：長度是剛 stat 到的，同 [`SftpInner::read_whole`]）。
     Error,
@@ -639,7 +642,8 @@ enum Short {
 }
 
 /// 來源模式的讀取（M12 第 7 段之三第二步）：`location` 從 `start` 起的 `len` bytes，一次一個 SFTP READ、一塊一塊交出，
-/// 不整份放進記憶體。一次要求 1 MiB，`File::read` 再依伺服器的上限截短（OpenSSH 255 KiB）。少送照 `short`。
+/// 不整份放進記憶體。一次要求 1 MiB，`File::read` 再依伺服器的上限截短（OpenSSH 255 KiB）；伺服器可以送得比要的
+/// 少，下一次從實際讀到的地方接著要（第四步）。比 `len` 先到檔尾照 `short`。
 fn stream_range(
     inner: Arc<SftpInner>,
     location: StorePath,
@@ -675,20 +679,18 @@ fn stream_range(
             Some(f) => f,
             None => {
                 let full = st.inner.full(&st.location);
-                let mut f = st
-                    .inner
+                st.inner
                     .sftp
                     .open(&full)
                     .await
-                    .map_err(|e| st.inner.store_error(&st.location, e))?;
-                if st.start > 0 {
-                    f.seek(std::io::SeekFrom::Start(st.start))
-                        .await
-                        .map_err(generic)?;
-                }
-                f
+                    .map_err(|e| st.inner.store_error(&st.location, e))?
             }
         };
+        // `File::read` 讀完把 offset 往前推「要的」長度、不是拿到的：伺服器少送時，下一次就跳過了資料。所以每次
+        // 自己定位到讀到的地方（seek 只改本地的 offset，不是一次來回）。
+        file.seek(std::io::SeekFrom::Start(st.start + st.done))
+            .await
+            .map_err(generic)?;
         let want = (st.len - st.done).min(CHUNK) as u32;
         let got = file
             .read(want, bytes::BytesMut::with_capacity(want as usize))
@@ -1624,8 +1626,13 @@ mod hardening_tests {
     }
 }
 
-/// 來源模式的讀取（M12 第 7 段之三）：對 tests/sftp-setup.sh 的伺服器跑，環境變數沒設就略過。放在模組裡是因為
-/// [`SftpStore`] 不公開。
+/// 測試用的假 SFTP 伺服器（M12 第 7 段之三第四步）。
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod fake;
+
+/// 來源模式的讀取（M12 第 7 段之三）：對 tests/sftp-setup.sh 的伺服器跑，環境變數沒設就略過；伺服器少送的情況用
+/// 假伺服器（`fake`）。放在模組裡是因為 [`SftpStore`] 不公開。
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod source_mode_tests {
@@ -1699,6 +1706,46 @@ mod source_mode_tests {
             out.extend_from_slice(&chunk?);
         }
         Ok(out)
+    }
+
+    /// 伺服器每次 READ 少送（SFTP 允許；`File::read` 的文件也寫著回來的可能比要的少）：讀到的仍要逐 byte 相同。
+    /// 用假伺服器（`fake`）：測試容器的 OpenSSH 讀一般檔案不會少送。
+    #[tokio::test]
+    async fn reads_every_byte_when_the_server_sends_less_than_asked() {
+        let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let mut failures = Vec::new();
+        for (start, short) in [(0, Short::End), (0, Short::Error), (12_345, Short::Error)] {
+            let inner = Arc::new(SftpInner {
+                sftp: Arc::new(fake::connect(content.clone(), 7_000).await),
+                fsync: false,
+                relaxed: false,
+                warned_no_o_excl: AtomicBool::new(false),
+                _stderr_tail: None,
+                _keepalive: Keepalive::Test,
+                root: String::new(),
+                display: "fake".to_owned(),
+                list_all: true,
+            });
+            let want = &content[start as usize..];
+            let got = collect(stream_range(
+                inner,
+                StorePath::from("f.bin"),
+                start,
+                want.len() as u64,
+                short,
+            ))
+            .await;
+            match got {
+                Ok(got) if got == want => {}
+                Ok(got) => failures.push(format!(
+                    "start {start}, {short:?}: read {} bytes, want {}",
+                    got.len(),
+                    want.len()
+                )),
+                Err(e) => failures.push(format!("start {start}, {short:?}: {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// 來源依列表的大小讀（第三步，不先 stat）：列表之後變長的檔案讀到列表的大小為止；變短的讀到現在的檔尾、不算錯
