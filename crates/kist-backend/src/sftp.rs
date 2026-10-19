@@ -813,13 +813,15 @@ enum MetaError {
     BadName(String),
     #[error("sftp entry {0:?}: server sent no mtime")]
     NoMtime(String),
+    #[error("sftp entry {0:?}: server sent no size")]
+    NoSize(String),
 }
 
 fn to_meta(path: &str, m: &MetaData) -> std::result::Result<ObjectMeta, MetaError> {
     // 名稱先檢查：命名規則外的條目無論屬性缺什麼都只是略過，不讓 list 失敗。
     let location =
         StorePath::parse(path).map_err(|e| MetaError::BadName(format!("{path}: {e}")))?;
-    let size = m.len().unwrap_or(0);
+    let size = m.len().ok_or_else(|| MetaError::NoSize(path.to_owned()))?;
     let last_modified = m
         .modified()
         .and_then(|ts| chrono::DateTime::from_timestamp(ts.into_raw() as i64, 0))
@@ -1656,6 +1658,21 @@ mod tests {
     use super::*;
     use openssh_sftp_client::metadata::MetaDataBuilder;
     use openssh_sftp_client::UnixTimeStamp;
+
+    /// 伺服器沒給大小（SFTP v3 的屬性都是選用的）不能當成 0：來源依列表的大小讀（第三步），那樣的檔案會記成空檔；
+    /// repo 的物件的大小 check 與 prune 也要用。同缺 mtime，大聲失敗。
+    #[test]
+    fn to_meta_rejects_entries_without_size() {
+        let ts = match UnixTimeStamp::from_raw(1_758_000_000) {
+            Some(t) => t,
+            None => panic!("valid timestamp rejected by UnixTimeStamp"),
+        };
+        let m = MetaDataBuilder::new().time(ts, ts).create();
+        match to_meta("packs/dd", &m) {
+            Err(e) => assert!(e.to_string().contains("server sent no size"), "{e}"),
+            Ok(meta) => panic!("missing size must be an error, got size {}", meta.size),
+        }
+    }
 
     /// GC 的標記年齡、touch 復活與「標記後重寫」檢查都拿 `last_modified`
     /// 當時間軸：伺服器缺送 mtime 時不能默默換成 sentinel 時間——
