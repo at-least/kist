@@ -9,7 +9,7 @@
 //! 都是這份副本不可信，呼叫端換下一個持有者（§10）。
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::Arc;
 
 use kist_crypto::v4::Keys;
@@ -40,15 +40,35 @@ pub const MAX_META: u64 = pack::MAX_META_ITEM;
 pub fn compress(raw: &[u8]) -> Result<Vec<u8>> {
     let z = CCTX
         .with(|c| -> std::io::Result<Vec<u8>> {
+            use zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::{ZSTD_e_continue, ZSTD_e_end};
+            use zstd::zstd_safe::{InBuffer, OutBuffer};
             let mut c = c.borrow_mut();
             // 前一項失敗在一半時，context 裡留著那一項的狀態
             c.reset(zstd::zstd_safe::ResetDirective::SessionOnly)
                 .map_err(zstd_error)?;
             c.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(ZSTD_LEVEL))
                 .map_err(zstd_error)?;
-            let mut enc = zstd::stream::write::Encoder::with_context(Vec::new(), &mut c);
-            enc.write_all(raw)?;
-            enc.finish()
+            // 直接寫進要交出去的 Vec（`zstd::stream` 的 wrapper 每次另配 32 KiB 的輸出 buffer）。先 continue
+            // 再 end，同 `encode_all`：zstd 不知道大小，輸出才與它相同
+            let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(raw.len()));
+            let mut input = InBuffer::around(raw);
+            let mut end = ZSTD_e_continue;
+            loop {
+                if out.len() == out.capacity() {
+                    out.reserve(out.capacity().max(64));
+                }
+                let pos = out.len();
+                let left = c
+                    .compress_stream2(&mut OutBuffer::around_pos(&mut out, pos), &mut input, end)
+                    .map_err(zstd_error)?;
+                if end == ZSTD_e_continue {
+                    if input.pos() == raw.len() {
+                        end = ZSTD_e_end;
+                    }
+                } else if left == 0 {
+                    return Ok(out);
+                }
+            }
         })
         .map_err(|e| CoreError::corrupt("<pack entry>", format!("zstd failed: {e}")))?;
     Ok(if keep_compressed(raw.len(), z.len()) {
