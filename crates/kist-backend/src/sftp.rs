@@ -365,7 +365,11 @@ async fn connect(cfg: &SftpConfig, auth: &SftpAuth) -> Result<(Keepalive, Arc<Sf
         .await
         .map_err(|e| BackendError::Sftp(format!("request sftp subsystem: {e}")))?;
     let (read_half, write_half) = tokio::io::split(channel.into_stream());
-    let sftp = Sftp::new(write_half, read_half, Default::default())
+    // openssh-sftp-client 預設把請求留在寫入緩衝裡、最多 0.5 ms 一起送（`flush_interval`）；tokio 的計時器以 ms 為
+    // 單位，只有一個請求在等的時候每個來回平均多等約半個 ms（M12 第 7 段之三第五步量到：來源的小檔一個檔案兩個
+    // 來回，這是一半的時間）。設 0：有請求就送（上游的說明：flush 在背景的 task 做，不拖慢呼叫端）。
+    let options = openssh_sftp_client::SftpOptions::new().flush_interval(std::time::Duration::ZERO);
+    let sftp = Sftp::new(write_half, read_half, options)
         .await
         .map_err(|e| BackendError::Sftp(format!("start sftp: {e}")))?;
 
