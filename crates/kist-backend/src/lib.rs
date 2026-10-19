@@ -494,11 +494,11 @@ pub fn install_tls_provider() {
 /// S3 store（bucket + 可選 prefix）的共用構造：`Backend::s3_with` 與
 /// 備份來源（`source::ObjectStoreSource`）都用它。`credentials` 給明確值時
 /// 蓋過環境變數（測試用；來源端一律走環境變數，傳 `None`）。
-pub(crate) fn s3_store(
+/// 一個 bucket 的 S3 client（設定從 `AWS_*` 環境變數）。
+pub(crate) fn s3_client(
     bucket: &str,
-    prefix: &str,
     credentials: Option<(&str, &str)>,
-) -> Result<Arc<dyn ObjectStore>> {
+) -> Result<object_store::aws::AmazonS3> {
     install_tls_provider();
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
     if let Some((key, secret)) = credentials {
@@ -506,7 +506,15 @@ pub(crate) fn s3_store(
             .with_access_key_id(key)
             .with_secret_access_key(secret);
     }
-    let s3 = builder.build()?;
+    Ok(builder.build()?)
+}
+
+pub(crate) fn s3_store(
+    bucket: &str,
+    prefix: &str,
+    credentials: Option<(&str, &str)>,
+) -> Result<Arc<dyn ObjectStore>> {
+    let s3 = s3_client(bucket, credentials)?;
     Ok(if prefix.is_empty() {
         Arc::new(s3)
     } else {

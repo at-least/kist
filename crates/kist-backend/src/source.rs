@@ -304,6 +304,8 @@ pub struct ObjectStoreSource {
     store: Arc<dyn ObjectStore>,
     /// SFTP 來源的同一個 store（[`Source::read_sized`] 不經 object_store 的 get：get 要先 stat 才有 meta）。
     sftp: Option<Arc<sftp::SftpStore>>,
+    /// S3 來源的同一個 client（列舉一頁一頁來，見 [`list_s3`]）。
+    s3: Option<Arc<object_store::aws::AmazonS3>>,
     /// 來源 root 的 store 路徑（空 = bucket 根）。
     root: object_store::path::Path,
     locator: Vec<u8>,
@@ -320,7 +322,7 @@ impl ObjectStoreSource {
             ))
         })?;
         let locator = spec.as_bytes().to_vec();
-        let (store, root, meta_kind, sftp_store) = if spec.starts_with("sftp://") {
+        let (store, root, meta_kind, sftp_store, s3_client) = if spec.starts_with("sftp://") {
             let cfg = sftp::parse_sftp_url(spec)
                 .map_err(|e| BackendError::Source(format!("{spec}: {e}")))?;
             // 來源模式：listing 不做 dot-skip——列的是使用者的資料，
@@ -334,15 +336,22 @@ impl ObjectStoreSource {
                 root,
                 kist_format::v4::meta::meta_kind::SFTP,
                 Some(store),
+                None,
             )
         } else if let Some(rest) = spec.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
             // 來源端用**裸 bucket**（不掛 PrefixStore；憑證走環境變數）：前綴由
             // self.root 負責拼接（to_store_path 會 join root+rel）。若再包
             // PrefixStore 會雙重前綴（實機 E2E 抓到：讀檔變成 prefix/prefix/key）。
-            let store = crate::s3_store(bucket, "", None)?;
+            let client = Arc::new(crate::s3_client(bucket, None)?);
             let root = s3_source_root(spec, prefix)?;
-            (store, root, kist_format::v4::meta::meta_kind::S3, None)
+            (
+                Arc::clone(&client) as Arc<dyn ObjectStore>,
+                root,
+                kist_format::v4::meta::meta_kind::S3,
+                None,
+                Some(client),
+            )
         } else {
             return Err(BackendError::Source(format!(
                 "{spec}: unsupported source scheme (want sftp:// or s3://)"
@@ -351,6 +360,7 @@ impl ObjectStoreSource {
         Ok(Self {
             store,
             sftp: sftp_store,
+            s3: s3_client,
             root,
             locator,
             meta_kind,
@@ -407,14 +417,64 @@ impl ObjectStoreSource {
 fn file_kind(meta: &object_store::ObjectMeta) -> SourceItemKind {
     SourceItemKind::File {
         size: meta.size,
-        mtime_ns: meta
-            .last_modified
-            .timestamp()
-            .saturating_mul(1_000_000_000)
-            .saturating_add(i64::from(meta.last_modified.timestamp_subsec_nanos())),
+        mtime_ns: mtime_ns(&meta.last_modified),
         etag: meta.e_tag.as_ref().map(|e| e.as_bytes().to_vec()),
         vern: meta.version.as_ref().map(|v| v.as_bytes().to_vec()),
     }
+}
+
+/// S3 來源的一個目錄，一頁一頁列（M12 第 7 段之三第十步）：object_store 的 `list_with_delimiter` 把每一頁的
+/// ObjectMeta 都收進一個 Vec 才交出來，100 萬個物件的平面前綴，那個 Vec 與它的字串加上轉換時的另一份是 backup 的
+/// 峰值（512 MiB 的門檻下被殺）。這裡每一頁搬進緊湊的清單就放掉。prefix 加 `/`、delimiter 是 `/`，同 object_store
+/// 自己的 `list_with_delimiter`；它以 BTreeSet 合併各頁的 common prefix，這裡由 [`CompactListing::sorted`] 合併同名的
+/// 目錄。`max_keys` 只給測試用（逼出好幾頁）。
+async fn list_s3(
+    s3: &object_store::aws::AmazonS3,
+    prefix: &object_store::path::Path,
+    max_keys: Option<usize>,
+) -> std::result::Result<CompactListing, BackendError> {
+    use object_store::list::{PaginatedListOptions, PaginatedListStore};
+    let delimiter = object_store::path::DELIMITER;
+    let raw = (!prefix.as_ref().is_empty()).then(|| format!("{}{delimiter}", prefix.as_ref()));
+    let mut listing = CompactListing::default();
+    let mut page_token = None;
+    loop {
+        let page = s3
+            .list_paginated(
+                raw.as_deref(),
+                PaginatedListOptions {
+                    delimiter: Some(std::borrow::Cow::Borrowed(delimiter)),
+                    max_keys,
+                    page_token: page_token.take(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| BackendError::Source(format!("{prefix}: {e}")))?;
+        for p in page.result.common_prefixes {
+            listing.push_dir(p.filename().unwrap_or("").as_bytes())?;
+        }
+        for meta in page.result.objects {
+            listing.push_file(
+                meta.location.filename().unwrap_or("").as_bytes(),
+                meta.size,
+                mtime_ns(&meta.last_modified),
+                meta.e_tag.as_deref().map(str::as_bytes),
+                meta.version.as_deref().map(str::as_bytes),
+            )?;
+        }
+        match page.page_token {
+            Some(t) => page_token = Some(t),
+            None => return Ok(listing.sorted()),
+        }
+    }
+}
+
+/// 遠端物件的 mtime（奈秒）。
+pub(crate) fn mtime_ns(t: &chrono::DateTime<chrono::Utc>) -> i64 {
+    t.timestamp()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(t.timestamp_subsec_nanos()))
 }
 
 /// `s3://bucket/<prefix>` 的 prefix → 來源的 root。與 to_store_path 同理：
@@ -472,31 +532,45 @@ impl Source for ObjectStoreSource {
                 }));
             }
         }
+        // SFTP：直接從 READDIR 放進緊湊的清單（不經一項一個 ObjectMeta 的 ListResult）。
+        if let Some(sftp) = &self.sftp {
+            let sftp = Arc::clone(sftp);
+            let listing = self.handle.block_on(async move {
+                sftp.list_source(Some(&prefix))
+                    .await
+                    .map_err(|e| BackendError::Source(format!("{prefix}: {e}")))
+            })?;
+            return Ok(Box::new(listing));
+        }
+        if let Some(s3) = &self.s3 {
+            let s3 = Arc::clone(s3);
+            let listing = self
+                .handle
+                .block_on(async move { list_s3(&s3, &prefix, None).await })?;
+            return Ok(Box::new(listing));
+        }
+        // 別的 store（測試的 InMemory）：整份 ListResult，一項一項搬進緊湊的清單。
         let result = self.handle.block_on(async move {
             store
                 .list_with_delimiter(Some(&prefix))
                 .await
                 .map_err(|e| BackendError::Source(format!("{prefix}: {e}")))
         })?;
-        let mut out = Vec::new();
-        // 子目錄（common prefix）。
-        for p in &result.common_prefixes {
-            out.push(SourceItem {
-                name: p.filename().unwrap_or("").as_bytes().to_vec(),
-                kind: SourceItemKind::Dir,
-            });
+        // 一個一個搬進緊湊的清單：每個 ObjectMeta 搬完就放掉。
+        let mut listing = CompactListing::default();
+        for p in result.common_prefixes {
+            listing.push_dir(p.filename().unwrap_or("").as_bytes())?;
         }
-        for meta in &result.objects {
-            out.push(SourceItem {
-                name: meta.location.filename().unwrap_or("").as_bytes().to_vec(),
-                kind: file_kind(meta),
-            });
+        for meta in result.objects {
+            listing.push_file(
+                meta.location.filename().unwrap_or("").as_bytes(),
+                meta.size,
+                mtime_ns(&meta.last_modified),
+                meta.e_tag.as_deref().map(str::as_bytes),
+                meta.version.as_deref().map(str::as_bytes),
+            )?;
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        // 遠端清單已整批在記憶體（伺服器回應的形狀）；迭代器只是包裝。
-        Ok(Box::new(StoreListing {
-            items: out.into_iter(),
-        }))
+        Ok(Box::new(listing.sorted()))
     }
 
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
@@ -539,7 +613,7 @@ impl ObjectStoreSource {
     }
 }
 
-/// 遠端列舉的迭代器包裝（清單已在 `list_with_delimiter` 回應裡整批到齊）。
+/// 檔案來源（root 本身是一個物件）的清單：只有那一項。
 struct StoreListing {
     items: std::vec::IntoIter<SourceItem>,
 }
@@ -547,6 +621,157 @@ struct StoreListing {
 impl SortedItems for StoreListing {
     fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
         self.items.next().map(Ok)
+    }
+}
+
+/// 遠端來源的一個目錄的清單（M12 第 7 段之三第十步）：名稱、etag、版本 ID 的 bytes 一個接一個放在一個 buffer 裡，
+/// 每個條目一個固定大小的列，依名稱排好；[`SortedItems::next_item`] 交出的時候才建 [`SourceItem`]，走過的列每過一半
+/// 放掉一次。整個目錄的清單要先到齊才能排序（SFTP 的 READDIR 不排序），這個目錄走完之前一直在記憶體裡：原本一項
+/// 一個 88 bytes 的 SourceItem 加上名稱（與 S3 的 etag）各一次配置，100 萬項的平面目錄是第一次 backup 的峰值裡
+/// 最大的遠端專屬項目（dhat：88 MiB 的那個 Vec，加上一百萬個小配置）。
+#[derive(Default)]
+pub(crate) struct CompactListing {
+    bytes: Vec<u8>,
+    rows: Vec<Row>,
+    /// 下一個要交出的列。
+    next: usize,
+}
+
+/// `CompactListing::bytes` 裡的一段；`len == NONE` 是沒有（不是空的）。
+#[derive(Clone, Copy)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+impl Span {
+    const NONE: u32 = u32::MAX;
+    const ABSENT: Span = Span {
+        start: 0,
+        len: Span::NONE,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct Row {
+    size: u64,
+    mtime_ns: i64,
+    name: Span,
+    etag: Span,
+    vern: Span,
+    dir: bool,
+}
+
+impl CompactListing {
+    fn span(&mut self, bytes: &[u8]) -> std::result::Result<Span, BackendError> {
+        let too_large = || {
+            BackendError::Source(
+                "a directory listing larger than 4 GiB of names (and etags) is not supported"
+                    .to_owned(),
+            )
+        };
+        let start = u32::try_from(self.bytes.len()).map_err(|_| too_large())?;
+        let len = u32::try_from(bytes.len())
+            .ok()
+            .filter(|&l| l != Span::NONE)
+            .ok_or_else(too_large)?;
+        start.checked_add(len).ok_or_else(too_large)?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(Span { start, len })
+    }
+
+    fn optional(&mut self, bytes: Option<&[u8]>) -> std::result::Result<Span, BackendError> {
+        match bytes {
+            Some(b) => self.span(b),
+            None => Ok(Span::ABSENT),
+        }
+    }
+
+    pub(crate) fn push_dir(&mut self, name: &[u8]) -> std::result::Result<(), BackendError> {
+        let name = self.span(name)?;
+        self.rows.push(Row {
+            size: 0,
+            mtime_ns: 0,
+            name,
+            etag: Span::ABSENT,
+            vern: Span::ABSENT,
+            dir: true,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn push_file(
+        &mut self,
+        name: &[u8],
+        size: u64,
+        mtime_ns: i64,
+        etag: Option<&[u8]>,
+        vern: Option<&[u8]>,
+    ) -> std::result::Result<(), BackendError> {
+        let name = self.span(name)?;
+        let etag = self.optional(etag)?;
+        let vern = self.optional(vern)?;
+        self.rows.push(Row {
+            size,
+            mtime_ns,
+            name,
+            etag,
+            vern,
+            dir: false,
+        });
+        Ok(())
+    }
+
+    fn get(&self, s: Span) -> &[u8] {
+        &self.bytes[s.start as usize..(s.start + s.len) as usize]
+    }
+
+    fn get_optional(&self, s: Span) -> Option<Vec<u8>> {
+        (s.len != Span::NONE).then(|| self.get(s).to_vec())
+    }
+
+    /// 依名稱的 bytes 排好（交出的順序），多配的容量還回去。同名的目錄排在檔案前面（S3 裡 `a` 與 `a/` 可以同時
+    /// 存在；原本先放目錄再穩定排序，順序同這裡），同名的目錄只留一個。
+    pub(crate) fn sorted(mut self) -> Self {
+        let bytes = std::mem::take(&mut self.bytes);
+        let name = |s: Span| &bytes[s.start as usize..(s.start + s.len) as usize];
+        self.rows.sort_unstable_by(|a, b| {
+            name(a.name)
+                .cmp(name(b.name))
+                .then_with(|| b.dir.cmp(&a.dir))
+        });
+        // 同名的目錄只留一個（S3 的 common prefix 可以在好幾頁裡都出現）
+        self.rows
+            .dedup_by(|a, b| a.dir && b.dir && name(a.name) == name(b.name));
+        self.bytes = bytes;
+        self.bytes.shrink_to_fit();
+        self.rows.shrink_to_fit();
+        self
+    }
+}
+
+impl SortedItems for CompactListing {
+    fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
+        // 走過的列放掉（名稱的 bytes 留著：列記的是它們的位置）。一半一次，攤提下來每列搬一次。
+        if self.next >= 4096 && self.next * 2 >= self.rows.len() {
+            self.rows.drain(..self.next);
+            self.rows.shrink_to_fit();
+            self.next = 0;
+        }
+        let row = *self.rows.get(self.next)?;
+        self.next += 1;
+        let name = self.get(row.name).to_vec();
+        let kind = if row.dir {
+            SourceItemKind::Dir
+        } else {
+            SourceItemKind::File {
+                size: row.size,
+                mtime_ns: row.mtime_ns,
+                etag: self.get_optional(row.etag),
+                vern: self.get_optional(row.vern),
+            }
+        };
+        Some(Ok(SourceItem { name, kind }))
     }
 }
 
@@ -811,6 +1036,143 @@ mod tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+mod compact_listing_tests {
+    use super::*;
+
+    fn all(mut l: CompactListing) -> Vec<SourceItem> {
+        std::iter::from_fn(|| l.next_item().map(|r| r.unwrap())).collect()
+    }
+
+    /// 交出的條目依名稱排好、欄位原樣（etag 與版本 ID 的「沒有」與「空的」不同）；同名的目錄在檔案前面、只有一個。
+    #[test]
+    fn yields_sorted_items_with_their_fields() {
+        let mut l = CompactListing::default();
+        l.push_file(b"b", 3, 30, Some(b"\"e-b\""), None).unwrap();
+        l.push_file(b"c", 4, 40, Some(b""), None).unwrap();
+        l.push_dir(b"c").unwrap();
+        l.push_file(b"a", 1, 10, None, Some(b"v1")).unwrap();
+        l.push_dir(b"c").unwrap();
+        l.push_dir(b"a.d").unwrap();
+        let got = all(l.sorted());
+        let shown: Vec<String> = got
+            .iter()
+            .map(|i| {
+                let name = String::from_utf8_lossy(&i.name);
+                match &i.kind {
+                    SourceItemKind::Dir => format!("{name}/"),
+                    SourceItemKind::File {
+                        size,
+                        mtime_ns,
+                        etag,
+                        vern,
+                    } => format!("{name} {size} {mtime_ns} {etag:?} {vern:?}"),
+                    SourceItemKind::Symlink { .. } => format!("{name}@"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "a 1 10 None Some([118, 49])",
+                "a.d/",
+                "b 3 30 Some([34, 101, 45, 98, 34]) None",
+                "c/",
+                "c 4 40 Some([]) None",
+            ]
+        );
+    }
+
+    /// S3 一頁一頁列（`list_s3`）：每頁兩個 key，逼出好幾頁；各頁的條目合在一起、依名稱排好、同名的目錄只有一個。
+    /// tests/minio-setup.sh 的環境變數沒設就略過；client 直接以那些值建（不 set_var）。
+    #[tokio::test]
+    async fn s3_listing_gathers_every_page() {
+        use object_store::path::Path as StorePath;
+        use object_store::ObjectStoreExt as _;
+        let (Ok(endpoint), Ok(bucket), Ok(key), Ok(secret)) = (
+            std::env::var("KIST_TEST_S3_ENDPOINT"),
+            std::env::var("KIST_TEST_S3_BUCKET"),
+            std::env::var("AWS_ACCESS_KEY_ID"),
+            std::env::var("AWS_SECRET_ACCESS_KEY"),
+        ) else {
+            eprintln!("S3 paginated listing test skipped (tests/minio-setup.sh 未跑)");
+            return;
+        };
+        crate::install_tls_provider();
+        let s3 = object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_region("us-east-1")
+            .with_bucket_name(bucket)
+            .with_access_key_id(key)
+            .with_secret_access_key(secret)
+            .build()
+            .unwrap();
+        let prefix = format!("listing-{}", std::process::id());
+        let keys = ["a", "b", "c", "d/x", "d/y", "e/z", "f"];
+        for k in keys {
+            let path = StorePath::from(format!("{prefix}/{k}"));
+            s3.put(&path, k.as_bytes().to_vec().into()).await.unwrap();
+        }
+        let listing = list_s3(&s3, &StorePath::from(prefix.as_str()), Some(2)).await;
+        for k in keys {
+            s3.delete(&StorePath::from(format!("{prefix}/{k}")))
+                .await
+                .unwrap();
+        }
+        let shown: Vec<String> = all(listing.unwrap())
+            .iter()
+            .map(|i| {
+                let name = String::from_utf8_lossy(&i.name).into_owned();
+                match &i.kind {
+                    SourceItemKind::Dir => format!("{name}/"),
+                    SourceItemKind::File { size, etag, .. } => {
+                        format!("{name} {size} etag:{}", etag.is_some())
+                    }
+                    SourceItemKind::Symlink { .. } => format!("{name}@"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "a 1 etag:true",
+                "b 1 etag:true",
+                "c 1 etag:true",
+                "d/",
+                "e/",
+                "f 1 etag:true"
+            ]
+        );
+    }
+
+    /// 走過的列分批放掉之後，後面的條目照樣正確。
+    #[test]
+    fn dropping_consumed_rows_keeps_the_rest_intact() {
+        let mut l = CompactListing::default();
+        for i in (0..20_000u32).rev() {
+            l.push_file(
+                format!("f{i:05}").as_bytes(),
+                u64::from(i),
+                i64::from(i),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let got = all(l.sorted());
+        assert_eq!(got.len(), 20_000);
+        for (i, item) in got.iter().enumerate() {
+            assert_eq!(item.name, format!("f{i:05}").as_bytes());
+            assert!(
+                matches!(item.kind, SourceItemKind::File { size, .. } if size == i as u64),
+                "{i}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod s3_root_probe_tests {
     use super::*;
     use object_store::path::Path as StorePath;
@@ -839,6 +1201,7 @@ mod s3_root_probe_tests {
         let src = ObjectStoreSource {
             store: Arc::new(store),
             sftp: None,
+            s3: None,
             root: StorePath::from("data"),
             locator: b"s3://bucket/data/".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
@@ -930,6 +1293,7 @@ mod store_path_tests {
         let src = ObjectStoreSource {
             store: Arc::new(store),
             sftp: None,
+            s3: None,
             root: StorePath::default(),
             locator: b"s3://bucket".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
@@ -972,6 +1336,7 @@ mod store_path_tests {
         let src = ObjectStoreSource {
             store: Arc::new(object_store::memory::InMemory::new()),
             sftp: None,
+            s3: None,
             root: StorePath::default(),
             locator: b"s3://bucket".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,

@@ -1067,6 +1067,71 @@ impl SftpStore {
         stream_range(Arc::clone(&self.0), location.clone(), 0, size, Short::End)
     }
 
+    /// 一個目錄的每個條目呼叫一次 `visit(相對 root 的 key, metadata)`（`.`、`..`，與不是來源模式時 `.` 開頭的，
+    /// 略過）；目錄不存在是空的。key 一樣回相對 root 的形式（跟 list 一致）。
+    async fn each_entry(
+        &self,
+        prefix: Option<&StorePath>,
+        mut visit: impl FnMut(String, &MetaData) -> object_store::Result<()>,
+    ) -> object_store::Result<()> {
+        let root = &self.0.root;
+        let dir = self.0.list_dir(prefix);
+        let mut fs = self.0.sftp.fs();
+        let d = match fs.open_dir(&dir).await {
+            Ok(d) => d,
+            Err(e) if is_not_found(&e) => return Ok(()),
+            Err(e) => return Err(generic(e)),
+        };
+        drop(fs);
+        let list_all = self.0.list_all;
+        let mut entries = std::pin::pin!(d.read_dir());
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(generic)?;
+            let name = entry.filename().to_string_lossy().into_owned();
+            if skip_in_listing(list_all, &name) {
+                continue;
+            }
+            let full = format!("{dir}/{name}");
+            visit(key_under_root(root, &full), &entry.metadata())?;
+        }
+        Ok(())
+    }
+
+    /// 來源的一個目錄（M12 第 7 段之三第十步）：直接放進緊湊的清單，不經一項一個 `ObjectMeta` 的 `ListResult`。
+    /// 規則同 `list_with_delimiter`：命名規則外的名稱略過、檔案沒有 mtime 是錯誤。
+    pub(crate) async fn list_source(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> object_store::Result<crate::source::CompactListing> {
+        let mut listing = crate::source::CompactListing::default();
+        self.each_entry(prefix, |key, m| {
+            if is_dir(m) {
+                if let Ok(p) = StorePath::parse(key) {
+                    listing
+                        .push_dir(p.filename().unwrap_or("").as_bytes())
+                        .map_err(generic)?;
+                }
+            } else {
+                match to_meta(&key, m) {
+                    Ok(meta) => listing
+                        .push_file(
+                            meta.location.filename().unwrap_or("").as_bytes(),
+                            meta.size,
+                            crate::source::mtime_ns(&meta.last_modified),
+                            None,
+                            None,
+                        )
+                        .map_err(generic)?,
+                    Err(MetaError::BadName(_)) => {}
+                    Err(e) => return Err(generic(e)),
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(listing.sorted())
+    }
+
     /// `open` 與 `open_source` 的共同本體：只差 `list_all`。
     async fn open_ssh(cfg: &SftpConfig, auth: &SftpAuth, list_all: bool) -> Result<Self> {
         let (keepalive, sftp) = connect(cfg, auth).await?;
@@ -1502,48 +1567,25 @@ impl ObjectStore for SftpStore {
         &self,
         prefix: Option<&StorePath>,
     ) -> object_store::Result<ListResult> {
-        // key 一樣回相對 root 的形式（跟 list 一致）。
-        let root = &self.0.root;
-        let dir = self.0.list_dir(prefix);
-        let mut fs = self.0.sftp.fs();
-        let d = match fs.open_dir(&dir).await {
-            Ok(d) => d,
-            Err(e) if is_not_found(&e) => {
-                return Ok(ListResult {
-                    common_prefixes: vec![],
-                    objects: vec![],
-                    extensions: Default::default(),
-                });
-            }
-            Err(e) => return Err(generic(e)),
-        };
-        drop(fs);
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
-        let list_all = self.0.list_all;
-        let mut entries = std::pin::pin!(d.read_dir());
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(generic)?;
-            let name = entry.filename().to_string_lossy().into_owned();
-            if skip_in_listing(list_all, &name) {
-                continue;
-            }
-            let full = format!("{dir}/{name}");
-            if is_dir(&entry.metadata()) {
-                match StorePath::parse(key_under_root(root, &full)) {
-                    Ok(p) => common_prefixes.push(p),
-                    // 伺服器給了 object_store 命名規則外的名稱：略過，不讓整個 list 失敗
-                    Err(_) => continue,
+        self.each_entry(prefix, |key, m| {
+            if is_dir(m) {
+                // 伺服器給了 object_store 命名規則外的名稱：略過，不讓整個 list 失敗
+                if let Ok(p) = StorePath::parse(key) {
+                    common_prefixes.push(p);
                 }
             } else {
-                match to_meta(&key_under_root(root, &full), &entry.metadata()) {
-                    Ok(m) => objects.push(m),
+                match to_meta(&key, m) {
+                    Ok(meta) => objects.push(meta),
                     // 同 walk：命名規則外的名稱略過；缺 mtime 讓 list 失敗
                     Err(MetaError::BadName(_)) => {}
                     Err(e) => return Err(generic(e)),
                 }
             }
-        }
+            Ok(())
+        })
+        .await?;
         common_prefixes.sort();
         Ok(ListResult {
             common_prefixes,
