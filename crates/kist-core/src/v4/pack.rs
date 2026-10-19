@@ -200,6 +200,29 @@ pub fn decode_trailer(
     })
 }
 
+/// 一項的密文：壓縮（[`compress`]）再以種類的金鑰加密，AAD 是它的 ID。
+fn seal_item(keys: &Keys, kind: Kind, id: ItemId, plain: &[u8]) -> Result<Vec<u8>> {
+    let framed = compress(plain)?;
+    Ok(match kind {
+        Kind::Data => keys.seal_chunk(&id.to_chunk(), &framed)?,
+        Kind::Meta => keys.seal_meta(&id.to_meta(), &framed)?,
+    })
+}
+
+/// trailer 的密文：先照 §6 檢查（`len` 是 trailer 之前的 bytes），不一致就不寫。
+fn seal_trailer(
+    keys: &Keys,
+    kind: Kind,
+    entries: &[PackEntry],
+    len: u64,
+    max_r: u64,
+) -> Result<Vec<u8>> {
+    let trailer = PackTrailer::new(kind, entries.to_vec())
+        .encode(len, max_r)
+        .map_err(|e| CoreError::corrupt("<pack trailer>", e.to_string()))?;
+    Ok(keys.seal_trailer(&trailer)?)
+}
+
 /// 一個已封好、待上傳的 pack 或 mpack。
 #[derive(Debug)]
 pub struct FinishedPack {
@@ -244,11 +267,7 @@ impl PackWriter {
 
     /// 壓縮、加密並接在後面。`plain` 是 chunk 的明文或 item 的規範 CBOR。
     pub fn add(&mut self, id: ItemId, plain: &[u8]) -> Result<PackEntry> {
-        let framed = compress(plain)?;
-        let sealed = match self.kind {
-            Kind::Data => self.keys.seal_chunk(&id.to_chunk(), &framed)?,
-            Kind::Meta => self.keys.seal_meta(&id.to_meta(), &framed)?,
-        };
+        let sealed = seal_item(&self.keys, self.kind, id, plain)?;
         let entry = PackEntry {
             i: id,
             o: self.buf.len() as u64,
@@ -268,10 +287,13 @@ impl PackWriter {
         }
         let entries = std::mem::take(&mut self.entries);
         let buf = std::mem::replace(&mut self.buf, pack::begin());
-        let trailer = PackTrailer::new(self.kind, entries.clone())
-            .encode(buf.len() as u64, self.max_r)
-            .map_err(|e| CoreError::corrupt("<pack trailer>", e.to_string()))?;
-        let sealed = self.keys.seal_trailer(&trailer)?;
+        let sealed = seal_trailer(
+            &self.keys,
+            self.kind,
+            &entries,
+            buf.len() as u64,
+            self.max_r,
+        )?;
         let bytes = pack::finish(buf, &sealed);
         let id = ObjectId::of(&bytes);
         Ok(Some(FinishedPack {
@@ -279,6 +301,155 @@ impl PackWriter {
             kind: self.kind,
             bytes,
             entries,
+        }))
+    }
+}
+
+fn spool_error(path: &std::path::Path, source: std::io::Error) -> CoreError {
+    CoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// 資料 pack 的寫入端，項目一邊加一邊寫進本機的暫存檔（M12 第 7 段之四第五步）：累積中的 pack 不在記憶體裡
+/// （[`PackWriter`] 的 buffer 是 `pack_target` 那麼大，預設 64 MiB）。名稱的 BLAKE3 邊寫邊算。暫存檔在 `dir`
+/// 下（本地快取的目錄；沒有快取時是系統的暫存目錄），[`FinishedSpool`] drop 時刪掉。
+pub struct SpoolWriter {
+    keys: Arc<Keys>,
+    kind: Kind,
+    target: u64,
+    max_r: u64,
+    dir: std::path::PathBuf,
+    open: Option<Spool>,
+    entries: Vec<PackEntry>,
+}
+
+/// 累積中的那一個 pack 的暫存檔。
+struct Spool {
+    out: std::io::BufWriter<tempfile::NamedTempFile>,
+    hasher: blake3::Hasher,
+    len: u64,
+}
+
+impl Spool {
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.out
+            .write_all(bytes)
+            .map_err(|e| spool_error(self.out.get_ref().path(), e))?;
+        self.hasher.update(bytes);
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+}
+
+/// 寫完的資料 pack：在暫存檔裡。
+pub struct FinishedSpool {
+    pub id: ObjectId,
+    pub kind: Kind,
+    pub len: u64,
+    pub entries: Vec<PackEntry>,
+    file: tempfile::NamedTempFile,
+}
+
+impl FinishedSpool {
+    /// 整份讀回記憶體，重算名稱：暫存檔在寫完之後壞了，pack 的名稱就與內容不符（要到 check 才看得出來）。
+    pub fn into_pack(self) -> Result<FinishedPack> {
+        let path = self.file.path().to_path_buf();
+        let bytes = std::fs::read(&path).map_err(|e| spool_error(&path, e))?;
+        if bytes.len() as u64 != self.len || ObjectId::of(&bytes) != self.id {
+            return Err(CoreError::corrupt(
+                path.display().to_string(),
+                format!("the spooled pack {} changed after it was written", self.id),
+            ));
+        }
+        Ok(FinishedPack {
+            id: self.id,
+            kind: self.kind,
+            bytes,
+            entries: self.entries,
+        })
+    }
+}
+
+impl SpoolWriter {
+    /// 參數同 [`PackWriter::new`]，加上暫存檔的目錄。
+    pub fn new(
+        keys: Arc<Keys>,
+        kind: Kind,
+        target: u64,
+        chunk_max: u32,
+        dir: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            keys,
+            kind,
+            target,
+            max_r: max_r(kind, chunk_max),
+            dir,
+            open: None,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.open.as_ref().is_some_and(|s| s.len >= self.target)
+    }
+
+    /// 同 [`PackWriter::add`]，寫進暫存檔。
+    pub fn add(&mut self, id: ItemId, plain: &[u8]) -> Result<PackEntry> {
+        let sealed = seal_item(&self.keys, self.kind, id, plain)?;
+        let spool = match &mut self.open {
+            Some(spool) => spool,
+            None => {
+                let file = tempfile::Builder::new()
+                    .prefix("kist-pack-")
+                    .tempfile_in(&self.dir)
+                    .map_err(|e| spool_error(&self.dir, e))?;
+                let mut spool = Spool {
+                    out: std::io::BufWriter::with_capacity(1 << 20, file),
+                    hasher: blake3::Hasher::new(),
+                    len: 0,
+                };
+                spool.write(&pack::begin())?;
+                self.open.insert(spool)
+            }
+        };
+        let entry = PackEntry {
+            i: id,
+            o: spool.len,
+            l: sealed.len() as u64,
+            r: plain.len() as u64,
+        };
+        spool.write(&sealed)?;
+        self.entries.push(entry);
+        Ok(entry)
+    }
+
+    /// 同 [`PackWriter::finish`]：接上 trailer，交出暫存檔裡的 pack，自己重置成空的。
+    pub fn finish(&mut self) -> Result<Option<FinishedSpool>> {
+        let Some(mut spool) = self.open.take() else {
+            return Ok(None);
+        };
+        let entries = std::mem::take(&mut self.entries);
+        let sealed = seal_trailer(&self.keys, self.kind, &entries, spool.len, self.max_r)?;
+        spool.write(&pack::finish(Vec::new(), &sealed))?;
+        let path = spool.out.get_ref().path().to_path_buf();
+        let file = spool
+            .out
+            .into_inner()
+            .map_err(|e| spool_error(&path, e.into_error()))?;
+        Ok(Some(FinishedSpool {
+            id: ObjectId::from_bytes(*spool.hasher.finalize().as_bytes()),
+            kind: self.kind,
+            len: spool.len,
+            entries,
+            file,
         }))
     }
 }
@@ -353,6 +524,82 @@ mod tests {
         let cut = &framed[..framed.len() / 2];
         assert!(decompress(cut, raw.len() as u64, "t").is_err());
         assert_eq!(decompress(&framed, raw.len() as u64, "t").unwrap(), raw);
+    }
+
+    /// 暫存檔的 pack 與記憶體裡的同一個結構：每一項的位置、長度、整個 pack 的長度相同（nonce 是亂數，bytes
+    /// 不同）；讀回的 pack 驗證得過、每一項解得開、名稱是讀回的 bytes 的 BLAKE3；讀回之後暫存檔刪掉；寫完之後再加
+    /// 是新的一個。
+    #[test]
+    fn a_spooled_data_pack_has_the_layout_of_the_in_memory_one() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        let chunks: Vec<Vec<u8>> = vec![
+            vec![0u8; 5000],
+            (0..=255u8).collect(),
+            b"x".to_vec(),
+            sample(3, 70_000),
+        ];
+        let mut m = PackWriter::new(Arc::clone(&k), Kind::Data, 1 << 20, 1024 * 1024);
+        let mut w = SpoolWriter::new(
+            Arc::clone(&k),
+            Kind::Data,
+            1 << 20,
+            1024 * 1024,
+            dir.path().to_path_buf(),
+        );
+        assert!(w.is_empty() && !w.is_full() && w.finish().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no file before the first item"
+        );
+        for c in &chunks {
+            let id = k.chunk_id(c).into();
+            assert_eq!(m.add(id, c).unwrap(), w.add(id, c).unwrap());
+        }
+        let mem = m.finish().unwrap().unwrap();
+        let spooled = w.finish().unwrap().unwrap();
+        assert!(w.is_empty() && w.finish().unwrap().is_none());
+        assert_eq!(spooled.entries, mem.entries);
+        assert_eq!(spooled.len, mem.bytes.len() as u64);
+        let path = spooled.file.path().to_path_buf();
+        let p = spooled.into_pack().unwrap();
+        assert!(!path.exists(), "the spool file is removed once read back");
+        assert_eq!(p.id, ObjectId::of(&p.bytes));
+        let t = trailer_of(&k, &data_key(p.id), &p.bytes, 1024 * 1024).unwrap();
+        assert_eq!(t.entries, p.entries);
+        for (c, e) in chunks.iter().zip(&t.entries) {
+            let sealed = &p.bytes[e.o as usize..(e.o + e.l) as usize];
+            assert_eq!(
+                &open_chunk(&k, &e.i.to_chunk(), sealed, e.r, 1024 * 1024).unwrap(),
+                c
+            );
+        }
+        w.add(k.chunk_id(b"again").into(), b"again").unwrap();
+        let again = w.finish().unwrap().unwrap();
+        assert_ne!(again.file.path(), path);
+        assert_eq!(again.entries.len(), 1);
+    }
+
+    /// 寫完之後暫存檔被改了：讀回是錯誤，不是一個名稱與內容不符的 pack。
+    #[test]
+    fn a_spooled_pack_changed_on_disk_is_an_error() {
+        let k = keys();
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SpoolWriter::new(
+            Arc::clone(&k),
+            Kind::Data,
+            1 << 20,
+            1024 * 1024,
+            dir.path().to_path_buf(),
+        );
+        w.add(k.chunk_id(b"abc").into(), b"abc").unwrap();
+        let spooled = w.finish().unwrap().unwrap();
+        let mut bytes = std::fs::read(spooled.file.path()).unwrap();
+        bytes[10] ^= 1;
+        std::fs::write(spooled.file.path(), &bytes).unwrap();
+        let e = spooled.into_pack().unwrap_err().to_string();
+        assert!(e.contains("changed after it was written"), "{e}");
     }
 
     fn keys() -> Arc<Keys> {

@@ -37,7 +37,7 @@ use kist_format::v4::snapshot::{build_roots, split_locator, Root, Snapshot, Snap
 use tokio::task::JoinSet;
 
 use super::cache::{Cache, Kind as CacheKind};
-use super::pack::{FinishedPack, PackWriter};
+use super::pack::{FinishedPack, FinishedSpool, PackWriter, SpoolWriter};
 use super::read::{DirStream, Reader};
 use super::repo::Repo;
 use super::spill::WrittenSet;
@@ -595,7 +595,7 @@ type DirFuture<'a> =
 /// 在 blocking 執行緒之間移進移出的可變狀態。
 struct Work {
     dedup: Dedup,
-    data: PackWriter,
+    data: SpoolWriter,
     meta: PackWriter,
     packs: UsedPacks,
 }
@@ -1212,6 +1212,11 @@ impl Repo {
 
         let chunker = self.config().chunker;
         let keys = Arc::clone(self.keys());
+        // 這次寫過的 chunk 與累積中的資料 pack 的暫存檔放在這裡
+        let spool_dir = self
+            .cache()
+            .map(|c| c.dir().to_path_buf())
+            .unwrap_or_else(std::env::temp_dir);
         let mut w = Walk {
             repo: self.clone(),
             keys: Arc::clone(&keys),
@@ -1224,19 +1229,16 @@ impl Repo {
             work: Some(Work {
                 dedup: Dedup {
                     reader: reader.clone(),
-                    written: WrittenSet::new(
-                        self.cache()
-                            .map(|c| c.dir().to_path_buf())
-                            .unwrap_or_else(std::env::temp_dir),
-                    ),
+                    written: WrittenSet::new(spool_dir.clone()),
                     handle: tokio::runtime::Handle::current(),
                     verified: 0,
                 },
-                data: PackWriter::new(
+                data: SpoolWriter::new(
                     Arc::clone(&keys),
                     Kind::Data,
                     settings.pack_target,
                     chunker.max,
+                    spool_dir,
                 ),
                 meta: PackWriter::new(
                     Arc::clone(&keys),
@@ -2206,7 +2208,7 @@ impl Walk {
             self.work = Some(work);
             state = state_back;
             if let Some(p) = finished {
-                self.handle_finished(p).await?;
+                self.handle_spooled(p).await?;
             }
             if let Some(e) = hard_error {
                 self.chunk_bufs.push(state.chunks.take_buf());
@@ -2227,6 +2229,13 @@ impl Walk {
     /// B3：封好的 pack 或 mpack 交去上傳（只在不存在時建立；mpack 在 replicas=1 時先主體、後 `.r1`；parity
     /// 選配），記下來給 delta 與 B4。自己寫的 mpack 也放進記憶體與本地快取：下一次 backup 讀 parent 的樹不必
     /// 下載。
+    async fn handle_spooled(&mut self, p: FinishedSpool) -> Result<()> {
+        // 等到有上傳的空位才讀回記憶體（還不能直接從檔案上傳）：記憶體裡最多是在上傳的那一個
+        self.wait_uploads(MAX_INFLIGHT_UPLOADS - 1).await?;
+        let p = blocking(move || p.into_pack()).await?;
+        self.handle_finished(p).await
+    }
+
     async fn handle_finished(&mut self, p: FinishedPack) -> Result<()> {
         self.wait_uploads(MAX_INFLIGHT_UPLOADS - 1).await?;
         let FinishedPack {
@@ -2384,7 +2393,10 @@ impl Walk {
         })
         .await?;
         self.work = Some(work);
-        for p in [data?, meta?].into_iter().flatten() {
+        if let Some(p) = data? {
+            self.handle_spooled(p).await?;
+        }
+        if let Some(p) = meta? {
             self.handle_finished(p).await?;
         }
         self.wait_uploads(0).await?;
