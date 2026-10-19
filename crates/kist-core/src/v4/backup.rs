@@ -840,11 +840,36 @@ enum RootPlan {
         path: PathBuf,
         item: SourceItem,
     },
-    RemoteDir(Arc<dyn Source>),
+    /// `listing`：`plan_roots` 列過的根，walk 接著用（[`Peeked`]）。
+    RemoteDir {
+        source: Arc<dyn Source>,
+        listing: Box<dyn SortedItems + Send>,
+    },
     RemoteFile {
         source: Arc<dyn Source>,
         item: SourceItem,
     },
+}
+
+/// 已經取走第一個條目的列表：先交出那一個，之後照原本的列表。遠端 root 的列表由 `plan_roots` 開始、walk 接著用，
+/// 根不必再列一次（M12 第 7 段之三第十二步）。
+struct Peeked {
+    first: Option<Option<std::result::Result<SourceItem, BackendError>>>,
+    rest: Box<dyn SortedItems + Send>,
+}
+
+impl SortedItems for Peeked {
+    fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
+        match self.first.take() {
+            Some(first) => first,
+            None => self.rest.next_item(),
+        }
+    }
+
+    /// 交出取走的那一個之後，原本的列表最後交出的也是它（取走之後沒有再往下列），posix 照它的。
+    fn posix(&self) -> Option<kist_backend::fsmeta::PosixMeta> {
+        self.rest.posix()
+    }
 }
 
 struct Planned {
@@ -889,10 +914,16 @@ async fn plan_roots(paths: &[PathBuf], opts: &BackupOptions) -> Result<Vec<Plann
                     plan: RootPlan::RemoteFile { source, item },
                 }
             }
-            _ => Planned {
+            (first, _) => Planned {
                 path,
                 t: node_type::DIR,
-                plan: RootPlan::RemoteDir(source),
+                plan: RootPlan::RemoteDir {
+                    source,
+                    listing: Box::new(Peeked {
+                        first: Some(first),
+                        rest: items,
+                    }),
+                },
             },
         };
         Ok::<_, CoreError>(plan)
@@ -1144,7 +1175,7 @@ impl Repo {
         let root_types: Vec<(Vec<u8>, u8)> =
             planned.iter().map(|p| (p.path.clone(), p.t)).collect();
         let sftp_root = planned.iter().find_map(|p| match &p.plan {
-            RootPlan::RemoteDir(source) | RootPlan::RemoteFile { source, .. }
+            RootPlan::RemoteDir { source, .. } | RootPlan::RemoteFile { source, .. }
                 if source.meta_kind() == meta_kind::SFTP =>
             {
                 Some(p.path.clone())
@@ -1410,7 +1441,7 @@ impl Walk {
                     named: Named::new(named),
                 };
                 let visit = Visit::root(self.root_state(&p.path)?, root_dev);
-                let (tree, used) = self.walk_dir(&ctx, b"", parent_tree, visit).await?;
+                let (tree, used) = self.walk_dir(&ctx, b"", None, parent_tree, visit).await?;
                 Ok((dir_root(p.path, tree), used))
             }
             RootPlan::LocalFile { path, item } => {
@@ -1438,13 +1469,15 @@ impl Walk {
                     .await?;
                 file_root(p.path, entry, &path.display().to_string())
             }
-            RootPlan::RemoteDir(source) => {
+            RootPlan::RemoteDir { source, listing } => {
                 let ctx = SourceCtx {
                     source,
                     named: Named::default(),
                 };
                 let visit = Visit::root(self.root_state(&p.path)?, None);
-                let (tree, used) = self.walk_dir(&ctx, b"", parent_tree, visit).await?;
+                let (tree, used) = self
+                    .walk_dir(&ctx, b"", Some(listing), parent_tree, visit)
+                    .await?;
                 Ok((dir_root(p.path, tree), used))
             }
             RootPlan::RemoteFile { source, item } => {
@@ -1513,10 +1546,12 @@ impl Walk {
     }
 
     /// 遞迴走訪一個目錄的內容：回傳它的根（Seg 或 Dir）與這棵子樹沿用的 (item, 持有者)。
+    /// `listed`：這個目錄已經開始的列表（遠端 root，[`Peeked`]）；沒有就在這裡列。
     fn walk_dir<'a>(
         &'a mut self,
         ctx: &'a SourceCtx,
         dir_rel: &'a [u8],
+        listed: Option<Box<dyn SortedItems + Send>>,
         parent_tree: Option<MetaId>,
         visit: Visit,
     ) -> DirFuture<'a> {
@@ -1533,13 +1568,15 @@ impl Walk {
                 None => None,
             };
 
-            let list_source = Arc::clone(&ctx.source);
-            let list_dir = dir_rel.to_vec();
-            let mut listing = match blocking(move || {
-                list_source.list(&list_dir).map_err(CoreError::from)
-            })
-            .await
-            {
+            let listing = match listed {
+                Some(l) => Ok(l),
+                None => {
+                    let list_source = Arc::clone(&ctx.source);
+                    let list_dir = dir_rel.to_vec();
+                    blocking(move || list_source.list(&list_dir).map_err(CoreError::from)).await
+                }
+            };
+            let mut listing = match listing {
                 Ok(l) => l,
                 Err(e) => {
                     self.skip(&ctx.display_path(dir_rel), &e.to_string());
@@ -1828,7 +1865,7 @@ impl Walk {
                         named: false,
                         toward_named: false,
                     };
-                    let (tree, sub) = self.walk_dir(ctx, rel, parent_tree, inside).await?;
+                    let (tree, sub) = self.walk_dir(ctx, rel, None, parent_tree, inside).await?;
                     used = sub;
                     tree
                 };
@@ -2638,6 +2675,69 @@ fn status_name(s: u8) -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// [`Peeked`] 先交出取走的那一個、posix 是它的，之後照原本的列表（第一個是錯誤的條目、列表是空的也一樣）。
+    #[test]
+    fn peeked_yields_the_taken_item_first_with_its_posix() {
+        struct Listing {
+            items: VecDeque<std::result::Result<(u8, u32), String>>,
+            last: Option<u32>,
+        }
+        impl SortedItems for Listing {
+            fn next_item(&mut self) -> Option<std::result::Result<SourceItem, BackendError>> {
+                let next = self.items.pop_front()?;
+                self.last = next.as_ref().ok().map(|&(_, mode)| mode);
+                Some(
+                    next.map(|(name, _)| SourceItem {
+                        name: vec![name],
+                        kind: SourceItemKind::Dir,
+                    })
+                    .map_err(BackendError::Sftp),
+                )
+            }
+            fn posix(&self) -> Option<kist_backend::fsmeta::PosixMeta> {
+                self.last.map(|mode| kist_backend::fsmeta::PosixMeta {
+                    mode,
+                    uid: 0,
+                    gid: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    inode: 0,
+                    dev: 0,
+                    nlink: 1,
+                })
+            }
+        }
+        let peek = |items: Vec<std::result::Result<(u8, u32), String>>| {
+            let mut rest: Box<dyn SortedItems + Send> = Box::new(Listing {
+                items: items.into(),
+                last: None,
+            });
+            Peeked {
+                first: Some(rest.next_item()),
+                rest,
+            }
+        };
+        let walk = |mut l: Peeked| {
+            let mut seen = Vec::new();
+            while let Some(item) = l.next_item() {
+                seen.push(match item {
+                    Ok(i) => format!("{} {:?}", i.name[0], l.posix().map(|p| p.mode)),
+                    Err(e) => format!("error {e} {:?}", l.posix().map(|p| p.mode)),
+                });
+            }
+            seen
+        };
+        assert_eq!(
+            walk(peek(vec![Ok((1, 10)), Ok((2, 20)), Ok((3, 30))])),
+            ["1 Some(10)", "2 Some(20)", "3 Some(30)"]
+        );
+        assert_eq!(
+            walk(peek(vec![Err("gone".into()), Ok((2, 20))])),
+            ["error sftp backend: gone None", "2 Some(20)"]
+        );
+        assert!(walk(peek(Vec::new())).is_empty());
+    }
 
     /// §11.1：E ＝ max(牆鐘經過, 含休眠的單調時鐘經過)。
     #[test]

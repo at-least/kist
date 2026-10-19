@@ -30,16 +30,19 @@ struct FakeSource {
     etags: BTreeMap<Vec<u8>, Vec<u8>>,
     /// `Source::read_ahead`（預設 0，同本機來源）。
     ahead: usize,
-    /// 開過的讀取，所有 clone 共用（注入的是 clone）。
+    /// `list` 會失敗的目錄。
+    unlistable: BTreeSet<Vec<u8>>,
+    /// 開過的讀取與列過的目錄，所有 clone 共用（注入的是 clone）。
     reads: Arc<std::sync::Mutex<Reads>>,
 }
 
-/// [`FakeSource`] 開過的讀取：照順序的 rel、現在開著幾個、最多同時開著幾個。
+/// [`FakeSource`] 開過的讀取：照順序的 rel、現在開著幾個、最多同時開著幾個；列過的目錄（照順序）。
 #[derive(Default)]
 struct Reads {
     opened: Vec<String>,
     open_now: usize,
     most_open: usize,
+    listed: Vec<String>,
 }
 
 /// 關掉（drop）時把 [`Reads::open_now`] 減一的讀取。
@@ -69,8 +72,14 @@ impl FakeSource {
             mtimes: BTreeMap::new(),
             etags: BTreeMap::new(),
             ahead: 0,
+            unlistable: BTreeSet::new(),
             reads: Arc::default(),
         }
+    }
+
+    /// 列過的目錄（照順序，根是 ""），並清掉紀錄。
+    fn take_listed(&self) -> Vec<String> {
+        std::mem::take(&mut self.reads.lock().unwrap().listed)
     }
 
     /// 開過的讀取（照順序），並清掉紀錄。
@@ -164,6 +173,17 @@ impl Source for FakeSource {
             fn next_item(&mut self) -> Option<Result<SourceItem, BackendError>> {
                 self.iter.next().map(Ok)
             }
+        }
+        self.reads
+            .lock()
+            .unwrap()
+            .listed
+            .push(String::from_utf8_lossy(dir).into_owned());
+        if self.unlistable.contains(dir) {
+            return Err(BackendError::Sftp(format!(
+                "cannot list {:?}: permission denied",
+                String::from_utf8_lossy(dir)
+            )));
         }
         Ok(Box::new(Items {
             iter: self.items_at(dir).into_iter(),
@@ -793,6 +813,55 @@ async fn remote_sources_read_ahead_within_a_directory() {
         );
         assert_eq!(restored(&repo, &s.snapshot, "f7").await, src.content("f7"));
     }
+}
+
+/// 遠端 root 只列一次：`plan_roots` 為了分辨 root 是檔案還是目錄已經列了根、取走第一項，walk 接著用那一份
+/// （原本再列一次：100 萬項的平面 root 就是兩次完整的列舉）。第一項是檔案、是目錄都一樣，第一項不會漏掉。
+#[tokio::test]
+async fn remote_root_is_listed_once() {
+    for (names, listed) in [
+        (
+            &["a", "b", "sub/x", "sub/deeper/y"][..],
+            &["", "sub", "sub/deeper"][..],
+        ),
+        (&["0/x", "a"][..], &["", "0"][..]),
+    ] {
+        let t = TestRepo::new().await;
+        let repo = t.open().await;
+        let mut src = FakeSource::new("mem://box/data", meta_kind::S3);
+        for (i, name) in names.iter().enumerate() {
+            src.put(name, random_bytes(30 + i as u64, 100), T0 * NS, Some(name));
+        }
+        let s = repo.backup(&[], source_opts(injected(&src))).await.unwrap();
+        assert_eq!(src.take_listed(), listed);
+        for name in names {
+            assert_eq!(
+                restored(&repo, &s.snapshot, name).await,
+                src.content(name),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// 列不了的遠端 root 讓 backup 失敗（不是記成一個空的 root）；列不了的子目錄是略過的條目，backup 照樣寫。
+#[tokio::test]
+async fn unlistable_remote_root_fails_the_backup() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let mut src = FakeSource::new("mem://box/data", meta_kind::SFTP);
+    src.put("a", random_bytes(40, 100), T0 * NS, None);
+    src.put("sub/x", random_bytes(41, 100), T0 * NS, None);
+    src.unlistable.insert(b"sub".to_vec());
+    let s = repo.backup(&[], source_opts(injected(&src))).await.unwrap();
+    assert_eq!(s.report.errors, 1);
+    assert_eq!(restored(&repo, &s.snapshot, "a").await, src.content("a"));
+    src.unlistable.insert(Vec::new());
+    let err = repo
+        .backup(&[], source_opts(injected(&src)))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot list \"\""), "{err}");
 }
 
 /// 預讀不猜：排除的、快速路徑沿用的（這裡是 s3 的 etag 與大小）、比 1 MiB 大的檔案不先讀；遇到目錄就不往後看，
