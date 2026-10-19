@@ -311,7 +311,17 @@ pub struct ObjectStoreSource {
     locator: Vec<u8>,
     meta_kind: u8,
     handle: tokio::runtime::Handle,
+    /// [`WholeRead`] 的 buffer：用完還回來給下一個檔案。
+    pool: BufPool,
 }
+
+/// 整份讀的小檔案的 buffer 池（M12 第 7 段之四第九步）：讀的 task（async 那一側）把收到的每一段複製進池子裡的一個
+/// `Vec`、那一段當場放掉；blocking 那一側讀完，`Vec` 還回池子。資料的 buffer 不再在 async 那一側配、在 blocking 那一
+/// 側放——zig 0.16 的 malloc（musl 的發佈檔）把放掉的小塊留在放掉它的那條執行緒，遠端來源的 backup 每個檔案都這樣
+/// 一次，留著的跟著檔案數長。池子最多留 [`POOL_MAX`] 個、每個容量最多 [`POOL_CAP_MAX`]。
+type BufPool = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+const POOL_MAX: usize = 32;
+const POOL_CAP_MAX: usize = 2 * WHOLE_MAX as usize;
 
 impl ObjectStoreSource {
     /// 從 URL 構造：`sftp://host[:port]/abs/path` 或 `s3://bucket/prefix`。
@@ -365,6 +375,7 @@ impl ObjectStoreSource {
             locator,
             meta_kind,
             handle,
+            pool: BufPool::default(),
         })
     }
 
@@ -608,19 +619,34 @@ impl ObjectStoreSource {
     ) -> Box<dyn Read + Send> {
         use futures::TryStreamExt;
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let pool = Arc::clone(&self.pool);
         self.handle.spawn(async move {
-            let parts = stream
-                .try_collect::<Vec<bytes::Bytes>>()
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()));
-            let _ = tx.send(parts); // 讀端已放棄
+            let mut stream = stream;
+            // 鎖壞了（拿著它的執行緒 panic 過）就當池子是空的：只是這次不重用
+            let mut buf = pool
+                .lock()
+                .ok()
+                .and_then(|mut p| p.pop())
+                .unwrap_or_default();
+            buf.clear();
+            let read = async {
+                while let Some(part) = stream.try_next().await? {
+                    buf.extend_from_slice(&part);
+                }
+                Ok::<_, object_store::Error>(())
+            }
+            .await;
+            let _ = tx.send(
+                read.map(|()| buf)
+                    .map_err(|e| std::io::Error::other(e.to_string())),
+            ); // 讀端已放棄
         });
         Box::new(WholeRead {
             handle: self.handle.clone(),
             rx: Some(rx),
-            parts: Vec::new(),
-            next: 0,
+            buf: Vec::new(),
             pos: 0,
+            pool: Arc::clone(&self.pool),
         })
     }
 
@@ -854,30 +880,37 @@ const WHOLE_MAX: u64 = 1024 * 1024;
 /// [`ObjectStoreSource::whole`] 的讀端：第一次讀的時候等那個 task 讀完。
 struct WholeRead {
     handle: tokio::runtime::Handle,
-    rx: Option<tokio::sync::oneshot::Receiver<std::io::Result<Vec<bytes::Bytes>>>>,
-    parts: Vec<bytes::Bytes>,
-    next: usize,
+    rx: Option<tokio::sync::oneshot::Receiver<std::io::Result<Vec<u8>>>>,
+    buf: Vec<u8>,
     pos: usize,
+    pool: BufPool,
 }
 
 impl Read for WholeRead {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if let Some(rx) = self.rx.take() {
-            self.parts = self.handle.block_on(rx).map_err(|_| {
+            self.buf = self.handle.block_on(rx).map_err(|_| {
                 std::io::Error::other("the source read task ended without a result")
             })??;
         }
-        while let Some(part) = self.parts.get(self.next) {
-            if self.pos < part.len() {
-                let n = (part.len() - self.pos).min(out.len());
-                out[..n].copy_from_slice(&part[self.pos..self.pos + n]);
-                self.pos += n;
-                return Ok(n);
-            }
-            self.next += 1;
-            self.pos = 0;
+        let n = (self.buf.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl Drop for WholeRead {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.buf);
+        if buf.capacity() == 0 || buf.capacity() > POOL_CAP_MAX {
+            return;
         }
-        Ok(0)
+        if let Ok(mut p) = self.pool.lock() {
+            if p.len() < POOL_MAX {
+                p.push(buf);
+            }
+        }
     }
 }
 
@@ -931,31 +964,32 @@ mod tests {
 
     fn whole_read(
         handle: &tokio::runtime::Handle,
+        pool: &BufPool,
     ) -> (
-        tokio::sync::oneshot::Sender<std::io::Result<Vec<bytes::Bytes>>>,
+        tokio::sync::oneshot::Sender<std::io::Result<Vec<u8>>>,
         WholeRead,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let r = WholeRead {
             handle: handle.clone(),
             rx: Some(rx),
-            parts: Vec::new(),
-            next: 0,
+            buf: Vec::new(),
             pos: 0,
+            pool: Arc::clone(pool),
         };
         (tx, r)
     }
 
-    /// 整份交出的讀端：幾段照順序交出（空的段跳過）；task 的錯誤照樣是錯誤；task 沒有送出結果就結束是錯誤，
-    /// 不是空檔。
+    /// 整份交出的讀端：內容照順序交出、讀完是 0；task 的錯誤照樣是錯誤；task 沒有送出結果就結束是錯誤，不是空檔；
+    /// drop 時 buffer 還回池子（池子滿了或太大的不留）。
     #[test]
-    fn whole_read_yields_the_parts_in_order_and_fails_loudly() {
+    fn whole_read_yields_the_content_fails_loudly_and_returns_its_buffer() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (tx, mut r) = whole_read(rt.handle());
-        let parts = ["ab", "", "cde", "f"].map(|p| bytes::Bytes::from(p.as_bytes().to_vec()));
-        tx.send(Ok(parts.to_vec())).unwrap();
+        let pool = BufPool::default();
+        let (tx, mut r) = whole_read(rt.handle(), &pool);
+        tx.send(Ok(b"abcdef".to_vec())).unwrap();
         let mut got = Vec::new();
-        let mut buf = [0u8; 2];
+        let mut buf = [0u8; 4];
         loop {
             let n = r.read(&mut buf).unwrap();
             if n == 0 {
@@ -964,15 +998,31 @@ mod tests {
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(got, b"abcdef");
+        drop(r);
+        assert_eq!(
+            pool.lock().unwrap().len(),
+            1,
+            "the buffer goes back to the pool"
+        );
 
-        let (tx, mut r) = whole_read(rt.handle());
+        let (tx, mut r) = whole_read(rt.handle(), &pool);
         tx.send(Err(std::io::Error::other("gone"))).unwrap();
         assert_eq!(r.read(&mut buf).unwrap_err().to_string(), "gone");
 
-        let (tx, mut r) = whole_read(rt.handle());
+        let (tx, mut r) = whole_read(rt.handle(), &pool);
         drop(tx);
         let e = r.read(&mut buf).unwrap_err().to_string();
         assert!(e.contains("ended without a result"), "{e}");
+
+        let (tx, mut r) = whole_read(rt.handle(), &pool);
+        tx.send(Ok(Vec::with_capacity(POOL_CAP_MAX + 1))).unwrap();
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+        drop(r);
+        assert_eq!(
+            pool.lock().unwrap().len(),
+            1,
+            "a buffer over the cap is not kept"
+        );
     }
 
     /// 本機列舉交出的 metadata 是剛回傳的那個條目的（同一次 lstat；走訪端不再 stat 第二次）：每個條目的 inode
@@ -1356,6 +1406,7 @@ mod s3_root_probe_tests {
             locator: b"s3://bucket/data/".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
             handle: tokio::runtime::Handle::current(),
+            pool: BufPool::default(),
         };
         // 生產端是從 blocking 執行緒呼叫 list（list 內部 block_on）；
         // 測試照同一個呼叫環境，不然 block_on 會在 runtime 執行緒上 panic。
@@ -1448,6 +1499,7 @@ mod store_path_tests {
             locator: b"s3://bucket".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
             handle: tokio::runtime::Handle::current(),
+            pool: BufPool::default(),
         };
         // list 與讀取的橋接內部都 block_on：照生產端在 blocking 執行緒上跑。
         let got = tokio::task::spawn_blocking(move || {
@@ -1491,6 +1543,7 @@ mod store_path_tests {
             locator: b"s3://bucket".to_vec(),
             meta_kind: kist_format::v4::meta::meta_kind::S3,
             handle: tokio::runtime::Handle::current(),
+            pool: BufPool::default(),
         };
         let (read, list) = tokio::task::spawn_blocking(move || {
             let read = src.read(b"bad\x01name").err();
