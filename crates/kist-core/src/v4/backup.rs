@@ -17,12 +17,12 @@
 //! 走訪的骨架（排除規則、記號檔、不跨檔案系統、深度上限、硬連結、快速路徑）來自 v3（ADR 019–021、024）；
 //! 來源與排除規則的型別（[`SourceSpec`]、[`Exclusions`]、[`Marker`]）在 v3 移除時從 v3 的 backup 搬來這裡。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kist_backend::source::{LocalSource, Source, SourceItem, SourceItemKind};
+use kist_backend::source::{LocalSource, SortedItems, Source, SourceItem, SourceItemKind};
 use kist_backend::{Backend, BackendError};
 use kist_crypto::v4::Keys;
 use kist_format::chunker::ChunkerParams;
@@ -660,6 +660,24 @@ impl Work {
         }
         Ok((outcomes, full))
     }
+}
+
+/// 預讀的檔案最大多少（M12 第 7 段之三第九步）：大的檔案自己就有好幾個 READ／GET 在等，不缺預讀；先開始讀的
+/// 每個檔案在記憶體裡最多約它的大小（遠端讀取的 4 格 channel），這個上限讓預讀的記憶體有界。
+const READ_AHEAD_MAX: u64 = 1024 * 1024;
+
+/// 遠端讀取的內容（還沒讀的 [`Source::read_sized`] 的結果）。
+type SourceRead = std::result::Result<Box<dyn std::io::Read + Send>, BackendError>;
+
+/// 目錄裡下一個要處理的項目，已經判斷過排除、取好 parent 的 entry（[`Walk::next_ahead`]）；預讀的檔案帶著已經
+/// 開始讀的內容。
+struct Ahead {
+    item: SourceItem,
+    posix: Option<kist_backend::fsmeta::PosixMeta>,
+    rel: Vec<u8>,
+    visit: Visit,
+    parent_entry: Option<Entry>,
+    read: Option<SourceRead>,
 }
 
 /// 走訪端看到的檔案事實：快速路徑與硬連結判別用。
@@ -1415,6 +1433,7 @@ impl Walk {
                         None,
                         parent_entry.as_ref(),
                         Visit::root(FilterState::default(), None),
+                        None,
                     )
                     .await?;
                 file_root(p.path, entry, &path.display().to_string())
@@ -1442,6 +1461,7 @@ impl Walk {
                         None,
                         parent_entry.as_ref(),
                         Visit::root(FilterState::default(), None),
+                        None,
                     )
                     .await?;
                 file_root(p.path, entry, &display)
@@ -1538,74 +1558,53 @@ impl Walk {
             let meta_id = |b: &[u8]| keys.meta_id(b);
             let mut builder = DirBuilder::new(Limits::V4)?;
             let mut outcomes = Vec::new();
-            while let Some(item) = listing.next_item() {
-                let item = match item {
-                    Ok(i) => i,
-                    Err(e) => {
-                        self.skip(&ctx.display_path(dir_rel), &e.to_string());
-                        continue;
-                    }
-                };
-                // 本機來源：列舉時那一次 lstat 的 metadata（不必再 stat 一次）
-                let posix = listing.posix();
-                let child_rel = join_rel(dir_rel, &item.name);
-                let named = ctx.named.paths.contains(&child_rel);
-                let toward_named = !named && ctx.named.toward.contains(&child_rel);
-                if visit.pass_through && !named && !toward_named {
-                    self.report.excluded += 1;
-                    continue;
-                }
-                let child_filter = self.exclude.patterns.descend(&visit.filter, &item.name);
-                let too_large = match (self.exclude.larger_than, &item.kind) {
-                    (Some(limit), SourceItemKind::File { size, .. }) => *size > limit,
-                    _ => false,
-                };
-                let beside_marker = markers
-                    .as_ref()
-                    .is_some_and(|names| !names.contains(&item.name));
-                let excluded = !named && (child_filter.is_match() || too_large || beside_marker);
-                if excluded && !toward_named {
-                    tracing::debug!("{}: excluded", ctx.display_path(&child_rel));
-                    self.report.excluded += 1;
-                    continue;
-                }
-                // 深度上限與讀取端同一把尺（同 v3）：寫得出、還原不回就是自造的損壞。
-                if matches!(item.kind, SourceItemKind::Dir) && visit.depth >= crate::MAX_TREE_DEPTH
+            // 遠端來源先判斷、先開始讀後面的檔案（[`Source::read_ahead`]，本機來源是 0：一個一個來，同原本）。
+            // 佇列裡最多是正在處理的這個加上 read_ahead 個；遇到目錄就不再往後看——它的子樹走完之前，後面的檔案不
+            // 先讀。parent 的 entry 照名稱的順序取，同原本。
+            let read_ahead = ctx.source.read_ahead();
+            let mut queue: VecDeque<Ahead> = VecDeque::new();
+            let mut listed_all = false;
+            loop {
+                while !listed_all
+                    && queue.len() <= read_ahead
+                    && !queue
+                        .back()
+                        .is_some_and(|a| matches!(a.item.kind, SourceItemKind::Dir))
                 {
-                    self.skip(
-                        &ctx.display_path(&child_rel),
-                        &format!(
-                            "directory nesting deeper than {} levels; the read side refuses deeper trees",
-                            crate::MAX_TREE_DEPTH
-                        ),
-                    );
-                    continue;
+                    match self
+                        .next_ahead(
+                            ctx,
+                            dir_rel,
+                            &mut *listing,
+                            &mut parent,
+                            markers.as_deref(),
+                            &visit,
+                        )
+                        .await?
+                    {
+                        Some(a) => queue.push_back(a),
+                        None => listed_all = true,
+                    }
                 }
-                let parent_entry = match parent.as_mut() {
-                    Some(s) => match s.take(&self.reader, &item.name).await {
-                        Ok(e) => e,
-                        Err(e) => {
-                            tracing::warn!(
-                                "cannot read the parent's copy of {}: {e}; re-reading the rest of this directory",
-                                ctx.display_path(dir_rel)
-                            );
-                            parent = None;
-                            None
-                        }
-                    },
-                    None => None,
+                for a in queue.iter_mut().skip(1) {
+                    if let (None, Some(size)) = (&a.read, self.reads_ahead(a)) {
+                        a.read = Some(ctx.source.read_sized(&a.rel, size));
+                    }
+                }
+                let Some(a) = queue.pop_front() else {
+                    break;
                 };
-                let child = Visit {
-                    depth: visit.depth,
-                    filter: child_filter,
-                    dev_bound: visit.dev_bound,
-                    pass_through: !named && (visit.pass_through || excluded),
-                    named,
-                    toward_named,
-                };
-                let display = ctx.display_path(&child_rel);
+                let display = ctx.display_path(&a.rel);
                 let Some((entry, child_used)) = self
-                    .process_entry(ctx, &child_rel, item, posix, parent_entry.as_ref(), child)
+                    .process_entry(
+                        ctx,
+                        &a.rel,
+                        a.item,
+                        a.posix,
+                        a.parent_entry.as_ref(),
+                        a.visit,
+                        a.read,
+                    )
                     .await?
                 else {
                     continue;
@@ -1631,7 +1630,121 @@ impl Walk {
         })
     }
 
+    /// 目錄列表裡下一個要處理的項目：跳過排除的、超過深度的（同原本的迴圈），判斷好它的 [`Visit`]，取好 parent
+    /// 的 entry（呼叫端照名稱的順序呼叫）。列表完了是 `None`。
+    async fn next_ahead(
+        &mut self,
+        ctx: &SourceCtx,
+        dir_rel: &[u8],
+        listing: &mut (dyn SortedItems + Send),
+        parent: &mut Option<DirStream>,
+        markers: Option<&[Vec<u8>]>,
+        visit: &Visit,
+    ) -> Result<Option<Ahead>> {
+        while let Some(item) = listing.next_item() {
+            let item = match item {
+                Ok(i) => i,
+                Err(e) => {
+                    self.skip(&ctx.display_path(dir_rel), &e.to_string());
+                    continue;
+                }
+            };
+            // 本機來源：列舉時那一次 lstat 的 metadata（不必再 stat 一次）
+            let posix = listing.posix();
+            let child_rel = join_rel(dir_rel, &item.name);
+            let named = ctx.named.paths.contains(&child_rel);
+            let toward_named = !named && ctx.named.toward.contains(&child_rel);
+            if visit.pass_through && !named && !toward_named {
+                self.report.excluded += 1;
+                continue;
+            }
+            let child_filter = self.exclude.patterns.descend(&visit.filter, &item.name);
+            let too_large = match (self.exclude.larger_than, &item.kind) {
+                (Some(limit), SourceItemKind::File { size, .. }) => *size > limit,
+                _ => false,
+            };
+            let beside_marker = markers.is_some_and(|names| !names.contains(&item.name));
+            let excluded = !named && (child_filter.is_match() || too_large || beside_marker);
+            if excluded && !toward_named {
+                tracing::debug!("{}: excluded", ctx.display_path(&child_rel));
+                self.report.excluded += 1;
+                continue;
+            }
+            // 深度上限與讀取端同一把尺（同 v3）：寫得出、還原不回就是自造的損壞。
+            if matches!(item.kind, SourceItemKind::Dir) && visit.depth >= crate::MAX_TREE_DEPTH {
+                self.skip(
+                    &ctx.display_path(&child_rel),
+                    &format!(
+                        "directory nesting deeper than {} levels; the read side refuses deeper trees",
+                        crate::MAX_TREE_DEPTH
+                    ),
+                );
+                continue;
+            }
+            let parent_entry = match parent.as_mut() {
+                Some(s) => match s.take(&self.reader, &item.name).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(
+                            "cannot read the parent's copy of {}: {e}; re-reading the rest of this directory",
+                            ctx.display_path(dir_rel)
+                        );
+                        *parent = None;
+                        None
+                    }
+                },
+                None => None,
+            };
+            let child = Visit {
+                depth: visit.depth,
+                filter: child_filter,
+                dev_bound: visit.dev_bound,
+                pass_through: !named && (visit.pass_through || excluded),
+                named,
+                toward_named,
+            };
+            return Ok(Some(Ahead {
+                item,
+                posix,
+                rel: child_rel,
+                visit: child,
+                parent_entry,
+                read: None,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// 預讀這個項目嗎：是要讀內容的檔案（快速路徑不能沿用 parent 的，[`Walk::unchanged`]）、不大於
+    /// [`READ_AHEAD_MAX`]。是的話回它列表上的大小。
+    fn reads_ahead(&self, a: &Ahead) -> Option<u64> {
+        let SourceItemKind::File {
+            size,
+            mtime_ns,
+            ref etag,
+            ..
+        } = a.item.kind
+        else {
+            return None;
+        };
+        if size > READ_AHEAD_MAX {
+            return None;
+        }
+        let facts = FileFacts {
+            size,
+            mtime_ns,
+            posix: a.posix,
+            etag: etag.clone(),
+        };
+        let reused = a
+            .parent_entry
+            .as_ref()
+            .is_some_and(|pe| pe.t == node_type::FILE && self.unchanged(&facts, pe));
+        (!reused).then_some(size)
+    }
+
     /// [`Walk::process_entry_inner`]，做完回報一次進度（不論寫進目錄、略過或記成錯誤）。
+    #[allow(clippy::too_many_arguments)] // 一個項目的全部事實；包成 struct 只是換個地方寫同樣的欄位
     async fn process_entry(
         &mut self,
         ctx: &SourceCtx,
@@ -1640,9 +1753,10 @@ impl Walk {
         posix: Option<kist_backend::fsmeta::PosixMeta>,
         parent: Option<&Entry>,
         visit: Visit,
+        read: Option<SourceRead>,
     ) -> Result<Option<(Entry, Used)>> {
         let out = self
-            .process_entry_inner(ctx, rel, item, posix, parent, visit)
+            .process_entry_inner(ctx, rel, item, posix, parent, visit, read)
             .await?;
         report_progress(
             self.progress.as_ref(),
@@ -1656,6 +1770,7 @@ impl Walk {
 
     /// 處理一個目錄項目：回傳它的 Entry 與它沿用的 (item, 持有者)；讀不到的、別的檔案系統上的檔案回 `None`。
     /// `listed` 是列舉時取得的 metadata（本機來源的目錄列舉有；root 與其他來源沒有，這裡自己 lstat）。
+    #[allow(clippy::too_many_arguments)] // 同 process_entry
     async fn process_entry_inner(
         &mut self,
         ctx: &SourceCtx,
@@ -1664,6 +1779,7 @@ impl Walk {
         listed: Option<kist_backend::fsmeta::PosixMeta>,
         parent: Option<&Entry>,
         visit: Visit,
+        read: Option<SourceRead>,
     ) -> Result<Option<(Entry, Used)>> {
         let mk = ctx.source.meta_kind();
         let posix = if mk == meta_kind::POSIX {
@@ -1747,7 +1863,7 @@ impl Walk {
                     etag: etag.clone(),
                 };
                 let Some((content, file_used)) =
-                    self.process_file(ctx, rel, &facts, parent).await?
+                    self.process_file(ctx, rel, &facts, parent, read).await?
                 else {
                     return Ok(None);
                 };
@@ -1793,12 +1909,14 @@ impl Walk {
     }
 
     /// 一個檔案：快速路徑 → 硬連結 → 讀檔切塊。`None` 是讀不到、已記錄略過。
+    /// `read` 是預讀已經開始讀的內容（[`Walk::reads_ahead`]）；沒有就在這裡開始讀。
     async fn process_file(
         &mut self,
         ctx: &SourceCtx,
         rel: &[u8],
         f: &FileFacts,
         parent: Option<&Entry>,
+        read: Option<SourceRead>,
     ) -> Result<Option<(FileContent, Used)>> {
         #[cfg(unix)]
         if let Some(p) = f.posix {
@@ -1821,7 +1939,7 @@ impl Walk {
                 return Ok(Some((hit.clone(), Used::new())));
             }
         }
-        let reader = match ctx.source.read_sized(rel, f.size) {
+        let reader = match read.unwrap_or_else(|| ctx.source.read_sized(rel, f.size)) {
             Ok(r) => r,
             Err(e) => {
                 self.skip(&ctx.display_path(rel), &e.to_string());
@@ -1866,22 +1984,11 @@ impl Walk {
         Ok(Some((content, used)))
     }
 
-    /// 快速路徑（同 v3 的分級）：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 預設與 generic 一樣
-    /// 一律重讀，開了 [`BackupOptions::sftp_trust_mtime`] 而且這次可以用（[`decide_mtime_trust`]）時看 size 與
-    /// mtime。內容照 B2 判斷：`ct=0` 每個 chunk 都要有可信的持有者；`ct=1` 的清單是一棵子樹，只判斷它的根
-    /// （沿用 parent 的子樹）。不成立就重讀。
-    async fn try_reuse(
-        &mut self,
-        f: &FileFacts,
-        parent: Option<&Entry>,
-    ) -> Result<Option<(FileContent, Used)>> {
-        let Some(pe) = parent else {
-            return Ok(None);
-        };
-        if pe.t != node_type::FILE {
-            return Ok(None);
-        }
-        let proven = match (f.posix.as_ref(), pe.mk) {
+    /// 快速路徑的 metadata 判斷（同 v3 的分級）：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 預設
+    /// 與 generic 一樣一律重讀，開了 [`BackupOptions::sftp_trust_mtime`] 而且這次可以用（[`decide_mtime_trust`]）時
+    /// 看 size 與 mtime。只看列表給的事實與 parent 的 Entry：預讀（[`Walk::reads_ahead`]）用同一個判斷。
+    fn unchanged(&self, f: &FileFacts, pe: &Entry) -> bool {
+        match (f.posix.as_ref(), pe.mk) {
             (Some(p), meta_kind::POSIX) => {
                 let now = fsmeta::FsMeta {
                     mode: p.mode,
@@ -1903,8 +2010,20 @@ impl Walk {
                 sftp_unchanged(pe, f.size, f.mtime_ns, self.parent_start)
             }
             _ => false,
+        }
+    }
+
+    /// 快速路徑：metadata 沒變（[`Walk::unchanged`]），內容照 B2 判斷：`ct=0` 每個 chunk 都要有可信的持有者；
+    /// `ct=1` 的清單是一棵子樹，只判斷它的根（沿用 parent 的子樹）。不成立就重讀。
+    async fn try_reuse(
+        &mut self,
+        f: &FileFacts,
+        parent: Option<&Entry>,
+    ) -> Result<Option<(FileContent, Used)>> {
+        let Some(pe) = parent else {
+            return Ok(None);
         };
-        if !proven {
+        if pe.t != node_type::FILE || !self.unchanged(f, pe) {
             return Ok(None);
         }
         let content = FileContent {

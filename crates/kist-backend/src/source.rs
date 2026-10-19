@@ -90,6 +90,11 @@ pub trait Source: Send + Sync + 'static {
         let _ = size;
         self.read(file)
     }
+    /// backup 在一個目錄裡最多先開始讀後面幾個檔案（M12 第 7 段之三第九步）：遠端來源一個檔案要幾次來回，
+    /// 一個接一個讀的時候時間都花在等；本機來源不用（0）。
+    fn read_ahead(&self) -> usize {
+        0
+    }
     /// rel 路徑 → 本機檔案系統路徑。只有本機來源會有（走訪端處理條目時
     /// 對路徑 lstat 取得 posix metadata、讀 xattr）；遠端來源回 None。
     fn local_path(&self, _rel: &[u8]) -> Option<std::path::PathBuf> {
@@ -441,6 +446,11 @@ impl Source for ObjectStoreSource {
 
     fn meta_kind(&self) -> u8 {
         self.meta_kind
+    }
+
+    /// 遠端來源：一個目錄裡同時最多讀 1 + 16 個檔案。
+    fn read_ahead(&self) -> usize {
+        16
     }
 
     fn list(&self, dir: &[u8]) -> std::result::Result<Box<dyn SortedItems + Send>, BackendError> {

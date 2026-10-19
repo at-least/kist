@@ -28,6 +28,36 @@ struct FakeSource {
     files: BTreeMap<Vec<u8>, Vec<u8>>,
     mtimes: BTreeMap<Vec<u8>, i64>,
     etags: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// `Source::read_ahead`（預設 0，同本機來源）。
+    ahead: usize,
+    /// 開過的讀取，所有 clone 共用（注入的是 clone）。
+    reads: Arc<std::sync::Mutex<Reads>>,
+}
+
+/// [`FakeSource`] 開過的讀取：照順序的 rel、現在開著幾個、最多同時開著幾個。
+#[derive(Default)]
+struct Reads {
+    opened: Vec<String>,
+    open_now: usize,
+    most_open: usize,
+}
+
+/// 關掉（drop）時把 [`Reads::open_now`] 減一的讀取。
+struct Counted {
+    inner: std::io::Cursor<Vec<u8>>,
+    reads: Arc<std::sync::Mutex<Reads>>,
+}
+
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.reads.lock().unwrap().open_now -= 1;
+    }
 }
 
 impl FakeSource {
@@ -38,7 +68,18 @@ impl FakeSource {
             files: BTreeMap::new(),
             mtimes: BTreeMap::new(),
             etags: BTreeMap::new(),
+            ahead: 0,
+            reads: Arc::default(),
         }
+    }
+
+    /// 開過的讀取（照順序），並清掉紀錄。
+    fn take_opened(&self) -> Vec<String> {
+        std::mem::take(&mut self.reads.lock().unwrap().opened)
+    }
+
+    fn most_open(&self) -> usize {
+        self.reads.lock().unwrap().most_open
     }
 
     fn put(&mut self, rel: &str, content: Vec<u8>, mtime_ns: i64, etag: Option<&str>) {
@@ -137,11 +178,26 @@ impl Source for FakeSource {
             file
         };
         match self.files.get(key) {
-            Some(content) => Ok(Box::new(std::io::Cursor::new(content.clone()))),
+            Some(content) => {
+                let mut reads = self.reads.lock().unwrap();
+                reads
+                    .opened
+                    .push(String::from_utf8_lossy(file).into_owned());
+                reads.open_now += 1;
+                reads.most_open = reads.most_open.max(reads.open_now);
+                Ok(Box::new(Counted {
+                    inner: std::io::Cursor::new(content.clone()),
+                    reads: Arc::clone(&self.reads),
+                }))
+            }
             None => Err(BackendError::NotFound(
                 String::from_utf8_lossy(file).into_owned(),
             )),
         }
+    }
+
+    fn read_ahead(&self) -> usize {
+        self.ahead
     }
 }
 
@@ -710,4 +766,70 @@ async fn trusting_sftp_mtime_is_refused_for_other_sources() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("sftp:// sources only"), "{err}");
+}
+
+// ---- 遠端來源在一個目錄裡預讀（M12 第 7 段之三第九步）----
+
+/// 遠端來源（`read_ahead` > 0）在一個目錄裡同時開著正在處理的這個加上 `read_ahead` 個讀取；本機來源（0）一次一個。
+/// 每個檔案只讀一次，讀回的內容相同。
+#[tokio::test]
+async fn remote_sources_read_ahead_within_a_directory() {
+    for ahead in [0, 4] {
+        let t = TestRepo::new().await;
+        let repo = t.open().await;
+        let mut src = FakeSource::new("mem://box/data", meta_kind::SFTP);
+        src.ahead = ahead;
+        for i in 0..10 {
+            src.put(&format!("f{i}"), random_bytes(10 + i, 3000), T0 * NS, None);
+        }
+        let s = repo.backup(&[], source_opts(injected(&src))).await.unwrap();
+        assert_eq!(src.most_open(), 1 + ahead, "read_ahead {ahead}");
+        let opened = src.take_opened();
+        assert_eq!(opened.len(), 10, "read_ahead {ahead}: {opened:?}");
+        assert_eq!(
+            opened.iter().collect::<BTreeSet<_>>().len(),
+            10,
+            "each file once: {opened:?}"
+        );
+        assert_eq!(restored(&repo, &s.snapshot, "f7").await, src.content("f7"));
+    }
+}
+
+/// 預讀不猜：排除的、快速路徑沿用的（這裡是 s3 的 etag 與大小）、比 1 MiB 大的檔案不先讀；遇到目錄就不往後看，
+/// 子目錄走完才讀它後面的檔案。
+#[tokio::test]
+async fn read_ahead_reads_only_files_that_will_be_read() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let mut src = FakeSource::new("mem://box/data", meta_kind::S3);
+    src.ahead = 4;
+    for name in ["a", "b", "c", "skip.tmp", "sub/x", "z"] {
+        src.put(name, random_bytes(20, 1000), T0 * NS, Some(name));
+    }
+    src.put(
+        "big",
+        random_bytes(21, 1024 * 1024 + 1),
+        T0 * NS,
+        Some("big"),
+    );
+    // 注入的是來源的 clone：改了來源之後要重新建選項。
+    let opts = |src: &FakeSource| BackupOptions {
+        exclude: kist_core::Exclusions::new(
+            kist_core::PathFilter::new(&["*.tmp".to_owned()]).unwrap(),
+            &[],
+            false,
+            None,
+            false,
+        )
+        .unwrap(),
+        ..source_opts(injected(src))
+    };
+    repo.backup(&[], opts(&src)).await.unwrap();
+    // 處理 a 的時候：b、big、c 已經判斷過，b 與 c 先開始讀（big 太大），sub 是目錄就停；z 要等 sub/x 讀完。
+    assert_eq!(src.take_opened(), ["b", "c", "a", "big", "sub/x", "z"]);
+
+    src.put("c", random_bytes(22, 1000), T0 * NS, Some("c2"));
+    let second = repo.backup(&[], opts(&src)).await.unwrap();
+    assert_eq!(src.take_opened(), ["c"], "only the changed file is read");
+    assert_eq!(second.report.files_reused, 5, "{:?}", second.report);
 }
