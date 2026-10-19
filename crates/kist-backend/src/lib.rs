@@ -63,6 +63,18 @@ pub enum BackendError {
     ConcurrentWrite(String),
     #[error("storage error: {0}")]
     Store(#[from] object_store::Error),
+    #[error("{path}: {source}")]
+    LocalFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("PUT {key}: HTTP {status}: {body}")]
+    Http {
+        key: String,
+        status: u16,
+        body: String,
+    },
     #[error("object {0} has an unrepresentable timestamp")]
     BadTimestamp(String),
     /// P0 的探針不通過：這個後端上不能執行 prune 與其他維護命令（format-v4.md §11.3、§12）。
@@ -187,6 +199,25 @@ impl std::fmt::Display for RepoLocation {
 pub struct Backend {
     store: Arc<dyn ObjectStore>,
     location: RepoLocation,
+    files: FileUpload,
+}
+
+/// [`Backend::put_file_if_absent`] 的做法，依後端（M12 第 7 段之四第七步）。
+#[derive(Clone)]
+enum FileUpload {
+    /// 本機：同 object_store 的 `PutMode::Create`（暫存檔、fsync、hard link、fsync 目錄），路徑照它的對應。
+    Local(Arc<object_store::local::LocalFileSystem>),
+    /// S3：object_store 簽好的 PUT URL（端點、region、憑證都照它的設定），body 從檔案串流，帶
+    /// `If-None-Match: *`。
+    S3 {
+        s3: object_store::aws::AmazonS3,
+        prefix: String,
+        http: reqwest::Client,
+    },
+    /// SFTP 與 rclone 橋接：遠端的暫存檔從本機檔案一段一段寫，再照原本的方式發布。
+    Sftp(Arc<sftp::SftpStore>),
+    /// [`Backend::from_store`]（測試）：讀進記憶體，照 `put_if_absent`。
+    Memory,
 }
 
 impl std::fmt::Debug for Backend {
@@ -220,10 +251,12 @@ impl Backend {
         // 隱含 durability），斷電時 rename 進去的 pack／index 內容可能還沒落盤。
         // snapshot 最後寫的 commit 規則（docs/format-v4.md §9）依賴 put_if_absent 回報成功即
         // durable——S3 ack 即 durable、SFTP 有 fsync（ADR 013），本機不能是例外。
-        let store = object_store::local::LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
+        let store =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(path)?.with_fsync(true));
         Ok(Self {
-            store: Arc::new(store),
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             location: RepoLocation::Local(path.to_path_buf()),
+            files: FileUpload::Local(store),
         })
     }
 
@@ -244,22 +277,44 @@ impl Backend {
     }
 
     fn s3_with(bucket: &str, prefix: &str, credentials: Option<(&str, &str)>) -> Result<Self> {
-        let store = s3_store(bucket, prefix, credentials)?;
+        let s3 = s3_client(bucket, credentials)?;
+        let store: Arc<dyn ObjectStore> = if prefix.is_empty() {
+            Arc::new(s3.clone())
+        } else {
+            Arc::new(PrefixStore::new(s3.clone(), Backend::path(prefix)?))
+        };
         let location = RepoLocation::S3 {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
         };
-        Ok(Self { store, location })
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| BackendError::Http {
+                key: String::new(),
+                status: 0,
+                body: format!("cannot build the HTTP client: {e}"),
+            })?;
+        Ok(Self {
+            store,
+            location,
+            files: FileUpload::S3 {
+                s3,
+                prefix: prefix.to_owned(),
+                http,
+            },
+        })
     }
 
     /// SFTP。會連線、驗 host key、認證、檢查伺服器擴充（見 [`sftp`] 模組說明）。
     /// `auth` 給 `sftp::auth_from_env()` 就是 CLI 的行為；測試給明確值。
     pub async fn sftp(cfg: &sftp::SftpConfig, auth: sftp::SftpAuth) -> Result<Self> {
-        let store = sftp::SftpStore::open(cfg, &auth).await?;
+        let store = Arc::new(sftp::SftpStore::open(cfg, &auth).await?);
         let location = RepoLocation::Sftp(cfg.clone());
         Ok(Self {
-            store: Arc::new(store),
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             location,
+            files: FileUpload::Sftp(store),
         })
     }
 
@@ -267,17 +322,22 @@ impl Backend {
     /// 當儲存體（見 [`sftp`] 模組說明與 ADR 014）。**語意比 `sftp://` 寬鬆**
     /// （`put_if_absent` 沒有原子守門），選 `rclone://` 就是同意這份妥協。
     pub async fn rclone(cfg: &sftp::RcloneConfig) -> Result<Self> {
-        let store = sftp::SftpStore::open_rclone(cfg).await?;
+        let store = Arc::new(sftp::SftpStore::open_rclone(cfg).await?);
         let location = RepoLocation::Rclone(cfg.clone());
         Ok(Self {
-            store: Arc::new(store),
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             location,
+            files: FileUpload::Sftp(store),
         })
     }
 
     /// 包任何 `object_store` 實作（測試用）。
     pub fn from_store(store: Arc<dyn ObjectStore>, location: RepoLocation) -> Self {
-        Self { store, location }
+        Self {
+            store,
+            location,
+            files: FileUpload::Memory,
+        }
     }
 
     pub(crate) fn path(key: &str) -> Result<StorePath> {
@@ -317,6 +377,49 @@ impl Backend {
             .await
             .map_err(|e| Self::map_err(key, e))?;
         Ok(())
+    }
+
+    /// 同 [`Self::put_if_absent`]（同樣的結果與處理方式），內容從本機檔案 `file` 讀、不整份放進記憶體（M12 第 7 段
+    /// 之四第七步：backup 的資料 pack 在暫存檔裡）。S3 是一次 PUT（body 從檔案串流）；本機、SFTP 與 rclone 先寫
+    /// 暫存檔再照原本的方式發布；[`Self::from_store`] 的後端讀進記憶體。
+    pub async fn put_file_if_absent(&self, key: &str, file: &Path) -> Result<()> {
+        let location = Self::path(key)?;
+        match &self.files {
+            FileUpload::Local(fs) => {
+                let dest = fs
+                    .path_to_filesystem(&location)
+                    .map_err(|e| Self::map_err(key, e))?;
+                let (src, key) = (file.to_path_buf(), key.to_owned());
+                tokio::task::spawn_blocking(move || local_create_from(&src, &dest, &key))
+                    .await
+                    .map_err(|e| BackendError::LocalFile {
+                        path: file.display().to_string(),
+                        source: std::io::Error::other(e),
+                    })?
+            }
+            FileUpload::S3 { s3, prefix, http } => {
+                let full = if prefix.is_empty() {
+                    location
+                } else {
+                    Self::path(&format!("{prefix}/{key}"))?
+                };
+                s3_create_from(s3, http, &full, key, file).await
+            }
+            FileUpload::Sftp(store) => store
+                .put_file_create(&location, file)
+                .await
+                .map_err(|e| Self::map_err(key, e)),
+            FileUpload::Memory => {
+                let bytes =
+                    tokio::fs::read(file)
+                        .await
+                        .map_err(|source| BackendError::LocalFile {
+                            path: file.display().to_string(),
+                            source,
+                        })?;
+                self.put_if_absent(key, bytes).await
+            }
+        }
     }
 
     /// `put_if_absent` 加讀回驗證：成功後重讀一次比對內容，物件在寫入與讀回之間被
@@ -509,15 +612,129 @@ pub(crate) fn s3_client(
     Ok(builder.build()?)
 }
 
-pub(crate) fn s3_store(
-    bucket: &str,
-    prefix: &str,
-    credentials: Option<(&str, &str)>,
-) -> Result<Arc<dyn ObjectStore>> {
-    let s3 = s3_client(bucket, credentials)?;
-    Ok(if prefix.is_empty() {
-        Arc::new(s3)
-    } else {
-        Arc::new(PrefixStore::new(s3, Backend::path(prefix)?))
+/// 本機的「只在不存在時建立」，內容從 `src` 複製：同 object_store 的 `PutMode::Create`（`dest#n` 的暫存檔、
+/// fsync、hard link、fsync 目錄；`fsync` 在 `Backend::local` 一律開著）。
+fn local_create_from(src: &Path, dest: &Path, key: &str) -> Result<()> {
+    let io = |path: &Path| {
+        let path = path.display().to_string();
+        move |source| BackendError::LocalFile { path, source }
+    };
+    let parent = dest.parent().ok_or_else(|| {
+        BackendError::InvalidKey(key.to_owned(), "no parent directory".to_owned())
+    })?;
+    if !parent.exists() {
+        std::fs::create_dir_all(parent).map_err(io(parent))?;
+        if let Some(grand) = parent.parent() {
+            fsync_dir(grand).map_err(io(grand))?;
+        }
+    }
+    let mut n = 1u32;
+    let (mut staging, staging_path) = loop {
+        let mut p = dest.as_os_str().to_owned();
+        p.push(format!("#{n}"));
+        let p = PathBuf::from(p);
+        match std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(f) => break (f, p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(io(&p)(e)),
+        }
+    };
+    let copied = (|| {
+        let mut from = std::fs::File::open(src).map_err(io(src))?;
+        std::io::copy(&mut from, &mut staging).map_err(io(&staging_path))?;
+        staging.sync_all().map_err(io(&staging_path))
+    })();
+    drop(staging);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(e);
+    }
+    let linked = std::fs::hard_link(&staging_path, dest);
+    let _ = std::fs::remove_file(&staging_path);
+    match linked {
+        Ok(()) => fsync_dir(parent).map_err(io(parent)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(BackendError::AlreadyExists(key.to_owned()))
+        }
+        Err(e) => Err(io(dest)(e)),
+    }
+}
+
+/// 目錄的 fsync，讓 link 與新建的目錄項目落盤；同 object_store，只在 Unix 上有意義（Windows 不能這樣開目錄）。
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// S3 的「只在不存在時建立」，body 從 `file` 串流：object_store 簽好的 PUT URL（一小時內有效），帶
+/// `If-None-Match: *`（不在簽章裡；MinIO 實測照樣檢查）。412 是已經存在。不重試：逾時的 PUT 可能已經寫進去，同
+/// `put_if_absent` 的說明。
+async fn s3_create_from(
+    s3: &object_store::aws::AmazonS3,
+    http: &reqwest::Client,
+    full: &StorePath,
+    key: &str,
+    file: &Path,
+) -> Result<()> {
+    use object_store::signer::Signer as _;
+    use tokio::io::AsyncReadExt as _;
+    let url = s3
+        .signed_url(
+            reqwest::Method::PUT,
+            full,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .map_err(|e| Backend::map_err(key, e))?;
+    let io = |source| BackendError::LocalFile {
+        path: file.display().to_string(),
+        source,
+    };
+    let src = tokio::fs::File::open(file).await.map_err(io)?;
+    let len = src.metadata().await.map_err(io)?.len();
+    let body = futures::stream::try_unfold(src, |mut f| async move {
+        let mut buf = vec![0u8; 1 << 20];
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        buf.truncate(n);
+        Ok(Some((bytes::Bytes::from(buf), f)))
+    });
+    let resp = http
+        .put(url)
+        .header(reqwest::header::IF_NONE_MATCH, "*")
+        .header(reqwest::header::CONTENT_LENGTH, len)
+        .body(reqwest::Body::wrap_stream(body))
+        .send()
+        .await
+        .map_err(|e| BackendError::Http {
+            key: key.to_owned(),
+            status: 0,
+            body: e.to_string(),
+        })?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::PRECONDITION_FAILED {
+        return Err(BackendError::AlreadyExists(key.to_owned()));
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(BackendError::Http {
+        key: key.to_owned(),
+        status: status.as_u16(),
+        body: body.chars().take(500).collect(),
     })
 }

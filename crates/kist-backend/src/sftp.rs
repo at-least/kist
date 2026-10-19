@@ -954,7 +954,11 @@ impl SftpInner {
     /// 暫存檔寫入：O_EXCL 建檔 → 寫 → fsync（伺服器支援時）→ close。
     /// 回傳暫存檔路徑；呼叫端負責 link/rename 進正式位址或刪掉。
     /// 寫入過程任何失敗都會把暫存檔清掉——不然 flaky 網路會在伺服器上累積殘骸。
-    async fn spool(&self, dir: &str, bytes: &[u8]) -> std::result::Result<String, StoreError> {
+    async fn spool(
+        &self,
+        dir: &str,
+        content: Content<'_>,
+    ) -> std::result::Result<String, StoreError> {
         self.ensure_dir(dir).await.map_err(generic)?;
         let mut name = [0u8; 8];
         getrandom::fill(&mut name).map_err(generic)?;
@@ -993,7 +997,21 @@ impl SftpInner {
             Err(e) => return Err(generic(e)),
         };
         let wrote = async {
-            f.write_all(bytes).await.map_err(generic)?;
+            match content {
+                Content::Bytes(bytes) => f.write_all(bytes).await.map_err(generic)?,
+                Content::File(path) => {
+                    use tokio::io::AsyncReadExt as _;
+                    let mut src = tokio::fs::File::open(path).await.map_err(generic)?;
+                    let mut buf = vec![0u8; 1 << 20];
+                    loop {
+                        let n = src.read(&mut buf).await.map_err(generic)?;
+                        if n == 0 {
+                            break;
+                        }
+                        f.write_all(&buf[..n]).await.map_err(generic)?;
+                    }
+                }
+            }
             if self.fsync {
                 f.sync_all().await.map_err(generic)?;
             }
@@ -1048,7 +1066,87 @@ impl SftpInner {
 /// 物件儲存：一個 key 一個檔案，實作 `object_store::ObjectStore`。
 pub(crate) struct SftpStore(Arc<SftpInner>);
 
+/// 寫進遠端暫存檔的內容：記憶體裡的 bytes，或本機的檔案（一段一段讀，不整份進記憶體）。
+#[derive(Clone, Copy)]
+enum Content<'a> {
+    Bytes(&'a [u8]),
+    File(&'a std::path::Path),
+}
+
 impl SftpStore {
+    /// 只在不存在時建立（`put_opts` 的 `PutMode::Create`，與 [`SftpStore::put_file_create`] 共用）：寫遠端的暫存檔，
+    /// 再 hardlink（寬鬆模式是 rename）到正式位址。
+    async fn create(
+        &self,
+        location: &StorePath,
+        content: Content<'_>,
+    ) -> object_store::Result<PutResult> {
+        let inner = &*self.0;
+        let full = inner.full(location);
+        // 快路徑：已存在就早退（每晚對同一棵未變 tree 重複上傳時省下整份上傳）；
+        // 真正的守門是後面的 hardlink（嚴格模式）或 publish 前的這次 stat（寬鬆模式）。
+        if inner.meta_of(&full).await.is_ok() {
+            return Err(StoreError::AlreadyExists {
+                path: location.to_string(),
+                source: "exists".into(),
+            });
+        }
+        let scratch = inner.spool(dir_of(&full), content).await?;
+        let mut fs = inner.sftp.fs();
+        let published = if inner.relaxed {
+            // rclone 橋接：hardlink 在 rclone 上不會動（宣稱支援、執行回
+            // OpUnsupported），退化成 posix-rename publish。race 視窗（兩個
+            // 寫入者同時通過上面的 stat）與緩解見模組說明與 ADR 014。
+            fs.rename(&scratch, &full).await
+        } else {
+            fs.hard_link(&scratch, &full).await
+        };
+        drop(fs);
+        inner.remove_quiet(&scratch).await;
+        match published {
+            Ok(()) => Ok(PutResult {
+                e_tag: None,
+                version: None,
+                extensions: Default::default(),
+            }),
+            Err(e) => {
+                // publish 被拒：用 stat 判別「已存在」還是別種錯誤
+                // （hardlink 是原子的，目標在的話就是完整的）。
+                let exists = inner.meta_of(&full).await.is_ok();
+                if exists {
+                    Err(StoreError::AlreadyExists {
+                        path: location.to_string(),
+                        source: Box::new(e),
+                    })
+                } else if !inner.relaxed && is_unsupported(&e) {
+                    // 伺服器宣稱支援 hardlink 卻在實際 link 時拒絕（rclone
+                    // 就是這樣）：給出指向橋接的明確錯誤，而不是莫名的 generic。
+                    Err(StoreError::Generic {
+                        store: "sftp",
+                        source: format!(
+                            "server advertises hardlink@openssh.com but rejected the \
+                             link ({e}); kist needs it for atomic conditional writes — \
+                             if this is rclone serve sftp, use the rclone:// bridge \
+                             instead"
+                        )
+                        .into(),
+                    })
+                } else {
+                    Err(generic(e))
+                }
+            }
+        }
+    }
+
+    /// 同 `put_opts` 的 `PutMode::Create`，內容從本機檔案 `file` 一段一段讀（M12 第 7 段之四第七步）。
+    pub(crate) async fn put_file_create(
+        &self,
+        location: &StorePath,
+        file: &std::path::Path,
+    ) -> object_store::Result<()> {
+        self.create(location, Content::File(file)).await.map(|_| ())
+    }
+
     pub async fn open(cfg: &SftpConfig, auth: &SftpAuth) -> Result<Self> {
         Self::open_ssh(cfg, auth, false).await
     }
@@ -1384,64 +1482,10 @@ impl ObjectStore for SftpStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        let bytes = bytes_of(&payload);
-        let inner = &*self.0;
-        let full = inner.full(location);
         match opts.mode {
             PutMode::Create => {
-                // 快路徑：已存在就早退（每晚對同一棵未變 tree 重複上傳時省下整份上傳）；
-                // 真正的守門是後面的 hardlink（嚴格模式）或 publish 前的這次 stat（寬鬆模式）。
-                if inner.meta_of(&full).await.is_ok() {
-                    return Err(StoreError::AlreadyExists {
-                        path: location.to_string(),
-                        source: "exists".into(),
-                    });
-                }
-                let scratch = inner.spool(dir_of(&full), &bytes).await?;
-                let mut fs = inner.sftp.fs();
-                let published = if inner.relaxed {
-                    // rclone 橋接：hardlink 在 rclone 上不會動（宣稱支援、執行回
-                    // OpUnsupported），退化成 posix-rename publish。race 視窗（兩個
-                    // 寫入者同時通過上面的 stat）與緩解見模組說明與 ADR 014。
-                    fs.rename(&scratch, &full).await
-                } else {
-                    fs.hard_link(&scratch, &full).await
-                };
-                drop(fs);
-                inner.remove_quiet(&scratch).await;
-                match published {
-                    Ok(()) => Ok(PutResult {
-                        e_tag: None,
-                        version: None,
-                        extensions: Default::default(),
-                    }),
-                    Err(e) => {
-                        // publish 被拒：用 stat 判別「已存在」還是別種錯誤
-                        // （hardlink 是原子的，目標在的話就是完整的）。
-                        let exists = inner.meta_of(&full).await.is_ok();
-                        if exists {
-                            Err(StoreError::AlreadyExists {
-                                path: location.to_string(),
-                                source: Box::new(e),
-                            })
-                        } else if !inner.relaxed && is_unsupported(&e) {
-                            // 伺服器宣稱支援 hardlink 卻在實際 link 時拒絕（rclone
-                            // 就是這樣）：給出指向橋接的明確錯誤，而不是莫名的 generic。
-                            Err(StoreError::Generic {
-                                store: "sftp",
-                                source: format!(
-                                    "server advertises hardlink@openssh.com but rejected the \
-                                     link ({e}); kist needs it for atomic conditional writes — \
-                                     if this is rclone serve sftp, use the rclone:// bridge \
-                                     instead"
-                                )
-                                .into(),
-                            })
-                        } else {
-                            Err(generic(e))
-                        }
-                    }
-                }
+                let bytes = bytes_of(&payload);
+                self.create(location, Content::Bytes(&bytes)).await
             }
             // 覆寫沒有使用者（v4 不覆寫任何物件，`Backend` 沒有這個 API），不實作。
             other => Err(StoreError::NotImplemented {
@@ -1644,7 +1688,7 @@ impl ObjectStore for SftpStore {
         // copy 只有 repo 端會用（來源模式的 store 只 list／get／head），讀取
         // 上限在這裡因此實際上無條件執行。
         let buf = inner.read_whole(from, 0, meta.size).await?;
-        let scratch = inner.spool(dir_of(&dst), &buf).await?;
+        let scratch = inner.spool(dir_of(&dst), Content::Bytes(&buf)).await?;
         let mut fs = inner.sftp.fs();
         let renamed = fs.rename(&scratch, &dst).await;
         drop(fs);

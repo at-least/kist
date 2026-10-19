@@ -84,6 +84,31 @@ async fn contract_v4(b: &Backend, strict: bool) {
         "第二次建立動了修改時間"
     );
 
+    // 1b. 從本機檔案建立（backup 的資料 pack）：同樣只在不存在時；已經存在的（不論怎麼建立的）不改
+    let tmp = tempfile::tempdir().unwrap();
+    let f1 = tmp.path().join("one");
+    let body: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&f1, &body).unwrap();
+    let fp = pack(1, 0xab);
+    b.put_file_if_absent(&fp, &f1).await.unwrap();
+    assert_eq!(b.get(&fp).await.unwrap(), body);
+    let f2 = tmp.path().join("two");
+    std::fs::write(&f2, b"different").unwrap();
+    let err = b.put_file_if_absent(&fp, &f2).await.unwrap_err();
+    assert!(matches!(err, BackendError::AlreadyExists(_)), "{err}");
+    let err = b.put_file_if_absent(&p, &f2).await.unwrap_err();
+    assert!(matches!(err, BackendError::AlreadyExists(_)), "{err}");
+    assert_eq!(b.get(&fp).await.unwrap(), body, "第二次建立改了內容");
+    assert_eq!(b.get(&p).await.unwrap(), b"one");
+    assert!(
+        keys(b, "packs")
+            .await
+            .iter()
+            .all(|k| !k.contains('#') && !k.contains(".tmp-")),
+        "暫存檔留在 repo 裡：{:?}",
+        keys(b, "packs").await
+    );
+
     // 2. list 與 head 一致；剛建立的物件接近本機時鐘
     let listed = b
         .list("packs")
@@ -113,12 +138,12 @@ async fn contract_v4(b: &Backend, strict: bool) {
     let other = pack(2, 0xaa);
     b.put_if_absent(&other, vec![2]).await.unwrap();
     assert_eq!(keys(b, "packs").await, {
-        let mut all = vec![p.clone(), big.clone(), other.clone()];
+        let mut all = vec![p.clone(), fp.clone(), big.clone(), other.clone()];
         all.sort();
         all
     });
     let client1 = format!("packs/{}", ClientId::from_bytes([1; 16]));
-    assert_eq!(keys(b, &client1).await.len(), 2);
+    assert_eq!(keys(b, &client1).await.len(), 3);
     assert!(keys(b, "nothing").await.is_empty());
 
     // 4. start-after：不含那個 key 本身，含它的 .r1 與之後的世代
