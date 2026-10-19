@@ -214,6 +214,23 @@ enum Command {
         /// directories are kept as empty directories. Local source paths on unix only.
         #[arg(long)]
         one_file_system: bool,
+        /// sftp:// sources only: reuse a file's previous contents without reading it when its
+        /// size and modification time match the parent snapshot and that second ended before the
+        /// parent backup started. Off by default: whoever writes a file can set both (`touch -d`,
+        /// `cp -p`), so a changed file whose size and time stay the same is missed until the next
+        /// full read; a server clock behind this machine's weakens the check by that much.
+        #[arg(long)]
+        trust_mtime: bool,
+        /// With --trust-mtime: read everything again when this machine's last full read of the
+        /// source is older than DURATION (default 7d), or when there is no record of one (no
+        /// local cache, --no-cache, or the first backup from here).
+        #[arg(
+            long,
+            value_name = "DURATION",
+            value_parser = parse_duration,
+            requires = "trust_mtime"
+        )]
+        reread_every: Option<std::time::Duration>,
     },
     /// List snapshots.
     Snapshots {
@@ -791,6 +808,8 @@ async fn run(cli: Cli) -> Result<()> {
             exclude_caches,
             exclude_larger_than,
             one_file_system,
+            trust_mtime,
+            reread_every,
         } => {
             if usize::from(parity) > kist_core::MAX_PARITY_SHARDS {
                 anyhow::bail!("--parity must be 0..={}", kist_core::MAX_PARITY_SHARDS);
@@ -835,6 +854,8 @@ async fn run(cli: Cli) -> Result<()> {
             opts.parity = parity;
             opts.source = source;
             opts.exclude = exclude;
+            opts.sftp_trust_mtime =
+                trust_mtime.then(|| reread_every.unwrap_or(kist_core::v4::DEFAULT_REREAD_EVERY));
             let summary = r.backup(&paths, opts).await?;
             let s = summary.stats;
             let rep = summary.report;
@@ -861,6 +882,17 @@ async fn run(cli: Cli) -> Result<()> {
                         "  excluded: {} item(s) matching the exclude patterns",
                         rep.excluded
                     );
+                }
+                if let Some(t) = &summary.mtime_trust {
+                    match t.reason {
+                        None => println!(
+                            "  trusted sizes and modification times: {} file(s) not read \
+                             (last full read {} UTC)",
+                            rep.files_reused,
+                            t.last_full_read.map(display_time_ns).unwrap_or_default()
+                        ),
+                        Some(why) => println!("  read every file: {why}"),
+                    }
                 }
             }
             if rep.errors > 0 {

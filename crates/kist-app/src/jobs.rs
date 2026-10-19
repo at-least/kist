@@ -138,6 +138,7 @@ async fn run_job_inner(
             opts.progress = progress;
             opts.source = b.source()?;
             opts.exclude = b.exclusions()?;
+            opts.sftp_trust_mtime = b.sftp_trust_mtime();
             let summary = repo.backup(&b.paths, opts).await?;
             let incomplete = summary.report.errors > 0;
             Ok((

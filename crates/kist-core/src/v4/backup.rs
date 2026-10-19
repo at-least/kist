@@ -36,7 +36,7 @@ use kist_format::v4::pack::Kind;
 use kist_format::v4::snapshot::{build_roots, split_locator, Root, Snapshot, SnapshotStats};
 use tokio::task::JoinSet;
 
-use super::cache::Kind as CacheKind;
+use super::cache::{Cache, Kind as CacheKind};
 use super::pack::{FinishedPack, PackWriter};
 use super::read::{DirStream, Reader};
 use super::repo::Repo;
@@ -271,7 +271,16 @@ pub struct BackupOptions {
     pub delta_every: usize,
     /// 進度回報：每處理完一個項目一次，結尾的 flush、B4 的檢查與 B5 的 commit 各一次。
     pub progress: Option<ProgressCallback>,
+    /// SFTP 來源的快速路徑（選用，預設關；M12 第 7 段之三第八步，修改 ADR 016 的分級）：`Some(every)` 時，大小與
+    /// mtime 都和 parent 相同、mtime 那一秒在 parent 開始之前就結束的檔案沿用 parent 的內容、不重讀——但這台 client
+    /// 上一次整份讀這個來源超過 `every` 了（或沒有紀錄：沒有本機快取、第一次）就整份讀（見 [`MtimeTrust`]）。大小與
+    /// mtime 都是寫檔案的人設得了的（`touch -d`、`cp -p`）：內容變了、兩個都沒變的檔案要到下一次整份讀才備份到。
+    /// 不是 SFTP 來源是用法錯誤。
+    pub sftp_trust_mtime: Option<Duration>,
 }
+
+/// [`BackupOptions::sftp_trust_mtime`] 的預設間隔：一週整份讀一次。
+pub const DEFAULT_REREAD_EVERY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// backup 進行中的即時狀態（給 UI 顯示進度）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -325,6 +334,7 @@ impl BackupOptions {
             lone_head_wait: Duration::from_secs(5),
             delta_every: 16,
             progress: None,
+            sftp_trust_mtime: None,
         }
     }
 }
@@ -387,6 +397,72 @@ pub struct BackupSummary {
     pub report: BackupReport,
     /// 這個 snapshot 的 roots。
     pub roots: Vec<RootSummary>,
+    /// 開了 SFTP 的快速路徑（[`BackupOptions::sftp_trust_mtime`]）時，這次的決定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime_trust: Option<MtimeTrust>,
+}
+
+/// SFTP 的快速路徑這次用不用（[`BackupOptions::sftp_trust_mtime`]）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MtimeTrust {
+    /// 這次沿用大小與 mtime 都沒變的檔案，不重讀。
+    pub trusted: bool,
+    /// 整份讀的原因；`trusted` 時是 `None`。
+    pub reason: Option<&'static str>,
+    /// 這台 client 上一次整份讀這個來源的時間（backup 的開始，Unix 奈秒）。
+    pub last_full_read: Option<i64>,
+    /// 多久至少整份讀一次（秒）。
+    pub reread_every_secs: u64,
+}
+
+/// 這台 client 上一次整份讀一個 SFTP 來源的紀錄，在本機快取裡的檔名：client 與來源的定位一起取 BLAKE3（同一個
+/// 快取目錄給兩個 client id 用時各自一份）。
+fn full_read_name(client: &ClientId, locator: &[u8]) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(client.as_bytes());
+    h.update(locator);
+    format!("full-read/{}", &h.finalize().to_hex()[..32])
+}
+
+/// SFTP 的快速路徑這次能不能用：要有 parent、有本機快取、快取裡記著這台 client 上一次整份讀這個來源的時間，那次距
+/// 這次開始不到 `every`，而且 parent 不比那次舊（不然 forget 掉新的 snapshot 之後，parent 可能是很久沒有整份讀過的
+/// 那一串）。紀錄在這次開始之後（時鐘往回調過）當成沒有。
+fn decide_mtime_trust(
+    cache: Option<&Cache>,
+    name: &str,
+    parent_time: Option<i64>,
+    now: i64,
+    every: Duration,
+) -> MtimeTrust {
+    let last = cache.and_then(|c| c.last_full_read(name));
+    let every_ns = i64::try_from(every.as_nanos()).unwrap_or(i64::MAX);
+    let reason = match (parent_time, cache, last) {
+        (None, _, _) => Some("no parent snapshot"),
+        (_, None, _) => Some("no local cache"),
+        (_, _, None) => Some("no full read recorded on this machine"),
+        (_, _, Some(t)) if t > now => Some("the recorded full read is later than now"),
+        (_, _, Some(t)) if now - t >= every_ns => Some("the last full read is too old"),
+        (Some(p), _, Some(t)) if p < t => {
+            Some("the parent snapshot is older than the last full read")
+        }
+        _ => None,
+    };
+    MtimeTrust {
+        trusted: reason.is_none(),
+        reason,
+        last_full_read: last,
+        reread_every_secs: every.as_secs(),
+    }
+}
+
+/// SFTP 來源的大小與 mtime 快速路徑（[`BackupOptions::sftp_trust_mtime`]）：parent 的 Entry 是 sftp、大小與 mtime 都
+/// 相同，而且 mtime 那一秒在 parent 開始之前就結束了。SFTP 的 mtime 是伺服器的秒：同一秒裡讀過之後又改的檔案看
+/// 起來沒變；伺服器的時鐘比這台慢多少，這個判斷就弱多少。
+fn sftp_unchanged(pe: &Entry, size: u64, mtime_ns: i64, parent_start: i64) -> bool {
+    pe.mk == meta_kind::SFTP
+        && pe.size == size
+        && pe.mtime == Some(mtime_ns)
+        && mtime_ns.saturating_add(1_000_000_000) <= parent_start
 }
 
 /// 一個檔案在 Entry 裡的內容。
@@ -589,6 +665,8 @@ impl Work {
 /// 走訪端看到的檔案事實：快速路徑與硬連結判別用。
 struct FileFacts {
     size: u64,
+    /// 列表給的 mtime（奈秒）；只有 SFTP 的快速路徑看它（posix 的在 `posix` 裡）。
+    mtime_ns: i64,
     posix: Option<kist_backend::fsmeta::PosixMeta>,
     etag: Option<Vec<u8>>,
 }
@@ -1047,7 +1125,35 @@ impl Repo {
             Reader::new(self.clone(), Arc::clone(&state), Some(opts.client)).with_verified(known);
         let root_types: Vec<(Vec<u8>, u8)> =
             planned.iter().map(|p| (p.path.clone(), p.t)).collect();
+        let sftp_root = planned.iter().find_map(|p| match &p.plan {
+            RootPlan::RemoteDir(source) | RootPlan::RemoteFile { source, .. }
+                if source.meta_kind() == meta_kind::SFTP =>
+            {
+                Some(p.path.clone())
+            }
+            _ => None,
+        });
         let parent = self.find_parent(&reader, opts.client, &root_types).await?;
+        // SFTP 來源：整份讀完、commit 之後記下這次的開始（下一次的 [`decide_mtime_trust`] 看它）。
+        let full_read = sftp_root.map(|locator| full_read_name(&opts.client, &locator));
+        let started_ns = i64::try_from(started.wall.unix_timestamp_nanos())
+            .map_err(|_| CoreError::Usage("the clock is out of range".to_owned()))?;
+        let mtime_trust = match (opts.sftp_trust_mtime, &full_read) {
+            (Some(every), Some(name)) => Some(decide_mtime_trust(
+                self.cache(),
+                name,
+                parent.as_ref().map(|p| p.snapshot.time),
+                started_ns,
+                every,
+            )),
+            (Some(_), None) => {
+                return Err(CoreError::Usage(
+                    "trusting sizes and modification times is for sftp:// sources only".to_owned(),
+                ))
+            }
+            (None, _) => None,
+        };
+        let full_read = full_read.filter(|_| !mtime_trust.as_ref().is_some_and(|t| t.trusted));
 
         let chunker = self.config().chunker;
         let keys = Arc::clone(self.keys());
@@ -1089,6 +1195,7 @@ impl Repo {
             stats: SnapshotStats::default(),
             report: BackupReport::default(),
             parent_start: parent.as_ref().map_or(0, |p| p.snapshot.time),
+            trust_sftp_mtime: mtime_trust.as_ref().is_some_and(|t| t.trusted),
             hardlinks: HashMap::new(),
             counted: HashSet::new(),
             chunk_bufs: Vec::new(),
@@ -1157,6 +1264,8 @@ impl Repo {
                 .iter()
                 .map(|(p, t)| RootSummary::new(p, *t))
                 .collect(),
+            full_read,
+            mtime_trust,
         })
     }
 
@@ -1185,6 +1294,8 @@ struct Walk {
     report: BackupReport,
     /// parent 的開始時間（快速路徑的 racy 判斷）。
     parent_start: i64,
+    /// 這次用 SFTP 的大小與 mtime 快速路徑（[`decide_mtime_trust`]）。
+    trust_sftp_mtime: bool,
     hardlinks: HashMap<(u64, u64), FileContent>,
     counted: HashSet<(u64, u64)>,
     chunk_bufs: Vec<Vec<u8>>,
@@ -1631,6 +1742,7 @@ impl Walk {
                 }
                 let facts = FileFacts {
                     size,
+                    mtime_ns,
                     posix,
                     etag: etag.clone(),
                 };
@@ -1754,8 +1866,9 @@ impl Walk {
         Ok(Some((content, used)))
     }
 
-    /// 快速路徑（同 v3 的分級）：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 與 generic 一律
-    /// 重讀。內容照 B2 判斷：`ct=0` 每個 chunk 都要有可信的持有者；`ct=1` 的清單是一棵子樹，只判斷它的根
+    /// 快速路徑（同 v3 的分級）：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 預設與 generic 一樣
+    /// 一律重讀，開了 [`BackupOptions::sftp_trust_mtime`] 而且這次可以用（[`decide_mtime_trust`]）時看 size 與
+    /// mtime。內容照 B2 判斷：`ct=0` 每個 chunk 都要有可信的持有者；`ct=1` 的清單是一棵子樹，只判斷它的根
     /// （沿用 parent 的子樹）。不成立就重讀。
     async fn try_reuse(
         &mut self,
@@ -1786,6 +1899,9 @@ impl Walk {
                 (Some(etag), Some(petag)) => petag.as_ref() == etag.as_slice() && pe.size == f.size,
                 _ => false,
             },
+            (None, meta_kind::SFTP) if self.trust_sftp_mtime => {
+                sftp_unchanged(pe, f.size, f.mtime_ns, self.parent_start)
+            }
             _ => false,
         };
         if !proven {
@@ -2173,6 +2289,9 @@ pub struct PreparedBackup {
     settings: Settings,
     progress: Option<ProgressCallback>,
     root_summaries: Vec<RootSummary>,
+    /// SFTP 來源整份讀了（沒有用快速路徑）：commit 之後在本機快取的這個檔名記下這次的開始。
+    full_read: Option<String>,
+    mtime_trust: Option<MtimeTrust>,
 }
 
 impl PreparedBackup {
@@ -2315,6 +2434,11 @@ impl PreparedBackup {
             c.add_verified(&self.reader.take_new_verified());
             c.set_seen_gen(g_c);
             c.set_last_snapshot(&key);
+            if let Some(name) = &self.full_read {
+                let started = i64::try_from(self.started.wall.unix_timestamp_nanos())
+                    .map_err(|_| CoreError::Usage("the clock is out of range".to_owned()))?;
+                c.set_last_full_read(name, started);
+            }
         }
         Ok(BackupSummary {
             snapshot: key,
@@ -2323,6 +2447,7 @@ impl PreparedBackup {
             stats: self.stats,
             report: self.report,
             roots: self.root_summaries,
+            mtime_trust: self.mtime_trust,
         })
     }
 

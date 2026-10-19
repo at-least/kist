@@ -16,6 +16,8 @@
 //! exclude_caches = true                 # 選填；同 --exclude-caches（CACHEDIR.TAG）
 //! exclude_larger_than = "1G"            # 選填；同 --exclude-larger-than（1024 為底）
 //! one_file_system = true                # 選填；同 --one-file-system
+//! trust_mtime = true                    # 選填；同 --trust-mtime（只有 sftp:// 來源）
+//! reread_every = "7d"                   # 選填；同 --reread-every（要 trust_mtime）
 //!
 //! [forget]                     # 選填；需要 Delete 權限，建議放在維護主機的設定裡
 //! keep_daily = 7
@@ -96,6 +98,12 @@ pub struct BackupSection {
     /// 同 `--one-file-system`。
     #[serde(default)]
     pub one_file_system: bool,
+    /// 同 `--trust-mtime`：SFTP 來源的大小與 mtime 快速路徑（選用，見 `BackupOptions::sftp_trust_mtime`）。
+    #[serde(default)]
+    pub trust_mtime: bool,
+    /// 同 `--reread-every`：多久至少整份讀一次（預設 7 天）；要 `trust_mtime`。
+    #[serde(default, with = "crate::duration::serde_opt")]
+    pub reread_every: Option<std::time::Duration>,
 }
 
 impl BackupSection {
@@ -104,6 +112,14 @@ impl BackupSection {
     pub fn source(&self) -> Result<kist_core::SourceSpec> {
         kist_core::SourceSpec::for_paths(&self.paths)
             .map_err(|e| AppError::Config(format!("[backup] paths: {e}")))
+    }
+
+    /// 這一節的 [`kist_core::v4::BackupOptions::sftp_trust_mtime`]。
+    pub fn sftp_trust_mtime(&self) -> Option<std::time::Duration> {
+        self.trust_mtime.then(|| {
+            self.reread_every
+                .unwrap_or(kist_core::v4::DEFAULT_REREAD_EVERY)
+        })
     }
 
     /// 這一節的排除規則（ADR 020、021）。載入設定時（[`Config::validate`]）就跑一次：
@@ -213,7 +229,18 @@ impl Config {
                     kist_core::MAX_PARITY_SHARDS
                 )));
             }
-            b.source()?;
+            let source = b.source()?;
+            if b.reread_every.is_some() && !b.trust_mtime {
+                return Err(AppError::Config(
+                    "[backup] reread_every needs trust_mtime = true".to_owned(),
+                ));
+            }
+            let sftp = matches!(&source, kist_core::SourceSpec::Url(u) if u.starts_with("sftp://"));
+            if b.trust_mtime && !sftp {
+                return Err(AppError::Config(
+                    "[backup] trust_mtime is for a single sftp:// source".to_owned(),
+                ));
+            }
             b.exclusions()?;
         }
         if let Some(f) = &self.forget {

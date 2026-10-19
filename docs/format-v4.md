@@ -260,8 +260,8 @@ entry = nonce(24) ‖ AEAD(alg byte ‖ data) ‖ tag(16)
 | 2 s3 | — | mtime, etag, vern | mode, uid, gid, ctime, dev, ino, nlink, xattrs |
 | 3 generic | — | mtime | 其餘全部 |
 
-快速路徑：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 與 generic 一律重讀。只看 mtime
-一律非法。硬連結以 `(dev, ino)` 在整個 snapshot（跨 roots）內判定。DIR 巢狀的實作上限 256 層。
+快速路徑：posix 看 size、mtime、ctime、inode；s3 看 etag 與 size；sftp 預設與 generic 一樣一律重讀，選用的
+`--trust-mtime` 看 size 與 mtime（§8.1）。只看 mtime 一律非法。硬連結以 `(dev, ino)` 在整個 snapshot（跨 roots）內判定。DIR 巢狀的實作上限 256 層。
 
 ### 8.1 快速路徑合約（內容可證明 > kernel 可證明 > 來源聲稱）
 
@@ -272,9 +272,11 @@ backup 把來源的一個項目與 parent snapshot 裡同一條路徑的 Entry �
 | --- | --- | --- |
 | mk=0 posix | size、mtime、ctime、inode 都沒變（dev 只在 `nlink>1` 時記錄，供硬連結識別，不參與快速路徑比較） | kernel 維護，使用者改不了（size 在實作的外層判斷比較） |
 | mk=2 s3 | etag 相同 + size 相同 | etag 是來源**計算並保證**的內容指紋（單段上傳＝MD5；多段／KMS 的 etag 仍是來源定義的確定性指紋） |
-| mk=1 sftp、mk=3 generic | **無安全快速路徑**——一律重讀，靠 chunk 去重吸收 | mtime 與 size 都是 client 可設的（`cp -p` 陷阱） |
+| mk=1 sftp（預設）、mk=3 generic | **無安全快速路徑**——一律重讀，靠 chunk 去重吸收 | mtime 與 size 都是 client 可設的（`cp -p` 陷阱） |
+| mk=1 sftp，選用（`--trust-mtime`） | size 相同 + mtime 相同 + mtime 那一秒在 parent 開始之前就結束了；而且這台 client 上一次整份讀這個來源不超過 `--reread-every`（預設 7 天）、parent 不比那次舊，不然這次整份讀 | 來源聲稱的，由使用者選擇信任：大小與 mtime 都沒變的改動要到下一次整份讀才備份到；mtime 是伺服器的秒，伺服器的時鐘比 client 慢多少，racy 判斷就弱多少（ADR 026「實作第七段之三」） |
 
-只看 mtime 的沿用**非法**（任何來源）。`etag`／`vern` 存在 Entry 裡就是為了下一次 backup 能做這個比較——
+只看 mtime 的沿用**非法**（任何來源）。選用的 sftp 快速路徑是 client 的行為、不是格式：Entry 沒有新欄位（sftp 的
+mtime 本來就必填），「上一次整份讀」的紀錄只在這台 client 的本機快取裡（沒有快取就整份讀）。`etag`／`vern` 存在 Entry 裡就是為了下一次 backup 能做這個比較——
 這是格式欄位，不是 client 的記憶體狀態（不同機器、不同版本的 client 都要能比）。parent 必須一直存在
 （§9 的 forget 規則、B4 的 HEAD）：沿用子樹時不查子樹裡每個 item 的持有者。
 

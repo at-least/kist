@@ -500,3 +500,214 @@ async fn one_file_system_is_refused_for_remote_sources() {
     assert!(err.to_string().contains("one-file-system"), "{err}");
     assert_eq!(t.count("snapshots"), 0);
 }
+
+// ---- SFTP 的大小與 mtime 快速路徑（選用；M12 第 7 段之三第八步，修改 ADR 016 的分級）----
+
+const NS: i64 = 1_000_000_000;
+const DAY: i64 = 86_400;
+/// 這些測試的起點（Unix 秒，2026-09-21）。
+const T0: i64 = 1_790_000_000;
+
+/// 牆鐘固定在 `secs`（Unix 秒）的 backup 選項；`trust` 開著 SFTP 的快速路徑（一週整份讀一次）。
+fn at(source: SourceSpec, secs: i64, trust: bool) -> BackupOptions {
+    let wall = time::OffsetDateTime::from_unix_timestamp(secs).unwrap();
+    BackupOptions {
+        source,
+        clock: kist_core::v4::Clock::new(move || kist_core::v4::Reading {
+            wall,
+            boot: std::time::Duration::from_secs(1_000_000),
+        }),
+        sftp_trust_mtime: trust.then_some(kist_core::v4::DEFAULT_REREAD_EVERY),
+        ..backup_options()
+    }
+}
+
+async fn trusting(
+    repo: &kist_core::v4::Repo,
+    src: &FakeSource,
+    secs: i64,
+) -> kist_core::v4::BackupSummary {
+    repo.backup(&[], at(injected(src), secs, true))
+        .await
+        .unwrap()
+}
+
+fn trust_of(s: &kist_core::v4::BackupSummary) -> kist_core::v4::MtimeTrust {
+    s.mtime_trust.clone().unwrap()
+}
+
+/// snapshot 裡 `rel` 的內容（還原到一個新目錄再讀）。
+async fn restored(repo: &kist_core::v4::Repo, snapshot: &str, rel: &str) -> Vec<u8> {
+    let target = tempfile::tempdir().unwrap();
+    repo.restore(&skey(snapshot), target.path(), RestoreOptions::default())
+        .await
+        .unwrap();
+    std::fs::read(target.path().join("box/data").join(rel)).unwrap()
+}
+
+fn sftp_source() -> FakeSource {
+    let mut src = FakeSource::new("mem://box/data", meta_kind::SFTP);
+    src.put("a.bin", random_bytes(3, 200 * 1024), (T0 - DAY) * NS, None);
+    src.put("d/b.bin", random_bytes(4, 50 * 1024), (T0 - DAY) * NS, None);
+    src
+}
+
+/// 整份讀過一次之後，大小與 mtime 都沒變的檔案沿用、不讀；mtime 或大小變了的照讀。
+#[tokio::test]
+async fn trusted_sftp_mtime_skips_unchanged_files_after_a_full_read() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let mut src = sftp_source();
+    let first = trusting(&repo, &src, T0).await;
+    assert_eq!(trust_of(&first).reason, Some("no parent snapshot"));
+    assert_eq!(first.report.files_reused, 0);
+
+    let second = trusting(&repo, &src, T0 + DAY).await;
+    let trust = trust_of(&second);
+    assert!(trust.trusted, "{trust:?}");
+    assert_eq!(trust.last_full_read, Some(T0 * NS));
+    assert_eq!(second.report.files_reused, 2, "{:?}", second.report);
+
+    src.touch("a.bin", (T0 + DAY) * NS);
+    src.put("d/b.bin", random_bytes(5, 60 * 1024), (T0 - DAY) * NS, None);
+    let third = trusting(&repo, &src, T0 + 2 * DAY).await;
+    assert!(trust_of(&third).trusted);
+    assert_eq!(third.report.files_reused, 0, "{:?}", third.report);
+    assert_eq!(
+        restored(&repo, &third.snapshot, "d/b.bin").await,
+        src.content("d/b.bin")
+    );
+}
+
+/// SFTP 的 mtime 是秒：mtime 那一秒沒有在 parent 開始之前結束的檔案（parent 讀它的同一秒裡可能又被改過）照讀；
+/// 剛好在 parent 開始前一秒的沿用。
+#[tokio::test]
+async fn trusted_sftp_mtime_rereads_a_file_from_the_parents_start_second() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let mut src = sftp_source();
+    src.put("racy.bin", random_bytes(6, 10 * 1024), T0 * NS, None);
+    src.put("edge.bin", random_bytes(7, 10 * 1024), (T0 - 1) * NS, None);
+    trusting(&repo, &src, T0).await;
+    let second = trusting(&repo, &src, T0 + DAY).await;
+    assert!(trust_of(&second).trusted);
+    // a.bin、d/b.bin、edge.bin 沿用；racy.bin 重讀
+    assert_eq!(second.report.files_reused, 3, "{:?}", second.report);
+}
+
+/// 至少每 `reread_every` 整份讀一次：信任的那幾次不更新紀錄，紀錄太舊就整份讀，之後又從那次算。
+#[tokio::test]
+async fn trusted_sftp_mtime_reads_everything_again_after_reread_every() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let src = sftp_source();
+    trusting(&repo, &src, T0).await;
+    for day in [1, 6] {
+        let s = trusting(&repo, &src, T0 + day * DAY).await;
+        let trust = trust_of(&s);
+        assert!(trust.trusted, "day {day}: {trust:?}");
+        assert_eq!(trust.last_full_read, Some(T0 * NS), "day {day}");
+        assert_eq!(s.report.files_reused, 2, "day {day}");
+    }
+    let full = trusting(&repo, &src, T0 + 8 * DAY).await;
+    assert_eq!(
+        trust_of(&full).reason,
+        Some("the last full read is too old")
+    );
+    assert_eq!(full.report.files_reused, 0, "{:?}", full.report);
+    let after = trusting(&repo, &src, T0 + 8 * DAY + 3600).await;
+    assert_eq!(trust_of(&after).last_full_read, Some((T0 + 8 * DAY) * NS));
+    assert_eq!(after.report.files_reused, 2);
+}
+
+/// 接受的風險（文件化的限制，不是 bug）：內容變了、大小與 mtime 都沒變的檔案，信任的那幾次沿用舊的內容；下一次
+/// 整份讀才備份到新的。
+#[tokio::test]
+async fn trusted_sftp_mtime_misses_a_same_size_same_mtime_change_until_the_next_full_read() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let mut src = sftp_source();
+    let before = src.content("a.bin");
+    trusting(&repo, &src, T0).await;
+    src.put("a.bin", random_bytes(8, 200 * 1024), (T0 - DAY) * NS, None);
+    let trusted = trusting(&repo, &src, T0 + DAY).await;
+    assert!(trust_of(&trusted).trusted);
+    assert_eq!(restored(&repo, &trusted.snapshot, "a.bin").await, before);
+    let full = trusting(&repo, &src, T0 + 8 * DAY).await;
+    assert!(!trust_of(&full).trusted);
+    assert_eq!(
+        restored(&repo, &full.snapshot, "a.bin").await,
+        src.content("a.bin")
+    );
+}
+
+/// 沒有本機快取（`--no-cache`）就沒有整份讀的紀錄：每次都整份讀。
+#[tokio::test]
+async fn trusted_sftp_mtime_without_a_cache_reads_everything() {
+    let t = TestRepo::new().await;
+    let repo = t.open_uncached().await;
+    let src = sftp_source();
+    trusting(&repo, &src, T0).await;
+    let second = trusting(&repo, &src, T0 + DAY).await;
+    assert_eq!(trust_of(&second).reason, Some("no local cache"));
+    assert_eq!(second.report.files_reused, 0);
+}
+
+/// parent 比上一次整份讀還舊（forget 掉了比較新的 snapshot）：parent 那一串不一定在 `reread_every` 之內整份讀過，
+/// 所以整份讀。沒開快速路徑的 backup 也是整份讀，一樣記下。
+#[tokio::test]
+async fn trusted_sftp_mtime_needs_a_parent_no_older_than_the_last_full_read() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let src = sftp_source();
+    trusting(&repo, &src, T0).await;
+    let plain = repo
+        .backup(&[], at(injected(&src), T0 + DAY, false))
+        .await
+        .unwrap();
+    assert_eq!(plain.mtime_trust, None);
+    repo.forget(kist_core::v4::ForgetOptions {
+        snapshots: vec![plain.snapshot.clone()],
+        retire: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let third = trusting(&repo, &src, T0 + 2 * DAY).await;
+    let trust = trust_of(&third);
+    assert_eq!(
+        trust.reason,
+        Some("the parent snapshot is older than the last full read")
+    );
+    assert_eq!(trust.last_full_read, Some((T0 + DAY) * NS));
+    assert_eq!(third.report.files_reused, 0);
+}
+
+/// 紀錄比這次開始還晚（時鐘往回調過）當成沒有紀錄。
+#[tokio::test]
+async fn trusted_sftp_mtime_ignores_a_full_read_recorded_in_the_future() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let src = sftp_source();
+    trusting(&repo, &src, T0 + 10 * DAY).await;
+    let back = trusting(&repo, &src, T0).await;
+    assert_eq!(
+        trust_of(&back).reason,
+        Some("the recorded full read is later than now")
+    );
+    assert_eq!(back.report.files_reused, 0);
+}
+
+/// 只有 SFTP 來源有這個快速路徑：別的來源開了是用法錯誤，不是默默沒作用。
+#[tokio::test]
+async fn trusting_sftp_mtime_is_refused_for_other_sources() {
+    let t = TestRepo::new().await;
+    let repo = t.open().await;
+    let mut src = FakeSource::new("mem://bucket/data", meta_kind::S3);
+    src.put("a.bin", b"a".to_vec(), T0 * NS, Some("e1"));
+    let err = repo
+        .backup(&[], at(injected(&src), T0, true))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("sftp:// sources only"), "{err}");
+}

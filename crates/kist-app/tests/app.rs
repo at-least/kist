@@ -307,6 +307,40 @@ fn remote_source_url_must_be_the_only_backup_path() {
     assert!(err.contains("the only path"), "{err}");
 }
 
+/// `[backup] trust_mtime`、`reread_every`（同 `--trust-mtime`、`--reread-every`）：只有一個 sftp:// 來源能開，
+/// `reread_every` 要 `trust_mtime`，沒寫 `reread_every` 是一週。
+#[test]
+fn trust_mtime_needs_one_sftp_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let password = write_password(dir.path());
+    let load = |backup: &str| {
+        let text = config_text(&dir.path().join("repo"), &password, dir.path(), backup);
+        Config::parse(&text).unwrap()
+    };
+    let err = load("[backup]\npaths = [\"/home\"]\ntrust_mtime = true\n")
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("single sftp:// source"), "{err}");
+    let err = load("[backup]\npaths = [\"sftp://h/x\"]\nreread_every = \"3d\"\n")
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("needs trust_mtime"), "{err}");
+    let cfg =
+        load("[backup]\npaths = [\"sftp://h/x\"]\ntrust_mtime = true\nreread_every = \"3d\"\n");
+    cfg.validate().unwrap();
+    assert_eq!(
+        cfg.backup.unwrap().sftp_trust_mtime(),
+        Some(std::time::Duration::from_secs(3 * 86_400))
+    );
+    let cfg = load("[backup]\npaths = [\"sftp://h/x\"]\ntrust_mtime = true\n");
+    assert_eq!(
+        cfg.backup.unwrap().sftp_trust_mtime(),
+        Some(kist_core::v4::DEFAULT_REREAD_EVERY)
+    );
+}
+
 /// `[backup] paths` 只有一個 `s3://` URL：直接備份那個遠端來源（同 `kist backup`）。原本工作沒有設來源，URL 被
 /// 當成本機路徑（「No such file or directory」）。tests/minio-setup.sh 的環境變數沒設就略過。
 #[tokio::test]

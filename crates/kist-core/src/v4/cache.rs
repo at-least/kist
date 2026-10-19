@@ -2,6 +2,8 @@
 //!
 //! - `gen`：看過的最大世代（B1 從它開始以 start-after 列出 `maint/gen/`）。
 //! - `last-snapshot`：自己最後一個 snapshot 的 key（ADR 026 第 8 層：消失時警告）。
+//! - `full-read/<hex>`：這台 client 上一次整份讀一個 SFTP 來源的時間（backup 的開始，Unix 奈秒；SFTP 的快速路徑看
+//!   它決定這次能不能信任大小與 mtime，M12 第 7 段之三第八步）。沒有就是整份讀。
 //! - `shards/<hex>`、`deltas/<hex>`、`mpacks/<hex>`：以內容命名的物件的 bytes（寫進 repo 的原樣，還是
 //!   密封的）。讀出時重算 BLAKE3，不等於名稱就刪掉、當成沒有。
 //! - `verified`：這台 client 取回並驗證過的 (item ID, pack 名稱)，每筆 64 bytes（B2 的第三種可信）。pack
@@ -108,6 +110,15 @@ impl Cache {
 
     pub fn set_last_snapshot(&self, key: &str) {
         self.write_text("last-snapshot", key);
+    }
+
+    /// `name`（`full-read/<hex>`）記的時間；沒有或讀不懂就是 `None`。
+    pub fn last_full_read(&self, name: &str) -> Option<i64> {
+        self.read_text(name)?.parse().ok()
+    }
+
+    pub fn set_last_full_read(&self, name: &str, started_ns: i64) {
+        self.write_text(name, &started_ns.to_string());
     }
 
     fn object_path(&self, kind: Kind, id: &ObjectId) -> PathBuf {

@@ -34,8 +34,8 @@ pub mod snapshots;
 pub mod state;
 
 pub use backup::{
-    BackupOptions, BackupProgress, BackupReport, BackupSummary, Clock, PreparedBackup,
-    ProgressCallback, Reading, RootSummary,
+    BackupOptions, BackupProgress, BackupReport, BackupSummary, Clock, MtimeTrust, PreparedBackup,
+    ProgressCallback, Reading, RootSummary, DEFAULT_REREAD_EVERY,
 };
 pub use forget::{ForgetOptions, ForgetSummary};
 /// backup 的 client id（kist-app 不直接依賴 kist-format，從這裡轉出去）。
