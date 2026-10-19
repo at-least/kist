@@ -1234,3 +1234,124 @@ kist-cli 單獨）乾淨；MinIO、SFTP、rclone、FUSE 全開（四個 setup �
 setup 腳本的雜訊（第七段之前
 就有、無害、沒改）：`rclone-setup.sh` 與 `fuse-setup.sh` 把 `rclone version`、`fusermount3 --version` 印到 stdout，
 被 `eval` 當成命令跑（`unknown command "v1.75.2"`、`fusermount3: extra arguments after the mountpoint`）。
+
+## 實作第七段之三：remote-to-remote（2026-10-19）
+
+**負責人**：「remote to remote backup 是我們很重要的應用」——遠端來源（`kist backup sftp://…`、`s3://…`，client 當轉運）
+寫進遠端的 repo，ADR 016 的動機。到這裡為止的量測與驗收都只用本機來源；第一次量遠端來源就找到 SFTP 來源把整個檔案讀進
+記憶體、一個檔案一個檔案讀、沒有快速路徑。建議四項——SFTP 來源一塊一塊讀；測試與驗收加上真的遠端來源；SFTP 的讀取
+少一次來回、一個檔案同時好幾個 READ；遠端來源跨檔案預讀——與一個決定：SFTP 加一個選用的快速路徑，預設關，看大小與
+mtime，至少每隔一段時間整份讀一次。負責人：「都按你的建議」。**這一節修改 ADR 016 第 4 項的分級**：sftp「沒有快速路徑」
+仍是預設，多一個選用的（規格 §8.1 的表加一列；ADR 016 開頭加了指向這裡的一行，原文不改）。**格式沒有改**：選用的快速
+路徑是 client 的行為，Entry 沒有新欄位，「上一次整份讀」的紀錄只在本機快取裡（`full-read/<hex>`）。往遠端還原（restore
+寫到 SFTP 或 S3）是當時的一個問題、不是建議，沒有做。
+
+**每一步**（一步一個 commit，gate 在 commit 訊息裡）：
+- `cf67b23` 第一步 真的遠端來源的測試（`v4_remote_sources.rs`：對 tests/sftp-setup.sh 與 minio-setup.sh 的容器
+  backup、讀回、沒變的第二次；在這之前沒有一個 v4 的測試用真的 SFTP 或 S3 當來源）。
+- `8148329` 第二步 SFTP 來源一塊一塊讀：來源模式的 `get` 原本以 `read_whole` 把整個檔案讀進一個 Vec。
+- `f4c6589` 測試：SFTP 的目錄深度測試在同一個伺服器上只有第一次跑得過（寫固定的 key、不刪），改成每次一個目錄。
+- `7a98d48` 第三步 依列表的大小讀、不先 STAT（每個檔案三次來回變兩次）。它引入兩個錯，第四步與第十一步修。
+- `0deb7ba` 第四步 openssh-sftp-client 的 `File::read` 讀完把 offset 推「要的」長度、不是收到的：伺服器少送時跳過資料，
+  第三步的依列表讀把它變成默默的錯位與截短。每個 READ 自己定位；`sftp/fake.rs`（只會 INIT、OPEN、READ、CLOSE 的 SFTP v3
+  假伺服器，接在 `tokio::io::duplex` 上）重現。
+- `3081341` 第五步 SSH 連線的 `flush_interval` 設 0：openssh-sftp-client 預設把請求留在寫入緩衝最多 0.5 ms，tokio 的
+  計時器以 ms 為單位，一次一個請求時每個來回平均多等約半個 ms。
+- `ac4eef0` 第六步 一個檔案同時好幾個 READ：第一個 READ 要 1 MiB、量出伺服器一次給的上限（用戶端不公開它），之後每個
+  READ 要那麼多、在等的最多 2 MiB（同 russh 的 channel window；1 到 8 MiB 量到一樣快，window 調大反而慢），照順序交出，
+  少送的那段補要。
+- `89ea332` 第七步 設定檔的 `[backup] paths` 可以是一個遠端來源：排程的 backup 原本沒有設來源，URL 被當成本機路徑
+  （「No such file or directory」）。規則搬到 `SourceSpec::for_paths`，CLI 與 kist-app 共用。
+- `4546979` 第八步 選用的 SFTP 快速路徑：`--trust-mtime`、`--reread-every`（預設 7d），設定檔 `trust_mtime`、
+  `reread_every`。規則：parent 的 Entry 是 sftp、大小與 mtime 相同、mtime 那一秒在 parent 開始之前就結束；這次能不能用：
+  有 parent、有本機快取、快取記著這台 client 上一次整份讀這個來源（backup 的開始）、那次距今不到 `every`、parent 不比那次
+  舊，紀錄在未來當成沒有。紀錄只在整份讀的那次 commit 之後寫。摘要多一行（這次信任或整份讀的原因）。
+- `25a8ba1` 第九步 遠端來源在一個目錄裡預讀：正在處理的加上 16 個，要讀內容（快速路徑不能沿用）而且不大於 1 MiB 的才先
+  開始讀，遇到目錄就停；本機來源一次一個，同原本。
+- `2afe22d` 第十步 遠端來源的清單換成緊湊的（名稱與 etag 在一個 buffer、一個條目一個 48 bytes 的列），SFTP 直接從
+  READDIR、S3 以 `PaginatedListStore` 一頁一頁列：平面 100 萬項原本在 512 MiB 的門檻下被殺。
+- `7cf9e2d` 第十一步 第三步的回歸：SFTP 來源的符號連結只讀到目標的前幾個 bytes（列表上是連結本身的大小）。符號連結改成
+  列的時候 STAT 一次，目標是檔案就記它的大小與 mtime，不是檔案或 STAT 不了就是一個略過的條目。
+- 文件：這一節、README、規格、PLAN、`bench/memory/README.md`、`tests/acceptance/README.md`、`run_r2r.py`、
+  `run-remote.sh`、M1 的 remote-to-remote log。
+
+**量測**（release build、同一台機器、兩個容器都在本機：SFTP 是 OpenSSH 10.3p1，S3 是 MinIO RELEASE.2025-09-07T16-13-09Z；
+網路的延遲幾乎是零，真實網路上的表現沒有量，UNVERIFIED；每一步與前一步的 binary 交替跑，數字是範圍；這台機器同時有別的
+負載，load average 9 到 39）：
+
+| 項目 | 之前 | 之後 | 那一步 |
+| --- | --- | --- | --- |
+| SFTP 來源，一個 1 GiB 的檔案，峰值 RSS | 1 225 MiB | 161 MiB | 第二步 |
+| SFTP 來源，1 980 個小檔（16 MiB） | 4.86 s | 3.86 s | 第三步 |
+| 同上 | 3.86 s | 1.37–1.78 s | 第五步 |
+| 同上，第一次 backup | 1.41–1.62 s | 0.32–0.44 s | 第九步 |
+| SFTP 來源，20 個 4 MiB 的檔案 | 1.72–2.19 s | 0.58–0.78 s | 第六步 |
+| SFTP 來源，一個 1 GiB 的檔案 | 21.7 s | 5.2 s | 第六步 |
+| SFTP 來源，2 000 個檔案（96 MiB），第一次 | 2.14–2.53 s | 0.78–1.04 s | 第九步 |
+| S3 來源，同一組，第一次 | 1.11–1.28 s | 0.48–0.50 s | 第九步 |
+| SFTP 來源，同一組，沒變的第二次 | 3.08 s（整份讀） | 0.28–0.29 s（`--trust-mtime`） | 第八步 |
+
+對照：同樣 20 個 4 MiB 的檔案從本機路徑備份 0.28–0.31 s；OpenSSH 自己的 sftp 用戶端下載 0.43–0.46 s（約 180 MiB/s）。
+
+平面 100 萬項（記憶體 bench 的 B 集放進兩個容器，`bench/memory/run-remote.sh`，進一個新的本機 repo；
+`sampled_max_ex_file_slab`，括號是 512 MiB 門檻跑法；最後一欄是這一節最後的 binary `7cf9e2d`）：
+
+| 來源與 backup | 第九步 | 第十一步 |
+| --- | --- | --- |
+| SFTP，第一次 | 499 MiB（被殺） | 398 MiB（398） |
+| SFTP，第二次（全部重讀，去重） | 381 MiB | 262 MiB（276） |
+| S3，第一次 | 350 MiB（被殺：取樣漏了尖峰） | 468 MiB（465） |
+| S3，第二次（全部以 etag 沿用） | 430 MiB（被殺） | 324 MiB（318） |
+
+同一組檔案從本機路徑：314 MiB（394）。S3 的時間在同樣的 backup 之間跳：第一次 2 到 7 分鐘、第二次 23 s 到 8 分鐘，由
+MinIO 決定（`mc ls` 列這個前綴一次 162 s），不列；量 S3 的那幾次，容器裡還有前一份驗收腳本留下、沒停掉的 `mc admin trace`（見「找到的」）。
+
+M1 的資料集（100 000 個檔案、9.75 GiB）放進兩個容器，各自備份進 MinIO 上的一個 S3 repo（`tests/acceptance/run_r2r.py`，
+log `tests/acceptance/r2r-acceptance-2026-10-19.log`，binary `7cf9e2d`；峰值 RSS 是每 0.1 s 取樣 /proc 的 VmRSS，很短的
+命令取樣不到；請求數是容器裡的 `mc admin trace`）：
+
+| 來源 | 命令 | 時間 | 峰值 RSS | 沿用的檔案 | repo 的請求 | 來源的請求 |
+| --- | --- | --- | --- | --- | --- | --- |
+| SFTP | 第一次 backup | 50.5 s | 275 MiB | 0 | 91（84 PUT） | — |
+| SFTP | 沒變的第二次（整份重讀、去重） | 45.8 s | 100 MiB | 0 | 13 | — |
+| SFTP | 再一次，`--trust-mtime` | 2.9 s | 76 MiB | 100 000 | 13 | — |
+| SFTP | restore 到本機（`diff -r` 相同） | 86.5 s | 65 MiB | | | |
+| S3 | 第一次 backup | 42.7 s | 231 MiB | 0 | 91 | 100 000 GET、1 102 LIST |
+| S3 | 沒變的第二次（etag 與大小） | 17.7 s | 77 MiB | 100 000 | 13 | 1 102 LIST |
+| S3 | restore 到本機（`diff -r` 相同） | 79.5 s | 61 MiB | | | |
+
+兩個 repo 的 `check` 都過。同一份資料從本機路徑備份進本機 repo（README 的 M1）：第一次 33 s、沒變的 1.1 s。M1 有 1 101 個
+目錄、每個不到 1 000 項：1 102 個 LIST 是 root 列了兩次（見「找到的」）。
+
+**找到的**：
+- 第三步自己引入的兩個錯，都只在還沒 push 的這幾個 commit 裡：伺服器少送時跳過資料（`File::read` 的 offset，第四步修）、
+  符號連結只讀到目標的前幾個 bytes（第十一步修）。第二個是看 B 集在 SFTP 為什麼多一個檔案找到的。
+- 排程的 backup 不能用遠端來源（第七步修）。
+- openssh-sftp-client 的預設 `flush_interval` 是每個來回半個 ms（第五步修）。
+- 遠端來源的清單：一項一個 88 bytes 的 SourceItem 加名稱與 etag 的小配置，整份留到目錄走完；S3 另外整份 `ListResult`
+  再轉一次（第十步修）。dhat：第十一步之後 S3 的第一次在峰值時活著的是 324 MiB（資料 pack 的兩個 buffer 119 MiB、pack 的
+  索引 35 MiB、去重的集合 33 MiB、沿用的清單 33 MiB、清單本身 67 MiB），量到的 465–497 MiB 比它多約 150 MiB，是 glibc
+  的分配器留著的；SFTP 也一樣（第九步：活著 329 MiB、量到 499 MiB）。
+- 遠端 root 的目錄列兩次：`plan_roots` 為了分辨 root 是檔案還是目錄，把整個 root 列一次、只看第一項，walk 再列一次
+  （S3 來源 21 個目錄的 trace 是 22 個 LIST）。100 萬項的平面 root 就是兩次完整的列舉；沒有改。
+- 驗收腳本的 trace：殺掉本機的 `docker exec` 不會停容器裡的 `mc admin trace`（沒有 tty，訊號不轉過去），留下來的訂閱者
+  一個佔 MinIO 約 12% 的 CPU，累積之後新的 trace 收不到東西。`run_r2r.py` 改成在容器裡記下 PID、結束時 kill；
+  `run_s3.py` 有同樣的寫法，沒有改。
+- SFTP 來源把符號連結跟過去讀、不記成符號連結（ADR 016 的已知限制）；連到目錄的與斷掉的是略過的條目。
+- `to_meta` 在伺服器沒給大小時當成 0（`unwrap_or(0)`）：那樣的伺服器的檔案會記成空檔。第三步之前 stat 走同一個轉換，
+  不是新的；OpenSSH 都會給大小，沒有改。
+
+**剩下的**：
+- 真實網路（延遲、頻寬、russh 的 window）上的表現沒有量，UNVERIFIED；這一輪的容器都在本機。
+- 沒有 limits@openssh.com 的伺服器：用戶端一次要 20 480 bytes，2 MiB 的上限是約 100 個 READ 在等——只在假伺服器上跑過，
+  真實的這種伺服器沒有試，UNVERIFIED。會少送的真實伺服器或檔案系統也沒有找到。
+- 分配器多留的約 150 MiB（上面）：沒有換分配器、沒有調 glibc 的參數。一個探針（SFTP 的平面 100 萬項、第一次 backup、`7cf9e2d`，交替各兩次）：預設 337、402 MiB，`MALLOC_ARENA_MAX=2` 326、340 MiB——最高的與變異都小一些，但次數太少，沒有據此改什麼。S3 的平面 100 萬項第一次離門檻只剩 30 到 47 MiB（第十步的 binary 482 MiB、最後的 465 MiB）。
+- 遠端 root 列兩次（上面）。
+- rclone 的 stdio 連線沒有改 `flush_interval`（沒量）。
+- `--trust-mtime` 的 racy 判斷比的是伺服器的 mtime 與這台的時鐘：伺服器慢多少，判斷就弱多少；文件與 help 都寫了。
+- 往遠端還原沒有做（上面）。
+- 沒有 push（等明確的指示）。
+
+**gate**：每一步的 commit 訊息裡（fmt、clippy、windows-gnu clippy 的 workspace 與 kist-cli、MinIO 與 SFTP 的環境變數開著的
+nextest）。程式碼的最終樹 `7cf9e2d`：fmt、clippy、windows-gnu clippy 乾淨，nextest 689 個通過、9 個略過。這一節的
+commit 只有文件與驗收的腳本、log。

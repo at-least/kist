@@ -1,0 +1,45 @@
+source: 100000 files, 9.75 GiB; sftp://kisttest@127.0.0.1:19222/repo/m1 and s3://kist-test/m1-source hold the same tree
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 init
+  -> exit 0, 0.2s, peak RSS 75 MiB
+  stderr: note: keep a copy of the `config` object and of your password somewhere safe; without either the repository cannot be opened
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 --json backup sftp://kisttest@127.0.0.1:19222/repo/m1
+  -> exit 0, 50.5s, peak RSS 275 MiB
+  S3 requests to r2r-from-sftp: 91: GetObject 3, ListObjectsV2 4, PutObject 84
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 --json backup sftp://kisttest@127.0.0.1:19222/repo/m1
+  -> exit 0, 45.8s, peak RSS 100 MiB
+  S3 requests to r2r-from-sftp: 13: GetObject 6, HeadObject 2, ListObjectsV2 4, PutObject 1
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 --json backup sftp://kisttest@127.0.0.1:19222/repo/m1 --trust-mtime
+  -> exit 0, 2.9s, peak RSS 76 MiB
+  S3 requests to r2r-from-sftp: 13: GetObject 6, HeadObject 2, ListObjectsV2 4, PutObject 1
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 restore latest /home/newlix/kist-acceptance-m1/out-r2r
+  -> exit 0, 86.5s, peak RSS 65 MiB
+diff -r /home/newlix/kist-acceptance-m1/src /home/newlix/kist-acceptance-m1/out-r2r/kisttest@127.0.0.1:19222/repo/m1: identical
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 check
+  -> exit 0, 0.5s, peak RSS 76 MiB
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 init
+  -> exit 0, 0.1s, peak RSS 0 MiB
+  stderr: note: keep a copy of the `config` object and of your password somewhere safe; without either the repository cannot be opened
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 --json backup s3://kist-test/m1-source
+  -> exit 0, 42.7s, peak RSS 231 MiB
+  S3 requests to r2r-from-s3: 91: GetObject 3, ListObjectsV2 4, PutObject 84
+  S3 requests to m1-source: 101102: GetObject 100000, ListObjectsV2 1102
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 --json backup s3://kist-test/m1-source
+  -> exit 0, 17.7s, peak RSS 77 MiB
+  S3 requests to r2r-from-s3: 13: GetObject 6, HeadObject 2, ListObjectsV2 4, PutObject 1
+  S3 requests to m1-source: 1102: ListObjectsV2 1102
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 restore latest /home/newlix/kist-acceptance-m1/out-r2r
+  -> exit 0, 79.5s, peak RSS 61 MiB
+diff -r /home/newlix/kist-acceptance-m1/src /home/newlix/kist-acceptance-m1/out-r2r/kist-test/m1-source: identical
+$ /tmp/claude-1000/-home-newlix-projects-kist/b6e5cc78-0fb4-481d-9f62-ccf06c9e7992/scratchpad/kist-step11 check
+  -> exit 0, 0.5s, peak RSS 33 MiB
+
+=== SUMMARY (remote to remote, repo on MinIO) ===
+source backup             time  peak RSS   reused  repo reqs  source reqs
+sftp   first             50.5s    275 MiB        0         91            -
+sftp   unchanged         45.8s    100 MiB        0         13            -
+sftp   --trust-mtime      2.9s     76 MiB   100000         13            -
+sftp   restore           86.5s     65 MiB        -          -            -
+s3     first             42.7s    231 MiB        0         91       101102
+s3     unchanged         17.7s     77 MiB   100000         13         1102
+s3     restore           79.5s     61 MiB        -          -            -
+ALL R2R ACCEPTANCE CHECKS PASSED

@@ -14,10 +14,26 @@ S3 版：先 `eval "$(sh tests/minio-setup.sh)"` 起 MinIO，再 `python3 -u run
 `mc admin trace --json` 裡數 S3 請求，依 API 分類印出。LIST 的 trace 記錄裡 path 是 bucket 本身、repo 的前綴在
 query 的 `prefix`，計數兩個都看；2026-10-19 之前只看 path，漏了 LIST）。
 
+Remote-to-remote 版（M12 第 7 段之三）：兩個容器都起好（`eval "$(sh tests/minio-setup.sh)"`、
+`eval "$(sh tests/sftp-setup.sh)"`），把同一份 `src` 放進去，再跑 `python3 -u run_r2r.py /path/to/kist`：
+
+```sh
+docker cp src kist-sftp:/home/kisttest/repo/m1 && docker exec kist-sftp chown -R kisttest /home/kisttest/repo/m1
+docker cp src kist-minio:/tmp/m1 && docker exec kist-minio sh -c 'mc cp --recursive --quiet /tmp/m1/ local/kist-test/m1-source/ && rm -rf /tmp/m1'
+```
+
+SFTP 來源（`$KIST_TEST_SFTP_URL/m1`）與 S3 來源（`s3://$KIST_TEST_S3_BUCKET/m1-source`）各自備份進 MinIO 上的一個
+S3 repo：第一次、沒變的第二次（S3 要全部以 etag 沿用、SFTP 要全部重讀），SFTP 再加一次 `--trust-mtime`（要全部
+沿用），之後 restore、對本機的 `src` 做 `diff -r`、`check`。每個 backup 印時間、峰值 RSS、repo 與 S3 來源各自的請求
+數。平的 100 萬檔（記憶體 bench 的 B 集）以同樣的方法放進容器，用 `bench/memory/run-remote.sh` 量記憶體。
+
 `run.py` 每一步都有斷言，任何一步失敗就非 0 結束。`rss.py` 可以單獨包住一個命令量它的峰值 RSS。
 `m1-acceptance-2026-09-04.log` 是 M1 驗收當天的完整輸出；`m1-acceptance-2026-09-05.log` 是審查修正後（commit `26637f0`）的重跑；`m2-acceptance-s3-2026-09-05.log` 是 M2 對 MinIO 的驗收（以上 v3）。
 v4：`m1-acceptance-v4-2026-10-18.log`、`m2-acceptance-s3-v4-2026-10-18.log` 是 `2e6b20b`（後者的請求數漏了 LIST）；
 `m1-acceptance-v4-2026-10-19.log`、`m2-acceptance-s3-v4-2026-10-19.log` 是 `b48e007`（沒變的 backup 加速之後；LIST 有數）。
+`r2r-acceptance-2026-10-19.log` 是 remote-to-remote 版（`7cf9e2d`）。`run_s3.py` 停 trace 的寫法（殺掉本機的
+`docker exec`）停不了容器裡的 `mc admin trace`：連跑幾次之後先 `docker top kist-minio` 看看，有留下來的就在容器裡 kill
+（`run_r2r.py` 已改成自己停）。
 
 M3（GC）：`python3 -u run_gc.py /path/to/kist` —— `init --grace 2h`（v4 的 grace 最低 2 小時、沒有 `--grace 0s`；
 要在 init 給：init 之後再調低是排空，72 小時內的標記都照 72 小時算）→ backup → 刪掉一成的目錄再 backup → forget 舊的

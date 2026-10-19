@@ -25,6 +25,9 @@
   東西；--gate = 512 MiB 硬門檻，樣本檔名加 `gate-`）。
 - `run-read.sh <kist-bin> <workdir> <label> [--gate]`：同一個 repo 上量 `check`、`check --read-data`、
   `restore latest`。
+- `run-remote.sh <kist-bin> <workdir> <source url> <label> [--gate]`：同 run-baseline.sh，來源是一個 `sftp://` 或
+  `s3://` URL（M12 第 7 段之三）；連線設定從環境來（`KIST_SFTP_*`、`AWS_*`）。測試集放進容器的方法見
+  `tests/acceptance/README.md`。
 - `run-v4.sh <kist-bin> <workdir> <set-a> <set-b>`：M12 第 7 段的整套（兩個測試集各做 backup ×2 的量測與門檻
   跑法、prune ×2 量測與 ×1 門檻、三個讀取命令的量測與門檻），門檻跑法被 OOM 殺掉只記錄不中斷，最後印出全部
   `.result`。`run-measured.sh` 在 scope 被殺時也會寫 `.result`（`exit_code` 143、`oom_kill_last_seen` unknown：

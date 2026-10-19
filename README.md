@@ -222,9 +222,11 @@ password_file = "/etc/kist/password"      # 只能用檔案
 timezone = "local"                        # 排程用的時區，或 "utc"
 
 [backup]
-paths = ["/home", "/etc"]
+paths = ["/home", "/etc"]                 # 或只有一個 sftp:// 或 s3:// URL（見「遠端來源」）
 schedule = "0 2 * * *"                    # cron（5 欄；前面可多加一欄秒）
 exclude = ["node_modules", "*.tmp"]       # 選填；規則見「排除規則」
+# trust_mtime = true                      # 選填，只有 sftp:// 來源；同 --trust-mtime
+# reread_every = "7d"                     # 選填，要 trust_mtime；同 --reread-every
 
 [notify]
 webhook_url = "https://example.com/hook"  # 每件工作結束 POST 一個 JSON
@@ -390,6 +392,30 @@ key，不做 TOFU——先用 `ssh user@host` 連一次把 key 記進 known_host
 `hardlink@openssh.com` 與 `posix-rename@openssh.com`（OpenSSH 的 sftp-server 都有；
 rclone 的 `serve sftp` 會在連線後明確拒絕，見下節）。
 
+### 遠端來源（`kist backup sftp://…`、`s3://…`）
+
+```sh
+kist backup sftp://me@nas.local/srv/data           # 連線設定同 SFTP repo：KIST_SFTP_KEY／PASSWORD／KNOWN_HOSTS、agent
+kist backup s3://bucket/photos                     # AWS_* 同 S3 repo（AWS_ENDPOINT 給 MinIO）
+kist backup sftp://me@nas.local/srv/data --trust-mtime   # 選用：大小與 mtime 沒變的檔案不讀（見下）
+```
+
+一次 backup 一個遠端來源（URL 必須是唯一的路徑）；設定檔的 `[backup] paths` 也可以是一個 URL。client 是轉運：讀遠端、
+本機切塊加密，再寫進 repo（repo 也可以是遠端的，就是 remote-to-remote）。讀取：一個目錄裡最多同時讀 17 個檔案
+（不大於 1 MiB 的才先開始讀），SFTP 的一個檔案同時有 2 MiB 的 READ 在等；記憶體不跟著檔案大小長。SFTP 來源不記符號連結：
+連到檔案的跟過去讀目標的內容，連到目錄的與斷掉的記成略過的項目（backup 以 3 結束）。
+
+沒變的檔案：`s3://` 以 etag 與大小判斷，沒變的物件不讀。`sftp://` 預設**每次整份讀**（去重讓 repo 不多存，但每個
+byte 都要經過網路）：SFTP 給的只有大小與 mtime，兩個都是寫檔案的人設得了的（`touch -d`、`cp -p`）。`--trust-mtime`
+（設定檔 `trust_mtime = true`）改成信任它們：大小與 mtime 都和上一次相同、mtime 那一秒早於上一次 backup 開始的
+檔案沿用上一次的內容。代價是內容變了、大小與 mtime 都沒變的檔案要到下一次整份讀才備份到；伺服器的時鐘比這台慢
+多少，同一秒裡又改的判斷就弱多少。所以這台機器上一次整份讀這個來源超過 `--reread-every`（預設 7d）、沒有紀錄（第一次、
+`--no-cache`、換了機器）或 parent 比那次舊，就整份讀一次；摘要的最後一行印出這次是哪一種與原因。整份讀的紀錄在本機
+快取裡，不在 repo 裡。
+
+大的 SFTP 樹也可以把 kist 裝在 SFTP 那台機器上，直接備份它的本機路徑：posix 的快速路徑（大小、mtime、ctime、inode，
+kernel 維護）不必整份讀，也不經過轉運；代價是那台機器要有 repo 的密碼。
+
 ### 瀏覽 snapshot：`kist mount`（Linux/macOS）
 
 ```sh
@@ -499,6 +525,23 @@ path 是 bucket 本身、repo 的前綴在 query，10-19 修正）。
 內容未變的 backup 的請求數與目錄數無關；新的一代的一次性成本上限是 256 片分片加 head。4 個 LIST 是 B1 的 head 與
 delta、找 parent 的自己的 snapshot、B4 的 head。restore 對 S3 仍比本機慢（88 s 對 31 s；10-19 的前一次跑是 99 s），差距
 的原因沒有 profile（UNVERIFIED）。
+
+### Remote to remote（遠端來源寫進 S3 repo，2026-10-19）
+
+同一份資料集放進本機 Docker 裡的 SFTP（OpenSSH 10.3p1）與 MinIO，各自以 `kist backup sftp://…`、`kist backup s3://…`
+備份進 MinIO 上的一個 S3 repo（腳本 `tests/acceptance/run_r2r.py`，log `tests/acceptance/r2r-acceptance-2026-10-19.log`，
+`7cf9e2d`）。兩個容器都在本機、網路延遲幾乎是零：真實網路上的時間沒有量。
+
+| 項目 | SFTP 來源 | S3 來源 |
+| --- | --- | --- |
+| 第一次 backup | 50.5 s，峰值 RSS 275 MiB | 42.7 s，231 MiB；來源 100 000 個 GET、1 102 個 LIST |
+| 沒變的第二次 | 45.8 s：預設每次整份重讀（去重，0 個新 pack） | 17.7 s：etag 與大小，全部沿用；1 102 個 LIST |
+| 沒變的，`--trust-mtime` | **2.9 s**：大小與 mtime，全部沿用 | — |
+| restore 到本機 | 86.5 s，`diff -r` **完全相同** | 79.5 s，`diff -r` **完全相同** |
+| 沒變的 backup 對 repo 的請求 | 13 | 13 |
+
+平面 100 萬項（記憶體 bench 的 B 集）的第一次 backup 在 512 MiB 的門檻內：SFTP 398 MiB、S3 465 MiB（本機路徑 394 MiB；
+`bench/memory/run-remote.sh`，數字是門檻跑法；見 ADR 026「實作第七段之三」）。S3 的那一個離門檻最近。
 
 ### M3（GC，真實時鐘）
 
