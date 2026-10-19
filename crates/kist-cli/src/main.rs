@@ -822,20 +822,7 @@ async fn run(cli: Cli) -> Result<()> {
             )?;
             // 遠端來源：第一個路徑是 `sftp://` 或 `s3://` URL → 整個 backup
             // 的來源就是那個 URL（單一 root；client 讀遠端 → 切塊 → 加密 → 上傳）。
-            let remote_url = paths
-                .first()
-                .and_then(|p| p.to_str())
-                .filter(|u| kist_backend::source::is_remote_spec(u))
-                .map(str::to_owned);
-            if remote_url.is_some() && paths.len() > 1 {
-                anyhow::bail!(
-                    "a remote source URL (sftp:// or s3://) is the only path a remote backup takes"
-                );
-            }
-            let (source, paths) = match remote_url {
-                Some(url) => (SourceSpec::Url(url.clone()), vec![PathBuf::from(url)]),
-                None => (SourceSpec::LocalPaths, paths),
-            };
+            let source = SourceSpec::for_paths(&paths)?;
             let r = open_repo(&repo).await?;
             // 先鎖再載入：同 jobs.rs——首建並發各自 mint 不同 id 的視窗。
             let _lock = client_id::lock(client_id_file.as_deref())?;

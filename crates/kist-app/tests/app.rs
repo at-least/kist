@@ -288,6 +288,67 @@ async fn run_once_backup_honours_exclude() {
     assert_eq!(outcomes[0].detail["report"]["excluded"].as_u64(), Some(2));
 }
 
+/// `[backup] paths` 的遠端 URL 必須是唯一的路徑（同 `kist backup`）：載入設定時就是錯誤。
+#[test]
+fn remote_source_url_must_be_the_only_backup_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let password = write_password(dir.path());
+    let text = config_text(
+        &dir.path().join("repo"),
+        &password,
+        dir.path(),
+        "[backup]\npaths = [\"s3://bucket/prefix\", \"/home\"]\n",
+    );
+    let err = Config::parse(&text)
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("the only path"), "{err}");
+}
+
+/// `[backup] paths` 只有一個 `s3://` URL：直接備份那個遠端來源（同 `kist backup`）。原本工作沒有設來源，URL 被
+/// 當成本機路徑（「No such file or directory」）。tests/minio-setup.sh 的環境變數沒設就略過。
+#[tokio::test]
+async fn run_once_backs_up_a_remote_source() {
+    let (Some(endpoint), Some(bucket)) = (
+        std::env::var("KIST_TEST_S3_ENDPOINT").ok(),
+        std::env::var("KIST_TEST_S3_BUCKET").ok(),
+    ) else {
+        eprintln!("remote source job test skipped (tests/minio-setup.sh 未跑)");
+        return;
+    };
+    // nextest 一個測試一個行程：這裡設的環境變數不影響別的測試。
+    std::env::set_var("AWS_ENDPOINT", endpoint);
+    std::env::set_var("AWS_ALLOW_HTTP", "true");
+    if std::env::var("AWS_DEFAULT_REGION").is_err() {
+        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+    }
+    let prefix = format!("app-src-{}", std::process::id());
+    let writer = kist_backend::Backend::s3(&bucket, &prefix).unwrap();
+    let files = [("a.txt", b"alpha".to_vec()), ("d/b.txt", b"beta".to_vec())];
+    for (name, content) in &files {
+        writer.put_if_absent(name, content.clone()).await.unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path()).await;
+    let password = write_password(dir.path());
+    let text = config_text(
+        &repo,
+        &password,
+        dir.path(),
+        &format!("[backup]\npaths = [\"s3://{bucket}/{prefix}\"]\n"),
+    );
+    let cfg = Config::parse(&text).unwrap();
+    cfg.validate().unwrap();
+    let outcomes = Daemon::new(cfg).unwrap().run_once(None, |_| {}).await;
+    for (name, _) in &files {
+        writer.delete(name).await.unwrap();
+    }
+    assert_eq!(outcomes[0].status, JobStatus::Success, "{:?}", outcomes[0]);
+    assert_eq!(outcomes[0].detail["stats"]["files"].as_u64(), Some(2));
+}
+
 #[tokio::test]
 async fn failure_is_reported_not_raised() {
     let dir = tempfile::tempdir().unwrap();

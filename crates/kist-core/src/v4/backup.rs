@@ -64,6 +64,27 @@ pub enum SourceSpec {
     Injected(Arc<dyn Source>, Vec<u8>),
 }
 
+impl SourceSpec {
+    /// 要備份的路徑決定來源：第一個是 `sftp://` 或 `s3://` URL 就是那個遠端來源，而且它必須是唯一的路徑；
+    /// 否則是本機路徑。`kist backup` 的參數與設定檔的 `[backup] paths` 共用這條規則。
+    pub fn for_paths(paths: &[PathBuf]) -> Result<Self> {
+        let Some(url) = paths
+            .first()
+            .and_then(|p| p.to_str())
+            .filter(|u| kist_backend::source::is_remote_spec(u))
+        else {
+            return Ok(Self::LocalPaths);
+        };
+        if paths.len() > 1 {
+            return Err(CoreError::Usage(
+                "a remote source URL (sftp:// or s3://) is the only path a remote backup takes"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self::Url(url.to_owned()))
+    }
+}
+
 // `Arc<dyn Source>` 沒有 Debug（trait object 不帶），手動把定位印出來。
 impl std::fmt::Debug for SourceSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

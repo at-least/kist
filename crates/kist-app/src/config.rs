@@ -8,7 +8,7 @@
 //! timezone = "local"                           # 或 "utc"；排程用哪個時區
 //!
 //! [backup]
-//! paths = ["/home", "/etc"]
+//! paths = ["/home", "/etc"]   # 或只有一個 sftp:// 或 s3:// URL：直接備份那個遠端來源（同 `kist backup`）
 //! schedule = "0 2 * * *"      # 5 或 6 欄（秒選填）cron；省略 = 只在 `run --once` 時跑
 //! exclude = ["*.tmp", "node_modules", "/home/me/.cache"]   # 選填；同 CLI 的 --exclude（ADR 020）
 //! iexclude = ["*.bak"]                  # 選填；同 --iexclude（不分大小寫，排在 exclude 之後）
@@ -99,6 +99,13 @@ pub struct BackupSection {
 }
 
 impl BackupSection {
+    /// 這一節的來源：`paths` 只有一個 `sftp://` 或 `s3://` URL 就是那個遠端來源，否則是本機路徑（同 `kist
+    /// backup`）。URL 與別的路徑混在一起，載入設定時（[`Config::validate`]）就是錯誤。
+    pub fn source(&self) -> Result<kist_core::SourceSpec> {
+        kist_core::SourceSpec::for_paths(&self.paths)
+            .map_err(|e| AppError::Config(format!("[backup] paths: {e}")))
+    }
+
     /// 這一節的排除規則（ADR 020、021）。載入設定時（[`Config::validate`]）就跑一次：
     /// 寫錯的樣式或記號讓 `kist run`／`kist serve` 起不來，不會等到排程時間才失敗。
     pub fn exclusions(&self) -> Result<kist_core::Exclusions> {
@@ -206,6 +213,7 @@ impl Config {
                     kist_core::MAX_PARITY_SHARDS
                 )));
             }
+            b.source()?;
             b.exclusions()?;
         }
         if let Some(f) = &self.forget {

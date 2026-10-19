@@ -136,6 +136,7 @@ async fn run_job_inner(
             );
             opts.parity = b.parity;
             opts.progress = progress;
+            opts.source = b.source()?;
             opts.exclude = b.exclusions()?;
             let summary = repo.backup(&b.paths, opts).await?;
             let incomplete = summary.report.errors > 0;
