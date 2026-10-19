@@ -403,7 +403,7 @@ kist backup sftp://me@nas.local/srv/data --trust-mtime   # 選用：大小與 mt
 一次 backup 一個遠端來源（URL 必須是唯一的路徑）；設定檔的 `[backup] paths` 也可以是一個 URL。client 是轉運：讀遠端、
 本機切塊加密，再寫進 repo（repo 也可以是遠端的，就是 remote-to-remote）。讀取：一個目錄裡最多同時讀 17 個檔案
 （不大於 1 MiB 的才先開始讀），SFTP 的一個檔案同時有 2 MiB 的 READ 在等；記憶體不跟著檔案大小長。SFTP 來源不記符號連結：
-連到檔案的跟過去讀目標的內容，連到目錄的與斷掉的記成略過的項目（backup 以 3 結束）。
+連到檔案的跟過去讀目標的內容（大小與 mtime 也記目標的），連到目錄的與斷掉的記成略過的項目（backup 以 3 結束）。
 
 沒變的檔案：`s3://` 以 etag 與大小判斷，沒變的物件不讀。`sftp://` 預設**每次整份讀**（去重讓 repo 不多存，但每個
 byte 都要經過網路）：SFTP 給的只有大小與 mtime，兩個都是寫檔案的人設得了的（`touch -d`、`cp -p`）。`--trust-mtime`
