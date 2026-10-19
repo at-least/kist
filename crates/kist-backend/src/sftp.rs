@@ -636,6 +636,14 @@ fn is_unsupported(e: &SftpError) -> bool {
     )
 }
 
+/// 來源模式讀一個檔案時，在等的 READ 加起來最多要這麼多 bytes（M12 第 7 段之三第六步）。同 russh 的 channel window
+/// 預設（2 MiB，剩一半以下才補）：要得再多，伺服器也要等 window 才送得出來；本機的容器量到 1 至 8 MiB 一樣快。
+const IN_FLIGHT_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 一個檔案的第一個 READ 要的長度。用戶端會把它截到伺服器一次給的上限（openssh-sftp-client 不公開那個上限，
+/// `max_read_len` 只在它自己的 CI feature 底下），回來的長度就是之後每個 READ 要的長度。
+const FIRST_READ: u64 = 1024 * 1024;
+
 /// 讀到的比要的少時（[`stream_range`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Short {
@@ -645,9 +653,10 @@ enum Short {
     End,
 }
 
-/// 來源模式的讀取（M12 第 7 段之三第二步）：`location` 從 `start` 起的 `len` bytes，一次一個 SFTP READ、一塊一塊交出，
-/// 不整份放進記憶體。一次要求 1 MiB，`File::read` 再依伺服器的上限截短（OpenSSH 255 KiB）；伺服器可以送得比要的
-/// 少，下一次從實際讀到的地方接著要（第四步）。比 `len` 先到檔尾照 `short`。
+/// 來源模式的讀取（M12 第 7 段之三第二步起）：`location` 從 `start` 起的 `len` bytes，一塊一塊交出，不整份放進記憶體。
+/// 第一個 READ 單獨送，它回來的長度是伺服器一次給的上限（[`FIRST_READ`]）；之後的 READ 每個要那麼多，在等的加起來
+/// 最多 [`IN_FLIGHT_BYTES`]，照順序交出（第六步）。伺服器可以送得比要的少：缺的那段馬上補要、排在最前面（第四步）。
+/// 比 `len` 先到檔尾照 `short`。
 fn stream_range(
     inner: Arc<SftpInner>,
     location: StorePath,
@@ -655,65 +664,130 @@ fn stream_range(
     len: u64,
     short: Short,
 ) -> BoxStream<'static, object_store::Result<Bytes>> {
-    const CHUNK: u64 = 1024 * 1024;
+    use openssh_sftp_client::file::File;
+    /// 一個在等的 READ：它要的 offset 與長度，和結果。
+    type Pending = futures::future::BoxFuture<
+        'static,
+        (u64, u64, object_store::Result<Option<bytes::BytesMut>>),
+    >;
     struct Reading {
         inner: Arc<SftpInner>,
         location: StorePath,
-        file: Option<openssh_sftp_client::file::File>,
+        file: Option<File>,
+        in_flight: futures::stream::FuturesOrdered<Pending>,
+        /// 在等的 READ 加起來要的 bytes。
+        pending: u64,
+        /// 之後每個 READ 要的長度；第一個 READ 回來之前不知道。
+        read_len: Option<u64>,
+        /// 下一個 READ 從哪裡要。
+        next: u64,
         start: u64,
+        /// 已經交出的 bytes。
         done: u64,
         len: u64,
         short: Short,
+    }
+    /// `offset` 起 `n` bytes 的一個 READ，用 `file` 的一份 clone（共用同一個 handle，offset 各自的）。
+    fn read_at(file: &File, offset: u64, n: u64) -> Pending {
+        let mut file = file.clone();
+        futures::FutureExt::boxed(async move {
+            use tokio::io::AsyncSeekExt as _;
+            // 每個 READ 自己定位：`File::read` 讀完推的是要的長度、不是拿到的（第四步）。seek 只改本地的 offset，
+            // 不是一次來回。
+            let got = match file.seek(std::io::SeekFrom::Start(offset)).await {
+                Ok(_) => file
+                    .read(n as u32, bytes::BytesMut::with_capacity(n as usize))
+                    .await
+                    .map_err(generic),
+                Err(e) => Err(generic(e)),
+            };
+            (offset, n, got)
+        })
     }
     let state = Reading {
         inner,
         location,
         file: None,
+        in_flight: futures::stream::FuturesOrdered::new(),
+        pending: 0,
+        read_len: None,
+        next: start,
         start,
         done: 0,
         len,
         short,
     };
     futures::stream::try_unfold(state, |mut st| async move {
-        use tokio::io::AsyncSeekExt as _;
         if st.done == st.len {
             return Ok(None);
         }
-        let mut file = match st.file.take() {
+        let full = st.inner.full(&st.location);
+        let file = match st.file.take() {
             Some(f) => f,
-            None => {
-                let full = st.inner.full(&st.location);
-                st.inner
-                    .sftp
-                    .open(&full)
-                    .await
-                    .map_err(|e| st.inner.store_error(&st.location, e))?
-            }
+            None => st
+                .inner
+                .sftp
+                .open(&full)
+                .await
+                .map_err(|e| st.inner.store_error(&st.location, e))?,
         };
-        // `File::read` 讀完把 offset 往前推「要的」長度、不是拿到的：伺服器少送時，下一次就跳過了資料。所以每次
-        // 自己定位到讀到的地方（seek 只改本地的 offset，不是一次來回）。
-        file.seek(std::io::SeekFrom::Start(st.start + st.done))
-            .await
-            .map_err(generic)?;
-        let want = (st.len - st.done).min(CHUNK) as u32;
-        let got = file
-            .read(want, bytes::BytesMut::with_capacity(want as usize))
-            .await
-            .map_err(generic)?;
-        st.file = Some(file);
-        match got {
+        let end = st.start + st.len;
+        let send = |st: &mut Reading, n: u64| {
+            st.in_flight.push_back(read_at(&file, st.next, n));
+            st.next += n;
+            st.pending += n;
+        };
+        match st.read_len {
+            None if st.in_flight.is_empty() => {
+                let n = (end - st.next).min(FIRST_READ);
+                send(&mut st, n);
+            }
+            None => {}
+            Some(read_len) => {
+                while st.next < end && st.pending < IN_FLIGHT_BYTES {
+                    let n = (end - st.next).min(read_len);
+                    send(&mut st, n);
+                }
+            }
+        }
+        // 還沒交出的那段一定有一個 READ 在等：不是剛送出去，就是補要的那段。
+        let Some((offset, n, got)) = st.in_flight.next().await else {
+            return Err(generic(std::io::Error::other(format!(
+                "{full}: no READ in flight after {} of {} bytes",
+                st.done, st.len
+            ))));
+        };
+        st.pending -= n;
+        match got? {
             Some(buf) if !buf.is_empty() => {
-                st.done += buf.len() as u64;
+                let got = buf.len() as u64;
+                // 送得比要的多：接著的 READ 是從要的長度之後讀的，會重疊。
+                if got > n {
+                    return Err(generic(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{full}: the server sent {got} bytes for a READ of {n}"),
+                    )));
+                }
+                if st.read_len.is_none() {
+                    // 第一個 READ：回來的長度就是之後每個 READ 要的長度，剩下的從這裡接著要。
+                    st.read_len = Some(got);
+                    st.next = offset + got;
+                } else if got < n {
+                    // 少送：缺的那段馬上補要，排在最前面——下一個交出的就是它。
+                    st.in_flight
+                        .push_front(read_at(&file, offset + got, n - got));
+                    st.pending += n - got;
+                }
+                st.done += got;
+                st.file = Some(file);
                 Ok(Some((buf.freeze(), st)))
             }
             _ if st.short == Short::End => Ok(None),
             _ => Err(generic(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
-                    "{}: server closed after {} of {} bytes",
-                    st.inner.full(&st.location),
-                    st.done,
-                    st.len
+                    "{full}: server closed after {} of {} bytes",
+                    st.done, st.len
                 ),
             ))),
         }
@@ -1712,44 +1786,94 @@ mod source_mode_tests {
         Ok(out)
     }
 
-    /// 伺服器每次 READ 少送（SFTP 允許；`File::read` 的文件也寫著回來的可能比要的少）：讀到的仍要逐 byte 相同。
-    /// 用假伺服器（`fake`）：測試容器的 OpenSSH 讀一般檔案不會少送。
+    /// 來源模式的 store，連到假伺服器。
+    fn fake_store(sftp: Sftp) -> Arc<SftpInner> {
+        Arc::new(SftpInner {
+            sftp: Arc::new(sftp),
+            fsync: false,
+            relaxed: false,
+            warned_no_o_excl: AtomicBool::new(false),
+            _stderr_tail: None,
+            _keepalive: Keepalive::Test,
+            root: String::new(),
+            display: "fake".to_owned(),
+            list_all: true,
+        })
+    }
+
+    /// 伺服器 READ 少送（SFTP 允許；`File::read` 的文件也寫著回來的可能比要的少）：讀到的仍要逐 byte 相同。用假
+    /// 伺服器（`fake`）：一次最多送 7 000 bytes（比用戶端要的 20 480 少），每第三個再少一半；測試容器的 OpenSSH 讀
+    /// 一般檔案不會少送。最後一種是列表的大小比檔案大（檔案變短了）：讀到檔尾為止、不算錯。
     #[tokio::test]
     async fn reads_every_byte_when_the_server_sends_less_than_asked() {
         let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let whole = content.len() as u64;
         let mut failures = Vec::new();
-        for (start, short) in [(0, Short::End), (0, Short::Error), (12_345, Short::Error)] {
-            let inner = Arc::new(SftpInner {
-                sftp: Arc::new(fake::connect(content.clone(), 7_000).await),
-                fsync: false,
-                relaxed: false,
-                warned_no_o_excl: AtomicBool::new(false),
-                _stderr_tail: None,
-                _keepalive: Keepalive::Test,
-                root: String::new(),
-                display: "fake".to_owned(),
-                list_all: true,
-            });
-            let want = &content[start as usize..];
+        for (start, len, short) in [
+            (0, whole, Short::End),
+            (0, whole, Short::Error),
+            (12_345, whole - 12_345, Short::Error),
+            (0, whole + 50_000, Short::End),
+        ] {
+            let replies = fake::Replies {
+                cap: 7_000,
+                short_every: 3,
+                hold: 1,
+            };
+            let (sftp, _) = fake::connect(content.clone(), replies).await;
             let got = collect(stream_range(
-                inner,
+                fake_store(sftp),
                 StorePath::from("f.bin"),
                 start,
-                want.len() as u64,
+                len,
                 short,
             ))
             .await;
+            let want = &content[start as usize..];
             match got {
                 Ok(got) if got == want => {}
                 Ok(got) => failures.push(format!(
-                    "start {start}, {short:?}: read {} bytes, want {}",
+                    "start {start}, len {len}, {short:?}: read {} bytes, want {}",
                     got.len(),
                     want.len()
                 )),
-                Err(e) => failures.push(format!("start {start}, {short:?}: {e}")),
+                Err(e) => failures.push(format!("start {start}, len {len}, {short:?}: {e}")),
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// 一個檔案同時有好幾個 READ 在等（第六步，管線化），不是一個一個來回：第一個之後，伺服器收到、還沒回的 READ
+    /// 加起來到 [`IN_FLIGHT_BYTES`]（假伺服器不宣告擴充，用戶端一次要 20 480 bytes）；照順序交出，逐 byte 相同。
+    #[tokio::test]
+    async fn keeps_several_reads_in_flight() {
+        let content: Vec<u8> = (0..6_000_000u32).map(|i| (i % 251) as u8).collect();
+        // 伺服器不主動回：用戶端 100 ms 沒有再送新的請求才回，所以「在等的最多幾個」就是用戶端一次送出幾個。
+        let replies = fake::Replies {
+            cap: usize::MAX,
+            short_every: 0,
+            hold: usize::MAX,
+        };
+        let (sftp, most_waiting) = fake::connect(content.clone(), replies).await;
+        let got = collect(stream_range(
+            fake_store(sftp),
+            StorePath::from("f.bin"),
+            0,
+            content.len() as u64,
+            Short::Error,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            got == content,
+            "read {} bytes, want {}",
+            got.len(),
+            content.len()
+        );
+        assert_eq!(
+            most_waiting.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            IN_FLIGHT_BYTES.div_ceil(20_480)
+        );
     }
 
     /// 來源依列表的大小讀（第三步，不先 stat）：列表之後變長的檔案讀到列表的大小為止；變短的讀到現在的檔尾、不算錯
