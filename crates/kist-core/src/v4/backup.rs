@@ -51,6 +51,11 @@ pub const M: Duration = Duration::from_secs(3600);
 /// 同時上傳中的 pack 數（每個最多 pack_target 的記憶體，同 v3）。
 const MAX_INFLIGHT_UPLOADS: usize = 1;
 
+/// 一份 delta 最多約列出這麼多個項目就寫出（M12 第 7 段之四第六步）：只看 pack 數時，一個 pack 可以裝幾萬個小
+/// chunk，100 萬個 1 KB 的檔案剛好 16 個 pack，一份 delta 列出全部 100 萬項（CBOR 42 MiB，編碼與加密時記憶體裡
+/// 三份，backup 的峰值）。一個 pack 的項目不拆到兩份 delta，一份最多是一個 pack 的項目加上這個數。
+pub const DELTA_ENTRIES: usize = 128 * 1024;
+
 /// 備份來源的指定（[`BackupOptions::source`]）。
 #[derive(Clone, Default)]
 pub enum SourceSpec {
@@ -270,6 +275,9 @@ pub struct BackupOptions {
     /// B3：每寫這麼多個 pack（資料與 mpack 合計）寫一份中間的 delta。
     #[doc(hidden)]
     pub delta_every: usize,
+    /// B3：等著寫的 delta 列出的項目到了這麼多也寫一份（[`DELTA_ENTRIES`]）。
+    #[doc(hidden)]
+    pub delta_entries: usize,
     /// 進度回報：每處理完一個項目一次，結尾的 flush、B4 的檢查與 B5 的 commit 各一次。
     pub progress: Option<ProgressCallback>,
     /// SFTP 來源的快速路徑（選用，預設關；M12 第 7 段之三第八步，修改 ADR 016 的分級）：`Some(every)` 時，大小與
@@ -334,6 +342,7 @@ impl BackupOptions {
             clock: Clock::system(),
             lone_head_wait: Duration::from_secs(5),
             delta_every: 16,
+            delta_entries: DELTA_ENTRIES,
             progress: None,
             sftp_trust_mtime: None,
         }
@@ -1251,6 +1260,7 @@ impl Repo {
             reader: reader.clone(),
             uploads: JoinSet::new(),
             since_delta: Vec::new(),
+            since_delta_entries: 0,
             own_packs: Vec::new(),
             used_subtree: false,
             stats: SnapshotStats::default(),
@@ -1266,6 +1276,7 @@ impl Repo {
             started,
             clock: opts.clock.clone(),
             delta_every: opts.delta_every.max(1),
+            delta_entries: opts.delta_entries.max(1),
             progress: opts.progress.clone(),
         };
 
@@ -1347,6 +1358,8 @@ struct Walk {
     uploads: JoinSet<Result<()>>,
     /// 上一份 delta 之後寫的 pack。
     since_delta: Vec<DeltaPack>,
+    /// `since_delta` 裡的項目數。
+    since_delta_entries: usize,
     /// 這次寫的 pack 與 mpack（B4：不能是 tombstone）。
     own_packs: Vec<ObjectId>,
     /// 沿用了 parent 的子樹（B4 對 parent 做 HEAD）。
@@ -1366,6 +1379,7 @@ struct Walk {
     started: Reading,
     clock: Clock,
     delta_every: usize,
+    delta_entries: usize,
     progress: Option<ProgressCallback>,
 }
 
@@ -2244,6 +2258,7 @@ impl Walk {
             bytes,
             entries,
         } = p;
+        self.since_delta_entries += entries.len();
         self.since_delta.push(DeltaPack {
             id,
             kind,
@@ -2322,7 +2337,9 @@ impl Walk {
             }
             Ok(())
         });
-        if self.since_delta.len() >= self.delta_every {
+        if self.since_delta.len() >= self.delta_every
+            || self.since_delta_entries >= self.delta_entries
+        {
             self.write_delta().await?;
         }
         Ok(())
@@ -2354,9 +2371,11 @@ impl Walk {
                 grace.as_secs()
             );
             self.since_delta.clear();
+            self.since_delta_entries = 0;
             return Ok(());
         }
         let packs = std::mem::take(&mut self.since_delta);
+        self.since_delta_entries = 0;
         let plain = Delta::new(self.own, packs).encode()?;
         let sealed = self.keys.seal_delta(&self.own, &plain)?;
         let id = ObjectId::of(&sealed);

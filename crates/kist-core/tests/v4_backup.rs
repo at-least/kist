@@ -634,3 +634,57 @@ async fn progress_is_reported_per_item_then_flush_verify_commit() {
     assert_eq!(tail, ["commit", "verify", "flush"]);
     assert_eq!(seen.last().unwrap().2, 2, "stats travel with the events");
 }
+
+/// 一份 delta 列出的項目到了 `delta_entries` 就寫出，不必等 `delta_every` 個 pack（第 7 段之四第六步）：每個資料
+/// pack（這裡 64 KiB、約 15 個 4 KiB 的 chunk）之後一份。另一個路徑的同樣內容在下一次 backup 裡從這幾份 delta
+/// 找到每一個 chunk，一個都不重寫。
+#[tokio::test]
+async fn a_delta_is_written_once_it_lists_enough_entries() {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let fill = |dir: &std::path::Path, rng: &mut rand::rngs::ThreadRng| {
+        std::fs::create_dir_all(dir).unwrap();
+        for i in 0..40 {
+            let bytes: Vec<u8> = (0..4096).map(|_| rng.random()).collect();
+            std::fs::write(dir.join(format!("f{i:02}")), bytes).unwrap();
+        }
+    };
+    let t = TestRepo::new().await;
+    let one = t.dir.path().join("one");
+    fill(&one, &mut rng);
+    let repo = t.open().await;
+    let all_at_once = repo
+        .backup(std::slice::from_ref(&one), opts(1))
+        .await
+        .unwrap();
+    assert!(
+        all_at_once.report.packs_new >= 2,
+        "{:?}",
+        all_at_once.report
+    );
+    assert_eq!(all_at_once.report.deltas_new, 1);
+
+    let t = TestRepo::new().await;
+    let src = t.dir.path().join("src");
+    fill(&src, &mut rng);
+    let repo = t.open().await;
+    let mut o = opts(1);
+    o.delta_entries = 10;
+    let first = repo.backup(std::slice::from_ref(&src), o).await.unwrap();
+    let r = first.report;
+    assert!(r.deltas_new >= r.packs_new && r.deltas_new >= 2, "{r:?}");
+    assert_eq!(t.keys("deltas").await.len() as u64, r.deltas_new);
+
+    let copy = t.dir.path().join("copy");
+    std::fs::create_dir_all(&copy).unwrap();
+    for e in std::fs::read_dir(&src).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), copy.join(e.file_name())).unwrap();
+    }
+    let second = repo
+        .backup(std::slice::from_ref(&copy), opts(1))
+        .await
+        .unwrap();
+    assert_eq!(second.report.chunks_new, 0, "{:?}", second.report);
+    assert_eq!(second.report.packs_new, 0, "{:?}", second.report);
+}
