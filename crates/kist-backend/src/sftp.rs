@@ -1104,6 +1104,7 @@ impl SftpStore {
         prefix: Option<&StorePath>,
     ) -> object_store::Result<crate::source::CompactListing> {
         let mut listing = crate::source::CompactListing::default();
+        let mut links = Vec::new();
         self.each_entry(prefix, |key, m| {
             if is_dir(m) {
                 if let Ok(p) = StorePath::parse(key) {
@@ -1111,6 +1112,8 @@ impl SftpStore {
                         .push_dir(p.filename().unwrap_or("").as_bytes())
                         .map_err(generic)?;
                 }
+            } else if m.file_type().is_some_and(|t| t.is_symlink()) {
+                links.push(key);
             } else {
                 match to_meta(&key, m) {
                     Ok(meta) => listing
@@ -1129,6 +1132,38 @@ impl SftpStore {
             Ok(())
         })
         .await?;
+        // 符號連結（第十一步）：READDIR 給的是連結本身的屬性（OpenSSH 的 sftp-server 以 lstat 列目錄），大小是目標路徑
+        // 的長度；讀它讀的卻是目標（OPEN 會跟過去），所以依列表的大小讀（第三步）只讀到目標的前幾個 bytes。SFTP 來源
+        // 不記符號連結（ADR 016 的已知限制），是跟過去讀目標：這裡 STAT（跟過去）一次，目標是檔案就記它的大小與
+        // mtime；目標是目錄、或 STAT 不了，交出一個錯誤的條目（backup 記成略過，同第三步之前讀的時候才回錯）。
+        for key in links {
+            let Ok(location) = StorePath::parse(&key) else {
+                continue; // 命名規則外的名稱：略過，同檔案
+            };
+            let name = location.filename().unwrap_or("").to_owned();
+            let full = self.0.full(&location);
+            let mut fs = self.0.sftp.fs();
+            let target = fs.metadata(&full).await;
+            drop(fs);
+            match target {
+                Ok(t) if !is_dir(&t) => match to_meta(&key, &t) {
+                    Ok(meta) => listing.push_file(
+                        name.as_bytes(),
+                        meta.size,
+                        crate::source::mtime_ns(&meta.last_modified),
+                        None,
+                        None,
+                    ),
+                    Err(e) => listing.push_error(name.as_bytes(), &e.to_string()),
+                },
+                Ok(_) => listing.push_error(
+                    name.as_bytes(),
+                    "a symbolic link to a directory (an sftp:// source follows links to files only)",
+                ),
+                Err(e) => listing.push_error(name.as_bytes(), &format!("symbolic link: {e}")),
+            }
+            .map_err(generic)?;
+        }
         Ok(listing.sorted())
     }
 
@@ -1758,6 +1793,7 @@ mod fake;
 mod source_mode_tests {
     use super::*;
     use object_store::ObjectStoreExt;
+    use std::collections::BTreeMap;
 
     fn env() -> Option<(SftpConfig, SftpAuth)> {
         let url = std::env::var("KIST_TEST_SFTP_URL").ok()?;
@@ -1915,6 +1951,92 @@ mod source_mode_tests {
         assert_eq!(
             most_waiting.load(std::sync::atomic::Ordering::Relaxed) as u64,
             IN_FLIGHT_BYTES.div_ceil(20_480)
+        );
+    }
+
+    /// 符號連結（第十一步）：SFTP 來源跟過去讀目標——列表上的大小與 mtime 是目標的（READDIR 給的是連結本身的，大小
+    /// 是目標路徑的長度），依它讀到整個目標；連到目錄的與斷掉的是錯誤的條目（backup 記成略過）。
+    #[tokio::test]
+    async fn source_listing_follows_symlinks_to_files() {
+        use crate::source::SortedItems as _;
+        let Some((mut cfg, auth)) = env() else {
+            eprintln!("SFTP symlink listing test skipped (tests/sftp-setup.sh 未跑)");
+            return;
+        };
+        cfg.path = format!(
+            "{}/links-{}",
+            cfg.path.trim_matches('/'),
+            std::process::id()
+        );
+        let writer = SftpStore::open(&cfg, &auth).await.unwrap();
+        let content: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        for (key, bytes) in [("target.bin", content.clone()), ("sub/x", b"x".to_vec())] {
+            let opts = PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            };
+            writer
+                .put_opts(&StorePath::from(key), PutPayload::from(bytes), opts)
+                .await
+                .unwrap();
+        }
+        let root = writer.0.root.clone();
+        let links = [
+            ("link", "target.bin"),
+            ("dirlink", "sub"),
+            ("broken", "missing"),
+        ];
+        let mut fs = writer.0.sftp.fs();
+        for (link, target) in links {
+            fs.symlink(target, format!("{root}/{link}")).await.unwrap();
+        }
+        drop(fs);
+        let source = SftpStore::open_source(&cfg, &auth).await.unwrap();
+        let mut listing = source.list_source(None).await.unwrap();
+        let mut items = BTreeMap::new();
+        while let Some(item) = listing.next_item() {
+            match item {
+                Ok(i) => items.insert(String::from_utf8(i.name.clone()).unwrap(), Ok(i.kind)),
+                Err(e) => items.insert(e.to_string(), Err(())),
+            };
+        }
+        let listed_size = match items.get("link") {
+            Some(Ok(crate::source::SourceItemKind::File { size, .. })) => *size,
+            other => panic!("link: {other:?}"),
+        };
+        let read = collect(source.stream_listed(&StorePath::from("link"), listed_size)).await;
+        let mut fs = writer.0.sftp.fs();
+        for (link, _) in links {
+            fs.remove_file(format!("{root}/{link}")).await.unwrap();
+        }
+        drop(fs);
+        for key in ["target.bin", "sub/x"] {
+            writer.delete(&StorePath::from(key)).await.unwrap();
+        }
+        assert_eq!(
+            listed_size,
+            content.len() as u64,
+            "the link's own size is listed"
+        );
+        assert!(
+            read.unwrap() == content,
+            "the bytes read through the link differ"
+        );
+        let errors: Vec<&String> = items
+            .iter()
+            .filter(|(_, v)| v.is_err())
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(errors.len(), 2, "{items:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("dirlink: a symbolic link to a directory")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("broken: symbolic link")),
+            "{errors:?}"
         );
     }
 

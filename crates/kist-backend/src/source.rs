@@ -652,14 +652,23 @@ impl Span {
     };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    File,
+    Dir,
+    /// 讀不了的條目：交出錯誤（走訪端記成略過），訊息在 `etag` 那一段。
+    Error,
+}
+
 #[derive(Clone, Copy)]
 struct Row {
     size: u64,
     mtime_ns: i64,
     name: Span,
+    /// 檔案的 etag；錯誤的條目的訊息。
     etag: Span,
     vern: Span,
-    dir: bool,
+    kind: RowKind,
 }
 
 impl CompactListing {
@@ -695,7 +704,26 @@ impl CompactListing {
             name,
             etag: Span::ABSENT,
             vern: Span::ABSENT,
-            dir: true,
+            kind: RowKind::Dir,
+        });
+        Ok(())
+    }
+
+    /// 一個讀不了的條目：輪到它時交出錯誤「名稱: 訊息」（走訪端記成略過、backup 以 3 結束）。
+    pub(crate) fn push_error(
+        &mut self,
+        name: &[u8],
+        message: &str,
+    ) -> std::result::Result<(), BackendError> {
+        let name = self.span(name)?;
+        let message = self.span(message.as_bytes())?;
+        self.rows.push(Row {
+            size: 0,
+            mtime_ns: 0,
+            name,
+            etag: message,
+            vern: Span::ABSENT,
+            kind: RowKind::Error,
         });
         Ok(())
     }
@@ -717,7 +745,7 @@ impl CompactListing {
             name,
             etag,
             vern,
-            dir: false,
+            kind: RowKind::File,
         });
         Ok(())
     }
@@ -735,14 +763,15 @@ impl CompactListing {
     pub(crate) fn sorted(mut self) -> Self {
         let bytes = std::mem::take(&mut self.bytes);
         let name = |s: Span| &bytes[s.start as usize..(s.start + s.len) as usize];
+        let dir = |r: &Row| r.kind == RowKind::Dir;
         self.rows.sort_unstable_by(|a, b| {
             name(a.name)
                 .cmp(name(b.name))
-                .then_with(|| b.dir.cmp(&a.dir))
+                .then_with(|| dir(b).cmp(&dir(a)))
         });
         // 同名的目錄只留一個（S3 的 common prefix 可以在好幾頁裡都出現）
         self.rows
-            .dedup_by(|a, b| a.dir && b.dir && name(a.name) == name(b.name));
+            .dedup_by(|a, b| dir(a) && dir(b) && name(a.name) == name(b.name));
         self.bytes = bytes;
         self.bytes.shrink_to_fit();
         self.rows.shrink_to_fit();
@@ -761,14 +790,20 @@ impl SortedItems for CompactListing {
         let row = *self.rows.get(self.next)?;
         self.next += 1;
         let name = self.get(row.name).to_vec();
-        let kind = if row.dir {
-            SourceItemKind::Dir
-        } else {
-            SourceItemKind::File {
+        let kind = match row.kind {
+            RowKind::Dir => SourceItemKind::Dir,
+            RowKind::File => SourceItemKind::File {
                 size: row.size,
                 mtime_ns: row.mtime_ns,
                 etag: self.get_optional(row.etag),
                 vern: self.get_optional(row.vern),
+            },
+            RowKind::Error => {
+                return Some(Err(BackendError::Source(format!(
+                    "{}: {}",
+                    String::from_utf8_lossy(&name),
+                    String::from_utf8_lossy(self.get(row.etag))
+                ))))
             }
         };
         Some(Ok(SourceItem { name, kind }))
