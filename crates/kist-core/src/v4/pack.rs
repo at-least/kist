@@ -8,7 +8,8 @@
 //! 或 metadata 的 2 MiB，與 trailer 宣稱的 `r` 無關，先限制輸出再比對長度——最後重算 ID。任何一步失敗
 //! 都是這份副本不可信，呼叫端換下一個持有者（§10）。
 
-use std::io::Read;
+use std::cell::RefCell;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use kist_crypto::v4::Keys;
@@ -21,12 +22,34 @@ use crate::{CoreError, Result};
 /// zstd 的等級（§6：level 3）。
 pub(crate) const ZSTD_LEVEL: i32 = 3;
 
+// 每條執行緒一個 zstd context，每一項重用：每一項新建一個時，zstd 每次以 C 的 malloc 配一塊 3.5 MiB 的
+// workspace（串流的寫法不知道大小）；100 萬個檔案就是 100 萬次。輸出與每次新建的 `zstd::encode_all` 相同。
+thread_local! {
+    static CCTX: RefCell<zstd::zstd_safe::CCtx<'static>> = RefCell::new(zstd::zstd_safe::CCtx::create());
+    static DCTX: RefCell<zstd::zstd_safe::DCtx<'static>> = RefCell::new(zstd::zstd_safe::DCtx::create());
+}
+
+fn zstd_error(code: zstd::zstd_safe::ErrorCode) -> std::io::Error {
+    std::io::Error::other(zstd::zstd_safe::get_error_name(code))
+}
+
 /// metadata item 解壓後的上限（§6）。
 pub const MAX_META: u64 = pack::MAX_META_ITEM;
 
 /// 一項的明文：`alg byte ‖ data`。壓縮省下的 bytes × 16 ≥ 原文長度才留壓縮版（§6）。
 pub fn compress(raw: &[u8]) -> Result<Vec<u8>> {
-    let z = zstd::encode_all(raw, ZSTD_LEVEL)
+    let z = CCTX
+        .with(|c| -> std::io::Result<Vec<u8>> {
+            let mut c = c.borrow_mut();
+            // 前一項失敗在一半時，context 裡留著那一項的狀態
+            c.reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+                .map_err(zstd_error)?;
+            c.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(ZSTD_LEVEL))
+                .map_err(zstd_error)?;
+            let mut enc = zstd::stream::write::Encoder::with_context(Vec::new(), &mut c);
+            enc.write_all(raw)?;
+            enc.finish()
+        })
         .map_err(|e| CoreError::corrupt("<pack entry>", format!("zstd failed: {e}")))?;
     Ok(if keep_compressed(raw.len(), z.len()) {
         pack::frame(Algorithm::Zstd, &z)
@@ -49,13 +72,17 @@ fn decompress(framed: &[u8], limit: u64, what: &str) -> Result<Vec<u8>> {
             Ok(data.to_vec())
         }
         Algorithm::Zstd => {
-            let decoder = zstd::stream::read::Decoder::with_buffer(data)
-                .map_err(|e| CoreError::corrupt(what, format!("zstd decode failed: {e}")))?;
             let mut out = Vec::new();
-            decoder
-                .take(limit.saturating_add(1))
-                .read_to_end(&mut out)
-                .map_err(|e| CoreError::corrupt(what, format!("zstd decode failed: {e}")))?;
+            DCTX.with(|d| -> std::io::Result<()> {
+                let mut d = d.borrow_mut();
+                d.reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+                    .map_err(zstd_error)?;
+                zstd::stream::read::Decoder::with_context(data, &mut d)
+                    .take(limit.saturating_add(1))
+                    .read_to_end(&mut out)?;
+                Ok(())
+            })
+            .map_err(|e| CoreError::corrupt(what, format!("zstd decode failed: {e}")))?;
             if out.len() as u64 > limit {
                 return Err(CoreError::corrupt(
                     what,
@@ -242,6 +269,71 @@ mod tests {
     use super::*;
     use kist_crypto::MasterKey;
     use kist_format::v4::ids::ClientId;
+
+    fn sample(seed: u64, n: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x & 0x0f) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reused_context_compresses_like_a_fresh_one() {
+        let sizes = [
+            0usize,
+            1,
+            1000,
+            1279,
+            70_000,
+            1 << 20,
+            3 << 20,
+            5,
+            200_000,
+            768,
+        ];
+        let mut zstd_items = 0;
+        for round in 0..3u64 {
+            for (k, &n) in sizes.iter().enumerate() {
+                let raw = sample(round * 100 + k as u64, n);
+                let fresh = zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap();
+                let framed = compress(&raw).unwrap();
+                let (alg, data) = pack::unframe(&framed).unwrap();
+                if alg == Algorithm::Zstd {
+                    assert_eq!(data, &fresh[..], "round {round} size {n}");
+                    zstd_items += 1;
+                } else {
+                    assert!(
+                        !keep_compressed(raw.len(), fresh.len()),
+                        "round {round} size {n}"
+                    );
+                }
+                assert_eq!(decompress(&framed, n as u64, "t").unwrap(), raw);
+            }
+        }
+        assert!(
+            zstd_items >= 21,
+            "only {zstd_items} items took the zstd path"
+        );
+    }
+
+    #[test]
+    fn a_decode_that_stops_halfway_does_not_break_the_next_one() {
+        let raw = sample(7, 1 << 20);
+        let framed = compress(&raw).unwrap();
+        assert_eq!(pack::unframe(&framed).unwrap().0, Algorithm::Zstd);
+        // 超過上限：讀到一半就停
+        assert!(decompress(&framed, 1000, "t").is_err());
+        assert_eq!(decompress(&framed, raw.len() as u64, "t").unwrap(), raw);
+        // 截斷的 frame
+        let cut = &framed[..framed.len() / 2];
+        assert!(decompress(cut, raw.len() as u64, "t").is_err());
+        assert_eq!(decompress(&framed, raw.len() as u64, "t").unwrap(), raw);
+    }
 
     fn keys() -> Arc<Keys> {
         Arc::new(Keys::derive(&MasterKey::from_bytes([9; 32])))
