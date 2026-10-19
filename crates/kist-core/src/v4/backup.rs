@@ -40,6 +40,7 @@ use super::cache::{Cache, Kind as CacheKind};
 use super::pack::{FinishedPack, PackWriter};
 use super::read::{DirStream, Reader};
 use super::repo::Repo;
+use super::spill::WrittenSet;
 use super::state::{pack_key, Generation, Holder, Source as HolderSource, State};
 use crate::filter::{FilterState, PathFilter};
 use crate::{blocking, fsmeta, CoreError, Result};
@@ -527,19 +528,24 @@ enum Outcome {
 /// B2：判斷沿用或重寫。只在 blocking 執行緒上用：取回驗證要以 `block_on` 等後端。
 struct Dedup {
     reader: Reader,
-    written: HashSet<ItemId>,
+    written: WrittenSet,
     handle: tokio::runtime::Handle,
     verified: u64,
 }
 
-/// [`Dedup::decide_cached`] 判斷不了：第一個候選不可信，要取回驗證（只能在 blocking 執行緒上做）。
-struct NeedFetch;
+/// [`Dedup::decide_cached`] 判斷不了。
+enum Undecided {
+    /// 第一個候選不可信，要取回驗證（只能在 blocking 執行緒上做）。
+    NeedFetch,
+    /// 查「這次寫過」失敗（暫存檔讀不了）。
+    Failed(CoreError),
+}
 
 impl Dedup {
     /// 不取回就判斷得了的 B2（async 端也能用）：這次寫過、沒有候選、第一個候選可信——與 [`Dedup::decide`] 的結果
-    /// 相同；第一個候選不可信時 `decide` 會先取回它驗證，這裡回 [`NeedFetch`]。
-    fn decide_cached(&self, id: ItemId, kind: Kind) -> std::result::Result<Decision, NeedFetch> {
-        if self.written.contains(&id) {
+    /// 相同；第一個候選不可信時 `decide` 會先取回它驗證，這裡回 [`Undecided::NeedFetch`]。
+    fn decide_cached(&self, id: ItemId, kind: Kind) -> std::result::Result<Decision, Undecided> {
+        if self.written.contains(&id).map_err(Undecided::Failed)? {
             return Ok(Decision::InRun);
         }
         match self
@@ -551,23 +557,23 @@ impl Dedup {
         {
             None => Ok(Decision::Write),
             Some(h) if self.reader.trusted(&id, &h) => Ok(Decision::Reuse(h)),
-            Some(_) => Err(NeedFetch),
+            Some(_) => Err(Undecided::NeedFetch),
         }
     }
 
-    fn decide(&mut self, id: ItemId, kind: Kind) -> Decision {
-        if self.written.contains(&id) {
-            return Decision::InRun;
+    fn decide(&mut self, id: ItemId, kind: Kind) -> Result<Decision> {
+        if self.written.contains(&id)? {
+            return Ok(Decision::InRun);
         }
         for h in self.reader.state.reuse_candidates(&id, kind) {
             if self.reader.trusted(&id, &h) {
-                return Decision::Reuse(h);
+                return Ok(Decision::Reuse(h));
             }
             match self.handle.block_on(self.reader.fetch(&h)) {
                 Ok(_) => {
                     self.reader.note_verified(id, &h);
                     self.verified += 1;
-                    return Decision::Reuse(h);
+                    return Ok(Decision::Reuse(h));
                 }
                 Err(e) => tracing::warn!(
                     "{id}: the copy in pack {} failed verification; not reusing it: {e}",
@@ -575,7 +581,7 @@ impl Dedup {
                 ),
             }
         }
-        Decision::Write
+        Ok(Decision::Write)
     }
 }
 
@@ -638,7 +644,7 @@ impl Work {
         let mut full = Vec::new();
         for (id, cbor) in items {
             let item: ItemId = id.into();
-            let outcome = match self.dedup.decide(item, Kind::Meta) {
+            let outcome = match self.dedup.decide(item, Kind::Meta)? {
                 Decision::InRun => Outcome::InRun,
                 Decision::Reuse(h) => {
                     let i = self.packs.intern(&h);
@@ -648,7 +654,7 @@ impl Work {
                 }
                 Decision::Write => {
                     self.meta.add(item, &cbor)?;
-                    self.dedup.written.insert(item);
+                    self.dedup.written.insert(item)?;
                     report.items_new += 1;
                     if self.meta.is_full() {
                         full.extend(self.meta.finish()?);
@@ -1218,7 +1224,11 @@ impl Repo {
             work: Some(Work {
                 dedup: Dedup {
                     reader: reader.clone(),
-                    written: HashSet::new(),
+                    written: WrittenSet::new(
+                        self.cache()
+                            .map(|c| c.dir().to_path_buf())
+                            .unwrap_or_else(std::env::temp_dir),
+                    ),
                     handle: tokio::runtime::Handle::current(),
                     verified: 0,
                 },
@@ -2078,18 +2088,17 @@ impl Walk {
             .reuse_file(&content, |d, id, kind| d.decide_cached(id, kind));
         let decided = match fast {
             Ok(decided) => decided,
-            Err(NeedFetch) => {
+            Err(Undecided::Failed(e)) => return Err(e),
+            Err(Undecided::NeedFetch) => {
                 let mut work = self.take_work()?;
                 let check = content.clone();
                 let (work, decided) = blocking(move || {
-                    let Ok(decided) = work.reuse_file(&check, |d, id, kind| {
-                        Ok::<_, std::convert::Infallible>(d.decide(id, kind))
-                    });
+                    let decided = work.reuse_file(&check, |d, id, kind| d.decide(id, kind));
                     Ok((work, decided))
                 })
                 .await?;
                 self.work = Some(work);
-                decided
+                decided?
             }
         };
         let Some((used, subtree)) = decided else {
@@ -2150,7 +2159,15 @@ impl Walk {
                     let item: ItemId = id.into();
                     state.bytes_total += chunk.len() as u64;
                     state.list.push((id, chunk.len() as u64));
-                    match work.dedup.decide(item, Kind::Data) {
+                    let decision = match work.dedup.decide(item, Kind::Data) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            hard_error = Some(e);
+                            done = true;
+                            break;
+                        }
+                    };
+                    match decision {
                         Decision::InRun => continue,
                         Decision::Reuse(h) => {
                             let i = work.packs.intern(&h);
@@ -2165,7 +2182,11 @@ impl Walk {
                         done = true;
                         break;
                     }
-                    work.dedup.written.insert(item);
+                    if let Err(e) = work.dedup.written.insert(item) {
+                        hard_error = Some(e);
+                        done = true;
+                        break;
+                    }
                     state.bytes_new += chunk.len() as u64;
                     state.chunks_new += 1;
                     if work.data.is_full() {

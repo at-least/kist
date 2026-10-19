@@ -31,6 +31,7 @@ pub mod rebuild;
 pub mod repo;
 pub mod restore;
 pub mod snapshots;
+mod spill;
 pub mod state;
 
 pub use backup::{
