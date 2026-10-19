@@ -497,11 +497,18 @@ impl Source for ObjectStoreSource {
         file: &[u8],
         size: u64,
     ) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
-        let Some(sftp) = &self.sftp else {
-            return self.read(file);
-        };
         let path = self.to_store_path(file)?;
-        Ok(self.bridge(sftp.stream_listed(&path, size)))
+        let Some(sftp) = &self.sftp else {
+            if size > WHOLE_MAX {
+                return self.read(file);
+            }
+            return Ok(self.whole(self.get_stream(path)));
+        };
+        let stream = sftp.stream_listed(&path, size);
+        if size <= WHOLE_MAX {
+            return Ok(self.whole(stream));
+        }
+        Ok(self.bridge(stream))
     }
 
     fn meta_kind(&self) -> u8 {
@@ -574,20 +581,49 @@ impl Source for ObjectStoreSource {
     }
 
     fn read(&self, file: &[u8]) -> std::result::Result<Box<dyn Read + Send>, BackendError> {
-        use futures::{StreamExt, TryStreamExt};
         let path = self.to_store_path(file)?;
-        let store = Arc::clone(&self.store);
-        let stream =
-            futures::stream::once(
-                async move { store.get(&path).await.map(|get| get.into_stream()) },
-            )
-            .try_flatten()
-            .boxed();
-        Ok(self.bridge(stream))
+        Ok(self.bridge(self.get_stream(path)))
     }
 }
 
 impl ObjectStoreSource {
+    /// 一個物件的內容：GET 的串流。
+    fn get_stream(
+        &self,
+        path: object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<bytes::Bytes>> {
+        use futures::{StreamExt, TryStreamExt};
+        let store = Arc::clone(&self.store);
+        futures::stream::once(async move { store.get(&path).await.map(|get| get.into_stream()) })
+            .try_flatten()
+            .boxed()
+    }
+
+    /// 小檔案：spawn 一個 task 讀完整份，以 oneshot 一次交給在 blocking thread 上讀的 [`WholeRead`]——不經過
+    /// [`ObjectStoreSource::bridge`] 的 4 格 channel。每個檔案少一個 channel 的配置，這些在 async 那一側配、在
+    /// blocking 那一側放。
+    fn whole(
+        &self,
+        stream: futures::stream::BoxStream<'static, object_store::Result<bytes::Bytes>>,
+    ) -> Box<dyn Read + Send> {
+        use futures::TryStreamExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.handle.spawn(async move {
+            let parts = stream
+                .try_collect::<Vec<bytes::Bytes>>()
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()));
+            let _ = tx.send(parts); // 讀端已放棄
+        });
+        Box::new(WholeRead {
+            handle: self.handle.clone(),
+            rx: Some(rx),
+            parts: Vec::new(),
+            next: 0,
+            pos: 0,
+        })
+    }
+
     /// spawn 一個 task 把串流推進 4 格的 channel，交出在 blocking thread 上讀的 [`StreamBridge`]。
     fn bridge(
         &self,
@@ -812,6 +848,39 @@ impl SortedItems for CompactListing {
 
 /// async 位元組流 → blocking [`Read`] 的橋接：spawn 的 pump task 把串流推進
 /// channel，讀端在 blocking thread 上 `Handle::block_on` 等下一塊。
+/// 整份讀進來交出的上限：同 backup 預讀的上限（kist-core 的 `READ_AHEAD_MAX`），預讀的檔案都走 [`WholeRead`]。
+const WHOLE_MAX: u64 = 1024 * 1024;
+
+/// [`ObjectStoreSource::whole`] 的讀端：第一次讀的時候等那個 task 讀完。
+struct WholeRead {
+    handle: tokio::runtime::Handle,
+    rx: Option<tokio::sync::oneshot::Receiver<std::io::Result<Vec<bytes::Bytes>>>>,
+    parts: Vec<bytes::Bytes>,
+    next: usize,
+    pos: usize,
+}
+
+impl Read for WholeRead {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(rx) = self.rx.take() {
+            self.parts = self.handle.block_on(rx).map_err(|_| {
+                std::io::Error::other("the source read task ended without a result")
+            })??;
+        }
+        while let Some(part) = self.parts.get(self.next) {
+            if self.pos < part.len() {
+                let n = (part.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&part[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            self.next += 1;
+            self.pos = 0;
+        }
+        Ok(0)
+    }
+}
+
 struct StreamBridge {
     handle: tokio::runtime::Handle,
     rx: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
@@ -859,6 +928,52 @@ pub async fn open_source(spec: &str) -> Result<Box<dyn Source>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn whole_read(
+        handle: &tokio::runtime::Handle,
+    ) -> (
+        tokio::sync::oneshot::Sender<std::io::Result<Vec<bytes::Bytes>>>,
+        WholeRead,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let r = WholeRead {
+            handle: handle.clone(),
+            rx: Some(rx),
+            parts: Vec::new(),
+            next: 0,
+            pos: 0,
+        };
+        (tx, r)
+    }
+
+    /// 整份交出的讀端：幾段照順序交出（空的段跳過）；task 的錯誤照樣是錯誤；task 沒有送出結果就結束是錯誤，
+    /// 不是空檔。
+    #[test]
+    fn whole_read_yields_the_parts_in_order_and_fails_loudly() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, mut r) = whole_read(rt.handle());
+        let parts = ["ab", "", "cde", "f"].map(|p| bytes::Bytes::from(p.as_bytes().to_vec()));
+        tx.send(Ok(parts.to_vec())).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2];
+        loop {
+            let n = r.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, b"abcdef");
+
+        let (tx, mut r) = whole_read(rt.handle());
+        tx.send(Err(std::io::Error::other("gone"))).unwrap();
+        assert_eq!(r.read(&mut buf).unwrap_err().to_string(), "gone");
+
+        let (tx, mut r) = whole_read(rt.handle());
+        drop(tx);
+        let e = r.read(&mut buf).unwrap_err().to_string();
+        assert!(e.contains("ended without a result"), "{e}");
+    }
 
     /// 本機列舉交出的 metadata 是剛回傳的那個條目的（同一次 lstat；走訪端不再 stat 第二次）：每個條目的 inode
     /// 與 mode 等於另外 lstat 的結果；還沒回傳任何條目、或列舉完之後是 `None`。
