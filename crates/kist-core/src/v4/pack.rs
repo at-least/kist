@@ -354,6 +354,37 @@ pub struct FinishedSpool {
 }
 
 impl FinishedSpool {
+    /// 暫存檔的路徑（從檔案上傳）。
+    pub fn path(&self) -> &std::path::Path {
+        self.file.path()
+    }
+
+    /// 一段一段讀、重算名稱，不整份進記憶體：暫存檔在寫完之後壞了，上傳上去的 pack 的名稱就與內容不符（要到
+    /// check 才看得出來）。
+    pub fn verify(&self) -> Result<()> {
+        use std::io::Read;
+        let path = self.file.path();
+        let mut f = std::fs::File::open(path).map_err(|e| spool_error(path, e))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut len = 0u64;
+        loop {
+            let n = f.read(&mut buf).map_err(|e| spool_error(path, e))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            len += n as u64;
+        }
+        if len != self.len || ObjectId::from_bytes(*hasher.finalize().as_bytes()) != self.id {
+            return Err(CoreError::corrupt(
+                path.display().to_string(),
+                format!("the spooled pack {} changed after it was written", self.id),
+            ));
+        }
+        Ok(())
+    }
+
     /// 整份讀回記憶體，重算名稱：暫存檔在寫完之後壞了，pack 的名稱就與內容不符（要到 check 才看得出來）。
     pub fn into_pack(self) -> Result<FinishedPack> {
         let path = self.file.path().to_path_buf();
@@ -595,9 +626,12 @@ mod tests {
         );
         w.add(k.chunk_id(b"abc").into(), b"abc").unwrap();
         let spooled = w.finish().unwrap().unwrap();
+        spooled.verify().unwrap();
         let mut bytes = std::fs::read(spooled.file.path()).unwrap();
         bytes[10] ^= 1;
         std::fs::write(spooled.file.path(), &bytes).unwrap();
+        let e = spooled.verify().unwrap_err().to_string();
+        assert!(e.contains("changed after it was written"), "{e}");
         let e = spooled.into_pack().unwrap_err().to_string();
         assert!(e.contains("changed after it was written"), "{e}");
     }

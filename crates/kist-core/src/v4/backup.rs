@@ -32,7 +32,7 @@ use kist_format::v4::keys::{Gen, Key, SnapTs, SNAPSHOTS};
 use kist_format::v4::meta::{
     build_chunks, content_type, meta_kind, node_type, DirBuilder, Entry, Limits,
 };
-use kist_format::v4::pack::Kind;
+use kist_format::v4::pack::{Kind, PackEntry};
 use kist_format::v4::snapshot::{build_roots, split_locator, Root, Snapshot, SnapshotStats};
 use tokio::task::JoinSet;
 
@@ -2243,11 +2243,50 @@ impl Walk {
     /// B3：封好的 pack 或 mpack 交去上傳（只在不存在時建立；mpack 在 replicas=1 時先主體、後 `.r1`；parity
     /// 選配），記下來給 delta 與 B4。自己寫的 mpack 也放進記憶體與本地快取：下一次 backup 讀 parent 的樹不必
     /// 下載。
-    async fn handle_spooled(&mut self, p: FinishedSpool) -> Result<()> {
-        // 等到有上傳的空位才讀回記憶體（還不能直接從檔案上傳）：記憶體裡最多是在上傳的那一個
+    /// B3：暫存檔裡的資料 pack 從檔案上傳（第 7 段之四第八步），不讀回記憶體；暫存檔跟著上傳的 task，傳完才刪。
+    /// 上傳之前一段一段重算名稱。開了 parity 的 repo 要整份編碼，照舊讀回記憶體、走 [`Walk::handle_finished`]。
+    async fn handle_spooled(&mut self, mut p: FinishedSpool) -> Result<()> {
         self.wait_uploads(MAX_INFLIGHT_UPLOADS - 1).await?;
-        let p = blocking(move || p.into_pack()).await?;
-        self.handle_finished(p).await
+        if self.parity > 0 {
+            let p = blocking(move || p.into_pack()).await?;
+            return self.handle_finished(p).await;
+        }
+        let entries = std::mem::take(&mut p.entries);
+        self.note_pack(p.id, p.kind, p.len, entries);
+        self.report.packs_new += 1;
+        let backend: Backend = self.repo.backend().clone();
+        let key = pack_key(p.kind, self.own, p.id);
+        self.uploads.spawn(async move {
+            let p = blocking(move || p.verify().map(|()| p)).await?;
+            // 以內容命名：「已存在」就是那份 bytes 已經在了（§12）
+            match backend.put_file_if_absent(&key.path(), p.path()).await {
+                Ok(()) | Err(BackendError::AlreadyExists(_)) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        });
+        self.delta_if_due().await
+    }
+
+    /// 記下寫好的 pack 給 delta 與 B4。
+    fn note_pack(&mut self, id: ObjectId, kind: Kind, size: u64, entries: Vec<PackEntry>) {
+        self.since_delta_entries += entries.len();
+        self.since_delta.push(DeltaPack {
+            id,
+            kind,
+            size,
+            entries,
+        });
+        self.own_packs.push(id);
+    }
+
+    /// pack 數或項目數到了就寫一份 delta。
+    async fn delta_if_due(&mut self) -> Result<()> {
+        if self.since_delta.len() >= self.delta_every
+            || self.since_delta_entries >= self.delta_entries
+        {
+            self.write_delta().await?;
+        }
+        Ok(())
     }
 
     async fn handle_finished(&mut self, p: FinishedPack) -> Result<()> {
@@ -2258,14 +2297,7 @@ impl Walk {
             bytes,
             entries,
         } = p;
-        self.since_delta_entries += entries.len();
-        self.since_delta.push(DeltaPack {
-            id,
-            kind,
-            size: bytes.len() as u64,
-            entries,
-        });
-        self.own_packs.push(id);
+        self.note_pack(id, kind, bytes.len() as u64, entries);
         let replica = match kind {
             Kind::Data => {
                 self.report.packs_new += 1;
@@ -2337,12 +2369,7 @@ impl Walk {
             }
             Ok(())
         });
-        if self.since_delta.len() >= self.delta_every
-            || self.since_delta_entries >= self.delta_entries
-        {
-            self.write_delta().await?;
-        }
-        Ok(())
+        self.delta_if_due().await
     }
 
     async fn wait_uploads(&mut self, max: usize) -> Result<()> {
