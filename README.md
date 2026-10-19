@@ -522,7 +522,8 @@ path 是 bucket 本身、repo 的前綴在 query，10-19 修正）。
 | 人為翻轉 pack 中一個 bit（透過 `mc` 上傳） | `check --read-data` 以非 0 結束並指名該 pack | 同 |
 | 峰值 RSS（backup 期間） | 188 MiB | 242 MiB |
 
-內容未變的 backup 的請求數與目錄數無關；新的一代的一次性成本上限是 256 片分片加 head。4 個 LIST 是 B1 的 head 與
+內容未變的 backup 的請求數與目錄數無關；新的一代的一次性成本上限是 256 片分片加 head。分片數看 pack 名稱的第一個
+byte，每次不同：同一份資料重跑（`7cf9e2d`，`run_s3.py` 改好停 trace 之後）是 13／77／10，多的一個是第 67 片。4 個 LIST 是 B1 的 head 與
 delta、找 parent 的自己的 snapshot、B4 的 head。restore 對 S3 仍比本機慢（88 s 對 31 s；10-19 的前一次跑是 99 s），差距
 的原因沒有 profile（UNVERIFIED）。
 

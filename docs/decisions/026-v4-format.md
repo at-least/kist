@@ -1335,8 +1335,10 @@ log `tests/acceptance/r2r-acceptance-2026-10-19.log`，binary `7cf9e2d`；峰值
 - 遠端 root 的目錄列兩次：`plan_roots` 為了分辨 root 是檔案還是目錄，把整個 root 列一次、只看第一項，walk 再列一次
   （S3 來源 21 個目錄的 trace 是 22 個 LIST）。100 萬項的平面 root 就是兩次完整的列舉；沒有改。
 - 驗收腳本的 trace：殺掉本機的 `docker exec` 不會停容器裡的 `mc admin trace`（沒有 tty，訊號不轉過去），留下來的訂閱者
-  一個佔 MinIO 約 12% 的 CPU，累積之後新的 trace 收不到東西。`run_r2r.py` 改成在容器裡記下 PID、結束時 kill；
-  `run_s3.py` 有同樣的寫法，沒有改。
+  一個佔 MinIO 約 12% 的 CPU，累積之後新的 trace 收不到東西。`run_r2r.py` 改成在容器裡記下 PID、結束時 kill，
+  `run_s3.py` 之後也改了。改了之後重跑 M2（`tests/acceptance/m2-acceptance-s3-v4-recount-2026-10-19.log`）：請求數
+  13／77／10，與引用的 13／76／10 只差 prune 之後那一次的 map 分片數（這次 67 片；分片依 pack 名稱的第一個 byte，每次
+  不同），引用的數字沒有受留下來的 trace 影響。
 - SFTP 來源把符號連結跟過去讀、不記成符號連結（ADR 016 的已知限制）；連到目錄的與斷掉的是略過的條目。
 - `to_meta` 在伺服器沒給大小時當成 0（`unwrap_or(0)`）：那樣的伺服器的檔案會記成空檔。第三步之前 stat 走同一個轉換，
   不是新的；OpenSSH 都會給大小，沒有改。

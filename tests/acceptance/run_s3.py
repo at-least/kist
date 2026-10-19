@@ -46,12 +46,16 @@ def traced(args):
     import collections, json, urllib.parse
     mc("admin", "trace", "--help")  # 這版 mc 要有 trace
     subprocess.run(["docker", "exec", CONTAINER, "sh", "-c", "rm -f /tmp/trace.jsonl"], check=True)
-    tracer = subprocess.Popen(["docker", "exec", "-i", CONTAINER, "mc", "admin", "trace", "--json", "--call", "s3", "local"],
+    # 容器裡的 mc 要自己停：殺掉本機的 docker exec 不會停它（沒有 tty，訊號不轉過去），留下來的訂閱者會一直佔著
+    # MinIO，累積幾個之後新的 trace 就收不到東西（同 run_r2r.py，2026-10-19 找到）。
+    tracer = subprocess.Popen(["docker", "exec", "-i", CONTAINER, "sh", "-c",
+                               "echo $$ > /tmp/kist-s3-trace.pid; exec mc admin trace --json --call s3 local"],
                               stdout=open(os.path.join(BASE, "trace.jsonl"), "wb"), stderr=subprocess.DEVNULL)
     time.sleep(3)  # trace 訂閱要一點時間；太早發的請求會漏
     result = run(args)
     time.sleep(2)
-    tracer.terminate(); tracer.wait()
+    subprocess.run(["docker", "exec", CONTAINER, "sh", "-c", "read p < /tmp/kist-s3-trace.pid && kill $p"], check=True)
+    tracer.wait()
     counts = collections.Counter()
     with open(os.path.join(BASE, "trace.jsonl"), "rb") as f:
         for line in f:
